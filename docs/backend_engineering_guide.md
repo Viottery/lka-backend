@@ -10,27 +10,19 @@ Linux Backend 是整个 Local Knowledge Agent OS 的核心执行层。它承载 
 
 ## 2. 核心职责
 
-Linux Backend 负责把用户任务从“请求”推进到“可执行计划”，再推进到“受控执行”和“可追踪结果”。
+Linux Backend 目前只负责三个基础动作：
 
 ```text
 HTTP API
   ↓
-Runtime
+Workspace Index
   ↓
-Main Agent Brain
+SQLite 持久化
   ↓
-Knowledge Context Engine
-  ↓
-Capability Registry
-  ↓
-Native Skills / Local Tools / Expert Tools
-  ↓
-Verifier
-  ↓
-Trace Recorder
+Static Capability Catalog
 ```
 
-当前实现只覆盖其中最小可运行闭环，未来会逐步补齐完整链路。
+当前阶段先把服务、索引和能力目录做稳，不再保留基于规则的任务规划或执行闭环。
 
 ---
 
@@ -49,73 +41,10 @@ backend/
       routes/
         health.py
         workspaces.py
-        tasks.py
-        traces.py
         capabilities.py
-        confirmations.py
 
     core/
       runtime.py
-
-      brain/
-        main_agent.py
-        intent.py
-        planner.py
-        decomposer.py
-        orchestrator.py
-        risk.py
-
-      agents/
-        sub_agent.py
-        worker_pool.py
-
-      knowledge/
-        object.py
-        context_package.py
-        context_engine.py
-        loaders/
-          file_loader.py
-          pdf_loader.py
-          markdown_loader.py
-          code_loader.py
-        chunker.py
-        embedder.py
-        indexer.py
-        retriever.py
-
-      capabilities/
-        schema.py
-        registry.py
-        selector.py
-
-      skills/
-        base.py
-        search_local_knowledge.py
-        summarize_folder.py
-        extract_tasks.py
-        organize_files.py
-        analyze_repo.py
-        delegate_to_coding_agent.py
-
-      tools/
-        filesystem.py
-        git.py
-        shell.py
-        sqlite.py
-        claude_code.py
-        codex.py
-
-      verifier/
-        verifier.py
-        diff_checker.py
-        test_runner.py
-        safety_checker.py
-
-      memory/
-        task_history.py
-        trace_recorder.py
-        skill_memory.py
-        skill_evolution.py
 
       storage/
         db.py
@@ -138,22 +67,14 @@ class LocalKnowledgeAgentRuntime:
     def index_workspace(self, workspace: str, options: dict | None = None) -> dict:
         ...
 
-    def plan_task(self, task: str, workspace: str | None = None) -> dict:
-        ...
-
-    def run_task(self, task: str, workspace: str | None = None, frontend: str = "unknown") -> dict:
-        ...
-
-    def get_trace(self, trace_id: str) -> dict:
+    def list_capabilities(self) -> list[dict]:
         ...
 ```
 
 ### 设计意图
 
 - `index_workspace`：把 workspace 变成可检索、可统计、可追踪的知识入口。
-- `plan_task`：把自然语言任务转成 intent、plan 和 capability 候选。
-- `run_task`：执行或编排任务，并产出 task / trace / verification 记录。
-- `get_trace`：把一次任务的完整执行过程暴露给前端和调试工具。
+- `list_capabilities`：返回当前对外公开的静态能力目录。
 
 ---
 
@@ -163,31 +84,28 @@ class LocalKnowledgeAgentRuntime:
 
 - FastAPI skeleton
 - SQLite
-- Qdrant
-- KnowledgeObject
-- ContextPackage
 - workspace index
-- retrieval
-- Capability Registry
-- Intent Parser
-- 3 个 Native Skills
-- Trace Recorder
+- static capability catalog
+- local-only binding
 
 ### P1
+
+- KnowledgeObject
+- ContextPackage
+- retrieval
+- Capabilities registry redesign
+- Native Skills 接口抽象
+
+### P2
 
 - SubAgent abstraction
 - organize_files
 - analyze_repo
 - delegate_to_coding_agent manual mode
 - Verifier diff/test
-- Confirmation API
-
-### P2
-
 - Claude/Codex CLI 自动调用
 - SSE/WebSocket 任务流
 - Skill Evolution proposal
-- 并行 SubAgent
 
 ---
 
@@ -197,22 +115,18 @@ class LocalKnowledgeAgentRuntime:
 
 - Health Check
 - Workspace index 的基础统计
-- Task planning 的规则化版本
-- Task / Trace / Confirmation 的持久化
 - Capability 列表返回
 
 这意味着：
 
 - 你在愿景里定义的模块没有丢，它们是后续的目标结构。
-- 当前实现只是把整体系统先跑起来，避免一开始就陷入复杂度。
-- 未来可按 P0 / P1 / P2 逐步替换现有 stub。
+- 当前实现只是把最基础的 HTTP 服务和索引先跑起来，避免一开始就陷入复杂度。
+- 未来可按 P0 / P1 / P2 逐步增加真正的知识层和能力层。
 
 ---
 
 ## 7. 设计原则
 
 - 先有最小闭环，再补智能能力。
-- 先把轨迹、状态、确认机制打牢，再做自动化执行。
+- 先把服务、索引、能力目录打牢，再做更复杂的 agent 协作。
 - 先保留显式能力注册，再考虑自动选择和自动调度。
-- 先支持人工可理解的计划，再逐步引入更强的 agent 协作。
-

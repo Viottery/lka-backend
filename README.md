@@ -7,7 +7,7 @@ path for future expansion.
 ## Current Scope
 
 - FastAPI application with the implemented HTTP routes
-- SQLite-backed storage for workspaces, tasks, traces, and confirmations
+- SQLite-backed storage for workspaces
 - Local-only default binding for development
 - Docker and Docker Compose support
 - Documentation for the current architecture and API contract
@@ -31,6 +31,8 @@ docs/
   api_contract.md
   backend_engineering_guide.md
   backend_implementation_plan.md
+  ai_coding_standard.md
+  mvp_todolist.md
 ```
 
 ## Quick Start
@@ -55,20 +57,15 @@ The default compose file starts the API and a local Qdrant container.
 
 - `GET /health`
 - `POST /workspaces/index`
-- `POST /tasks/plan`
-- `POST /tasks/run`
-- `GET /tasks/{task_id}`
 - `GET /capabilities`
-- `GET /traces`
-- `GET /traces/{trace_id}`
-- `POST /confirmations/{confirmation_id}`
 
 ## Notes
 
-- The runtime is intentionally lightweight and rule-based.
-- High-risk actions are surfaced as confirmation requests.
+- The runtime is intentionally lightweight and does not perform task planning or execution.
 - The docs in `docs/` are organized as:
   - `project_overview.md` for the mission and vision
   - `backend_engineering_guide.md` for backend architecture
   - `backend_implementation_plan.md` for delivery stages
   - `api_contract.md` for the HTTP interface
+  - `ai_coding_standard.md` for coding and reporting rules
+  - `mvp_todolist.md` for the implementation checklist

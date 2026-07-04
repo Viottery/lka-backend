@@ -1,53 +1,70 @@
 # Local Knowledge Agent OS：MVP Todolist
 
-> 目标：通过逐项完成本清单，最终实现一个可运行、可演示、可验证、可继续扩展的 Local Knowledge Agent OS MVP。
+> 目标：按下面的顺序逐项实现，最终得到一个真正以 Agent 核心能力为中心的 MVP。
 >
-> 这份清单以“先闭环、再增强”为原则，优先保证最小可用路径完整，再逐步增加上下文、能力、验证与演化能力。
+> 这份清单的目标不是“把后端堆起来”，而是打通一条最小但完整的闭环：
+>
+> 用户任务 -> 本地知识检索 -> 上下文构造 -> 任务理解 -> 计划生成 -> 能力选择 -> 子任务 / 专家工具执行 -> 结果验证 -> 轨迹记录 -> Skill Proposal
+>
+> 执行规则：
+>
+> - 一次只推进一个阶段中的少量任务。
+> - 每个条目开始前先明确预期目标。
+> - 每个条目都要说明修改了哪些文件。
+> - 每个条目都要说明做了哪些测试、结果如何、如何验证。
+> - 优先完成“能形成闭环”的能力，而不是孤立基础设施。
 
 ---
 
 ## 0. MVP 成功定义
 
-在进入具体任务之前，先明确 MVP 必须达到什么程度。
-
-### MVP 最终应具备的能力
+### 0.1 MVP 最终应具备的能力
 
 - 能在本地启动 Linux Backend。
 - 能通过 HTTP API 接收任务。
 - 能索引一个本地 workspace。
-- 能根据任务生成可读的计划。
+- 能从本地知识中构造上下文。
+- 能根据任务生成可读、可解释的执行计划。
+- 能识别任务意图、风险等级和候选能力。
+- 能执行基础技能或子任务编排。
+- 能按上下文管理策略调用 Codex / Claude Code 等专家工具。
+- 能自动生成 Skill Proposal，必要时可生成 Skill Draft / Scaffold。
 - 能记录 task、trace、confirmation 等核心状态。
 - 能提供基础的 capability 列表。
 - 能在高风险操作时进入确认流程。
-- 能给出可解释、可追踪、可回放的结果。
-- 能支持未来扩展到更强的 RAG、技能和专家工具调用。
+- 能给出可追踪、可回放、可验证的结果。
 
-### MVP 不是必须完成的内容
+### 0.2 MVP 不是必须完成的内容
 
 - 不要求真正的复杂 agent 自主推理闭环。
-- 不要求完整向量检索和 embedding 生产级实现。
-- 不要求自动修改大量文件。
-- 不要求多用户系统。
+- 不要求生产级 embedding / rerank / vector search。
 - 不要求完整 GUI。
-- 不要求复杂权限系统。
-- 不要求自动 skill 生成。
+- 不要求多用户系统。
+- 不要求企业权限系统。
+- 不要求自动删除文件或自动 git push。
+- 不要求一次性完成全部 skill 自动生成体系。
 
-### MVP 的核心判断标准
+### 0.3 MVP 的核心判断标准
 
 如果用户输入一个真实任务，系统能够：
 
 1. 理解任务类型。
-2. 生成可读计划。
-3. 选择合适能力。
-4. 记录执行轨迹。
-5. 在高风险时要求确认。
-6. 返回稳定、结构化的结果。
+2. 检索相关本地知识。
+3. 构造上下文包。
+4. 生成可读计划。
+5. 选择合适能力。
+6. 执行一个或多个子步骤。
+7. 记录执行轨迹。
+8. 在高风险时要求确认。
+9. 返回稳定、结构化的结果。
 
 那么 MVP 就算成立。
 
 ---
 
-## 1. 项目基础与工程约定
+## 1. 先固化规则与文档
+
+这一阶段的目标不是写业务逻辑，而是把项目“怎么做”先定义清楚。
 
 ### 1.1 仓库结构确认
 
@@ -55,298 +72,258 @@
 - [ ] 确认 `docs/` 内文档分层正确：
   - [ ] `project_overview.md` 作为项目总纲
   - [ ] `backend_engineering_guide.md` 作为后端架构说明
-  - [ ] `backend_implementation_plan.md` 作为实施路线图
+  - [ ] `backend_implementation_plan.md` 作为长期实施路线图
   - [ ] `api_contract.md` 作为接口契约
-  - [ ] `mvp_todolist.md` 作为执行清单
+  - [ ] `ai_coding_standard.md` 作为 coding 规范
+  - [ ] `mvp_todolist.md` 作为当前执行清单
 - [ ] 确认 `temp.md` 作为源草稿保留，不参与对外说明。
 
 ### 1.2 术语统一
 
 - [ ] 统一 `Main Agent Brain` 的定义和中文解释。
 - [ ] 统一 `Knowledge Context Engine` 的职责边界。
-- [ ] 统一 `Capability Registry`、`Native Skill`、`Expert Tool` 的命名。
+- [ ] 统一 `Capability Registry`、`Native Skill`、`Expert Tool`、`Sub Agent` 的命名。
 - [ ] 统一 `Trace`、`Context Package`、`Verifier` 的文档描述。
-- [ ] 统一“计划 / 任务 / 轨迹 / 确认 / 能力”这些核心词汇的用法。
+- [ ] 统一“计划 / 任务 / 轨迹 / 确认 / 能力 / 技能”这些核心词汇的用法。
 
-### 1.3 运行目标确认
+### 1.3 执行规范
+
+- [ ] 明确 coding agent 必须先读哪些文档。
+- [ ] 明确 coding agent 每一步都要告知预期目标。
+- [ ] 明确 coding agent 每一步都要说明修改的文件。
+- [ ] 明确 coding agent 每一步都要说明测试与验证结果。
+- [ ] 明确 coding agent 遇到架构、API、数据模型变更时需要先确认。
+
+### 1.4 运行目标确认
 
 - [ ] 明确后端默认监听地址为 `127.0.0.1:8765`。
 - [ ] 明确 SQLite 作为本地持久化方案。
-- [ ] 明确 Qdrant 目前可以作为服务占位，但 MVP 不强依赖其真实检索能力。
+- [ ] 明确 Qdrant 先作为能力预留或占位，不把它当作 MVP 成败关键。
 - [ ] 明确前端与后端的职责边界。
 
 ### 完成标准
 
-- 文档中的术语、结构、职责没有明显冲突。
+- 文档、命名、执行规范没有明显冲突。
 - 读者能在 5 分钟内理解这个项目做什么、怎么跑、先做什么。
 
 ---
 
-## 2. API 与数据模型骨架
+## 2. 先做上下文管理
 
-### 2.1 请求与响应模型
+这一阶段是项目亮点的第一根支柱。没有 Context Engine，后面的规划和执行都只是规则分支。
 
-- [ ] 定义 Health 响应模型。
-- [ ] 定义 Workspace Index 请求模型。
-- [ ] 定义 Workspace Index 响应模型。
-- [ ] 定义 Task Plan 请求模型。
-- [ ] 定义 Task Plan 响应模型。
-- [ ] 定义 Task Run 请求模型。
-- [ ] 定义 Task Run 响应模型。
-- [ ] 定义 Task Record 响应模型。
-- [ ] 定义 Capability Item 与 Capability List 响应模型。
-- [ ] 定义 Trace Record 响应模型。
-- [ ] 定义 Confirmation Decision 请求模型。
-- [ ] 定义 Confirmation Response 模型。
+### 2.1 定义上下文对象
 
-### 2.2 API 契约对齐
+- [ ] 定义 `Context Package` 的结构。
+- [ ] 至少支持 `related_files`、`related_snippets`、`project_constraints`、`risk_notes`、`suggested_tools`、`verification_plan`。
+- [ ] 让 Context Package 能表达“这次任务为什么这么做”。
+- [ ] 明确 Context Package 是任务规划和专家工具输入的共同基础。
 
-- [ ] 确认 `/health` 返回内容稳定。
-- [ ] 确认 `/workspaces/index` 支持 `workspace`、`source_frontend`、`options`。
-- [ ] 确认 `/tasks/plan` 返回 `intent`、`plan`、`suggested_capabilities`、`risk`。
-- [ ] 确认 `/tasks/run` 返回 `task_id`、`status`、`summary`、`trace_id`、`requires_user_action`、`artifacts`。
-- [ ] 确认 `/tasks/{task_id}` 能返回单个任务。
-- [ ] 确认 `/capabilities` 返回能力清单。
-- [ ] 确认 `/traces` 返回轨迹列表。
-- [ ] 确认 `/traces/{trace_id}` 返回完整轨迹。
-- [ ] 确认 `/confirmations/{confirmation_id}` 能记录用户决策。
+### 2.2 本地知识检索
 
-### 2.3 错误约定
+- [ ] 实现 workspace 内容扫描。
+- [ ] 能识别常见文件类型。
+- [ ] 能提取文本内容。
+- [ ] 能生成可用于规划的上下文摘要。
+- [ ] 能根据任务关键词召回相关文件或片段。
+- [ ] 能识别 README、测试命令、配置文件等高价值上下文。
 
-- [ ] 未找到 task 时返回 `404 task not found`。
-- [ ] 未找到 trace 时返回 `404 trace not found`。
-- [ ] 无效请求返回 FastAPI/Pydantic 默认校验错误或统一格式错误。
-- [ ] 明确哪些接口未来可能扩展错误码。
+### 2.3 Context Assembly
 
-### 完成标准
+- [ ] 根据用户任务组装上下文包。
+- [ ] 根据任务类型选择不同的上下文来源。
+- [ ] 给复杂任务提供更完整的上下文。
+- [ ] 给简单任务提供轻量上下文。
+- [ ] 明确上下文包里哪些信息是“建议”，哪些是“约束”。
 
-- 所有 MVP API 都有明确的请求/响应结构。
-- 前后端可以不看实现直接按契约集成。
+### 2.4 约束注入
 
----
-
-## 3. 存储层 MVP
-
-### 3.1 SQLite 初始化
-
-- [ ] 在配置的数据目录下创建 SQLite 文件。
-- [ ] 在启动时自动初始化数据库表。
-- [ ] 确保数据库目录不存在时可自动创建。
-- [ ] 确保重复启动不会破坏已有数据。
-
-### 3.2 数据表设计
-
-- [ ] 创建 `workspaces` 表。
-- [ ] 创建 `tasks` 表。
-- [ ] 创建 `traces` 表。
-- [ ] 创建 `confirmations` 表。
-- [ ] 确认每张表的主键、必填字段和默认值合理。
-
-### 3.3 持久化行为
-
-- [ ] workspace 索引结果可写入数据库。
-- [ ] task 记录可写入数据库。
-- [ ] trace 记录可写入数据库。
-- [ ] confirmation 决策可写入数据库。
-- [ ] 同 ID 冲突时可更新旧记录而非报错。
-
-### 3.4 连接与读取
-
-- [ ] SQLite 连接使用 row factory，便于按字段名读取。
-- [ ] 读取 task 时可返回结构化对象。
-- [ ] 读取 trace 时可返回结构化对象。
-- [ ] 列表接口返回稳定顺序。
+- [ ] 注入项目约束。
+- [ ] 注入风险提示。
+- [ ] 注入用户偏好或历史行为。
+- [ ] 注入建议执行工具和验证计划。
+- [ ] 注入专家工具调用前必须携带的必要上下文。
 
 ### 完成标准
 
-- 后端重启后，历史记录仍然可读。
-- 核心对象有稳定的持久化基础。
+- 系统不只是“拿到文件列表”，而是能形成可用于 agent 决策的上下文包。
+- 上下文管理可以独立支撑任务规划、专家工具输入和 trace 解释。
 
 ---
 
-## 4. Runtime 核心闭环
+## 3. 再做 Main Agent Brain
 
-### 4.1 Health 能力
+这一阶段目标是把“知道任务”变成“知道怎么做”。
 
-- [ ] 实现 `health()`。
-- [ ] 返回 `status`、`version`、`service`。
-- [ ] `/health` 路由直接透传 runtime 结果。
+### 3.1 任务理解
 
-### 4.2 Workspace Index
+- [ ] 实现任务分类。
+- [ ] 能区分知识总结、文件整理、代码分析、复杂修改、一般问答。
+- [ ] 能识别任务目标中的动作意图。
+- [ ] 能识别任务中隐含的风险信号。
 
-- [ ] 实现 `index_workspace()`。
-- [ ] 输入 workspace 路径后可检查目录是否存在。
-- [ ] 对存在目录进行文件统计。
-- [ ] 生成稳定的 `workspace_id`。
-- [ ] 将索引结果写入 SQLite。
-- [ ] 返回 `indexed_files` 和 `indexed_chunks`。
+### 3.2 任务规划
 
-### 4.3 Task Planning
+- [ ] 为每类任务输出明确步骤。
+- [ ] 步骤按执行顺序排列。
+- [ ] 计划中能体现检索、执行、验证三个阶段。
+- [ ] 计划中能体现高风险点。
+- [ ] 计划中能体现是否适合直接执行、是否需要确认、是否需要专家工具。
 
-- [ ] 实现 `plan_task()`。
-- [ ] 至少支持基础意图分类。
-- [ ] 至少支持文件整理类任务识别。
-- [ ] 至少支持 TODO / 待办提取类任务识别。
-- [ ] 至少支持一般任务兜底分类。
-- [ ] 输出可读的计划步骤。
-- [ ] 输出建议能力列表。
-- [ ] 输出风险等级。
+### 3.3 风险判断
 
-### 4.4 Task Run
+- [ ] 识别修改、删除、重命名、批量操作等高风险任务。
+- [ ] 将高风险任务标记为 `high`。
+- [ ] 将可直接执行的任务标记为 `low` 或 `medium`。
+- [ ] 让风险等级直接影响后续执行路径。
 
-- [ ] 实现 `run_task()`。
-- [ ] 根据任务生成稳定的 `task_id`。
-- [ ] 根据任务和计划生成稳定的 `trace_id`。
-- [ ] 写入 task 记录。
-- [ ] 写入 trace 记录。
-- [ ] 返回任务执行结果对象。
-- [ ] 在高风险任务时切换到 `waiting_for_confirmation`。
+### 3.4 能力选择
 
-### 4.5 Task / Trace 查询
-
-- [ ] 实现 `get_task()`。
-- [ ] 实现 `list_traces()`。
-- [ ] 实现 `get_trace()`。
-- [ ] 查询不到时返回 `None`，由路由层转为 404。
-
-### 4.6 Confirmation 记录
-
-- [ ] 实现 `confirm()`。
-- [ ] 保存 decision。
-- [ ] 将状态标记为 resolved。
-- [ ] 返回确认结果对象。
+- [ ] 从能力目录中选择候选能力。
+- [ ] 将任务类型映射到 native skills。
+- [ ] 保留 expert tools 的入口。
+- [ ] 保留未来 MCP tools 的扩展位置。
+- [ ] 让能力选择结果能进入 trace 和 verifier。
 
 ### 完成标准
 
-- 单次任务从输入到 task/trace/confirmation 的最小闭环完整。
-- 不依赖真实 agent，也能稳定输出结构化结果。
+- 系统能对用户输入给出“怎么做”的答案，而不只是“是什么”的回答。
+- Main Agent Brain 已经可以输出结构化计划与能力建议。
 
 ---
 
-## 5. 路由层 MVP
+## 4. 打通任务计划与执行
 
-### 5.1 FastAPI App 装配
+这一阶段是 MVP 的核心闭环，重点是“从输入到输出”。
 
-- [ ] 在 `main.py` 中创建 FastAPI app。
-- [ ] 注入 settings。
-- [ ] 挂载 runtime 到 `app.state`。
-- [ ] 挂载所有路由模块。
+### 4.1 Task Plan
 
-### 5.2 路由拆分
+- [ ] 实现 `/tasks/plan`。
+- [ ] 输入 task 后先做 intent 识别。
+- [ ] 结合 Context Package 生成计划。
+- [ ] 返回建议能力列表。
+- [ ] 返回风险等级。
+- [ ] 让返回值足以给前端做下一步决策。
 
-- [ ] `health.py`
-- [ ] `workspaces.py`
-- [ ] `tasks.py`
-- [ ] `traces.py`
-- [ ] `capabilities.py`
-- [ ] `confirmations.py`
+### 4.2 Task Run
 
-### 5.3 路由行为
+- [ ] 实现 `/tasks/run`。
+- [ ] 根据 task、workspace、frontend、mode 生成稳定 task id。
+- [ ] 根据 task 和 plan 生成稳定 trace id。
+- [ ] 将 task 记录写入数据库。
+- [ ] 将 trace 记录写入数据库。
+- [ ] 返回执行结果对象。
+- [ ] 支持把复杂任务拆解为多个可追踪步骤。
 
-- [ ] 路由层只做参数接收、错误转换和结果返回。
-- [ ] 业务逻辑不写在路由层。
-- [ ] 路由命名与文档保持一致。
-- [ ] 路由返回类型与 schemas 保持一致。
+### 4.3 Execution Mode
+
+- [ ] 支持 `interactive` 模式。
+- [ ] 支持 `manual` 或 `dry_run` 思路的预留。
+- [ ] 高风险任务优先进入确认流。
+- [ ] 低风险任务可以直接走完整执行闭环。
+
+### 4.4 子任务编排
+
+- [ ] 把复杂任务拆成多个子步骤。
+- [ ] 每个子步骤有明确目标。
+- [ ] 每个子步骤都有可追踪的中间结果。
+- [ ] 允许先串行，后并行。
+- [ ] 让子任务结果可以回流到 trace 和 skill proposal。
 
 ### 完成标准
 
-- 代码层分层清楚。
-- 路由层不会变成难维护的“大函数堆”。
+- 用户任务能从“输入”变成“计划 + 执行记录 + trace”。
+- 这条链路是 MVP 的核心，而不是附属功能。
 
 ---
 
-## 6. Capability Registry MVP
+## 5. 补齐 Capability Registry 和 Skills
 
-### 6.1 能力清单
+这一阶段让 Agent 的“能做什么”变得显式可管理。
 
-- [ ] 设计一个显式能力列表。
+### 5.1 能力清单
+
+- [ ] 设计显式能力列表。
 - [ ] 包含至少以下能力：
+  - [ ] `search_local_knowledge`
   - [ ] `summarize_folder`
   - [ ] `extract_tasks`
   - [ ] `organize_files`
+  - [ ] `analyze_repo`
+  - [ ] `delegate_to_coding_agent`
   - [ ] `claude_code`
   - [ ] `codex`
 - [ ] 每个能力包含类型、风险、是否需要确认。
 
-### 6.2 能力分类
+### 5.2 能力分类
 
 - [ ] 区分 `native_skill`。
+- [ ] 区分 `local_tool`。
 - [ ] 区分 `expert_tool`。
-- [ ] 为未来 `local_tool`、`mcp_tool` 留出扩展空间。
+- [ ] 为未来 `mcp_tool` 留出扩展空间。
 
-### 6.3 能力选择规则
+### 5.3 任务与能力映射
 
-- [ ] 文件总结类任务优先匹配 `summarize_folder`。
-- [ ] TODO 提取类任务优先匹配 `extract_tasks`。
-- [ ] 文件整理类任务优先匹配 `organize_files`。
-- [ ] 复杂代码修改类任务保留对 `claude_code` / `codex` 的入口。
+- [ ] 知识总结优先匹配 `summarize_folder`。
+- [ ] TODO 提取优先匹配 `extract_tasks`。
+- [ ] 文件整理优先匹配 `organize_files`。
+- [ ] repo 分析优先匹配 `analyze_repo`。
+- [ ] 复杂代码修改保留 `delegate_to_coding_agent` / `claude_code` / `codex` 路径。
+
+### 5.4 专家工具接入
+
+- [ ] 根据 Context Package 组织给 Codex / Claude Code 的输入。
+- [ ] 专家工具调用前先检查风险等级和确认条件。
+- [ ] 专家工具调用后收集输出、diff 或结果摘要。
+- [ ] 将专家工具调用结果写入 trace。
 
 ### 完成标准
 
 - 用户和系统都能看到“当前可用能力是什么”。
 - 任务计划能与能力清单建立对应关系。
+- 专家工具不再是“旁门”，而是受控的能力入口。
 
 ---
 
-## 7. 任务规划 MVP
+## 6. 做好 Trace、Verifier、Confirmation
 
-### 7.1 意图识别
+这一阶段是让系统从“能跑”走向“可信、可解释、可回放”。
 
-- [ ] 识别“文件整理”类任务。
-- [ ] 识别“待办提取”类任务。
-- [ ] 识别“代码分析”类任务。
-- [ ] 识别“复杂修改”类任务。
-- [ ] 提供“通用助手”兜底类型。
-
-### 7.2 计划生成
-
-- [ ] 每类任务输出一组清晰步骤。
-- [ ] 计划步骤数量保持在可读范围内。
-- [ ] 步骤命名保持动词开头、短句表达。
-- [ ] 高风险任务计划里要显式体现确认点。
-
-### 7.3 风险识别
-
-- [ ] 识别包含删除、修改、remove、delete 等高风险词汇的任务。
-- [ ] 识别复杂文件操作类高风险任务。
-- [ ] 风险等级至少分为 `low`、`medium`、`high`。
-
-### 7.4 计划与能力联动
-
-- [ ] plan 返回建议能力。
-- [ ] 任务类型与能力选择有明确映射。
-- [ ] 计划可以作为后续执行和 trace 的基础。
-
-### 完成标准
-
-- 用户输入任务后，系统能给出“为什么这么做”的计划感。
-
----
-
-## 8. Trace 与可解释性 MVP
-
-### 8.1 Trace 记录
+### 6.1 Trace Recorder
 
 - [ ] 记录用户原始目标。
 - [ ] 记录识别出的 intent。
 - [ ] 记录执行计划。
 - [ ] 记录上下文摘要。
 - [ ] 记录使用的能力。
+- [ ] 记录子任务结果。
 - [ ] 记录验证结果。
 - [ ] 记录成功或失败状态。
 
-### 8.2 Trace 查询
+### 6.2 Verifier
+
+- [ ] 设计基础 verifier 接口。
+- [ ] 支持 diff 检查的预留。
+- [ ] 支持测试命令执行的预留。
+- [ ] 支持文件越权检查的预留。
+- [ ] 支持风险操作确认的预留。
+- [ ] 支持把 verifier 结果写入 trace。
+
+### 6.3 Confirmation Flow
+
+- [ ] 高风险任务进入确认流程。
+- [ ] `POST /confirmations/{confirmation_id}` 接收 decision。
+- [ ] 支持 approved。
+- [ ] 支持 rejected。
+- [ ] 决策写入数据库。
+- [ ] 状态更新为 resolved。
+
+### 6.4 Trace 查询
 
 - [ ] 支持 trace 列表。
 - [ ] 支持 trace 详情。
 - [ ] trace 列表返回精简字段，方便浏览。
 - [ ] trace 详情返回完整信息，方便调试。
-
-### 8.3 可解释性要求
-
-- [ ] 每次 task run 后都能找到对应 trace。
-- [ ] 每个 trace 都能看出任务是怎么被处理的。
-- [ ] 轨迹数据可以用于未来 skill evolution。
 
 ### 完成标准
 
@@ -355,80 +332,105 @@
 
 ---
 
-## 9. 确认机制 MVP
+## 7. 引入 Skill Evolution
 
-### 9.1 触发条件
+这一阶段把“经验沉淀”变成能力，而不是只停留在日志。
 
-- [ ] 高风险任务进入确认流程。
-- [ ] 确认流程与 task 状态联动。
-- [ ] 确认流程不依赖前端私有逻辑。
+### 7.1 模式发现
 
-### 9.2 API 行为
+- [ ] 从 trace 中识别重复成功模式。
+- [ ] 识别“文件总结 + TODO 提取 + checklist 生成”等高频模式。
+- [ ] 识别需要专家工具介入的重复任务模式。
+- [ ] 识别适合沉淀为 Native Skill 的模式。
 
-- [ ] `POST /confirmations/{confirmation_id}` 接收 decision。
-- [ ] 支持 approved。
-- [ ] 支持 rejected。
-- [ ] 决策写入数据库。
-- [ ] 状态更新为 resolved。
+### 7.2 Skill Proposal
 
-### 9.3 风险边界
+- [ ] 生成 Skill Proposal。
+- [ ] 生成 Skill Draft 或 Scaffold。
+- [ ] 为 skill 定义名称、输入、步骤、验证方式、适用场景。
+- [ ] 让 proposal 可以被人工审查和回滚。
 
-- [ ] 高风险动作不应默认直接执行。
-- [ ] 删除或大规模修改类动作必须可拦截。
-- [ ] 后续可扩展为真正的 action gating。
+### 7.3 Skill 注册
 
-### 完成标准
+- [ ] 能把 skill 作为候选能力注册到 capability registry。
+- [ ] 能让 skill 被计划器优先考虑。
+- [ ] 能让 skill 的来源 trace 可追溯。
 
-- 系统具备最基础的安全闸门。
-- 用户可以明确控制高风险动作。
+### 7.4 Skill 演化边界
 
----
-
-## 10. Workspace Index MVP
-
-### 10.1 输入处理
-
-- [ ] 接收本地 workspace 路径。
-- [ ] 允许前端传入来源标识。
-- [ ] 接收但不强依赖 options。
-
-### 10.2 索引行为
-
-- [ ] 扫描目录中的文件。
-- [ ] 统计文件总数。
-- [ ] 估算 chunk 数量。
-- [ ] 生成可复用 workspace id。
-
-### 10.3 索引结果
-
-- [ ] 返回索引状态。
-- [ ] 返回统计信息。
-- [ ] 将结果持久化。
+- [ ] MVP 阶段允许生成 proposal / draft。
+- [ ] MVP 阶段不要求完全自动把 proposal 写成生产代码。
+- [ ] MVP 阶段必须保证 skill 演化可审计、可回退。
 
 ### 完成标准
 
-- 用户能把一个目录交给后端，后端能给出可记录、可查询的索引结果。
+- 系统不只是会执行任务，还能从任务中学习。
+- 轨迹和 skill proposal 之间形成闭环。
 
 ---
 
-## 11. 文档与说明 MVP
+## 8. 路由层与代码组织
 
-### 11.1 总览文档
+这一阶段目的是让实现和文档一致，代码结构清晰。
+
+### 8.1 FastAPI App 装配
+
+- [ ] 在 `main.py` 中创建 FastAPI app。
+- [ ] 注入 settings。
+- [ ] 挂载 runtime 到 `app.state`。
+- [ ] 挂载所有路由模块。
+
+### 8.2 路由拆分
+
+- [ ] `health.py`
+- [ ] `workspaces.py`
+- [ ] `tasks.py`
+- [ ] `traces.py`
+- [ ] `capabilities.py`
+- [ ] `confirmations.py`
+
+### 8.3 路由行为
+
+- [ ] 路由层只做参数接收、错误转换和结果返回。
+- [ ] 业务逻辑不写在路由层。
+- [ ] 路由命名与文档保持一致。
+- [ ] 路由返回类型与 schemas 保持一致。
+
+### 8.4 代码结构要求
+
+- [ ] runtime 保持为协调层，不堆过多细节逻辑。
+- [ ] 存储层只处理持久化。
+- [ ] schema 层只处理数据结构。
+- [ ] 文档和代码术语保持一致。
+
+### 完成标准
+
+- 代码层分层清楚。
+- 路由层不会变成难维护的“大函数堆”。
+
+---
+
+## 9. 文档与说明
+
+这一阶段保证别人能看懂、能跑起来、能继续开发。
+
+### 9.1 总览文档
 
 - [ ] `project_overview.md` 保留项目背景、目标、愿景、场景和成功标准。
 - [ ] `backend_engineering_guide.md` 保留后端架构、模块说明和技术边界。
-- [ ] `backend_implementation_plan.md` 保留阶段推进节奏。
+- [ ] `backend_implementation_plan.md` 保留长期路线图。
 - [ ] `api_contract.md` 保留接口样例与约束。
-- [ ] `mvp_todolist.md` 作为执行入口。
+- [ ] `ai_coding_standard.md` 保留 coding 规范。
+- [ ] `mvp_todolist.md` 作为当前执行入口。
 
-### 11.2 README
+### 9.2 README
 
 - [ ] README 能说明项目是什么。
 - [ ] README 能说明怎么启动。
 - [ ] README 能说明文档结构。
 - [ ] README 能让新读者快速找到正确文档。
 
-### 11.3 文档一致性
+### 9.3 文档一致性
 
 - [ ] 文档里的接口示例和代码保持一致。
 - [ ] 文档里的术语和代码保持一致。
@@ -441,15 +443,17 @@
 
 ---
 
-## 12. 测试与验证 MVP
+## 10. 测试与验证
 
-### 12.1 基础校验
+这一阶段的目标是让每个模块都有可重复的验证方法。
+
+### 10.1 基础校验
 
 - [ ] 运行 Python 语法检查。
 - [ ] 运行最小启动验证。
 - [ ] 确认 `/health` 可访问。
 
-### 12.2 接口验证
+### 10.2 接口验证
 
 - [ ] 验证 `/workspaces/index`。
 - [ ] 验证 `/tasks/plan`。
@@ -460,35 +464,45 @@
 - [ ] 验证 `/traces/{trace_id}`。
 - [ ] 验证 `/confirmations/{confirmation_id}`。
 
-### 12.3 数据验证
+### 10.3 数据验证
 
 - [ ] 确认数据库文件可生成。
 - [ ] 确认数据表可创建。
-- [ ] 确认任务和轨迹可持久化。
+- [ ] 确认 workspace 索引可持久化。
+- [ ] 确认 task / trace / confirmation 可持久化。
 - [ ] 确认重启后数据仍可读。
+
+### 10.4 端到端验证
+
+- [ ] 选择一个真实文件夹作为测试 workspace。
+- [ ] 跑通索引 -> 规划 -> 执行 -> trace 查询 的最小闭环。
+- [ ] 跑通高风险任务 -> confirmation 的分支闭环。
+- [ ] 跑通至少一次 expert tool 或 skill proposal 的流程。
 
 ### 完成标准
 
 - 至少有一条端到端 smoke test 能跑通。
-- API、存储、运行时三层都能被基础验证覆盖。
+- API、存储、运行时、规划、执行、轨迹、演化三层都能被基础验证覆盖。
 
 ---
 
-## 13. 部署与运行 MVP
+## 11. 部署与运行
 
-### 13.1 本地运行
+这一阶段让项目真正具备“别人拉下来就能看”的能力。
+
+### 11.1 本地运行
 
 - [ ] 能用 `uv sync` 安装依赖。
 - [ ] 能用 `uv run uvicorn app.api.main:app` 启动服务。
 - [ ] `.env.example` 中的配置可直接参考。
 
-### 13.2 Docker 运行
+### 11.2 Docker 运行
 
 - [ ] `docker compose up --build` 可启动服务。
 - [ ] API 容器可访问。
 - [ ] Qdrant 容器可启动。
 
-### 13.3 运行说明
+### 11.3 运行说明
 
 - [ ] README 写清本地运行方式。
 - [ ] README 写清 Docker 运行方式。
@@ -500,39 +514,34 @@
 
 ---
 
-## 14. MVP 交付顺序建议
+## 12. 当前阶段交付顺序建议
 
-### 第一阶段：能启动
+如果你要真正按顺序做，我建议这样排：
 
-- [ ] 配置
-- [ ] FastAPI app
-- [ ] `/health`
-- [ ] SQLite 初始化
-- [ ] README 基础说明
+### 第一阶段：先理解
 
-### 第二阶段：能记录
+- [ ] Context Package
+- [ ] workspace 扫描与上下文摘要
+- [ ] 任务意图识别
+- [ ] 基础计划生成
 
-- [ ] `/workspaces/index`
+### 第二阶段：再执行
+
 - [ ] `/tasks/plan`
 - [ ] `/tasks/run`
-- [ ] task 持久化
-- [ ] trace 持久化
+- [ ] capability 列表
+- [ ] 基础 skill / sub agent 入口
+- [ ] Expert Tool 调用入口
 
-### 第三阶段：能解释
+### 第三阶段：再解释
 
-- [ ] `/tasks/{task_id}`
 - [ ] `/traces`
 - [ ] `/traces/{trace_id}`
-- [ ] capability 列表
-- [ ] 更清晰的计划输出
+- [ ] verifier 基础记录
+- [ ] confirmation 流程
+- [ ] skill proposal 生成
 
-### 第四阶段：能控制风险
-
-- [ ] confirmation API
-- [ ] 高风险任务拦截
-- [ ] 风险标注
-
-### 第五阶段：能演示
+### 第四阶段：再演示
 
 - [ ] 文档统一
 - [ ] 示例请求齐全
@@ -541,27 +550,29 @@
 
 ---
 
-## 15. MVP 完成验收
+## 13. MVP 完成验收
 
-当以下条件全部满足时，可以认为 MVP 已完成：
+当以下条件全部满足时，可以认为 MVP 完成：
 
 - [ ] 能启动服务。
 - [ ] 能索引 workspace。
+- [ ] 能生成 Context Package。
 - [ ] 能规划任务。
 - [ ] 能运行任务。
-- [ ] 能记录 task。
-- [ ] 能记录 trace。
 - [ ] 能列出 capabilities。
 - [ ] 能处理 confirmation。
 - [ ] 能查询 task 和 trace。
+- [ ] 能做基础验证。
+- [ ] 能调用 Codex / Claude Code 作为专家工具。
+- [ ] 能基于 trace 生成 Skill Proposal 或 Skill Draft。
 - [ ] 文档能完整解释项目目标和运行方式。
-- [ ] 至少一条真实任务链路可演示。
+- [ ] 至少一条任务闭环可演示。
 
 ---
 
-## 16. 后续演进预留
+## 14. 后续演进预留
 
-MVP 完成后，下一阶段可以继续做：
+当前阶段完成后，下一阶段可以继续做：
 
 - [ ] 真正的 retrieval / embedding / vector store 接入。
 - [ ] 更强的 intent parser。
@@ -569,6 +580,6 @@ MVP 完成后，下一阶段可以继续做：
 - [ ] Native skill 拆分与扩展。
 - [ ] Verifier 增强。
 - [ ] 复杂代码任务自动化。
-- [ ] Skill evolution proposal。
+- [ ] Skill evolution 机制增强。
 - [ ] Windows frontend 适配。
 

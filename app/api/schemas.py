@@ -24,42 +24,6 @@ class WorkspaceIndexResponse(BaseModel):
     indexed_chunks: int
 
 
-class TaskPlanRequest(BaseModel):
-    task: str
-    workspace: str | None = None
-    frontend: str | None = None
-
-
-class TaskPlanResponse(BaseModel):
-    intent: str
-    plan: list[str]
-    suggested_capabilities: list[str]
-    risk: str
-
-
-class TaskRunRequest(BaseModel):
-    task: str
-    workspace: str | None = None
-    frontend: str | None = None
-    mode: str = "interactive"
-
-
-class TaskRunResponse(BaseModel):
-    task_id: str
-    status: str
-    summary: str
-    trace_id: str
-    requires_user_action: bool = False
-    artifacts: list[dict[str, Any]] = Field(default_factory=list)
-
-
-class TaskRecordResponse(BaseModel):
-    task_id: str
-    status: str
-    summary: str
-    trace_id: str
-
-
 class CapabilityItem(BaseModel):
     name: str
     type: str
@@ -69,26 +33,3 @@ class CapabilityItem(BaseModel):
 
 class CapabilityListResponse(BaseModel):
     capabilities: list[CapabilityItem]
-
-
-class TraceRecordResponse(BaseModel):
-    trace_id: str
-    user_goal: str
-    intent: str
-    plan: list[str]
-    context_summary: str
-    capabilities_used: list[str]
-    verification_result: dict[str, Any]
-    success: bool
-
-
-class ConfirmationDecisionRequest(BaseModel):
-    decision: str
-    frontend: str | None = None
-
-
-class ConfirmationResponse(BaseModel):
-    confirmation_id: str
-    decision: str
-    status: str
-

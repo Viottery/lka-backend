@@ -1,10 +1,7 @@
 from fastapi import FastAPI
 
 from app.api.routes.capabilities import router as capabilities_router
-from app.api.routes.confirmations import router as confirmations_router
 from app.api.routes.health import router as health_router
-from app.api.routes.tasks import router as tasks_router
-from app.api.routes.traces import router as traces_router
 from app.api.routes.workspaces import router as workspaces_router
 from app.core.config import get_settings
 from app.core.runtime import LocalKnowledgeAgentRuntime
@@ -17,13 +14,9 @@ def create_app() -> FastAPI:
 
     app.include_router(health_router)
     app.include_router(workspaces_router)
-    app.include_router(tasks_router)
     app.include_router(capabilities_router)
-    app.include_router(traces_router)
-    app.include_router(confirmations_router)
 
     return app
 
 
 app = create_app()
-

@@ -1,46 +1,69 @@
-# Linux Backend：Implementation Plan
+# Linux Backend：Long-Term Roadmap
 
-这份文档保留项目推进节奏，同时尽量把“愿景”和“当前阶段”连起来。
-它既是开发路线图，也是模块演化的约束说明。
+这份文档描述的是长期路线图，不是当前执行清单。
+它回答的是“这个后端最终要长成什么样”，而不是“下一步先做哪一项”。
+
+当前执行请看 `docs/mvp_todolist.md`。
 
 ---
 
-## 总体目标
+## 1. 目标分层
 
-把一个任务从输入一路推进到：
+### 1.1 短期目标
+
+- 保持一个稳定、可启动、可验证的 Linux Backend 骨架。
+- 保留最小的 HTTP 服务、workspace 索引和静态能力目录。
+- 让文档、接口和代码保持同一套术语。
+
+### 1.2 中期目标
+
+- 让系统从“索引工具”升级为“上下文驱动的 agent runtime”。
+- 把本地知识转成 Context Package，而不只是文件列表。
+- 让任务理解、计划、执行和验证成为显式阶段。
+
+### 1.3 长期目标
+
+- 让 system 可以选择技能、工具和子代理来完成真实任务。
+- 让执行结果可追踪、可验证、可回放。
+- 让历史经验能够沉淀为 Skill Proposal，并逐步演化成可复用技能。
+
+---
+
+## 2. 总体演进路径
 
 ```text
-识别意图 -> 生成计划 -> 选择能力 -> 执行技能 -> 验证结果 -> 记录轨迹
+基础服务
+  -> Context Package
+  -> Main Agent Brain
+  -> Capability Registry
+  -> Native Skills / Sub Agents / Expert Tools
+  -> Verifier / Trace Recorder
+  -> Skill Evolution
+  -> 多前端与更多数据源
 ```
 
-最终形成一个可展示、可调试、可迭代的后端闭环。
+这条路径强调的是“先基础，后智能；先显式，后自动；先可验证，后扩展”。
 
 ---
 
-## Week 1：后端基础与 Knowledge Layer
+## 3. 阶段一：基础服务层
 
 目标：
 
 ```text
-可以启动后端，可以索引 workspace，可以构造 ContextPackage。
+服务可启动，workspace 可索引，能力目录可查看。
 ```
 
-任务：
+主要内容：
 
-- FastAPI skeleton
+- FastAPI app bootstrap
 - `/health`
 - `/workspaces/index`
-- SQLite init
-- Qdrant init
-- KnowledgeObject
-- File loaders
-- Chunker
-- Embedder
-- Retriever
-- ContextPackage
-- KnowledgeContextEngine v0
+- SQLite 初始化
+- 静态 capability catalog
+- 基础文档对齐
 
-验收：
+验收思路：
 
 ```bash
 curl http://127.0.0.1:8765/health
@@ -52,117 +75,161 @@ curl -X POST http://127.0.0.1:8765/workspaces/index \
   -d '{"workspace": "/mnt/c/Users/chuan/Documents/NTU"}'
 ```
 
-### 这一周的重点
-
-- 先把服务跑起来。
-- 先把 workspace 当成最小知识单元。
-- 先建立上下文构造链路，哪怕是简化版。
-
 ---
 
-## Week 2：Main Agent + Capability + Skills
+## 4. 阶段二：知识上下文层
 
 目标：
 
 ```text
-用户任务 → intent → plan → capability → skill execution。
+workspace -> Context Package
 ```
 
-任务：
+主要内容：
 
-- Intent Parser
-- Planner
-- Capability Registry
-- Capability Selector
-- search_local_knowledge
-- summarize_folder
-- extract_tasks
-- `/tasks/plan`
-- `/tasks/run`
+- `Knowledge Context Engine`
+- 文件扫描与类型识别
+- 文本提取
+- 片段切分
+- 本地知识摘要
+- 任务相关上下文组装
+- 项目约束与风险提示注入
 
-### 这一周的重点
-
-- 把“看懂用户在做什么”变成明确步骤。
-- 把能力注册和能力选择分开。
-- 把技能执行从核心编排里拆出去。
+这一层的核心不是“回答问题”，而是把本地知识转换成可以驱动 agent 决策的上下文。
 
 ---
 
-## Week 3：SubAgent + Expert Tools
+## 5. 阶段三：任务理解与规划层
 
 目标：
 
 ```text
-支持 repo 分析和 expert tool prompt 生成。
+任务输入 -> intent -> plan -> capability candidates
 ```
 
-任务：
+主要内容：
 
-- SubAgent
-- organize_files
-- analyze_repo
-- delegate_to_coding_agent
-- Claude Code manual mode
-- Codex manual mode
-- git diff helper
+- `Main Agent Brain`
+- 任务分类
+- 意图识别
+- 执行计划生成
+- 风险识别
+- 候选能力选择
 
-### 这一周的重点
-
-- 把需要更强推理或更高风险的动作单独隔离。
-- 让人工介入成为系统设计的一等公民，而不是补丁。
-- 让专家工具调用进入受控流程。
+这一层需要把“用户想做什么”拆成系统可以执行和验证的步骤。
 
 ---
 
-## Week 4：Verifier + Trace + Skill Evolution Stub
+## 6. 阶段四：能力与执行层
 
 目标：
 
 ```text
-完成可展示闭环。
+plan -> skills / sub agents / expert tools
 ```
 
-任务：
+主要内容：
 
-- Verifier
-- diff_checker
-- test_runner
-- safety_checker
-- Trace Recorder
-- `/traces`
-- Confirmation API
-- Skill Evolution Proposal Stub
-- README / Demo polishing
+- `Capability Registry`
+- `Native Skills`
+- `Sub Agents`
+- `Expert Tools`
+- `local tools`
+- `delegate_to_coding_agent`
+- `analyze_repo`
+- `summarize_folder`
+- `extract_tasks`
+- `organize_files`
+- `Codex / Claude Code` 接入路径
 
-### 这一周的重点
+这一层强调受控执行：
 
-- 所有动作都要能回放、能解释、能追踪。
-- 风险动作必须有确认机制。
-- 做出“能展示”的同时，也保留“能继续长大”的空间。
-
----
-
-## 演进原则
-
-- 不要一开始把所有 agent 能力都做成自动化。
-- 每个阶段都要能独立验证。
-- 先把数据结构、轨迹、确认机制做稳，再扩大执行面。
-- 计划文档允许理想化，但实现文档必须与当前代码保持一致。
+- 先选择能力，再执行
+- 先构造上下文，再调用专家工具
+- 先判断风险，再决定是否需要确认
 
 ---
 
-## 和当前实现的对应关系
+## 7. 阶段五：验证与可解释层
 
-当前仓库已经具备的内容，主要落在 Week 1 的一部分和 Week 2 的最小闭环：
+目标：
+
+```text
+执行结果 -> verifier -> trace
+```
+
+主要内容：
+
+- `Verifier`
+- diff 检查
+- test runner
+- safety checker
+- `Trace Recorder`
+- 任务过程回放
+- 执行结果摘要
+- 失败原因记录
+
+这一层保证系统不是黑箱，后续每一次执行都可以复查。
+
+---
+
+## 8. 阶段六：Skill Evolution
+
+目标：
+
+```text
+trace -> pattern -> skill proposal
+```
+
+主要内容：
+
+- 重复成功模式识别
+- Skill Proposal
+- Skill Draft / Scaffold
+- skill 注册与版本管理
+- 可回滚、可审计的技能沉淀机制
+
+这一层让系统不仅能“完成任务”，还能够“从任务中长出技能”。
+
+---
+
+## 9. 阶段七：多前端与更多数据源
+
+目标：
+
+```text
+Linux Backend 变成统一智能中枢
+```
+
+主要内容：
+
+- Windows frontend 适配
+- Linux frontend 适配
+- 更多本地数据源
+- 更完善的路径映射
+- 未来的 MCP / local tool 扩展
+
+---
+
+## 10. 演进原则
+
+- 先基础，后智能。
+- 先显式，后自动。
+- 先可验证，后扩展。
+- 先单点可用，后系统协作。
+- 每个阶段都要能独立验收。
+- 长期路线图可以理想化，但当前实现必须与现实代码一致。
+
+---
+
+## 11. 与当前实现的关系
+
+当前仓库已经完成的是阶段一的最小骨架：
 
 - FastAPI app bootstrap
 - `/health`
 - `/workspaces/index`
 - SQLite init
-- task planning stub
-- task run stub
-- trace persistence
-- confirmation persistence
+- capability list
 
-后续可以继续沿着 Week 1 到 Week 4 的顺序补齐，不需要推倒重来。
-
+后续能力会按照上面的阶段顺序逐步补齐，不再回到之前那条基于规则的 task 路径。

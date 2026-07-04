@@ -36,33 +36,6 @@ def init_db(db_path: Path) -> None:
                 indexed_files INTEGER NOT NULL DEFAULT 0,
                 indexed_chunks INTEGER NOT NULL DEFAULT 0
             );
-
-            CREATE TABLE IF NOT EXISTS tasks (
-                task_id TEXT PRIMARY KEY,
-                task_text TEXT NOT NULL,
-                workspace_path TEXT,
-                frontend TEXT,
-                status TEXT NOT NULL,
-                summary TEXT NOT NULL,
-                trace_id TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS traces (
-                trace_id TEXT PRIMARY KEY,
-                user_goal TEXT NOT NULL,
-                intent TEXT NOT NULL,
-                plan_json TEXT NOT NULL,
-                context_summary TEXT NOT NULL,
-                capabilities_json TEXT NOT NULL,
-                verification_json TEXT NOT NULL,
-                success INTEGER NOT NULL DEFAULT 1
-            );
-
-            CREATE TABLE IF NOT EXISTS confirmations (
-                confirmation_id TEXT PRIMARY KEY,
-                decision TEXT,
-                status TEXT NOT NULL
-            );
             """
         )
         conn.commit()
