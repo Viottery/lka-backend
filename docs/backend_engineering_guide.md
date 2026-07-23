@@ -10,12 +10,14 @@ Linux Backend 是整个 Local Knowledge Agent OS 的核心执行层。它承载 
 
 ## 2. 核心职责
 
-Linux Backend 目前只负责三个基础动作：
+Linux Backend 目前只负责四个基础动作：
 
 ```text
 HTTP API
   ↓
 Workspace Index
+  ↓
+Workspace File Structure Index
   ↓
 SQLite 持久化
   ↓
@@ -23,6 +25,8 @@ Static Capability Catalog
 ```
 
 当前阶段先把服务、索引和能力目录做稳，不再保留基于规则的任务规划或执行闭环。
+
+Workspace Index 同时需要记录 workspace 的结构化元数据和文件构成索引。文件构成索引包括目录层级、文件名、扩展名、路径位置、README、配置文件、测试命令和其他高价值元数据，用于在不依赖向量检索时提升效率和准确率。
 
 ---
 
@@ -58,6 +62,12 @@ backend/
 - 当前仓库只实现了其中很小一部分，但目录规划保留了后续演进路径。
 - 这份结构的价值在于：它让后续扩展不会每次都重新发明分层方式。
 
+### 存储与检索约定
+
+- SQLite 是当前 MVP 的主存储方案，用于 workspace 索引元数据、任务记录、trace、confirmation 和其他结构化状态。
+- Qdrant 只作为可选语义检索扩展，不作为 MVP 必需项。
+- 非向量检索应优先依赖 workspace 的结构化索引、文件构成索引和本地文件系统检索。
+
 ---
 
 ## 4. 核心接口
@@ -91,7 +101,7 @@ class LocalKnowledgeAgentRuntime:
 ### P1
 
 - KnowledgeObject
-- ContextPackage
+- TaskContext
 - retrieval
 - Capabilities registry redesign
 - Native Skills 接口抽象

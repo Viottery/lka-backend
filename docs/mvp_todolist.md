@@ -50,7 +50,7 @@
 
 1. 理解任务类型。
 2. 检索相关本地知识。
-3. 构造上下文包。
+3. 构造 TaskContext。
 4. 生成可读计划。
 5. 选择合适能力。
 6. 执行一个或多个子步骤。
@@ -68,38 +68,30 @@
 
 ### 1.1 仓库结构确认
 
-- [ ] 确认 `app/`、`docs/`、`Dockerfile`、`docker-compose.yml`、`pyproject.toml` 的职责划分清晰。
-- [ ] 确认 `docs/` 内文档分层正确：
-  - [ ] `project_overview.md` 作为项目总纲
-  - [ ] `backend_engineering_guide.md` 作为后端架构说明
-  - [ ] `backend_implementation_plan.md` 作为长期实施路线图
-  - [ ] `api_contract.md` 作为接口契约
-  - [ ] `ai_coding_standard.md` 作为 coding 规范
-  - [ ] `mvp_todolist.md` 作为当前执行清单
-- [ ] 确认 `temp.md` 作为源草稿保留，不参与对外说明。
+- [x] 确认 `app/`、`docs/`、`Dockerfile`、`docker-compose.yml`、`pyproject.toml` 的职责划分清晰。
+- [x] 确认 `docs/` 内文档分层正确：
+  - [x] `project_overview.md` 作为项目总纲
+  - [x] `backend_engineering_guide.md` 作为后端架构说明
+  - [x] `backend_implementation_plan.md` 作为长期实施路线图
+  - [x] `api_contract.md` 作为接口契约
+  - [x] `ai_coding_standard.md` 作为 coding 规范
+  - [x] `mvp_todolist.md` 作为当前执行清单
+- [x] 确认 `temp.md` 作为源草稿保留，不参与对外说明。
 
 ### 1.2 术语统一
 
-- [ ] 统一 `Main Agent Brain` 的定义和中文解释。
-- [ ] 统一 `Knowledge Context Engine` 的职责边界。
-- [ ] 统一 `Capability Registry`、`Native Skill`、`Expert Tool`、`Sub Agent` 的命名。
-- [ ] 统一 `Trace`、`Context Package`、`Verifier` 的文档描述。
-- [ ] 统一“计划 / 任务 / 轨迹 / 确认 / 能力 / 技能”这些核心词汇的用法。
+- [x] 统一 `Main Agent Brain` 的定义和中文解释。
+- [x] 统一 `Knowledge Context Engine` 的职责边界。
+- [x] 统一 `Capability Registry`、`Native Skills`、`Local Tools`、`Expert Tools`、`MCP Tools`、`Sub Agents` 的命名。
+- [x] 统一 `Trace`、`Context Package`、`Verifier` 的文档描述。
+- [x] 统一“计划 / 任务 / 轨迹 / 确认 / 能力 / 技能”这些核心词汇的用法。
 
-### 1.3 执行规范
+### 1.3 运行目标确认
 
-- [ ] 明确 coding agent 必须先读哪些文档。
-- [ ] 明确 coding agent 每一步都要告知预期目标。
-- [ ] 明确 coding agent 每一步都要说明修改的文件。
-- [ ] 明确 coding agent 每一步都要说明测试与验证结果。
-- [ ] 明确 coding agent 遇到架构、API、数据模型变更时需要先确认。
-
-### 1.4 运行目标确认
-
-- [ ] 明确后端默认监听地址为 `127.0.0.1:8765`。
-- [ ] 明确 SQLite 作为本地持久化方案。
-- [ ] 明确 Qdrant 先作为能力预留或占位，不把它当作 MVP 成败关键。
-- [ ] 明确前端与后端的职责边界。
+- [x] 明确后端默认监听地址为 `127.0.0.1:8765`。
+- [x] 明确 SQLite 作为本地持久化方案。
+- [x] 明确 Qdrant 先作为能力预留或占位，不把它当作 MVP 成败关键。
+- [x] 明确前端与后端的职责边界。
 
 ### 完成标准
 
@@ -114,12 +106,43 @@
 
 ### 2.1 定义上下文对象
 
-- [ ] 定义 `Context Package` 的结构。
-- [ ] 至少支持 `related_files`、`related_snippets`、`project_constraints`、`risk_notes`、`suggested_tools`、`verification_plan`。
-- [ ] 让 Context Package 能表达“这次任务为什么这么做”。
-- [ ] 明确 Context Package 是任务规划和专家工具输入的共同基础。
+- [x] 定义 `Context Package` 的结构。
+- [x] 至少支持 `related_files`、`related_snippets`、`project_constraints`、`risk_notes`、`suggested_tools`、`verification_plan`。
+- [x] 让 Context Package 能表达“这次任务为什么这么做”。
+- [x] 明确 Context Package 是任务规划和专家工具输入的共同基础。
 
-### 2.2 本地知识检索
+决策记录：
+
+- 上下文对象采用从粗到细的层级：`BaseContext`、`SessionContext`、`TaskContext`、`ExecutionContext`、`VerificationContext`。
+- `SessionContext` 与对话窗口绑定，随用户交互、用户设置、记忆、workspace 和执行反馈持续演化。
+- `TaskContext` 承接原 checklist 中 `Context Package` 的目的，用于表达计划内容与结构，不再为旧名称单独保留具体子类。
+- `TaskContext` 从 `SessionContext`、workspace 索引、本地知识检索结果和当前目标中派生，不默认绑定 task，也不默认携带 `task_id`。
+- `TaskContext` 至少包含 `related_files`、`related_snippets`、`project_constraints`、`risk_notes`、`suggested_tools`、`verification_plan`，并通过 `reasoning_summary` 表达“为什么这些上下文支撑当前规划或执行”。
+- Main Agent Brain、Expert Tools、Sub Agents 和 Verifier 应消费 `TaskContext` 或其派生视图，避免各模块自行拼接不透明上下文。
+- 具体结构、生命周期和派生规则以 `docs/project_overview.md` 的 Knowledge Context Engine 章节为准。
+
+### 2.2 Runtime Debug Infrastructure
+
+这一阶段先搭建调试型运行骨架，目的不是实现复杂 agent 自动执行，而是让后续加入的 Context、Retrieval、Tool、LLM 和 Trace 模块都能被独立验证。
+
+- [ ] 定义 `EventRecord`，统一记录 `event_id`、`event_type`、`session_id`、`context_id`、`payload`、`status`、`error`、`created_at`。
+- [ ] 定义显式 `RuntimeLoop` 骨架，按固定阶段串联 context 更新、检索调用、工具调用、LLM 调用和 trace 记录。
+- [ ] 定义 `LLMClient` 接口和 mock provider，先支持稳定假响应，避免早期调试依赖真实模型。
+- [ ] 定义 `RetrievalProvider` 接口和 mock/local provider，用于后续验证 workspace 扫描、本地知识检索和上下文召回。
+- [ ] 定义 `ToolSpec`、`ToolInvocation`、`ToolResult`，统一 native skill、local tool、expert tool 的调用形状。
+- [ ] 定义最小 `TraceRecorder`，记录每个阶段的输入、输出、context id、event id、错误信息和验证线索。
+- [ ] 提供一个调试入口，用于验证 `SessionContext -> TaskContext -> Retrieval -> Tool/LLM -> Trace` 的结构化链路。
+- [ ] 明确该阶段不做复杂自主规划、不做后台任务队列、不做生产级 embedding、不做真实文件修改工具。
+
+完成标准：
+
+- 给定 `session_id`、workspace 和用户输入，系统能生成结构化事件序列。
+- 系统能创建或更新 `SessionContext`，并派生一个可检查的 `TaskContext`。
+- 系统能触发一次 mock/local retrieval 调用，并返回结构化结果。
+- 系统能触发一次 mock LLM 或 mock tool 调用，并返回结构化结果。
+- 系统能记录一条 trace，说明每一步使用了什么 context、调用了什么接口、得到什么结果。
+
+### 2.3 本地知识检索
 
 - [ ] 实现 workspace 内容扫描。
 - [ ] 能识别常见文件类型。
@@ -128,15 +151,15 @@
 - [ ] 能根据任务关键词召回相关文件或片段。
 - [ ] 能识别 README、测试命令、配置文件等高价值上下文。
 
-### 2.3 Context Assembly
+### 2.4 Context Assembly
 
-- [ ] 根据用户任务组装上下文包。
+- [ ] 根据用户任务组装 TaskContext。
 - [ ] 根据任务类型选择不同的上下文来源。
 - [ ] 给复杂任务提供更完整的上下文。
 - [ ] 给简单任务提供轻量上下文。
-- [ ] 明确上下文包里哪些信息是“建议”，哪些是“约束”。
+- [ ] 明确 TaskContext 里哪些信息是“建议”，哪些是“约束”。
 
-### 2.4 约束注入
+### 2.5 约束注入
 
 - [ ] 注入项目约束。
 - [ ] 注入风险提示。
@@ -146,7 +169,7 @@
 
 ### 完成标准
 
-- 系统不只是“拿到文件列表”，而是能形成可用于 agent 决策的上下文包。
+- 系统不只是“拿到文件列表”，而是能形成可用于 agent 决策的 TaskContext。
 - 上下文管理可以独立支撑任务规划、专家工具输入和 trace 解释。
 
 ---
@@ -200,7 +223,7 @@
 
 - [ ] 实现 `/tasks/plan`。
 - [ ] 输入 task 后先做 intent 识别。
-- [ ] 结合 Context Package 生成计划。
+- [ ] 结合 TaskContext 生成计划。
 - [ ] 返回建议能力列表。
 - [ ] 返回风险等级。
 - [ ] 让返回值足以给前端做下一步决策。
@@ -272,7 +295,7 @@
 
 ### 5.4 专家工具接入
 
-- [ ] 根据 Context Package 组织给 Codex / Claude Code 的输入。
+- [ ] 根据 TaskContext 和裁剪后的 ExecutionContext 组织给 Codex / Claude Code 的输入。
 - [ ] 专家工具调用前先检查风险等级和确认条件。
 - [ ] 专家工具调用后收集输出、diff 或结果摘要。
 - [ ] 将专家工具调用结果写入 trace。
@@ -341,7 +364,7 @@
 - [ ] 从 trace 中识别重复成功模式。
 - [ ] 识别“文件总结 + TODO 提取 + checklist 生成”等高频模式。
 - [ ] 识别需要专家工具介入的重复任务模式。
-- [ ] 识别适合沉淀为 Native Skill 的模式。
+- [ ] 识别适合沉淀为 Native Skills 的模式。
 
 ### 7.2 Skill Proposal
 
@@ -520,7 +543,7 @@
 
 ### 第一阶段：先理解
 
-- [ ] Context Package
+- [ ] TaskContext
 - [ ] workspace 扫描与上下文摘要
 - [ ] 任务意图识别
 - [ ] 基础计划生成
@@ -556,7 +579,7 @@
 
 - [ ] 能启动服务。
 - [ ] 能索引 workspace。
-- [ ] 能生成 Context Package。
+- [ ] 能生成 TaskContext。
 - [ ] 能规划任务。
 - [ ] 能运行任务。
 - [ ] 能列出 capabilities。
@@ -582,4 +605,3 @@
 - [ ] 复杂代码任务自动化。
 - [ ] Skill evolution 机制增强。
 - [ ] Windows frontend 适配。
-

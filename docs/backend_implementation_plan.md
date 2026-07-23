@@ -18,7 +18,7 @@
 ### 1.2 中期目标
 
 - 让系统从“索引工具”升级为“上下文驱动的 agent runtime”。
-- 把本地知识转成 Context Package，而不只是文件列表。
+- 把本地知识转成 TaskContext，而不只是文件列表。
 - 让任务理解、计划、执行和验证成为显式阶段。
 
 ### 1.3 长期目标
@@ -33,10 +33,10 @@
 
 ```text
 基础服务
-  -> Context Package
-  -> Main Agent Brain
+  -> TaskContext
+  -> Main Agent Brain（主代理大脑）
   -> Capability Registry
-  -> Native Skills / Sub Agents / Expert Tools
+  -> Native Skills / Local Tools / Sub Agents / Expert Tools / MCP Tools
   -> Verifier / Trace Recorder
   -> Skill Evolution
   -> 多前端与更多数据源
@@ -82,20 +82,42 @@ curl -X POST http://127.0.0.1:8765/workspaces/index \
 目标：
 
 ```text
-workspace -> Context Package
+SessionContext + workspace -> TaskContext -> ExecutionContext / VerificationContext
 ```
 
 主要内容：
 
-- `Knowledge Context Engine`
+- `Knowledge Context Engine（知识上下文引擎）`
+- `Background Knowledge Layer（背景知识层）`
+- `Dynamic Context Assembly（动态上下文组装层）`
+- `BaseContext`
+- `SessionContext`
+- `TaskContext`
+- `ExecutionContext`
+- `VerificationContext`
+- `ContextAssembler / ContextDeriver`
 - 文件扫描与类型识别
 - 文本提取
 - 片段切分
 - 本地知识摘要
+- 默认上下文整理
 - 任务相关上下文组装
 - 项目约束与风险提示注入
 
-这一层的核心不是“回答问题”，而是把本地知识转换成可以驱动 agent 决策的上下文。
+这一层的核心不是“回答问题”，而是把对话状态、本地知识、项目约束、用户偏好和执行反馈转换成可以驱动 agent 决策的上下文。
+
+TaskContext 承接原 todolist 中 `Context Package` 的目的，不再为旧名称单独保留具体子类。它不应被建模为 task 的私有对象，而应从会话级 `SessionContext` 中按目标、阶段和消费方派生，并能继续裁剪为执行和验证所需的上下文视图。
+
+MVP 阶段的 TaskContext 至少需要表达：
+
+- `related_files`
+- `related_snippets`
+- `project_constraints`
+- `risk_notes`
+- `suggested_tools`
+- `verification_plan`
+- 当前目标为什么需要这些上下文
+- 这些上下文如何支撑计划、专家工具输入和 trace 解释
 
 ---
 
@@ -109,10 +131,12 @@ workspace -> Context Package
 
 主要内容：
 
-- `Main Agent Brain`
+- `Main Agent Brain（主代理大脑）`
+- `Task`
 - 任务分类
 - 意图识别
 - 执行计划生成
+- `Plan`
 - 风险识别
 - 候选能力选择
 
@@ -132,15 +156,18 @@ plan -> skills / sub agents / expert tools
 
 - `Capability Registry`
 - `Native Skills`
+- `Local Tools`
 - `Sub Agents`
 - `Expert Tools`
-- `local tools`
+- `MCP Tools`
 - `delegate_to_coding_agent`
 - `analyze_repo`
 - `summarize_folder`
 - `extract_tasks`
 - `organize_files`
 - `Codex / Claude Code` 接入路径
+
+Capability Registry is the authoritative catalog for available capabilities. It records what can be called, what metadata is attached to each capability, and whether confirmation is required before use. It does not execute capabilities itself.
 
 这一层强调受控执行：
 
@@ -165,7 +192,9 @@ plan -> skills / sub agents / expert tools
 - test runner
 - safety checker
 - `Trace Recorder`
+- `Confirmation`
 - 任务过程回放
+- 任务回退支持
 - 执行结果摘要
 - 失败原因记录
 
@@ -186,6 +215,7 @@ trace -> pattern -> skill proposal
 - 重复成功模式识别
 - Skill Proposal
 - Skill Draft / Scaffold
+- `Skill`
 - skill 注册与版本管理
 - 可回滚、可审计的技能沉淀机制
 

@@ -12,6 +12,14 @@ path for future expansion.
 - Docker and Docker Compose support
 - Documentation for the current architecture and API contract
 
+## Repository Responsibilities
+
+- `app/`: backend application code, including API routes, runtime orchestration, schemas, and storage helpers.
+- `docs/`: canonical project documentation, execution rules, API contract, and implementation tracking.
+- `Dockerfile`: builds the backend container image and starts the API server inside the container.
+- `docker-compose.yml`: runs the local API stack and the Qdrant service with local port binding.
+- `pyproject.toml`: defines package metadata, Python version, runtime dependencies, and developer tooling.
+
 ## Project Layout
 
 ```text

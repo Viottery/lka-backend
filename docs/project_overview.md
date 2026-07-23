@@ -58,6 +58,15 @@ Local Knowledge Agent OS 的核心目标是：
 
 这些信息不只是用于问答，而是作为 Agent 做任务规划、能力选择和结果验证的上下文基础。
 
+本项目默认把本地知识组织为两层：
+
+* 结构化元数据与文件构成索引
+* 可选的语义检索层
+
+其中，文件构成索引指的是对 workspace 的目录结构、文件名、扩展名、路径层级、README、测试命令、配置文件和其他高价值元数据进行显式建模，用于提升非向量检索场景下的效率和准确率。
+
+语义检索层则是备用能力，不是默认前提。
+
 ---
 
 ### 3.2 构建真正有用的桌面助手
@@ -102,7 +111,7 @@ RAG 的定位是：
 * 项目约束
 * 用户偏好
 
-然后再决定是由 Native Skill 处理，还是调用 Claude Code / Codex。
+然后再决定是由 Native Skills 处理，还是调用 Claude Code / Codex。
 
 当用户要求整理文件夹时，系统应先检索：
 
@@ -116,6 +125,8 @@ RAG 的定位是：
 
 因此，本项目中的 RAG 服务于整个 Agent 系统，而不是只服务于问答。
 
+在实现上，本项目不把检索能力简单等同于向量检索。默认检索层应优先使用 workspace 的结构化元数据、文件构成索引和本地文件系统检索，再按需启用语义检索作为补充。
+
 ---
 
 ### 3.4 构建 Agent Harness
@@ -124,20 +135,23 @@ RAG 的定位是：
 
 Agent Harness 包括：
 
-* Main Agent Brain
+* Main Agent Brain（主代理大脑）
 * Knowledge Context Engine
 * Capability Registry
-* Native Skill Library
+* Native Skills
 * Sub Agent Execution
 * Local Tools
 * Expert Tools
 * Verifier
 * Trace Recorder
 * Skill Evolution Layer
+* Workspace File Structure Index
 
 其核心作用是：
 
 > 把一个无状态的大语言模型包装成一个可以长期执行任务、调用工具、验证结果、记录经验的智能系统。
+
+Workspace File Structure Index 是知识上下文构造的基础输入之一，负责为非向量检索提供稳定的文件结构和元数据支撑。
 
 ---
 
@@ -164,9 +178,28 @@ Claude Code 和 Codex 在本系统中的定位是：
 
 > Agent 负责想清楚问题，专家工具负责高质量执行复杂子任务。
 
----
+### 3.6 默认运行与存储约定
 
-### 3.6 支持 Skill Evolution
+MVP 默认绑定地址是 `127.0.0.1:8765`，但必须通过配置项覆盖，不应写死。
+
+本地持久化默认使用 SQLite，作为任务、轨迹、确认和 workspace 索引元数据的主存储。
+
+Qdrant 保留为可选的语义检索扩展，不作为 MVP 的必要前提。
+
+### 3.7 Workspace 文件构成索引
+
+Workspace 文件构成索引负责为每个 workspace 建立结构化索引，重点记录：
+
+* 目录层级
+* 文件名与扩展名
+* 路径位置
+* README 与配置文件
+* 测试命令和启动信息
+* 其他高价值元数据
+
+它的目标不是替代语义检索，而是在不依赖向量检索时仍然提高召回效率、精确度和上下文组织能力。
+
+### 3.8 支持 Skill Evolution
 
 系统需要具备长期演化能力。
 
@@ -181,7 +214,7 @@ Claude Code 和 Codex 在本系统中的定位是：
 * 验证结果
 * 成功或失败原因
 
-当某类任务多次成功出现时，系统可以尝试将其沉淀为 Native Skill。
+当某类任务多次成功出现时，系统可以尝试将其沉淀为 Native Skills。
 
 例如：
 
@@ -191,7 +224,7 @@ Claude Code 和 Codex 在本系统中的定位是：
 summarize_admission_documents
 ```
 
-未来再次遇到类似任务时，系统可以优先使用自己的 Native Skill，而不是每次都重新规划或调用外部专家工具。
+未来再次遇到类似任务时，系统可以优先使用自己的 Native Skills，而不是每次都重新规划或调用外部专家工具。
 
 Skill Evolution 的目标不是让 Agent 直接修改核心代码，而是形成：
 
@@ -221,7 +254,7 @@ Windows Frontend / Linux Frontend
           ▼
 WSL / Docker Local Backend Server
           │
-          ├─ Main Agent Brain
+          ├─ Main Agent Brain（主代理大脑）
           ├─ Knowledge Context Engine
           ├─ Capability Registry
           ├─ Native Skills
@@ -252,9 +285,9 @@ WSL / Docker Local Backend Server
 
 ## 5. 核心模块说明
 
-### 5.1 Main Agent Brain
+### 5.1 Main Agent Brain（主代理大脑）
 
-Main Agent Brain 是整个系统的核心控制层。
+Main Agent Brain 是整个系统的核心控制层，负责理解任务、规划执行、调度能力、控制风险和组织验证。
 
 它负责：
 
@@ -274,54 +307,129 @@ Main Agent 不应该亲自完成所有事情，而是负责决定：
 
 > 这个任务应该如何完成。
 
-### 5.2 Knowledge Context Engine
+### 5.2 Knowledge Context Engine（知识上下文引擎）
 
-Knowledge Context Engine 负责从本地知识中构造任务上下文。
+Knowledge Context Engine 负责把本地知识转成任务可用的上下文，不直接给出答案，也不直接替代 Main Agent Brain 的规划职责。
 
-它的输出不是简单答案，而是 Context Package。
+本项目中的上下文不是单一对象，而是一组从粗到细逐步派生的结构。核心原则是：
 
-Context Package 可能包含：
+* 对话层上下文负责持续承接信息。
+* 规划层上下文负责解释“为什么这样做”。
+* 执行层上下文负责给技能、工具和子代理提供最小必要输入。
+* 验证层上下文负责说明结果应该如何被检查。
 
-* 相关知识片段
-* 相关文件
-* 相关代码
-* 历史任务
-* 用户偏好
-* 项目约束
-* 风险提示
-* 建议工具
-* 验证计划
+这一设计参考了现有 agent 系统中的通用做法：把短期会话状态、长期记忆、运行时依赖和 LLM 可见输入分开管理；让子代理或复杂工具调用使用隔离后的上下文视图；把执行过程和上下文选择写入 trace，避免上下文成为不可解释的 prompt 拼接。
 
-这个模块是本项目区别于普通 RAG 系统的关键。
+它分为两个主要部分：
+
+#### 5.2.1 Background Knowledge Layer（背景知识层）
+
+Background Knowledge Layer 负责整理和维护长期可复用的默认上下文，作为系统在没有明确任务时也可以调用的静态知识底座。
+
+它可以覆盖：
+
+* 个人习惯
+* 重要信息
+* 常用偏好
+* 特化知识场景中的核心内容
+* 长期项目约束
+
+#### 5.2.2 Dynamic Context Assembly（动态上下文组装层）
+
+Dynamic Context Assembly 负责根据用户当前输入现场扫描、摘要、筛选和组装任务上下文。
+
+它的输出不是简单答案，而是可以被规划、执行和验证消费的 TaskContext。这里的 TaskContext 承接原 todolist 中 `Context Package` 的目的，但不再为旧名称单独保留具体子类。
+
+#### 5.2.3 Context 层级
+
+MVP 阶段先定义以下上下文层级：
+
+* `BaseContext`：所有上下文对象的公共抽象，统一记录来源、范围、约束、事实、风险、建议能力、验证线索和可追踪元数据。
+* `SessionContext`：与对话窗口绑定的会话级上下文，随用户交互和执行反馈持续演化。它可以包含系统提示词摘要、用户偏好、长期记忆引用、当前 workspace、已确认事实、当前目标草稿和最近执行状态。
+* `TaskContext`：从 `SessionContext`、workspace 索引、本地知识检索结果和当前目标中派生出的任务级上下文。它承载计划内容与结构，解释当前目标为什么应该这样规划、选择哪些能力、注意哪些风险以及如何验证。它不是 task 的私有字段，也不默认携带 `task_id`。
+* `ExecutionContext`：面向 Native Skills、Local Tools、Sub Agents、Expert Tools 和 MCP Tools 的执行上下文，是从 `TaskContext` 裁剪出的最小必要输入。
+* `VerificationContext`：面向 Verifier 的验证上下文，重点包含预期结果、改动范围、验证命令、风险点和验收标准。
+
+这些对象可以用父类或协议统一表达，但转换逻辑不应全部塞进父类。推荐使用 `ContextAssembler` 或 `ContextDeriver` 负责从会话态上下文派生出规划、执行和验证所需的具体上下文对象。
+
+#### 5.2.4 TaskContext 结构
+
+TaskContext 至少包含以下字段：
+
+* `context_id`：上下文自身的稳定标识。
+* `context_type`：例如 `task`、`execution`、`verification`。
+* `lifecycle_status`：例如 `bootstrap`、`gathering`、`ready_for_planning`、`ready_for_execution`、`consumed`、`stale`。
+* `session_id`：所属对话窗口或交互会话。
+* `workspace_id`：当前关联的 workspace，可为空。
+* `goal_summary`：当前目标的结构化摘要，不等同于 task。
+* `source_refs`：上下文来源引用，例如 workspace index、用户消息、系统提示词、记忆、trace、文件片段。
+* `related_files`：与当前目标相关的文件路径、角色、相关原因和置信度。
+* `related_snippets`：与当前目标相关的文本或代码片段、来源位置和引用原因。
+* `project_constraints`：项目规则、架构边界、运行约束和用户已确认限制。
+* `risk_notes`：风险信号、潜在副作用和是否需要 confirmation 的理由。
+* `suggested_tools`：建议使用的能力、工具、子代理或专家工具，以及推荐理由。
+* `verification_plan`：建议的检查方式、测试命令、人工验收点和失败处理建议。
+* `reasoning_summary`：简短说明“为什么这些上下文足以支持当前规划或执行”。
+* `visibility`：说明该上下文是否可给 LLM、工具、子代理或 trace 使用。
+* `token_budget`：可选字段，用于控制派生给 LLM 或专家工具的上下文大小。
+
+其中，`related_files`、`related_snippets`、`project_constraints`、`risk_notes`、`suggested_tools` 和 `verification_plan` 是 MVP 必需字段。
+
+#### 5.2.5 生命周期与派生规则
+
+TaskContext 可以伴随对话创建一个空白或默认版本，但初始版本只是任务上下文的草稿容器，不代表已经完成上下文组装。
+
+推荐生命周期：
+
+1. `bootstrap`：对话开始时创建，记录 `session_id`、默认约束、系统提示词摘要、用户偏好引用和空的上下文槽位。
+2. `gathering`：用户补充目标、workspace 或限制条件后，系统更新 `SessionContext` 并收集候选上下文来源。
+3. `ready_for_planning`：目标已经足够明确，系统从 `SessionContext` 和 workspace 索引派生出 TaskContext。
+4. `ready_for_execution`：计划已经形成，系统按具体 step、skill、subagent 或 expert tool 从 TaskContext 裁剪出 ExecutionContext。
+5. `consumed`：规划、执行或验证完成后，Trace Recorder 记录使用过的上下文摘要、来源引用和决策理由。
+6. `stale`：当用户目标、workspace、风险状态或关键文件发生变化时，旧上下文标记为过期，需要重新派生。
+
+派生 TaskContext 或其子视图的决策依据包括：
+
+* 当前目标是否已经明确到可以规划。
+* 消费方是 planner、skill、local tool、subagent、expert tool 还是 verifier。
+* workspace、文件范围、风险等级或用户约束是否发生变化。
+* 当前上下文是否包含过多无关历史、冗余输出或过期事实。
+* 是否需要隔离高噪声操作，例如日志分析、测试输出、全仓搜索或专家工具调用。
+
+TaskContext 的价值在于表达“这次任务为什么这么做”：它不仅列出相关材料，还要说明这些材料如何支持目标理解、计划生成、能力选择、风险控制和验证方案。Main Agent Brain、Expert Tools 和 Verifier 都应消费 TaskContext 或其派生视图，而不是各自重新拼接不透明的 prompt。
+
+这个模块是本项目区别于普通 RAG 系统的关键：它把本地知识组织成可追踪、可裁剪、可验证的 agent 决策输入。
 
 ### 5.3 Capability Registry
 
-Capability Registry 统一管理系统中的所有能力。
+Capability Registry is the system’s authoritative capability catalog.
 
-能力包括：
+It defines what the system can call, how each capability should be described, and what risk and confirmation metadata must be attached before use.
+
+It includes:
 
 * Native Skills
 * Local Tools
 * Expert Tools
 * Future MCP Tools
 
-每个能力都有自己的：
+Each capability should expose:
 
-* 名称
-* 描述
-* 输入格式
-* 输出格式
-* 成本
-* 延迟
-* 风险等级
-* 是否需要用户确认
-* 适用场景
+* name
+* description
+* input schema
+* output schema
+* cost
+* latency
+* risk level
+* confirmation requirement
+* applicable scenarios
 
-Main Agent 通过 Capability Registry 判断当前任务应该调用哪些能力。
+Capability Registry does not execute capabilities. It only registers, describes, and exposes them so Main Agent can choose the right option.
 
-### 5.4 Native Skill Library
+### 5.4 Native Skills
 
-Native Skills 是系统内部可复用的能力。
+Native Skills are reusable capabilities built into the system itself.
 
 MVP 阶段可实现：
 
@@ -332,9 +440,15 @@ MVP 阶段可实现：
 * analyze_repo
 * delegate_to_coding_agent
 
-Native Skill 是系统自身能力的体现，也是未来 Skill Evolution 的目标载体。
+Native Skills are the system’s own capabilities and the main target for future Skill Evolution.
 
-### 5.5 Sub Agents
+### 5.5 Local Tools
+
+Local Tools are execution-oriented helpers that operate directly on the local environment, such as reading files, inspecting directories, running tests, and checking diffs.
+
+They are not the system’s planning layer. They are the hands the system uses to interact with the local machine.
+
+### 5.6 Sub Agents
 
 Sub Agent 是短生命周期的执行单元。
 
@@ -350,7 +464,7 @@ Sub Agent 的特点是：
 
 MVP 阶段可以先串行执行 Sub Agent，后续再支持并行。
 
-### 5.6 Expert Tools
+### 5.7 Expert Tools
 
 Expert Tools 包括：
 
@@ -365,9 +479,15 @@ Expert Tools 包括：
 * 复杂文件处理
 * 高难度自动化任务
 
-调用 Expert Tool 前，系统必须构造完整 Context Package。
+调用 Expert Tool 前，系统必须构造完整 TaskContext，并按工具需求裁剪出 ExecutionContext。
 
-### 5.7 Verifier
+### 5.8 MCP Tools
+
+MCP Tools are standardized external tools exposed through the MCP ecosystem.
+
+They are reserved for future expansion and are not required to complete the current MVP baseline.
+
+### 5.9 Verifier
 
 Verifier 负责检查任务结果是否可靠。
 
@@ -382,9 +502,9 @@ Verifier 负责检查任务结果是否可靠。
 
 Verifier 是系统从 Demo 走向真实可用工具的关键。
 
-### 5.8 Trace Recorder
+### 5.10 Trace Recorder
 
-Trace Recorder 负责记录完整执行轨迹。
+Trace Recorder 负责记录完整执行轨迹，并保留支持回放与回退所需的上下文和操作信息。
 
 记录内容包括：
 
@@ -397,10 +517,11 @@ Trace Recorder 负责记录完整执行轨迹。
 * 工具输出
 * 验证结果
 * 成功或失败状态
+* 回退所需的前置状态、操作顺序和结果引用
 
-这些轨迹既用于调试，也用于未来 Skill Evolution。
+这些轨迹既用于调试，也用于回放、回退和未来 Skill Evolution。
 
-### 5.9 Skill Evolution Layer
+### 5.11 Skill Evolution Layer
 
 Skill Evolution Layer 负责从历史任务中发现可复用模式。
 
@@ -423,17 +544,44 @@ MVP 阶段可以只实现 Skill Proposal，而不自动生成可执行 skill。
 * 验证方式
 * 来源 trace
 
+### 5.12 Execution Concepts
+
+#### 5.12.1 Task
+
+Task is the execution object created around a user goal. It stores the original input, state, related workspace, related plan, related trace, and final result.
+
+Task answers the question: what is being done?
+
+#### 5.12.2 Plan
+
+Plan is the structured decision output generated before execution. It describes the intended steps, candidate capabilities, risk level, confirmation points, and verification approach.
+
+Plan answers the question: how should this task be done?
+
+#### 5.12.3 Confirmation
+
+Confirmation is the explicit approval step for risky or user-controlled actions. It records whether execution may continue and captures the decision outcome.
+
+Confirmation answers the question: may this step proceed?
+
+#### 5.12.4 Skill
+
+Skill is a reusable task pattern that can be promoted from repeated successful execution. A skill is more stable than a single task run and is usually surfaced through the capability registry.
+
+Skill answers the question: what reusable method has the system learned?
+
 ### 模块之间的关系
 
 这几个模块不是并列堆砌的功能列表，而是一条连续的任务处理链：
 
-1. Main Agent Brain 先理解任务。
+1. Main Agent Brain（主代理大脑）先理解任务。
 2. Knowledge Context Engine 再构造上下文。
 3. Capability Registry 决定可用能力。
-4. Native Skills、Local Tools、Expert Tools、Sub Agents 负责执行。
-5. Verifier 检查结果。
-6. Trace Recorder 留下轨迹。
-7. Skill Evolution Layer 从历史中发现模式。
+4. Plan 描述执行方式，Task 承载任务对象，Confirmation 控制高风险步骤。
+5. Native Skills、Local Tools、Expert Tools、Sub Agents 负责执行。
+6. Verifier 检查结果。
+7. Trace Recorder 留下轨迹并保留回放与回退所需信息。
+8. Skill Evolution Layer 从历史中发现模式。
 
 ---
 
@@ -530,7 +678,7 @@ MVP 阶段只生成建议，不直接移动或删除文件。
 
 1. 分析 repo。
 2. 检索相关上下文。
-3. 构造 Context Package。
+3. 构造 TaskContext。
 4. 判断是否需要 Claude Code / Codex。
 5. 生成 expert tool prompt 或调用 CLI。
 6. 检查 Git diff。
@@ -582,7 +730,7 @@ MVP 阶段不要求自动生成可执行 skill，但要能展示 Skill Evolution
 * Qdrant / SQLite 基础存储
 * 文件夹索引
 * Knowledge Object
-* Context Package
+* TaskContext
 * Basic Retrieval
 * Main Agent Runtime
 * Capability Registry

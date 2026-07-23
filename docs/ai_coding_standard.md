@@ -1,9 +1,18 @@
 # AI Coding Standard
 
-This document defines the execution mode and reporting standard for the coding agent
-working on Local Knowledge Agent OS.
+This document is the coding workflow contract for work on Local Knowledge Agent OS.
+It defines how the coding agent should read, confirm, edit, validate, and report.
 
-The goal is to make implementation work predictable, reviewable, and easy to verify:
+It does not define product behavior, task semantics, or implementation scope.
+Those belong to:
+
+- `docs/project_overview.md`
+- `docs/backend_engineering_guide.md`
+- `docs/backend_implementation_plan.md`
+- `docs/api_contract.md`
+- `docs/mvp_todolist.md`
+
+The goal here is to make implementation work predictable, reviewable, and easy to verify:
 
 - read the project documents before making changes
 - confirm expectations before changing architecture or implementation details
@@ -264,14 +273,18 @@ The project’s target architecture is:
 
 - backend core
 - multiple frontends
-- knowledge context engine
-- capability registry
-- native skills
-- local tools
-- expert tools
+- Knowledge Context Engine
+- Capability Registry
+- Native Skills
+- Local Tools
+- Expert Tools
 - verifier
 - trace recorder
 - skill evolution layer
+- task
+- plan
+- confirmation
+- skill
 
 The agent should prefer changes that support this architecture rather than replacing it.
 
@@ -291,14 +304,20 @@ Overly complex automation should be deferred unless the task explicitly asks for
 
 Use the project’s established terms consistently:
 
-- Main Agent Brain
-- Knowledge Context Engine
-- Capability Registry
+- Main Agent Brain（主代理大脑）
+- Knowledge Context Engine（知识上下文引擎）
+- Capability Registry: the authoritative catalog of available capabilities, their metadata, and confirmation requirements.
 - Native Skills
+- Local Tools
 - Sub Agents
 - Expert Tools
+- MCP Tools
 - Verifier
 - Trace Recorder
+- Task
+- Plan
+- Confirmation
+- Skill
 - Skill Evolution Layer
 
 ---
