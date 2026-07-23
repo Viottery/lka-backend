@@ -125,14 +125,23 @@
 
 这一阶段先搭建调试型运行骨架，目的不是实现复杂 agent 自动执行，而是让后续加入的 Context、Retrieval、Tool、LLM 和 Trace 模块都能被独立验证。
 
-- [ ] 定义 `EventRecord`，统一记录 `event_id`、`event_type`、`session_id`、`context_id`、`payload`、`status`、`error`、`created_at`。
-- [ ] 定义显式 `RuntimeLoop` 骨架，按固定阶段串联 context 更新、检索调用、工具调用、LLM 调用和 trace 记录。
-- [ ] 定义 `LLMClient` 接口和 mock provider，先支持稳定假响应，避免早期调试依赖真实模型。
-- [ ] 定义 `RetrievalProvider` 接口和 mock/local provider，用于后续验证 workspace 扫描、本地知识检索和上下文召回。
-- [ ] 定义 `ToolSpec`、`ToolInvocation`、`ToolResult`，统一 native skill、local tool、expert tool 的调用形状。
-- [ ] 定义最小 `TraceRecorder`，记录每个阶段的输入、输出、context id、event id、错误信息和验证线索。
-- [ ] 提供一个调试入口，用于验证 `SessionContext -> TaskContext -> Retrieval -> Tool/LLM -> Trace` 的结构化链路。
-- [ ] 明确该阶段不做复杂自主规划、不做后台任务队列、不做生产级 embedding、不做真实文件修改工具。
+- [x] 定义 `EventRecord`，统一记录 `event_id`、`event_type`、`session_id`、`context_id`、`payload`、`status`、`error`、`created_at`。
+- [x] 定义显式 `RuntimeLoop` 骨架，按固定阶段串联 context 更新、检索调用、工具调用、LLM 调用和 trace 记录。
+- [x] 定义 `LLMClient` 接口和 mock provider，先支持稳定假响应，避免早期调试依赖真实模型。
+- [x] 定义 `RetrievalProvider` 接口和 mock/local provider，用于后续验证 workspace 扫描、本地知识检索和上下文召回。
+- [x] 定义 `ToolSpec`、`ToolInvocation`、`ToolResult`，统一 native skill、local tool、expert tool 的调用形状。
+- [x] 定义最小 `TraceRecorder`，记录每个阶段的输入、输出、context id、event id、错误信息和验证线索。
+- [x] 提供一个调试入口，用于验证 `SessionContext -> TaskContext -> Retrieval -> Tool/LLM -> Trace` 的结构化链路。
+- [x] 明确该阶段不做复杂自主规划、不做后台任务队列、不做生产级 embedding、不做真实文件修改工具。
+
+决策记录：
+
+- 新增 `POST /runtime/debug` 作为 2.2 阶段的调试入口，不替代后续 `/tasks/plan` 或 `/tasks/run`。
+- Runtime Debug 链路采用固定事件顺序：`session_context.updated`、`task_context.derived`、`retrieval.completed`、`tool.completed`、`llm.completed`、`trace.recorded`。
+- LLM 调用使用 `MockLLMClient`，返回稳定假响应，不依赖外部模型或网络。
+- Retrieval 使用 `LocalDebugRetrievalProvider`，只做只读 workspace 文件元数据采样，不做文本抽取、embedding 或 rerank。
+- Tool 调用使用 `runtime_debug_echo` mock local tool，只回显结构化上下文信息，不修改文件。
+- Trace 和事件写入 SQLite 的 `traces` 与 `runtime_events` 表，供后续调试、回放和 verifier 扩展使用。
 
 完成标准：
 

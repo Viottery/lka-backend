@@ -66,6 +66,7 @@ The default compose file starts the API and a local Qdrant container.
 - `GET /health`
 - `POST /workspaces/index`
 - `GET /capabilities`
+- `POST /runtime/debug`
 
 ## Notes
 

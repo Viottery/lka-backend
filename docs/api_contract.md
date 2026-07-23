@@ -110,7 +110,48 @@ GET /capabilities
 
 ---
 
-## 4. Compatibility Notes
+## 4. Runtime Debug Entry
+
+```http
+POST /runtime/debug
+```
+
+请求：
+
+```json
+{
+  "session_id": "session_001",
+  "workspace": "/mnt/c/Users/chuan/Documents/NTU",
+  "user_input": "Analyze this workspace for runtime debugging."
+}
+```
+
+响应：
+
+```json
+{
+  "trace_id": "trace_xxx",
+  "session_context": {},
+  "task_context": {},
+  "events": [],
+  "retrieval_result": {},
+  "tool_invocation": {},
+  "tool_result": {},
+  "llm_response": {},
+  "trace": {}
+}
+```
+
+### 设计说明
+
+- 这是 2.2 阶段的调试入口，用于验证运行时结构化链路。
+- 当前实现只使用 mock/local provider，不调用真实 LLM，不执行真实文件修改工具。
+- 该接口用于验证 `SessionContext -> TaskContext -> Retrieval -> Tool/LLM -> Trace`，
+  不等同于后续 `/tasks/plan` 或 `/tasks/run`。
+
+---
+
+## 5. Compatibility Notes
 
 - 当前后端实现是轻量骨架，因此部分返回值是规则化输出而非真实 agent 结果。
 - 这份契约保留了未来完整系统需要的字段，便于逐步替换实现。

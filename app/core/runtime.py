@@ -12,6 +12,12 @@ from app.api.schemas import (
     WorkspaceIndexResponse,
 )
 from app.core.config import Settings
+from app.core.context import ContextAssembler
+from app.core.llm import MockLLMClient
+from app.core.retrieval import LocalDebugRetrievalProvider
+from app.core.runtime_loop import RuntimeDebugRun, RuntimeLoop
+from app.core.tools import MockToolExecutor
+from app.core.tracing import TraceRecorder
 from app.storage.db import connect, get_db_path, init_db
 
 
@@ -27,6 +33,13 @@ class LocalKnowledgeAgentRuntime:
         self.settings = settings
         self.db_path = get_db_path(settings.data_dir)
         init_db(self.db_path)
+        self.debug_loop = RuntimeLoop(
+            context_assembler=ContextAssembler(),
+            retrieval_provider=LocalDebugRetrievalProvider(),
+            llm_client=MockLLMClient(),
+            tool_executor=MockToolExecutor(),
+            trace_recorder=TraceRecorder(self._conn),
+        )
 
     def _conn(self) -> sqlite3.Connection:
         return connect(self.db_path)
@@ -106,3 +119,18 @@ class LocalKnowledgeAgentRuntime:
             CapabilityItem(name="claude_code", type="expert_tool", risk="medium", requires_confirmation=True),
             CapabilityItem(name="codex", type="expert_tool", risk="medium", requires_confirmation=True),
         ]
+
+    def run_debug(
+        self,
+        *,
+        session_id: str,
+        workspace: str | None,
+        user_input: str,
+    ) -> RuntimeDebugRun:
+        """Run the fixed-stage debug runtime chain."""
+
+        return self.debug_loop.run_debug(
+            session_id=session_id,
+            workspace=workspace,
+            user_input=user_input,
+        )

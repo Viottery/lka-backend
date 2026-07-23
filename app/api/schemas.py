@@ -4,6 +4,13 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from app.core.context import SessionContext, TaskContext
+from app.core.events import EventRecord
+from app.core.llm import LLMResponse
+from app.core.retrieval import RetrievalResult
+from app.core.tools import ToolInvocation, ToolResult
+from app.core.tracing import TraceRecord
+
 
 class HealthResponse(BaseModel):
     status: str = "ok"
@@ -33,3 +40,21 @@ class CapabilityItem(BaseModel):
 
 class CapabilityListResponse(BaseModel):
     capabilities: list[CapabilityItem]
+
+
+class RuntimeDebugRequest(BaseModel):
+    session_id: str
+    workspace: str | None = None
+    user_input: str
+
+
+class RuntimeDebugResponse(BaseModel):
+    trace_id: str
+    session_context: SessionContext
+    task_context: TaskContext
+    events: list[EventRecord]
+    retrieval_result: RetrievalResult
+    tool_invocation: ToolInvocation
+    tool_result: ToolResult
+    llm_response: LLMResponse
+    trace: TraceRecord

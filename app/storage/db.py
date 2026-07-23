@@ -36,6 +36,27 @@ def init_db(db_path: Path) -> None:
                 indexed_files INTEGER NOT NULL DEFAULT 0,
                 indexed_chunks INTEGER NOT NULL DEFAULT 0
             );
+
+            CREATE TABLE IF NOT EXISTS runtime_events (
+                event_id TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                context_id TEXT,
+                payload TEXT NOT NULL,
+                status TEXT NOT NULL,
+                error TEXT,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS traces (
+                trace_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                context_id TEXT,
+                status TEXT NOT NULL,
+                events_payload TEXT NOT NULL,
+                verification_clues TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
             """
         )
         conn.commit()
