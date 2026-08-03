@@ -18,6 +18,44 @@
 
 ## 0. MVP 成功定义
 
+### 0.0 Urgent 方向调整：邮件处理助手优先
+
+第一版 MVP 的主场景调整为邮件处理助手。本地 workspace 能力继续保留，但在第一版中降级为辅助 context provider。
+
+邮件优先主线不推翻原有 Agent Harness 设计，而是把主数据源从 workspace 暂时切换为邮件：
+
+```text
+邮件导入 / 同步
+  -> 本地邮件持久化
+  -> 关键词 / 语义检索
+  -> TaskContext / MatterContext
+  -> Main Agent Brain
+  -> LLM 处理循环
+  -> 事务整理
+  -> Trace Recorder
+  -> 后续 Skill Evolution
+```
+
+Urgent track 的阶段目标：
+
+- [x] 建立本地邮件存储模型，支持邮件、附件 metadata、邮件分块、事务和处理记录。
+- [x] 提供 `POST /mail/import`，先支持本地 JSON 导入，便于无 OAuth 场景下测试。
+- [x] 提供 `GET /mail/search`，先支持 SQLite FTS 关键词检索。
+- [x] 提供 `POST /mail/process`，先基于本地邮件候选集生成事务整理结果。
+- [x] 提供 `GET /mail/matters`，查看事务列表。
+- [ ] 接入 Outlook 只读同步，采用 Device Code Flow，权限优先限制为 `User.Read Mail.Read offline_access`。
+- [ ] Outlook 第一版先同步邮件正文和附件 metadata，附件内容后续按需下载。
+- [ ] 接入第三方 LLM API provider；未配置 API key 时保留 mock provider，保证测试稳定。
+- [ ] 后续再把 Codex / Claude Code Expert Tools 放回邮件任务后的优化路径。
+
+决策记录：
+
+- 邮件是第一版 MVP 的主数据源，本地 workspace 是辅助上下文来源。
+- Outlook 真实数据接入优先使用 Microsoft Graph Device Code Flow，避免本地测试依赖公网 callback。
+- 初期只申请只读权限，不发送邮件、不修改邮箱状态、不删除邮件。
+- 附件初期只保存 metadata，避免首次同步被大附件、空间和下载失败拖慢。
+- 语义检索可以先预留接口和数据结构，关键词检索先用 SQLite FTS5 落地。
+
 ### 0.1 MVP 最终应具备的能力
 
 - 能在本地启动 Backend Core。

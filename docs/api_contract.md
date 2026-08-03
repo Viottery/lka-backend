@@ -171,7 +171,135 @@ POST /runtime/debug
 
 ---
 
-## 5. Compatibility Notes
+## 5. Mail Import
+
+```http
+POST /mail/import
+```
+
+请求：
+
+```json
+{
+  "account": {
+    "provider": "local_json",
+    "email_address": "user@example.com",
+    "display_name": "User"
+  },
+  "messages": [
+    {
+      "external_id": "msg_001",
+      "folder": "Inbox",
+      "subject": "Visa document reminder",
+      "sender": "admin@example.com",
+      "to": ["user@example.com"],
+      "cc": [],
+      "received_at": "2026-08-03T09:30:00Z",
+      "body_text": "Please submit the missing document by Friday.",
+      "attachments": [
+        {
+          "external_id": "att_001",
+          "name": "checklist.pdf",
+          "content_type": "application/pdf",
+          "size": 12345
+        }
+      ]
+    }
+  ]
+}
+```
+
+响应：
+
+```json
+{
+  "account_id": "mail_account_xxx",
+  "imported_messages": 1,
+  "imported_attachments": 1
+}
+```
+
+---
+
+## 6. Mail Search
+
+```http
+GET /mail/search?q=document&limit=10
+```
+
+响应：
+
+```json
+{
+  "query": "document",
+  "messages": [
+    {
+      "message_id": "mail_msg_xxx",
+      "subject": "Visa document reminder",
+      "sender": "admin@example.com",
+      "folder": "Inbox",
+      "received_at": "2026-08-03T09:30:00Z",
+      "snippet": "Please submit the missing document by Friday."
+    }
+  ]
+}
+```
+
+---
+
+## 7. Mail Process
+
+```http
+POST /mail/process
+```
+
+请求：
+
+```json
+{
+  "query": "visa document",
+  "limit": 10
+}
+```
+
+响应：
+
+```json
+{
+  "run_id": "mail_run_xxx",
+  "status": "completed",
+  "processed_messages": 1,
+  "matters_created": 1
+}
+```
+
+---
+
+## 8. List Mail Matters
+
+```http
+GET /mail/matters
+```
+
+响应：
+
+```json
+{
+  "matters": [
+    {
+      "matter_id": "mail_matter_xxx",
+      "title": "Visa document reminder",
+      "status": "open",
+      "priority": "normal",
+      "summary": "Please submit the missing document by Friday."
+    }
+  ]
+}
+```
+
+---
+
+## 9. Compatibility Notes
 
 - 当前后端实现是轻量骨架，因此部分返回值是规则化输出而非真实 agent 结果。
 - 这份契约保留了未来完整系统需要的字段，便于逐步替换实现。

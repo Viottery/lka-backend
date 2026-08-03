@@ -7,6 +7,16 @@ from pydantic import BaseModel, Field
 from app.core.context import SessionContext, TaskContext
 from app.core.events import EventRecord
 from app.core.llm import LLMResponse
+from app.core.mail import (
+    MailAccountInput,
+    MailAttachmentInput,
+    MailImportResult,
+    MailMatter,
+    MailMatterList,
+    MailMessageInput,
+    MailProcessResult,
+    MailSearchResult,
+)
 from app.core.retrieval import RetrievalResult
 from app.core.tools import ToolInvocation, ToolResult
 from app.core.tracing import TraceRecord
@@ -58,3 +68,36 @@ class RuntimeDebugResponse(BaseModel):
     tool_result: ToolResult
     llm_response: LLMResponse
     trace: TraceRecord
+
+
+class MailImportRequest(BaseModel):
+    account: MailAccountInput
+    messages: list[MailMessageInput]
+
+
+class MailImportResponse(MailImportResult):
+    pass
+
+
+class MailSearchResponse(MailSearchResult):
+    pass
+
+
+class MailProcessRequest(BaseModel):
+    query: str | None = None
+    limit: int = 10
+
+
+class MailProcessResponse(MailProcessResult):
+    pass
+
+
+class MailMatterListResponse(MailMatterList):
+    matters: list[MailMatter]
+
+
+__all__ = [
+    "MailAccountInput",
+    "MailAttachmentInput",
+    "MailMessageInput",
+]

@@ -103,6 +103,95 @@ def init_db(db_path: Path) -> None:
                 verification_clues TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS mail_accounts (
+                account_id TEXT PRIMARY KEY,
+                provider TEXT NOT NULL,
+                email_address TEXT NOT NULL,
+                display_name TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(provider, email_address)
+            );
+
+            CREATE TABLE IF NOT EXISTS mail_messages (
+                message_id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                external_id TEXT NOT NULL,
+                folder TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                sender TEXT NOT NULL,
+                recipients TEXT NOT NULL,
+                cc TEXT NOT NULL,
+                received_at TEXT,
+                body_text TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(account_id) REFERENCES mail_accounts(account_id),
+                UNIQUE(account_id, external_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS mail_attachments (
+                attachment_id TEXT PRIMARY KEY,
+                message_id TEXT NOT NULL,
+                external_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                content_type TEXT,
+                size INTEGER,
+                is_downloaded INTEGER NOT NULL DEFAULT 0,
+                local_path TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(message_id) REFERENCES mail_messages(message_id),
+                UNIQUE(message_id, external_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS mail_chunks (
+                chunk_id TEXT PRIMARY KEY,
+                message_id TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(message_id) REFERENCES mail_messages(message_id),
+                UNIQUE(message_id, chunk_index)
+            );
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS mail_messages_fts USING fts5(
+                message_id UNINDEXED,
+                subject,
+                sender,
+                folder,
+                body_text
+            );
+
+            CREATE TABLE IF NOT EXISTS mail_matters (
+                matter_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                status TEXT NOT NULL,
+                priority TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS mail_matter_links (
+                matter_id TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(matter_id, message_id),
+                FOREIGN KEY(matter_id) REFERENCES mail_matters(matter_id),
+                FOREIGN KEY(message_id) REFERENCES mail_messages(message_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS mail_processing_runs (
+                run_id TEXT PRIMARY KEY,
+                query TEXT,
+                status TEXT NOT NULL,
+                processed_messages INTEGER NOT NULL,
+                matters_created INTEGER NOT NULL,
+                provider TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
             """
         )
         conn.commit()

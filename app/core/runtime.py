@@ -12,6 +12,15 @@ from app.api.schemas import (
 from app.core.config import Settings
 from app.core.context import ContextAssembler
 from app.core.llm import MockLLMClient
+from app.core.mail import (
+    MailAccountInput,
+    MailImportResult,
+    MailMatterList,
+    MailMessageInput,
+    MailProcessResult,
+    MailSearchResult,
+    MailService,
+)
 from app.core.retrieval import LocalDebugRetrievalProvider
 from app.core.runtime_loop import RuntimeDebugRun, RuntimeLoop
 from app.core.tools import MockToolExecutor
@@ -38,6 +47,7 @@ class LocalKnowledgeAgentRuntime:
             workspace_roots=settings.parsed_workspace_roots(),
         )
         self.filesystem_scanner = FilesystemScanner(self.platform)
+        self.mail_service = MailService(self._conn)
         self.debug_loop = RuntimeLoop(
             context_assembler=ContextAssembler(),
             retrieval_provider=LocalDebugRetrievalProvider(
@@ -145,6 +155,8 @@ class LocalKnowledgeAgentRuntime:
         """Return the currently advertised capability catalog."""
 
         return [
+            CapabilityItem(name="search_mail", type="native_skill", risk="low", requires_confirmation=False),
+            CapabilityItem(name="process_mail", type="native_skill", risk="low", requires_confirmation=False),
             CapabilityItem(name="summarize_folder", type="native_skill", risk="low", requires_confirmation=False),
             CapabilityItem(name="extract_tasks", type="native_skill", risk="low", requires_confirmation=False),
             CapabilityItem(name="organize_files", type="native_skill", risk="medium", requires_confirmation=True),
@@ -166,3 +178,28 @@ class LocalKnowledgeAgentRuntime:
             workspace=workspace,
             user_input=user_input,
         )
+
+    def import_mail(
+        self,
+        *,
+        account: MailAccountInput,
+        messages: list[MailMessageInput],
+    ) -> MailImportResult:
+        """Persist locally imported mail messages."""
+
+        return self.mail_service.import_messages(account=account, messages=messages)
+
+    def search_mail(self, *, query: str, limit: int = 10) -> MailSearchResult:
+        """Search locally persisted mail with SQLite FTS."""
+
+        return self.mail_service.search_messages(query=query, limit=limit)
+
+    def process_mail(self, *, query: str | None = None, limit: int = 10) -> MailProcessResult:
+        """Run the first deterministic mail matter extraction loop."""
+
+        return self.mail_service.process_messages(query=query, limit=limit)
+
+    def list_mail_matters(self, *, limit: int = 50) -> MailMatterList:
+        """Return locally extracted mail matters."""
+
+        return self.mail_service.list_matters(limit=limit)
