@@ -46,7 +46,9 @@ Urgent track 的阶段目标：
 - [x] 新增本地 provider 配置模板，覆盖 LLM、Outlook、IMAP 和 local BGE embedding 配置。
 - [x] 接入 Outlook 只读同步，采用 Device Code Flow，权限优先限制为 `User.Read Mail.Read offline_access`。
 - [x] Outlook 第一版先同步邮件正文和附件 metadata，附件内容后续按需下载。
-- [ ] 接入第三方 LLM API provider；未配置 API key 时保留 mock provider，保证测试稳定。
+- [ ] 部署 / 接入真实第三方 LLM API provider；未配置 API key 时保留 mock provider，保证测试稳定。
+- [ ] 将邮件纳入本地持久化存储管理，补齐邮件整理、检索和概括工具。
+- [ ] 支持多轮会话和会话切换，让邮件处理结果、上下文和 trace 能按 session 组织。
 - [ ] 接入本地 `BAAI/bge-m3` embedding provider，并兼容 Windows / Linux 模型缓存路径。
 - [ ] 后续再把 Codex / Claude Code Expert Tools 放回邮件任务后的优化路径。
 
@@ -619,14 +621,23 @@ Urgent track 的阶段目标：
 
 如果你要真正按顺序做，我建议这样排：
 
-### 第一阶段：先理解
+### 第一阶段：邮件优先闭环
 
-- [ ] TaskContext
+- [ ] 部署 / 接入真实 LLM API provider，并保留 mock fallback。
+- [ ] 将邮件作为本地持久化知识源管理，明确 account、message、attachment、chunk、matter、processing run 的生命周期。
+- [ ] 补齐邮件整理、检索和概括工具，让邮件候选集可以进入 TaskContext / MatterContext。
+- [ ] 支持多轮会话和会话切换，让 session 能绑定邮件处理上下文、matter 和 trace。
+- [ ] 基于邮件上下文完成一次 mock/real LLM 处理链路验证。
+
+### 第二阶段：再理解
+
+- [ ] TaskContext / MatterContext
 - [ ] workspace 扫描与上下文摘要
+- [ ] 邮件与 workspace 混合上下文组装
 - [ ] 任务意图识别
 - [ ] 基础计划生成
 
-### 第二阶段：再执行
+### 第三阶段：再执行
 
 - [ ] `/tasks/plan`
 - [ ] `/tasks/run`
@@ -634,7 +645,7 @@ Urgent track 的阶段目标：
 - [ ] 基础 skill / sub agent 入口
 - [ ] Expert Tool 调用入口
 
-### 第三阶段：再解释
+### 第四阶段：再解释
 
 - [ ] `/traces`
 - [ ] `/traces/{trace_id}`
@@ -642,7 +653,7 @@ Urgent track 的阶段目标：
 - [ ] confirmation 流程
 - [ ] skill proposal 生成
 
-### 第四阶段：再演示
+### 第五阶段：再演示
 
 - [ ] 文档统一
 - [ ] 示例请求齐全

@@ -322,7 +322,8 @@ POST /mail/outlook/auth/start
 
 - 使用 Microsoft Graph Device Code Flow。
 - 只读同步路径要求 `User.Read Mail.Read offline_access`。
-- `client_id` 从 `config/local.toml` 指定的环境变量读取，默认是 `MS_GRAPH_CLIENT_ID`。
+- `client_id` 可在 `config/local.toml` 中直接配置，也可通过 `client_id_env`
+  指定环境变量读取，默认环境变量名是 `MS_GRAPH_CLIENT_ID`。
 
 ---
 

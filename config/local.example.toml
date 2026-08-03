@@ -5,6 +5,8 @@
 #
 # Prefer *_env fields for secrets. For example, set OPENAI_API_KEY in your
 # shell or .env, then reference it here as api_key_env = "OPENAI_API_KEY".
+# Microsoft Graph client IDs are not secrets, so Outlook can use client_id
+# directly or client_id_env for environment-variable based configuration.
 
 [llm]
 provider = "mock"
@@ -16,6 +18,7 @@ timeout_seconds = 60
 [mail.outlook]
 enabled = false
 auth_method = "device_code"
+client_id = ""
 client_id_env = "MS_GRAPH_CLIENT_ID"
 tenant_id = "consumers"
 scopes = ["User.Read", "Mail.Read", "offline_access"]

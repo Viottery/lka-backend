@@ -65,6 +65,38 @@ normalize_embeddings = true
     assert config.embedding.cache_dir == Path("data/test-models")
 
 
+def test_outlook_client_id_can_be_loaded_directly_from_config(tmp_path):
+    config_path = tmp_path / "local.toml"
+    config_path.write_text(
+        """
+[mail.outlook]
+enabled = true
+client_id = "dd5c654c-9e3c-41fc-9e14-15088af6c8bf"
+""",
+        encoding="utf-8",
+    )
+
+    config = load_local_config(config_path)
+
+    assert config.mail.outlook.resolved_client_id() == "dd5c654c-9e3c-41fc-9e14-15088af6c8bf"
+
+
+def test_outlook_client_id_env_accepts_literal_guid_for_local_config(tmp_path):
+    config_path = tmp_path / "local.toml"
+    config_path.write_text(
+        """
+[mail.outlook]
+enabled = true
+client_id_env = "dd5c654c-9e3c-41fc-9e14-15088af6c8bf"
+""",
+        encoding="utf-8",
+    )
+
+    config = load_local_config(config_path)
+
+    assert config.mail.outlook.resolved_client_id() == "dd5c654c-9e3c-41fc-9e14-15088af6c8bf"
+
+
 def test_settings_loads_config_from_configured_path(tmp_path, monkeypatch):
     config_path = tmp_path / "local.toml"
     config_path.write_text(

@@ -9,6 +9,12 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 
+def _is_env_var_name(value: str) -> bool:
+    return bool(value) and (value[0].isalpha() or value[0] == "_") and all(
+        character.isalnum() or character == "_" for character in value
+    )
+
+
 class LLMProviderConfig(BaseModel):
     provider: str = "mock"
     base_url: str = "https://api.openai.com/v1"
@@ -23,6 +29,7 @@ class LLMProviderConfig(BaseModel):
 class OutlookMailConfig(BaseModel):
     enabled: bool = False
     auth_method: str = "device_code"
+    client_id: str = ""
     client_id_env: str = "MS_GRAPH_CLIENT_ID"
     tenant_id: str = "consumers"
     scopes: list[str] = Field(
@@ -33,7 +40,17 @@ class OutlookMailConfig(BaseModel):
     download_attachment_content: bool = False
 
     def resolved_client_id(self) -> str | None:
-        return os.getenv(self.client_id_env) if self.client_id_env else None
+        if self.client_id.strip():
+            return self.client_id.strip()
+        configured_value = self.client_id_env.strip()
+        if not configured_value:
+            return None
+        env_value = os.getenv(configured_value)
+        if env_value:
+            return env_value
+        if not _is_env_var_name(configured_value):
+            return configured_value
+        return None
 
 
 class IMAPMailConfig(BaseModel):
