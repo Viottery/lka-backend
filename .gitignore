@@ -13,4 +13,7 @@ build/
 data/
 *.sqlite3
 .env
-
+config/local.toml
+config/secrets*.toml
+config/tokens*.json
+config/cache/

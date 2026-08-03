@@ -68,6 +68,38 @@ uv run uvicorn app.api.main:app --host 127.0.0.1 --port 8765
 
 The service listens on `http://127.0.0.1:8765` by default.
 
+## Local Provider Config
+
+Provider, mail, and embedding settings live in a local TOML file:
+
+```bash
+cp config/local.example.toml config/local.toml
+```
+
+`config/local.toml` is ignored by git. Use it for local provider choices and
+secret environment variable names:
+
+- `llm`: third-party LLM API provider, model, base URL, and API key env var.
+- `mail.outlook`: Microsoft Graph Device Code Flow settings. Outlook does not
+  require storing an email password for this path.
+- `mail.imap`: optional IMAP settings for providers that require an app password.
+- `embedding`: local embedding provider config. The default is `BAAI/bge-m3`
+  for multilingual retrieval, with model files cached under `./data/models`.
+
+On Windows PowerShell, set secrets outside the TOML file:
+
+```powershell
+$env:OPENAI_API_KEY="..."
+$env:MS_GRAPH_CLIENT_ID="..."
+```
+
+On Linux/macOS:
+
+```bash
+export OPENAI_API_KEY="..."
+export MS_GRAPH_CLIENT_ID="..."
+```
+
 Windows workspace paths should be sent as backend-local paths. Prefer `/` in
 JSON to avoid escaping:
 
@@ -98,6 +130,8 @@ scripts/sync_to_windows.sh /mnt/c/Users/chuan/projects/lka_backend --apply
 
 The default mode is a dry run. Add `--delete` only when the WSL copy is the
 source of truth and the Windows target should mirror deletions.
+Local secrets such as `config/local.toml`, token files, and `.env` are excluded;
+create a separate `config/local.toml` on Windows when needed.
 
 ## Docker
 

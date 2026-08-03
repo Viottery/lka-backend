@@ -1,0 +1,40 @@
+# Local Knowledge Agent OS local configuration template.
+#
+# Copy this file to config/local.toml and fill values locally.
+# config/local.toml is intentionally ignored by git.
+#
+# Prefer *_env fields for secrets. For example, set OPENAI_API_KEY in your
+# shell or .env, then reference it here as api_key_env = "OPENAI_API_KEY".
+
+[llm]
+provider = "mock"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+model = "gpt-4.1-mini"
+timeout_seconds = 60
+
+[mail.outlook]
+enabled = false
+auth_method = "device_code"
+client_id_env = "MS_GRAPH_CLIENT_ID"
+tenant_id = "consumers"
+scopes = ["User.Read", "Mail.Read", "offline_access"]
+token_store_path = "./data/secrets/outlook_token.json"
+sync_folder = "Inbox"
+download_attachment_content = false
+
+[mail.imap]
+enabled = false
+host = ""
+port = 993
+username = ""
+password_env = "MAIL_IMAP_PASSWORD"
+use_ssl = true
+
+[embedding]
+provider = "local_bge"
+model_name = "BAAI/bge-m3"
+device = "auto"
+cache_dir = "./data/models"
+batch_size = 16
+normalize_embeddings = true

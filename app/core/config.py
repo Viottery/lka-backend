@@ -6,6 +6,8 @@ from pathlib import Path
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.core.local_config import LocalAppConfig, load_local_config
+
 
 class Settings(BaseSettings):
     """Runtime configuration loaded from `.env` and environment variables."""
@@ -23,6 +25,7 @@ class Settings(BaseSettings):
     allow_symlinks: bool = Field(default=False, alias="LKA_ALLOW_SYMLINKS")
     skip_hidden: bool = Field(default=True, alias="LKA_SKIP_HIDDEN")
     max_scan_files: int = Field(default=50_000, alias="LKA_MAX_SCAN_FILES")
+    local_config_path: Path = Field(default=Path("./config/local.toml"), alias="LKA_LOCAL_CONFIG")
     qdrant_url: str = Field(default="http://127.0.0.1:6333", alias="QDRANT_URL")
 
     def parsed_workspace_roots(self) -> list[Path]:
@@ -35,6 +38,11 @@ class Settings(BaseSettings):
             for root in self.workspace_roots.split(";")
             if root.strip()
         ]
+
+    def load_local_config(self) -> LocalAppConfig:
+        """Load provider, mail, and embedding config from the local TOML file."""
+
+        return load_local_config(self.local_config_path)
 
 
 @lru_cache(maxsize=1)

@@ -97,6 +97,10 @@ rsync_args=(
   --exclude "coverage.xml"
   --exclude htmlcov/
   --exclude .env
+  --exclude config/local.toml
+  --exclude "config/secrets*.toml"
+  --exclude "config/tokens*.json"
+  --exclude config/cache/
   --exclude uv.lock
 )
 

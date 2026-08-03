@@ -43,9 +43,11 @@ Urgent track 的阶段目标：
 - [x] 提供 `GET /mail/search`，先支持 SQLite FTS 关键词检索。
 - [x] 提供 `POST /mail/process`，先基于本地邮件候选集生成事务整理结果。
 - [x] 提供 `GET /mail/matters`，查看事务列表。
+- [x] 新增本地 provider 配置模板，覆盖 LLM、Outlook、IMAP 和 local BGE embedding 配置。
 - [ ] 接入 Outlook 只读同步，采用 Device Code Flow，权限优先限制为 `User.Read Mail.Read offline_access`。
 - [ ] Outlook 第一版先同步邮件正文和附件 metadata，附件内容后续按需下载。
 - [ ] 接入第三方 LLM API provider；未配置 API key 时保留 mock provider，保证测试稳定。
+- [ ] 接入本地 `BAAI/bge-m3` embedding provider，并兼容 Windows / Linux 模型缓存路径。
 - [ ] 后续再把 Codex / Claude Code Expert Tools 放回邮件任务后的优化路径。
 
 决策记录：
@@ -55,6 +57,8 @@ Urgent track 的阶段目标：
 - 初期只申请只读权限，不发送邮件、不修改邮箱状态、不删除邮件。
 - 附件初期只保存 metadata，避免首次同步被大附件、空间和下载失败拖慢。
 - 语义检索可以先预留接口和数据结构，关键词检索先用 SQLite FTS5 落地。
+- 本地配置文件使用 `config/local.toml`，该文件不进入 git，也不会通过 WSL -> Windows 同步脚本复制。
+- Outlook Graph Device Code Flow 不保存邮箱密码；IMAP 路径如需密码，优先使用 `password_env` 引用环境变量。
 
 ### 0.1 MVP 最终应具备的能力
 
