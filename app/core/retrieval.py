@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import os
-from pathlib import Path
 from typing import Protocol
 
 from pydantic import BaseModel, Field
 
 from app.core.context import RelatedFile, RelatedSnippet, TaskContext
+from app.platform import FilesystemScanner, PathResolver, ScanOptions
 
 
 class RetrievalResult(BaseModel):
@@ -37,6 +36,17 @@ class LocalDebugRetrievalProvider:
 
     provider_name = "local_debug_retrieval"
 
+    def __init__(
+        self,
+        *,
+        path_resolver: PathResolver,
+        filesystem_scanner: FilesystemScanner,
+        scan_options: ScanOptions,
+    ) -> None:
+        self.path_resolver = path_resolver
+        self.filesystem_scanner = filesystem_scanner
+        self.scan_options = scan_options
+
     def retrieve(
         self,
         *,
@@ -53,8 +63,8 @@ class LocalDebugRetrievalProvider:
                 notes=["No workspace was provided; returned an empty retrieval result."],
             )
 
-        workspace_path = Path(workspace)
-        if not workspace_path.exists():
+        resolved = self.path_resolver.resolve_workspace(workspace)
+        if not resolved.exists:
             return RetrievalResult(
                 provider=self.provider_name,
                 status="completed",
@@ -63,32 +73,27 @@ class LocalDebugRetrievalProvider:
                 notes=["Workspace path does not exist; returned an empty retrieval result."],
             )
 
-        related_files: list[RelatedFile] = []
-        for root, _, files in os.walk(workspace_path):
-            for filename in sorted(files):
-                if len(related_files) >= 10:
-                    break
-                full_path = Path(root) / filename
-                try:
-                    relative_path = str(full_path.relative_to(workspace_path))
-                except ValueError:
-                    relative_path = str(full_path)
-                role = "readme" if filename.lower().startswith("readme") else "workspace_file"
-                related_files.append(
-                    RelatedFile(
-                        path=relative_path,
-                        role=role,
-                        reason="Local debug retrieval sampled workspace file metadata.",
-                        confidence=0.4,
-                    )
-                )
-            if len(related_files) >= 10:
-                break
+        scan_result = self.filesystem_scanner.scan_workspace(
+            resolved,
+            options=self.scan_options,
+        )
+        related_files = [
+            RelatedFile(
+                path=file.relative_path,
+                role=file.role,
+                reason="Local debug retrieval sampled workspace file metadata.",
+                confidence=0.4,
+            )
+            for file in scan_result.sampled_files
+        ]
 
         related_snippets = [
             RelatedSnippet(
                 source="runtime_debug",
-                text=f"Workspace sample contains {len(related_files)} file metadata item(s).",
+                text=(
+                    f"Workspace sample contains {len(related_files)} file metadata item(s) "
+                    f"on {resolved.platform}."
+                ),
                 reason="Debug retrieval reports metadata only; text extraction is deferred to 2.3.",
             )
         ]
@@ -99,5 +104,8 @@ class LocalDebugRetrievalProvider:
             query=query,
             related_files=related_files,
             related_snippets=related_snippets,
-            notes=["Read-only metadata retrieval completed without semantic search."],
+            notes=[
+                "Read-only metadata retrieval completed without semantic search.",
+                f"Resolved workspace path: {resolved.normalized_path}",
+            ],
         )

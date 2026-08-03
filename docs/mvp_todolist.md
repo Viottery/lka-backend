@@ -20,7 +20,7 @@
 
 ### 0.1 MVP 最终应具备的能力
 
-- 能在本地启动 Linux Backend。
+- 能在本地启动 Backend Core。
 - 能通过 HTTP API 接收任务。
 - 能索引一个本地 workspace。
 - 能从本地知识中构造上下文。
@@ -73,6 +73,7 @@
   - [x] `project_overview.md` 作为项目总纲
   - [x] `backend_engineering_guide.md` 作为后端架构说明
   - [x] `backend_implementation_plan.md` 作为长期实施路线图
+  - [x] `platform_support.md` 作为跨平台运行与适配说明
   - [x] `api_contract.md` 作为接口契约
   - [x] `ai_coding_standard.md` 作为 coding 规范
   - [x] `mvp_todolist.md` 作为当前执行清单
@@ -93,10 +94,30 @@
 - [x] 明确 Qdrant 先作为能力预留或占位，不把它当作 MVP 成败关键。
 - [x] 明确前端与后端的职责边界。
 
+### 1.4 跨平台基础适配
+
+- [x] 明确后端目标从 Linux-only 调整为 Windows/Linux 原生 Backend Core。
+- [x] 增加 `app/platform/` 作为平台差异边界。
+- [x] 增加平台识别能力，支持 `auto`、`windows`、`linux`、`macos`。
+- [x] 增加 workspace 路径解析入口，避免业务层直接处理路径差异。
+- [x] 增加只读文件系统扫描器，支持递归、隐藏文件、symlink 和扫描上限配置。
+- [x] 让 `/workspaces/index` 使用平台扫描配置。
+- [x] 让 `/runtime/debug` 的 local retrieval 复用平台扫描器。
+- [x] 更新 README、API 合同、工程指南、长期路线图和跨平台说明文档。
+
+决策记录：
+
+- 不拆分 Windows Backend / Linux Backend 两套代码。
+- 一套 Backend Core 保持 FastAPI、SQLite、Context、Trace 等核心逻辑共享。
+- Windows/Linux 差异集中进入 `app/platform/`。
+- Docker/WSL 作为可选运行方式，不作为 Windows 原生支持的前提。
+- 后续命令执行、专家工具和本地工具调用应新增统一 `CommandRunner`，不要在业务层写死 shell。
+
 ### 完成标准
 
 - 文档、命名、执行规范没有明显冲突。
 - 读者能在 5 分钟内理解这个项目做什么、怎么跑、先做什么。
+- 读者能理解 Windows/Linux 原生运行的路径、配置和测试差异。
 
 ---
 
@@ -527,6 +548,8 @@
 - [ ] 能用 `uv sync` 安装依赖。
 - [ ] 能用 `uv run uvicorn app.api.main:app` 启动服务。
 - [ ] `.env.example` 中的配置可直接参考。
+- [ ] Windows PowerShell 原生启动说明可复现。
+- [ ] Linux shell 原生启动说明可复现。
 
 ### 11.2 Docker 运行
 
@@ -539,6 +562,8 @@
 - [ ] README 写清本地运行方式。
 - [ ] README 写清 Docker 运行方式。
 - [ ] README 写清默认端口和默认监听地址。
+- [x] README 写清 Windows/Linux 原生启动基础命令。
+- [x] `docs/platform_support.md` 写清平台配置、路径、API 调用和测试矩阵。
 
 ### 完成标准
 

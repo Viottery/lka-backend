@@ -182,6 +182,10 @@ Claude Code 和 Codex 在本系统中的定位是：
 
 MVP 默认绑定地址是 `127.0.0.1:8765`，但必须通过配置项覆盖，不应写死。
 
+Backend Core 应支持 Windows 和 Linux 原生 Python 运行。平台差异应集中在
+`app/platform/`，包括路径解析、文件系统扫描、后续命令执行和本地工具调用。
+Docker/WSL 可以作为可选部署或开发方式，但不应成为 Windows 支持的前提。
+
 本地持久化默认使用 SQLite，作为任务、轨迹、确认和 workspace 索引元数据的主存储。
 
 Qdrant 保留为可选的语义检索扩展，不作为 MVP 的必要前提。

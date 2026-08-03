@@ -1,8 +1,12 @@
-# Linux Backend：Engineering Guide
+# Backend Core：Engineering Guide
 
 ## 1. 项目定位
 
-Linux Backend 是整个 Local Knowledge Agent OS 的核心执行层。它承载 HTTP API、运行时调度、知识上下文构建、能力选择、技能执行、验证与轨迹记录等核心职责。
+Backend Core 是整个 Local Knowledge Agent OS 的核心执行层。它承载 HTTP API、
+运行时调度、知识上下文构建、能力选择、技能执行、验证与轨迹记录等核心职责。
+
+Backend Core 目标是支持 Windows 和 Linux 原生 Python 运行。Docker/WSL 可以作为
+可选运行方式，但不应成为 Windows 支持的前提。
 
 这个文档既描述当前已实现的后端骨架，也保留项目的中长期愿景，方便后续分阶段落地。
 
@@ -10,12 +14,14 @@ Linux Backend 是整个 Local Knowledge Agent OS 的核心执行层。它承载 
 
 ## 2. 核心职责
 
-Linux Backend 目前只负责四个基础动作：
+Backend Core 目前只负责五个基础动作：
 
 ```text
 HTTP API
   ↓
 Workspace Index
+  ↓
+Platform Path / Filesystem Adapter
   ↓
 Workspace File Structure Index
   ↓
@@ -49,11 +55,22 @@ backend/
 
     core/
       runtime.py
+      context.py
+      retrieval.py
+      runtime_loop.py
+      tools.py
+      tracing.py
 
-      storage/
-        db.py
-        models.py
-        vector_store.py
+    platform/
+      base.py
+      detect.py
+      paths.py
+      filesystem.py
+
+    storage/
+      db.py
+      models.py
+      vector_store.py
 ```
 
 ### 说明
@@ -61,12 +78,15 @@ backend/
 - 上面这份结构是“目标结构”，不是当前实现的全部内容。
 - 当前仓库只实现了其中很小一部分，但目录规划保留了后续演进路径。
 - 这份结构的价值在于：它让后续扩展不会每次都重新发明分层方式。
+- `app/platform/` 是跨平台边界，用于集中处理路径、文件系统和后续命令执行差异。
 
 ### 存储与检索约定
 
 - SQLite 是当前 MVP 的主存储方案，用于 workspace 索引元数据、任务记录、trace、confirmation 和其他结构化状态。
 - Qdrant 只作为可选语义检索扩展，不作为 MVP 必需项。
 - 非向量检索应优先依赖 workspace 的结构化索引、文件构成索引和本地文件系统检索。
+- Workspace 路径必须先经过 `PathResolver`，文件扫描必须优先经过 `FilesystemScanner`。
+- 后续本地命令、专家工具、测试命令应经过统一 `CommandRunner`，避免业务代码写死 shell。
 
 ---
 
@@ -97,6 +117,8 @@ class LocalKnowledgeAgentRuntime:
 - workspace index
 - static capability catalog
 - local-only binding
+- native Windows/Linux path resolution
+- cross-platform read-only filesystem scanning
 
 ### P1
 
@@ -105,6 +127,7 @@ class LocalKnowledgeAgentRuntime:
 - retrieval
 - Capabilities registry redesign
 - Native Skills 接口抽象
+- CommandRunner 平台抽象
 
 ### P2
 
@@ -126,6 +149,9 @@ class LocalKnowledgeAgentRuntime:
 - Health Check
 - Workspace index 的基础统计
 - Capability 列表返回
+- Runtime Debug 结构化链路
+- SQLite trace / runtime event 持久化
+- 平台识别、workspace 路径解析和只读文件扫描
 
 这意味着：
 

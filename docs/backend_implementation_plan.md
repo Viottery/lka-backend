@@ -1,4 +1,4 @@
-# Linux Backend：Long-Term Roadmap
+# Backend Core：Long-Term Roadmap
 
 这份文档描述的是长期路线图，不是当前执行清单。
 它回答的是“这个后端最终要长成什么样”，而不是“下一步先做哪一项”。
@@ -11,9 +11,10 @@
 
 ### 1.1 短期目标
 
-- 保持一个稳定、可启动、可验证的 Linux Backend 骨架。
+- 保持一个稳定、可启动、可验证的 Backend Core 骨架。
 - 保留最小的 HTTP 服务、workspace 索引和静态能力目录。
 - 让文档、接口和代码保持同一套术语。
+- 支持 Windows/Linux 原生 Python 运行，Docker/WSL 仅作为可选路径。
 
 ### 1.2 中期目标
 
@@ -61,6 +62,9 @@
 - `/workspaces/index`
 - SQLite 初始化
 - 静态 capability catalog
+- 平台识别
+- workspace 路径解析
+- 跨平台只读文件扫描
 - 基础文档对齐
 
 验收思路：
@@ -72,7 +76,17 @@ curl http://127.0.0.1:8765/health
 ```bash
 curl -X POST http://127.0.0.1:8765/workspaces/index \
   -H "Content-Type: application/json" \
-  -d '{"workspace": "/mnt/c/Users/chuan/Documents/NTU"}'
+  -d '{"workspace": "/home/chuan/Documents/NTU", "source_frontend": "linux-native"}'
+```
+
+Windows PowerShell 验收思路：
+
+```powershell
+Invoke-RestMethod `
+  -Uri "http://127.0.0.1:8765/workspaces/index" `
+  -Method Post `
+  -ContentType "application/json" `
+  -Body '{"workspace":"C:/Users/chuan/Documents/NTU","source_frontend":"windows-native"}'
 ```
 
 ---
@@ -228,15 +242,18 @@ trace -> pattern -> skill proposal
 目标：
 
 ```text
-Linux Backend 变成统一智能中枢
+Backend Core 变成统一智能中枢
 ```
 
 主要内容：
 
 - Windows frontend 适配
 - Linux frontend 适配
+- Windows native backend 适配
+- Linux native backend 适配
 - 更多本地数据源
 - 更完善的路径映射
+- 更完善的命令执行抽象
 - 未来的 MCP / local tool 扩展
 
 ---
@@ -259,7 +276,9 @@ Linux Backend 变成统一智能中枢
 - FastAPI app bootstrap
 - `/health`
 - `/workspaces/index`
-- SQLite init
-- capability list
+- `/capabilities`
+- `/runtime/debug`
+- SQLite 初始化
+- 平台识别、路径解析和只读 workspace 文件扫描
 
 后续能力会按照上面的阶段顺序逐步补齐，不再回到之前那条基于规则的 task 路径。

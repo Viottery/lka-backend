@@ -1,6 +1,6 @@
 # Local Knowledge Agent OS：HTTP API Contract
 
-> 本文档定义 Linux Backend Server 与 Windows/Linux Frontend 之间的最小 HTTP API 契约。
+> 本文档定义 Backend Core 与 Windows/Linux Frontend 之间的最小 HTTP API 契约。
 >
 > 当前阶段只保留基础服务能力，不包含任务规划、任务执行、轨迹或确认流。
 
@@ -45,12 +45,28 @@ POST /workspaces/index
 
 ```json
 {
-  "workspace": "/mnt/c/Users/chuan/Documents/NTU",
-  "source_frontend": "windows-cli",
+  "workspace": "/home/chuan/Documents/NTU",
+  "source_frontend": "linux-native",
   "options": {
     "recursive": true,
-    "include_code": true,
-    "include_pdf": true
+    "skip_hidden": true,
+    "allow_symlinks": false,
+    "max_files": 50000
+  }
+}
+```
+
+Windows 原生后端示例：
+
+```json
+{
+  "workspace": "C:/Users/chuan/Documents/NTU",
+  "source_frontend": "windows-native",
+  "options": {
+    "recursive": true,
+    "skip_hidden": true,
+    "allow_symlinks": false,
+    "max_files": 50000
   }
 }
 ```
@@ -71,7 +87,11 @@ POST /workspaces/index
 - 这是 workspace 索引的最小合同。
 - 当前实现先统计文件数量和估算 chunk 数量，后续再接入真正的知识抽取与检索。
 - 未来 workspace 索引还会补充文件构成索引，用于在不依赖向量检索时提升效率和准确率。
-- `options` 字段保留给前端扩展使用。
+- `workspace` 表示后端进程可访问的本地路径。Windows 原生后端应传 Windows 路径，
+  Linux 原生后端应传 POSIX 路径。
+- Windows JSON 推荐使用 `C:/Users/...` 写法，避免反斜杠转义。
+- 当前 `options` 支持 `recursive`、`skip_hidden`、`allow_symlinks`、`max_files`
+  和 `sample_limit`。
 
 ---
 
@@ -121,7 +141,7 @@ POST /runtime/debug
 ```json
 {
   "session_id": "session_001",
-  "workspace": "/mnt/c/Users/chuan/Documents/NTU",
+  "workspace": "/home/chuan/Documents/NTU",
   "user_input": "Analyze this workspace for runtime debugging."
 }
 ```

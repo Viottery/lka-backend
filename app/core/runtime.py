@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import os
 import sqlite3
 from hashlib import sha1
-from pathlib import Path
 
 from app.api.schemas import (
     CapabilityItem,
@@ -18,6 +16,7 @@ from app.core.retrieval import LocalDebugRetrievalProvider
 from app.core.runtime_loop import RuntimeDebugRun, RuntimeLoop
 from app.core.tools import MockToolExecutor
 from app.core.tracing import TraceRecorder
+from app.platform import FilesystemScanner, PathResolver, ScanOptions, detect_platform
 from app.storage.db import connect, get_db_path, init_db
 
 
@@ -33,9 +32,19 @@ class LocalKnowledgeAgentRuntime:
         self.settings = settings
         self.db_path = get_db_path(settings.data_dir)
         init_db(self.db_path)
+        self.platform = detect_platform(settings.platform)
+        self.path_resolver = PathResolver(
+            self.platform,
+            workspace_roots=settings.parsed_workspace_roots(),
+        )
+        self.filesystem_scanner = FilesystemScanner(self.platform)
         self.debug_loop = RuntimeLoop(
             context_assembler=ContextAssembler(),
-            retrieval_provider=LocalDebugRetrievalProvider(),
+            retrieval_provider=LocalDebugRetrievalProvider(
+                path_resolver=self.path_resolver,
+                filesystem_scanner=self.filesystem_scanner,
+                scan_options=self._scan_options(),
+            ),
             llm_client=MockLLMClient(),
             tool_executor=MockToolExecutor(),
             trace_recorder=TraceRecorder(self._conn),
@@ -52,14 +61,6 @@ class LocalKnowledgeAgentRuntime:
             "version": self.settings.version,
             "service": self.settings.app_name,
         }
-
-    def _count_workspace_items(self, workspace_path: Path) -> tuple[int, int]:
-        indexed_files = 0
-        indexed_chunks = 0
-        for _root, _, files in os.walk(workspace_path):
-            indexed_files += len(files)
-            indexed_chunks += len(files) * 4
-        return indexed_files, indexed_chunks
 
     def _upsert_workspace(
         self,
@@ -88,25 +89,56 @@ class LocalKnowledgeAgentRuntime:
         finally:
             conn.close()
 
-    def index_workspace(self, workspace: str, source_frontend: str | None = None, options: dict | None = None) -> WorkspaceIndexResponse:
+    def _scan_options(self, options: dict | None = None) -> ScanOptions:
+        options = options or {}
+        return ScanOptions(
+            recursive=bool(options.get("recursive", True)),
+            skip_hidden=bool(options.get("skip_hidden", self.settings.skip_hidden)),
+            allow_symlinks=bool(options.get("allow_symlinks", self.settings.allow_symlinks)),
+            max_files=int(options.get("max_files", self.settings.max_scan_files)),
+            sample_limit=int(options.get("sample_limit", 10)),
+        )
+
+    def index_workspace(
+        self,
+        workspace: str,
+        source_frontend: str | None = None,
+        options: dict | None = None,
+    ) -> WorkspaceIndexResponse:
         """Record a lightweight workspace index summary.
 
-        The current implementation counts files only. The `options` payload is
-        accepted for compatibility with the API contract, but is not yet used.
+        The current implementation counts files only. The `options` payload can
+        tune cross-platform scan behavior while preserving the API response.
         """
 
-        workspace_path = Path(workspace)
-        workspace_id = _stable_id("ws", workspace)
-        indexed_files = 0
-        indexed_chunks = 0
-        if workspace_path.exists():
-            indexed_files, indexed_chunks = self._count_workspace_items(workspace_path)
-        self._upsert_workspace(workspace_id, workspace, source_frontend, indexed_files, indexed_chunks)
+        resolved = self.path_resolver.resolve_workspace(
+            workspace,
+            source_frontend=source_frontend,
+        )
+        workspace_id = _stable_id("ws", resolved.normalized_path)
+        if self.path_resolver.is_allowed_workspace(resolved):
+            scan_result = self.filesystem_scanner.scan_workspace(
+                resolved,
+                options=self._scan_options(options),
+            )
+        else:
+            scan_result = self.filesystem_scanner.scan_workspace(
+                resolved,
+                options=ScanOptions(max_files=0),
+            )
+
+        self._upsert_workspace(
+            workspace_id,
+            resolved.normalized_path,
+            source_frontend,
+            scan_result.indexed_files,
+            scan_result.indexed_chunks,
+        )
         return WorkspaceIndexResponse(
             workspace_id=workspace_id,
             status="completed",
-            indexed_files=indexed_files,
-            indexed_chunks=indexed_chunks,
+            indexed_files=scan_result.indexed_files,
+            indexed_chunks=scan_result.indexed_chunks,
         )
 
     def list_capabilities(self) -> list[CapabilityItem]:
