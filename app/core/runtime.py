@@ -21,6 +21,12 @@ from app.core.mail import (
     MailSearchResult,
     MailService,
 )
+from app.core.outlook import (
+    OutlookAuthCompleteResult,
+    OutlookAuthStartResult,
+    OutlookService,
+    OutlookSyncResult,
+)
 from app.core.retrieval import LocalDebugRetrievalProvider
 from app.core.runtime_loop import RuntimeDebugRun, RuntimeLoop
 from app.core.tools import MockToolExecutor
@@ -48,6 +54,12 @@ class LocalKnowledgeAgentRuntime:
         )
         self.filesystem_scanner = FilesystemScanner(self.platform)
         self.mail_service = MailService(self._conn)
+        self.local_app_config = settings.load_local_config()
+        self.outlook_service = OutlookService(
+            self._conn,
+            self.mail_service,
+            self.local_app_config,
+        )
         self.debug_loop = RuntimeLoop(
             context_assembler=ContextAssembler(),
             retrieval_provider=LocalDebugRetrievalProvider(
@@ -203,3 +215,28 @@ class LocalKnowledgeAgentRuntime:
         """Return locally extracted mail matters."""
 
         return self.mail_service.list_matters(limit=limit)
+
+    def start_outlook_auth(self) -> OutlookAuthStartResult:
+        """Start Microsoft Graph Device Code Flow for Outlook read-only sync."""
+
+        return self.outlook_service.start_device_auth()
+
+    def complete_outlook_auth(self, *, device_code: str) -> OutlookAuthCompleteResult:
+        """Complete one Device Code Flow polling attempt and persist tokens locally."""
+
+        return self.outlook_service.complete_device_auth(device_code=device_code)
+
+    def sync_outlook_mail(
+        self,
+        *,
+        folder: str | None = None,
+        limit: int = 25,
+        max_pages: int = 1,
+    ) -> OutlookSyncResult:
+        """Read Outlook mail through Microsoft Graph and persist it locally."""
+
+        return self.outlook_service.sync_messages(
+            folder=folder,
+            limit=limit,
+            max_pages=max_pages,
+        )

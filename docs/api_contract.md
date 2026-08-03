@@ -299,7 +299,100 @@ GET /mail/matters
 
 ---
 
-## 9. Compatibility Notes
+## 9. Outlook Auth Start
+
+```http
+POST /mail/outlook/auth/start
+```
+
+响应：
+
+```json
+{
+  "device_code": "device-code",
+  "user_code": "ABCD-EFGH",
+  "verification_uri": "https://microsoft.com/devicelogin",
+  "expires_in": 900,
+  "interval": 5,
+  "message": "Open the verification URL and enter the code."
+}
+```
+
+说明：
+
+- 使用 Microsoft Graph Device Code Flow。
+- 只读同步路径要求 `User.Read Mail.Read offline_access`。
+- `client_id` 从 `config/local.toml` 指定的环境变量读取，默认是 `MS_GRAPH_CLIENT_ID`。
+
+---
+
+## 10. Outlook Auth Complete
+
+```http
+POST /mail/outlook/auth/complete
+```
+
+请求：
+
+```json
+{
+  "device_code": "device-code"
+}
+```
+
+响应：
+
+```json
+{
+  "status": "authorized",
+  "expires_at": 1785749400,
+  "error": null
+}
+```
+
+如果用户尚未在浏览器完成授权，响应中的 `status` 为 `pending`。
+授权成功后，token 会保存到本地配置指定的 `token_store_path`。
+
+---
+
+## 11. Outlook Sync
+
+```http
+POST /mail/outlook/sync
+```
+
+请求：
+
+```json
+{
+  "folder": "Inbox",
+  "limit": 25,
+  "max_pages": 1
+}
+```
+
+响应：
+
+```json
+{
+  "account_id": "mail_account_xxx",
+  "folder": "Inbox",
+  "imported_messages": 25,
+  "imported_attachments": 3,
+  "status": "completed"
+}
+```
+
+说明：
+
+- 该接口只读拉取 Outlook 邮件正文和附件 metadata。
+- 附件内容不在第一版下载，数据库中的附件记录保持 `is_downloaded = 0`。
+- 当前为手动同步入口，`mail_sync_state` 会记录最近一次同步结果；实时同步、delta link
+  和 webhook 后续再实现。
+
+---
+
+## 12. Compatibility Notes
 
 - 当前后端实现是轻量骨架，因此部分返回值是规则化输出而非真实 agent 结果。
 - 这份契约保留了未来完整系统需要的字段，便于逐步替换实现。

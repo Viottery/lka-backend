@@ -192,6 +192,19 @@ def init_db(db_path: Path) -> None:
                 provider TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS mail_sync_state (
+                provider TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                folder TEXT NOT NULL,
+                status TEXT NOT NULL,
+                last_sync_at TEXT NOT NULL,
+                next_link TEXT,
+                delta_link TEXT,
+                last_result_payload TEXT NOT NULL,
+                PRIMARY KEY(provider, account_id, folder),
+                FOREIGN KEY(account_id) REFERENCES mail_accounts(account_id)
+            );
             """
         )
         conn.commit()

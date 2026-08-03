@@ -17,6 +17,11 @@ from app.core.mail import (
     MailProcessResult,
     MailSearchResult,
 )
+from app.core.outlook import (
+    OutlookAuthCompleteResult,
+    OutlookAuthStartResult,
+    OutlookSyncResult,
+)
 from app.core.retrieval import RetrievalResult
 from app.core.tools import ToolInvocation, ToolResult
 from app.core.tracing import TraceRecord
@@ -94,6 +99,28 @@ class MailProcessResponse(MailProcessResult):
 
 class MailMatterListResponse(MailMatterList):
     matters: list[MailMatter]
+
+
+class OutlookAuthStartResponse(OutlookAuthStartResult):
+    pass
+
+
+class OutlookAuthCompleteRequest(BaseModel):
+    device_code: str
+
+
+class OutlookAuthCompleteResponse(OutlookAuthCompleteResult):
+    pass
+
+
+class OutlookSyncRequest(BaseModel):
+    folder: str | None = None
+    limit: int = Field(default=25, ge=1, le=100)
+    max_pages: int = Field(default=1, ge=1, le=10)
+
+
+class OutlookSyncResponse(OutlookSyncResult):
+    pass
 
 
 __all__ = [
