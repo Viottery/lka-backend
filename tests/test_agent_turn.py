@@ -124,6 +124,7 @@ def test_agent_turn_retries_rate_limited_llm_and_logs_failure(tmp_path, monkeypa
     )
 
     assert fake_llm.calls == 5
+    assert fake_llm.max_output_tokens_seen == [8192, 8192, 8192, 8192, 8192]
     assert response.answer == "LLM final answer after retry."
     assert [event.status for event in response.llm_events] == [
         "rate_limited",
@@ -162,6 +163,7 @@ def test_agent_turn_retries_rate_limited_llm_and_logs_failure(tmp_path, monkeypa
 class _RateLimitedThenWorkingLLM:
     def __init__(self) -> None:
         self.calls = 0
+        self.max_output_tokens_seen: list[int | None] = []
 
     def complete_text(
         self,
@@ -173,6 +175,7 @@ class _RateLimitedThenWorkingLLM:
         max_output_tokens: int | None = None,
     ) -> LLMResponse:
         self.calls += 1
+        self.max_output_tokens_seen.append(max_output_tokens)
         if self.calls == 1:
             raise LLMRateLimitError(
                 status_code=429,

@@ -103,6 +103,7 @@ class AgentTurnLoop:
         self.llm_max_attempts = 2
         self.default_rate_limit_wait_seconds = 1.0
         self.max_decision_steps = 6
+        self.llm_generation_token_budget = 8192
 
     def run(
         self,
@@ -238,7 +239,7 @@ class AgentTurnLoop:
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             prompt_summary=f"agent_turn_route user_input={user_input[:80]}",
-            max_output_tokens=400,
+            max_output_tokens=self.llm_generation_token_budget,
             llm_events=llm_events,
         )
         if response is None:
@@ -545,7 +546,7 @@ class AgentTurnLoop:
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             prompt_summary=f"agent_turn_decision observations={len(observations)}",
-            max_output_tokens=900,
+            max_output_tokens=self.llm_generation_token_budget,
             llm_events=llm_events,
         )
         if response is None:
