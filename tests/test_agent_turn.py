@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -61,6 +62,12 @@ def test_agent_turn_expands_mail_package_and_records_log(tmp_path, monkeypatch):
         "mail.search",
         "mail.load_messages",
     ]
+    assert [event.action for event in response.decision_events] == [
+        "select_package",
+        "call_tool",
+        "call_tool",
+        "answer",
+    ]
     assert full_body_sentinel in response.answer
     assert response.log_path is not None
 
@@ -116,20 +123,40 @@ def test_agent_turn_retries_rate_limited_llm_and_logs_failure(tmp_path, monkeypa
         request,
     )
 
-    assert fake_llm.calls == 3
+    assert fake_llm.calls == 5
     assert response.answer == "LLM final answer after retry."
     assert [event.status for event in response.llm_events] == [
         "rate_limited",
         "completed",
         "completed",
+        "completed",
+        "completed",
+    ]
+    assert [event.stage for event in response.llm_events] == [
+        "route",
+        "route",
+        "decision",
+        "decision",
+        "decision",
     ]
     assert response.llm_events[0].status_code == 429
     assert response.llm_events[0].retry_after == "0"
+    assert [event.action for event in response.decision_events] == [
+        "select_package",
+        "call_tool",
+        "call_tool",
+        "answer",
+    ]
+    assert [event.tool_name for event in response.tool_events] == [
+        "mail.search",
+        "mail.load_messages",
+    ]
 
     log_text = Path(response.log_path or "").read_text(encoding="utf-8")
     assert "rate_limited" in log_text
     assert "Choose at most one tool package" in log_text
-    assert "loaded_mail_messages" in log_text
+    assert "Choose the next single action" in log_text
+    assert "## Decision Events" in log_text
 
 
 class _RateLimitedThenWorkingLLM:
@@ -157,6 +184,37 @@ class _RateLimitedThenWorkingLLM:
                 '{"selected_package":"mail","reason":"test route",'
                 '"search_query":"NTUSO"}'
             )
+        elif "Choose the next single action" in system_prompt:
+            payload = json.loads(user_prompt)
+            observations = payload["observations"]
+            if not observations:
+                content = json.dumps(
+                    {
+                        "action": "call_tool",
+                        "tool_name": "mail.search",
+                        "tool_input": {"query": "NTUSO", "limit": 8},
+                        "reason": "Search first.",
+                    }
+                )
+            elif observations[-1]["tool_name"] == "mail.search":
+                messages = observations[-1]["result"]["output"]["messages"]
+                message_ids = [message["message_id"] for message in messages[:1]]
+                content = json.dumps(
+                    {
+                        "action": "call_tool",
+                        "tool_name": "mail.load_messages",
+                        "tool_input": {"message_ids": message_ids},
+                        "reason": "Load the matching message.",
+                    }
+                )
+            else:
+                content = json.dumps(
+                    {
+                        "action": "answer",
+                        "answer": "LLM final answer after retry.",
+                        "reason": "Loaded message is enough.",
+                    }
+                )
         else:
             content = "LLM final answer after retry."
         return LLMResponse(

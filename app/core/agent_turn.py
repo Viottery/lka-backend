@@ -59,6 +59,19 @@ class AgentTurnLLMEvent(BaseModel):
     error: str | None = None
 
 
+class AgentTurnDecisionEvent(BaseModel):
+    step_index: int
+    decided_at: str
+    source: str
+    action: str
+    selected_package: str | None = None
+    tool_name: str | None = None
+    tool_input: dict[str, Any] = Field(default_factory=dict)
+    answer: str | None = None
+    reason: str | None = None
+    raw_output: str | None = None
+
+
 class AgentTurnResult(BaseModel):
     session_id: str
     trace_id: str
@@ -66,6 +79,7 @@ class AgentTurnResult(BaseModel):
     selected_package: str | None = None
     package_catalog: list[dict[str, Any]] = Field(default_factory=list)
     expanded_tools: list[dict[str, Any]] = Field(default_factory=list)
+    decision_events: list[AgentTurnDecisionEvent] = Field(default_factory=list)
     tool_events: list[AgentTurnToolEvent] = Field(default_factory=list)
     llm_events: list[AgentTurnLLMEvent] = Field(default_factory=list)
     log_path: str | None = None
@@ -88,6 +102,7 @@ class AgentTurnLoop:
         self.log_dir = log_dir
         self.llm_max_attempts = 2
         self.default_rate_limit_wait_seconds = 1.0
+        self.max_decision_steps = 6
 
     def run(
         self,
@@ -118,7 +133,13 @@ class AgentTurnLoop:
             for package in self.tool_executor.registry.list_packages()
         ]
         llm_events: list[AgentTurnLLMEvent] = []
-        route = self._route(user_input=user_input, package_catalog=package_catalog, llm_events=llm_events)
+        decision_events: list[AgentTurnDecisionEvent] = []
+        route = self._route(
+            user_input=user_input,
+            package_catalog=package_catalog,
+            llm_events=llm_events,
+            decision_events=decision_events,
+        )
         selected_package = route.get("selected_package")
         tool_events: list[AgentTurnToolEvent] = []
         expanded_tools: list[dict[str, Any]] = []
@@ -135,11 +156,20 @@ class AgentTurnLoop:
                 context=context,
                 tool_events=tool_events,
                 llm_events=llm_events,
+                decision_events=decision_events,
+                expanded_tools=expanded_tools,
             )
         else:
             answer = (
                 "我还没有为这个请求选择到可执行工具。当前最小 Agent turn 只支持在需要"
                 "本地邮件上下文时展开 mail package。"
+            )
+            self._record_decision(
+                decision_events,
+                source="local",
+                action="answer",
+                answer=answer,
+                reason="No supported package was selected.",
             )
 
         result = AgentTurnResult(
@@ -149,6 +179,7 @@ class AgentTurnLoop:
             selected_package=selected_package if isinstance(selected_package, str) else None,
             package_catalog=package_catalog,
             expanded_tools=expanded_tools,
+            decision_events=decision_events,
             tool_events=tool_events,
             llm_events=llm_events,
         )
@@ -162,6 +193,9 @@ class AgentTurnLoop:
                 "trace_id": trace_id,
                 "selected_package": result.selected_package,
                 "log_path": result.log_path,
+                "decision_events": [
+                    event.model_dump(mode="json") for event in decision_events
+                ],
                 "tool_events": [event.model_dump(mode="json") for event in tool_events],
             },
         )
@@ -173,9 +207,17 @@ class AgentTurnLoop:
         user_input: str,
         package_catalog: list[dict[str, Any]],
         llm_events: list[AgentTurnLLMEvent],
+        decision_events: list[AgentTurnDecisionEvent],
     ) -> dict[str, Any]:
         if self.llm_client is None:
-            return self._route_locally(user_input)
+            route = self._route_locally(user_input)
+            self._record_route_decision(
+                decision_events,
+                source="local",
+                route=route,
+                raw_output=None,
+            )
+            return route
 
         system_prompt = (
             "You are the Main Agent Brain for Local Knowledge Agent OS. Choose at most one "
@@ -200,14 +242,44 @@ class AgentTurnLoop:
             llm_events=llm_events,
         )
         if response is None:
-            return self._route_locally(user_input)
+            route = self._route_locally(user_input)
+            self._record_route_decision(
+                decision_events,
+                source="local",
+                route=route,
+                raw_output=None,
+            )
+            return route
 
         parsed = self._parse_json_object(response.content)
         if not isinstance(parsed, dict):
-            return self._route_locally(user_input)
+            route = self._route_locally(user_input)
+            self._record_route_decision(
+                decision_events,
+                source="local",
+                route=route,
+                raw_output=response.content,
+            )
+            return route
         if parsed.get("selected_package") == "mail":
+            self._record_route_decision(
+                decision_events,
+                source="llm",
+                route=parsed,
+                raw_output=response.content,
+            )
             return parsed
-        return {"selected_package": None, "reason": parsed.get("reason") or "No package selected."}
+        route = {
+            "selected_package": None,
+            "reason": parsed.get("reason") or "No package selected.",
+        }
+        self._record_route_decision(
+            decision_events,
+            source="llm",
+            route=route,
+            raw_output=response.content,
+        )
+        return route
 
     def _route_locally(self, user_input: str) -> dict[str, Any]:
         lower = user_input.lower()
@@ -252,8 +324,47 @@ class AgentTurnLoop:
         context: ToolContext,
         tool_events: list[AgentTurnToolEvent],
         llm_events: list[AgentTurnLLMEvent],
+        decision_events: list[AgentTurnDecisionEvent],
+        expanded_tools: list[dict[str, Any]],
+    ) -> str:
+        if self.llm_client is not None:
+            answer = self._run_llm_decision_loop(
+                user_input=user_input,
+                route=route,
+                context=context,
+                tool_events=tool_events,
+                llm_events=llm_events,
+                decision_events=decision_events,
+                expanded_tools=expanded_tools,
+            )
+            if answer:
+                return answer
+        return self._run_mail_tools_locally(
+            user_input=user_input,
+            route=route,
+            context=context,
+            tool_events=tool_events,
+            decision_events=decision_events,
+        )
+
+    def _run_mail_tools_locally(
+        self,
+        *,
+        user_input: str,
+        route: dict[str, Any],
+        context: ToolContext,
+        tool_events: list[AgentTurnToolEvent],
+        decision_events: list[AgentTurnDecisionEvent],
     ) -> str:
         query = str(route.get("search_query") or user_input)
+        self._record_decision(
+            decision_events,
+            source="local",
+            action="call_tool",
+            tool_name="mail.search",
+            tool_input={"query": query, "limit": 8},
+            reason="Local fallback searches mail before loading full messages.",
+        )
         search_result = self._execute_tool(
             tool_name="mail.search",
             tool_input={"query": query, "limit": 8},
@@ -267,11 +378,28 @@ class AgentTurnLoop:
             if isinstance(message, dict) and message.get("message_id")
         ]
         if not message_ids:
-            return f"我在本地邮件中没有找到与 `{query}` 相关的结果。"
+            answer = f"我在本地邮件中没有找到与 `{query}` 相关的结果。"
+            self._record_decision(
+                decision_events,
+                source="local",
+                action="answer",
+                answer=answer,
+                reason="mail.search returned no message ids.",
+            )
+            return answer
 
+        load_input = {"message_ids": message_ids[:5]}
+        self._record_decision(
+            decision_events,
+            source="local",
+            action="call_tool",
+            tool_name="mail.load_messages",
+            tool_input=load_input,
+            reason="Load full message bodies for the final answer.",
+        )
         load_result = self._execute_tool(
             tool_name="mail.load_messages",
-            tool_input={"message_ids": message_ids[:5]},
+            tool_input=load_input,
             context=context,
             tool_events=tool_events,
         )
@@ -280,15 +408,221 @@ class AgentTurnLoop:
             for message in load_result.output.get("messages", [])
             if isinstance(message, dict)
         ]
-        if self.llm_client is not None:
-            answer = self._answer_with_llm(
+        answer = self._answer_locally(user_input=user_input, loaded_messages=loaded_messages)
+        self._record_decision(
+            decision_events,
+            source="local",
+            action="answer",
+            answer=answer,
+            reason="Local fallback answer generated from loaded messages.",
+        )
+        return answer
+
+    def _run_llm_decision_loop(
+        self,
+        *,
+        user_input: str,
+        route: dict[str, Any],
+        context: ToolContext,
+        tool_events: list[AgentTurnToolEvent],
+        llm_events: list[AgentTurnLLMEvent],
+        decision_events: list[AgentTurnDecisionEvent],
+        expanded_tools: list[dict[str, Any]],
+    ) -> str | None:
+        observations: list[dict[str, Any]] = []
+        allowed_tool_names = {
+            str(tool.get("name"))
+            for tool in expanded_tools
+            if isinstance(tool.get("name"), str)
+        }
+        for step_index in range(1, self.max_decision_steps + 1):
+            decision = self._decide_next_action(
+                user_input=user_input,
+                route=route,
+                expanded_tools=expanded_tools,
+                observations=observations,
+                llm_events=llm_events,
+            )
+            if decision is None:
+                return None
+
+            action = str(decision.get("action") or "")
+            self._record_decision(
+                decision_events,
+                source="llm",
+                action=action,
+                tool_name=decision.get("tool_name"),
+                tool_input=decision.get("tool_input")
+                if isinstance(decision.get("tool_input"), dict)
+                else {},
+                answer=decision.get("answer") if isinstance(decision.get("answer"), str) else None,
+                reason=decision.get("reason") if isinstance(decision.get("reason"), str) else None,
+                raw_output=decision.get("_raw_output")
+                if isinstance(decision.get("_raw_output"), str)
+                else None,
+                step_index=step_index + 1,
+            )
+
+            if action == "answer":
+                answer = str(decision.get("answer") or "").strip()
+                return answer or None
+
+            if action != "call_tool":
+                return None
+
+            tool_name = str(decision.get("tool_name") or "")
+            tool_input = (
+                decision.get("tool_input")
+                if isinstance(decision.get("tool_input"), dict)
+                else {}
+            )
+            if tool_name not in allowed_tool_names:
+                observations.append(
+                    {
+                        "tool_name": tool_name,
+                        "status": "rejected",
+                        "error": "Tool is not available in the expanded package.",
+                    }
+                )
+                continue
+
+            tool_result = self._execute_tool(
+                tool_name=tool_name,
+                tool_input=tool_input,
+                context=context,
+                tool_events=tool_events,
+            )
+            observations.append(
+                {
+                    "tool_name": tool_name,
+                    "input": tool_input,
+                    "result": tool_result.model_dump(mode="json"),
+                }
+            )
+
+        loaded_messages = self._loaded_messages_from_observations(observations)
+        if loaded_messages:
+            return self._answer_with_llm(
                 user_input=user_input,
                 loaded_messages=loaded_messages,
                 llm_events=llm_events,
             )
-            if answer:
-                return answer
-        return self._answer_locally(user_input=user_input, loaded_messages=loaded_messages)
+        return None
+
+    def _decide_next_action(
+        self,
+        *,
+        user_input: str,
+        route: dict[str, Any],
+        expanded_tools: list[dict[str, Any]],
+        observations: list[dict[str, Any]],
+        llm_events: list[AgentTurnLLMEvent],
+    ) -> dict[str, Any] | None:
+        system_prompt = (
+            "You are the Main Agent Brain for Local Knowledge Agent OS. Choose the next "
+            "single action for this agent turn. You may call one available tool or answer. "
+            "Use tools when more local evidence is needed. For mail questions, normally "
+            "call mail.search first, then mail.load_messages for relevant message ids, then "
+            "answer from observations. Return only strict JSON in one of these forms: "
+            '{"action":"call_tool","tool_name":"mail.search","tool_input":{"query":"...",'
+            '"limit":8},"reason":"..."}, '
+            '{"action":"call_tool","tool_name":"mail.load_messages","tool_input":'
+            '{"message_ids":["..."]},"reason":"..."}, '
+            '{"action":"answer","answer":"...","reason":"..."}'
+        )
+        user_prompt = json.dumps(
+            {
+                "user_input": user_input,
+                "route": route,
+                "expanded_tools": expanded_tools,
+                "observations": observations,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        response = self._complete_text_with_retry(
+            stage="decision",
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            prompt_summary=f"agent_turn_decision observations={len(observations)}",
+            max_output_tokens=900,
+            llm_events=llm_events,
+        )
+        if response is None:
+            return None
+        parsed = self._parse_json_object(response.content)
+        if not isinstance(parsed, dict):
+            return None
+        parsed["_raw_output"] = response.content
+        return parsed
+
+    def _record_route_decision(
+        self,
+        decision_events: list[AgentTurnDecisionEvent],
+        *,
+        source: str,
+        route: dict[str, Any],
+        raw_output: str | None,
+    ) -> None:
+        selected_package = route.get("selected_package")
+        self._record_decision(
+            decision_events,
+            source=source,
+            action="select_package",
+            selected_package=selected_package
+            if isinstance(selected_package, str)
+            else None,
+            reason=route.get("reason") if isinstance(route.get("reason"), str) else None,
+            raw_output=raw_output,
+        )
+
+    def _record_decision(
+        self,
+        decision_events: list[AgentTurnDecisionEvent],
+        *,
+        source: str,
+        action: str,
+        selected_package: str | None = None,
+        tool_name: str | None = None,
+        tool_input: dict[str, Any] | None = None,
+        answer: str | None = None,
+        reason: str | None = None,
+        raw_output: str | None = None,
+        step_index: int | None = None,
+    ) -> None:
+        decision_events.append(
+            AgentTurnDecisionEvent(
+                step_index=step_index or len(decision_events) + 1,
+                decided_at=_now_iso(),
+                source=source,
+                action=action,
+                selected_package=selected_package,
+                tool_name=tool_name,
+                tool_input=tool_input or {},
+                answer=answer,
+                reason=reason,
+                raw_output=raw_output,
+            )
+        )
+
+    def _loaded_messages_from_observations(
+        self,
+        observations: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        for observation in reversed(observations):
+            if observation.get("tool_name") != "mail.load_messages":
+                continue
+            result = observation.get("result")
+            if not isinstance(result, dict):
+                continue
+            output = result.get("output")
+            if not isinstance(output, dict):
+                continue
+            messages = output.get("messages")
+            if not isinstance(messages, list):
+                continue
+            return [message for message in messages if isinstance(message, dict)]
+        return []
 
     def _execute_tool(
         self,
@@ -513,6 +847,12 @@ class AgentTurnLoop:
             "## Expanded Tools",
             "",
             self._json_block(result.expanded_tools),
+            "",
+            "## Decision Events",
+            "",
+            self._json_block(
+                [event.model_dump(mode="json") for event in result.decision_events]
+            ),
             "",
             "## Tool Events",
             "",

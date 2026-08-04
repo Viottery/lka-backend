@@ -203,6 +203,7 @@ POST /agent/turn
   "selected_package": "mail",
   "package_catalog": [],
   "expanded_tools": [],
+  "decision_events": [],
   "tool_events": [],
   "llm_events": [],
   "log_path": "data/agent_logs/agent_turn_xxx.md"
@@ -215,9 +216,11 @@ POST /agent/turn
 - Agent 第一层只读取 Tool Package catalog；当前已实现的可展开 package 是 `mail`。
 - 当 turn 判断用户目标需要本地邮件上下文时，才展开 `mail.search`、
   `mail.load_messages`、`mail.persist_matters` 等具体工具。
+- 展开 package 后，Agent 会进入单次 turn 内的 step-limited loop：每一步生成一个
+  `decision_event`，动作可以是调用一个工具或直接回答；工具结果作为 observation 进入下一步。
 - 每次调用会显式追加 user / agent session message，并写入本地 markdown run log。
-- run log 由代码模板生成，包含用户输入、package catalog、展开工具、工具调用输入输出、
-  LLM 完整 prompt / output / 错误分类和最终回答。
+- run log 由代码模板生成，包含用户输入、package catalog、展开工具、决策事件、
+  工具调用输入输出、LLM 完整 prompt / output / 错误分类和最终回答。
 - 未配置真实 LLM 或 LLM 调用失败时，Agent turn 会降级到本地 heuristic，保持链路可运行。
 
 ---

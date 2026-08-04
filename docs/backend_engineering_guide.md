@@ -52,6 +52,10 @@ MailService / SQLite
 
 `MailService` 只提供确定性的存储、查询、加载和持久化方法，不调用 LLM，不选择执行步骤。
 LLM 推理、工具选择、观察工具结果和反馈循环属于 Agent Loop。
+第一版通用 Agent turn 使用单次查询内的 step-limited harness：先选择 Tool Package，
+再展开具体工具，然后反复执行 `decision -> tool call -> observation`，直到 Agent
+给出最终回答或达到步数上限。每一步只能调用一个工具或回答，避免在领域服务里隐藏
+多步骤自动化。
 
 会话基础设施当前由本地 SQLite 管理，使用显式 `session_id` 支撑平行会话和多轮会话。
 后端不维护隐式全局当前会话；前端切换会话时必须把目标 `session_id` 传给运行入口。
@@ -66,6 +70,7 @@ Session Service 只负责创建会话、追加消息、读取历史和更新时�
 
 - 运行时间、`run_id`、`session_id` 和用户输入。
 - 第一层 Tool Package catalog 和实际展开的 package。
+- Agent 每一步 decision，包括 action、reason、选中的 tool、tool input 或最终 answer。
 - 每个 tool 的选择时间、输入、输出、状态和错误。
 - 给 LLM 的完整 system prompt、user prompt 和 LLM 完整输出。
 - 最终结构化结果。

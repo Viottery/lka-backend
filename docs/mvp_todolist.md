@@ -76,6 +76,8 @@ Urgent track 的阶段目标：
 - 会话由显式 `session_id` 区分，后端不维护隐式全局当前会话；前端切换会话时必须把目标 `session_id` 传入运行入口。
 - 邮件数据源是全局本地知识源，不存在独立邮件会话引擎；mail tools 只提供一次性观察结果，各 session 是否保留邮件引用、摘要和上下文由通用 Agent turn 决定。
 - 不提供 `/mail/process` 这类邮件专属 agent endpoint；邮件整理必须通过通用 Agent turn 调用 `mail` tools 完成。
+- 通用 Agent turn 已扩展为单次查询内的 step-limited 决策循环：先选择 Tool Package，
+  再按观察结果多次决定是否调用工具或最终回答；当前可执行 package 仍以 `mail` 为主。
 
 ### 0.1 MVP 最终应具备的能力
 
