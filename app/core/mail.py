@@ -86,14 +86,6 @@ class MailMatter(BaseModel):
     priority: str
 
 
-class MailProcessResult(BaseModel):
-    run_id: str
-    status: str
-    processed_messages: int
-    matters_created: int
-    log_path: str | None = None
-
-
 class MailMatterList(BaseModel):
     matters: list[MailMatter]
 
@@ -301,30 +293,6 @@ class MailService:
             ],
         )
 
-    def process_messages(
-        self,
-        *,
-        query: str | None = None,
-        limit: int = 10,
-    ) -> MailProcessResult:
-        messages = self._messages_for_processing(query=query, limit=limit)
-        now = _now_iso()
-        run_id = _stable_id("mail_run", query or "", now)
-        drafts = self.draft_matters_locally(messages)
-        matters_created = self.persist_matter_drafts(
-            drafts=drafts,
-            provider="local_heuristic",
-            link_reason="Local mail processing run.",
-        )
-        return self.record_processing_run(
-            run_id=run_id,
-            query=query,
-            status="completed",
-            processed_messages=len(messages),
-            matters_created=matters_created,
-            provider="local_heuristic",
-        )
-
     def list_matters(self, *, limit: int = 50) -> MailMatterList:
         conn = self._conn_factory()
         try:
@@ -358,15 +326,6 @@ class MailService:
         if not terms:
             return '""'
         return " OR ".join(f'"{term}"' for term in terms)
-
-    def _messages_for_processing(
-        self,
-        *,
-        query: str | None,
-        limit: int,
-    ) -> list[MailMessageRecord]:
-        search_result = self.search_messages(query=query or "", limit=limit)
-        return self.load_messages([message.message_id for message in search_result.messages])
 
     def load_messages(self, message_ids: list[str]) -> list[MailMessageRecord]:
         if not message_ids:
@@ -486,49 +445,6 @@ class MailService:
         finally:
             conn.close()
         return matters_created
-
-    def record_processing_run(
-        self,
-        *,
-        run_id: str,
-        session_id: str,
-        query: str | None,
-        status: str,
-        processed_messages: int,
-        matters_created: int,
-        provider: str,
-    ) -> MailProcessResult:
-        conn = self._conn_factory()
-        try:
-            conn.execute(
-                """
-                INSERT INTO mail_processing_runs(
-                    run_id, session_id, query, status, processed_messages,
-                    matters_created, provider, created_at
-                )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    run_id,
-                    session_id,
-                    query,
-                    status,
-                    processed_messages,
-                    matters_created,
-                    provider,
-                    _now_iso(),
-                ),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
-        return MailProcessResult(
-            run_id=run_id,
-            status=status,
-            processed_messages=processed_messages,
-            matters_created=matters_created,
-        )
 
     def _json_list(self, value: str) -> list[str]:
         try:

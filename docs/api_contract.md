@@ -108,6 +108,12 @@ GET /capabilities
 {
   "capabilities": [
     {
+      "name": "mail",
+      "type": "tool_package",
+      "risk": "low_to_medium",
+      "requires_confirmation": false
+    },
+    {
       "name": "summarize_folder",
       "type": "native_skill",
       "risk": "low",
@@ -361,57 +367,17 @@ GET /mail/search?q=document&limit=10
 
 ---
 
-## 8. Mail Process
-
-```http
-POST /mail/process
-```
-
-请求：
-
-```json
-{
-  "session_id": "session_xxx",
-  "query": "visa document",
-  "limit": 10
-}
-```
-
-响应：
-
-```json
-{
-  "run_id": "mail_run_xxx",
-  "status": "completed",
-  "processed_messages": 1,
-  "matters_created": 1,
-  "log_path": "data/agent_logs/mail_run_xxx.md"
-}
-```
-
 说明：
 
-- 该接口当前是邮件优先 MVP 的固定 Agent Loop 演示入口。
-- `session_id` 可选；传入时只作为当前 Agent turn 的工具访问上下文，用于 run log 和
-  审计来源。未传时使用 smoke context，不会创建隐式全局会话。
-- 该接口不会自动追加 session message history；邮件工具只提供一次性搜索 / 加载结果给
-  Agent Loop。各会话如何保留邮件观察、引用或总结，后续由通用 Agent turn 决定。
-- 执行链路为 `mail.search -> mail.load_messages -> LLM reasoning -> mail.persist_matters`。
-- `MailService` 只负责本地存储、查询、完整正文加载和持久化，不直接调用 LLM。
-- 每次运行都会由本地代码生成自然语言友好的 Markdown run log，不调用 LLM 生成日志。
-- run log 记录运行时间、用户输入、package/tool 选择、工具输入输出、完整 LLM system/user prompt、完整 LLM 输出和最终结果。
-- run log 可能包含完整邮件正文和个人信息，默认只写入本地 `data/agent_logs/`。
-- 如果 LLM provider 返回 `429` 限流，Agent Loop 会记录 `rate_limited`、`status_code`
-  和 `retry_after`，先按 `Retry-After` 或本地默认等待时间重试；重试耗尽后才降级使用
-  本地 heuristic 生成 matter，processing provider 标记为
-  `agent_local_heuristic_after_rate_limit`。
-- 其他 LLM 调用错误会按认证失败、网络失败、超时、非 429 HTTP 错误和 provider 响应
-  解析失败分别记录，并选择对应的本地 heuristic 降级 provider。
-- 后续通用任务入口会迁移到 `/tasks/plan` / `/tasks/run`，该接口保留为邮件链路 smoke endpoint。
+- 当前没有 `/mail/process` 或其他邮件专属 agent endpoint。
+- 邮件能力通过 Tool Package 暴露给后续通用 Agent turn：`mail.search`、
+  `mail.load_messages`、`mail.persist_matters`。
+- 邮件整理、概括、匹配等行为应由通用 Agent turn 决定是否调用 mail tools，而不是通过
+  mail 路由直接启动独立 agent loop。
 
 ---
 
-## 9. List Mail Matters
+## 8. List Mail Matters
 
 ```http
 GET /mail/matters
@@ -435,7 +401,7 @@ GET /mail/matters
 
 ---
 
-## 10. Outlook Auth Start
+## 9. Outlook Auth Start
 
 ```http
 POST /mail/outlook/auth/start
@@ -463,7 +429,7 @@ POST /mail/outlook/auth/start
 
 ---
 
-## 11. Outlook Auth Complete
+## 10. Outlook Auth Complete
 
 ```http
 POST /mail/outlook/auth/complete
@@ -492,7 +458,7 @@ POST /mail/outlook/auth/complete
 
 ---
 
-## 12. Outlook Sync
+## 11. Outlook Sync
 
 ```http
 POST /mail/outlook/sync
@@ -529,7 +495,7 @@ POST /mail/outlook/sync
 
 ---
 
-## 13. Compatibility Notes
+## 12. Compatibility Notes
 
 - 当前后端实现是轻量骨架，因此部分返回值是规则化输出而非真实 agent 结果。
 - 这份契约保留了未来完整系统需要的字段，便于逐步替换实现。

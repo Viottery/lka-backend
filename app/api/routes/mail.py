@@ -4,8 +4,6 @@ from app.api.schemas import (
     MailImportRequest,
     MailImportResponse,
     MailMatterListResponse,
-    MailProcessRequest,
-    MailProcessResponse,
     MailSearchResponse,
     OutlookAuthCompleteRequest,
     OutlookAuthCompleteResponse,
@@ -35,16 +33,6 @@ def search_mail(
 ) -> MailSearchResponse:
     result = request.app.state.runtime.search_mail(query=q, limit=limit)
     return MailSearchResponse(**result.model_dump())
-
-
-@router.post("/process", response_model=MailProcessResponse)
-def process_mail(payload: MailProcessRequest, request: Request) -> MailProcessResponse:
-    result = request.app.state.runtime.process_mail(
-        query=payload.query,
-        limit=payload.limit,
-        session_id=payload.session_id,
-    )
-    return MailProcessResponse(**result.model_dump())
 
 
 @router.get("/matters", response_model=MailMatterListResponse)

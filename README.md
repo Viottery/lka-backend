@@ -149,7 +149,6 @@ The default compose file starts the API and a local Qdrant container.
 - `POST /runtime/debug`
 - `POST /mail/import`
 - `GET /mail/search`
-- `POST /mail/process`
 - `GET /mail/matters`
 - `POST /mail/outlook/auth/start`
 - `POST /mail/outlook/auth/complete`

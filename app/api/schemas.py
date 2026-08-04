@@ -14,7 +14,6 @@ from app.core.mail import (
     MailMatter,
     MailMatterList,
     MailMessageInput,
-    MailProcessResult,
     MailSearchResult,
 )
 from app.core.outlook import (
@@ -120,16 +119,6 @@ class MailImportResponse(MailImportResult):
 
 
 class MailSearchResponse(MailSearchResult):
-    pass
-
-
-class MailProcessRequest(BaseModel):
-    query: str | None = None
-    limit: int = 10
-    session_id: str | None = None
-
-
-class MailProcessResponse(MailProcessResult):
     pass
 
 

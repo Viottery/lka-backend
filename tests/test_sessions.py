@@ -1,19 +1,19 @@
 from __future__ import annotations
 
-import sqlite3
 from types import SimpleNamespace
 
 from app.api.main import create_app
-from app.api.routes.mail import import_mail, process_mail
+from app.api.routes.mail import import_mail
 from app.api.routes.sessions import (
     append_session_message,
     create_session,
     get_session,
     list_sessions,
 )
-from app.api.schemas import MailImportRequest, MailProcessRequest
+from app.api.schemas import MailImportRequest
 from app.api.schemas import SessionAppendMessageRequest, SessionCreateRequest
 from app.core.config import get_settings
+from app.core.tools import ToolContext
 
 
 def test_parallel_sessions_and_mail_tool_access_are_independent(tmp_path, monkeypatch):
@@ -76,13 +76,19 @@ def test_parallel_sessions_and_mail_tool_access_are_independent(tmp_path, monkey
     )
     assert imported.imported_messages == 1
 
-    processed = process_mail(
-        MailProcessRequest(session_id=first_session_id, query="coliwoo notice", limit=10),
-        request,
+    tool_result = app.state.runtime.tool_executor.execute(
+        invocation_id="session_mail_search",
+        tool_name="mail.search",
+        tool_input={"query": "coliwoo notice", "limit": 10},
+        context=ToolContext(
+            session_id=first_session_id,
+            trace_id="trace_session_mail_search",
+            context_id="ctx_session_mail_search",
+        ),
     )
 
-    assert processed.processed_messages == 1
-    assert processed.matters_created == 1
+    assert tool_result.status == "completed"
+    assert len(tool_result.output["messages"]) == 1
 
     first_detail = get_session(first_session_id, request)
     second_detail = get_session(second_session_id, request)
@@ -96,14 +102,3 @@ def test_parallel_sessions_and_mail_tool_access_are_independent(tmp_path, monkey
 
     listed_ids = {session.session_id for session in listed.sessions}
     assert {first_session_id, second_session_id}.issubset(listed_ids)
-
-    conn = sqlite3.connect(app.state.runtime.db_path)
-    try:
-        run_session_id = conn.execute(
-            "SELECT session_id FROM mail_processing_runs WHERE run_id = ?",
-            (processed.run_id,),
-        ).fetchone()[0]
-    finally:
-        conn.close()
-
-    assert run_session_id == first_session_id

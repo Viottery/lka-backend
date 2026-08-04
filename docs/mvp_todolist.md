@@ -41,14 +41,13 @@ Urgent track 的阶段目标：
 - [x] 建立本地邮件存储模型，支持邮件、附件 metadata、邮件分块、事务和处理记录。
 - [x] 提供 `POST /mail/import`，先支持本地 JSON 导入，便于无 OAuth 场景下测试。
 - [x] 提供 `GET /mail/search`，先支持 SQLite FTS 关键词检索。
-- [x] 提供 `POST /mail/process`，先基于本地邮件候选集生成事务整理结果。
 - [x] 提供 `GET /mail/matters`，查看事务列表。
 - [x] 新增本地 provider 配置模板，覆盖 LLM、Outlook、IMAP 和 local BGE embedding 配置。
 - [x] 接入 Outlook 只读同步，采用 Device Code Flow，权限优先限制为 `User.Read Mail.Read offline_access`。
 - [x] Outlook 第一版先同步邮件正文和附件 metadata，附件内容后续按需下载。
 - [x] 部署 / 接入真实第三方 LLM API provider；未配置 API key 时保留 mock provider，保证测试稳定。
-- [x] 建立第一版邮件 Tool Package / Tool Executor / Agent Loop，避免 `MailService` 直接调用 LLM。
-- [x] 每次邮件 Agent Loop 运行生成本地 Markdown run log，记录用户输入、工具调用、完整 LLM prompt/output 和最终结果。
+- [x] 建立第一版邮件 Tool Package / Tool Executor，避免 `MailService` 直接调用 LLM。
+- [ ] 建立通用 Agent turn 入口，由会话层选择是否展开 `mail` package 并记录工具调用 / LLM prompt / output。
 - [x] 对 LLM HTTP `429` 限流做显式识别、等待重试、run log 记录和本地 heuristic 降级。
 - [x] 对 LLM 认证、网络、超时、非 429 HTTP 和 provider 响应解析错误做分类记录和针对性降级。
 - [x] 建立第一版平行 / 多轮会话基础设施，支持创建会话、追加消息、列出会话和读取历史；邮件工具调用只接收 `session_id` 作为访问上下文，不自动写会话历史。
@@ -76,6 +75,7 @@ Urgent track 的阶段目标：
 - 其他 LLM 调用错误必须在 Agent Loop 中分类处理，避免把所有 provider 问题折叠成不可诊断的通用失败。
 - 会话由显式 `session_id` 区分，后端不维护隐式全局当前会话；前端切换会话时必须把目标 `session_id` 传入运行入口。
 - 邮件数据源是全局本地知识源，不存在独立邮件会话引擎；mail tools 只提供一次性观察结果，各 session 是否保留邮件引用、摘要和上下文由通用 Agent turn 决定。
+- 不提供 `/mail/process` 这类邮件专属 agent endpoint；邮件整理必须通过通用 Agent turn 调用 `mail` tools 完成。
 
 ### 0.1 MVP 最终应具备的能力
 
@@ -637,10 +637,10 @@ Urgent track 的阶段目标：
 ### 第一阶段：邮件优先闭环
 
 - [x] 部署 / 接入真实 LLM API provider，并保留 mock fallback。
-- [x] 建立第一版 `mail` Tool Package，并通过固定 Agent Loop 调用 `mail.search`、`mail.load_messages` 和 `mail.persist_matters`。
-- [x] 为邮件 Agent Loop 生成本地自然语言 run log。
+- [x] 建立第一版 `mail` Tool Package，包含 `mail.search`、`mail.load_messages` 和 `mail.persist_matters`。
+- [ ] 建立通用 Agent turn，并在其中生成本地自然语言 run log。
 - [x] 为 LLM 调用加入限流等待重试和错误分类降级。
-- [x] 建立第一版平行 / 多轮会话基础设施；`/mail/process` 只使用 `session_id` 作为工具访问上下文，不写 session history。
+- [x] 建立第一版平行 / 多轮会话基础设施；mail tools 只使用 `session_id` 作为工具访问上下文，不写 session history。
 - [ ] 将邮件作为本地持久化知识源管理，明确 account、message、attachment、chunk、matter、processing run 的生命周期。
 - [ ] 补齐邮件整理、检索和概括工具，让邮件候选集可以进入 TaskContext / MatterContext。
 - [ ] 将 session 与 TaskContext / MatterContext / trace 查询接口进一步整合。

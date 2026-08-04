@@ -94,8 +94,8 @@ class PersistMailMattersTool:
         ]
         matters_created = self.mail_service.persist_matter_drafts(
             drafts=drafts,
-            provider=str(invocation.input.get("provider") or "agent_loop"),
-            link_reason=str(invocation.input.get("link_reason") or "Agent mail processing run."),
+            provider=str(invocation.input.get("provider") or "tool_executor"),
+            link_reason=str(invocation.input.get("link_reason") or "Mail tool invocation."),
         )
         return ToolResult(
             invocation_id=invocation.invocation_id,

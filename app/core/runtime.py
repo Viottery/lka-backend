@@ -9,11 +9,9 @@ from app.api.schemas import (
     CapabilityItem,
     WorkspaceIndexResponse,
 )
-from app.core.agent_logging import AgentRunLogger
-from app.core.agent_loop import MailProcessingAgentLoop
 from app.core.config import Settings
 from app.core.context import ContextAssembler
-from app.core.llm import MockLLMClient, TextLLMClient, build_text_llm_client
+from app.core.llm import MockLLMClient
 from app.core.mail_tools import (
     MAIL_PACKAGE,
     LoadMailMessagesTool,
@@ -25,7 +23,6 @@ from app.core.mail import (
     MailImportResult,
     MailMatterList,
     MailMessageInput,
-    MailProcessResult,
     MailSearchResult,
     MailService,
 )
@@ -71,21 +68,12 @@ class LocalKnowledgeAgentRuntime:
         self.session_service = SessionService(self._conn)
         self.mail_service = MailService(self._conn)
         self.local_app_config = settings.load_local_config()
-        self.mail_llm_client: TextLLMClient | None = build_text_llm_client(
-            self.local_app_config.llm
-        )
         self.tool_registry = ToolRegistry()
         self.tool_registry.register_package(MAIL_PACKAGE)
         self.tool_registry.register_tool(SearchMailTool(self.mail_service))
         self.tool_registry.register_tool(LoadMailMessagesTool(self.mail_service))
         self.tool_registry.register_tool(PersistMailMattersTool(self.mail_service))
         self.tool_executor = ToolExecutor(self.tool_registry)
-        self.mail_agent_loop = MailProcessingAgentLoop(
-            mail_service=self.mail_service,
-            tool_executor=self.tool_executor,
-            llm_client=self.mail_llm_client,
-            run_logger=AgentRunLogger(self.settings.data_dir / "agent_logs"),
-        )
         self.outlook_service = OutlookService(
             self._conn,
             self.mail_service,
@@ -198,8 +186,7 @@ class LocalKnowledgeAgentRuntime:
         """Return the currently advertised capability catalog."""
 
         return [
-            CapabilityItem(name="search_mail", type="native_skill", risk="low", requires_confirmation=False),
-            CapabilityItem(name="process_mail", type="native_skill", risk="low", requires_confirmation=False),
+            CapabilityItem(name="mail", type="tool_package", risk="low_to_medium", requires_confirmation=False),
             CapabilityItem(name="summarize_folder", type="native_skill", risk="low", requires_confirmation=False),
             CapabilityItem(name="extract_tasks", type="native_skill", risk="low", requires_confirmation=False),
             CapabilityItem(name="organize_files", type="native_skill", risk="medium", requires_confirmation=True),
@@ -278,22 +265,6 @@ class LocalKnowledgeAgentRuntime:
             content=content,
             payload=payload,
         )
-
-    def process_mail(
-        self,
-        *,
-        query: str | None = None,
-        limit: int = 10,
-        session_id: str | None = None,
-    ) -> MailProcessResult:
-        """Run the fixed first agent loop for mail matter extraction."""
-
-        result = self.mail_agent_loop.run(
-            session_id=session_id or "mail_process_smoke",
-            query=query,
-            limit=limit,
-        )
-        return result
 
     def list_mail_matters(self, *, limit: int = 50) -> MailMatterList:
         """Return locally extracted mail matters."""

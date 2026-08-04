@@ -45,17 +45,6 @@ def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
     return row is not None
 
 
-def _ensure_column(
-    conn: sqlite3.Connection,
-    table_name: str,
-    column_name: str,
-    definition: str,
-) -> None:
-    if column_name in _table_columns(conn, table_name):
-        return
-    conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
-
-
 def _next_legacy_table_name(conn: sqlite3.Connection, base_name: str) -> str:
     index = 1
     while True:
@@ -219,17 +208,6 @@ def init_db(db_path: Path) -> None:
                 FOREIGN KEY(message_id) REFERENCES mail_messages(message_id)
             );
 
-            CREATE TABLE IF NOT EXISTS mail_processing_runs (
-                run_id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL DEFAULT 'mail_process_smoke',
-                query TEXT,
-                status TEXT NOT NULL,
-                processed_messages INTEGER NOT NULL,
-                matters_created INTEGER NOT NULL,
-                provider TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-
             CREATE TABLE IF NOT EXISTS mail_sync_state (
                 provider TEXT NOT NULL,
                 account_id TEXT NOT NULL,
@@ -243,12 +221,6 @@ def init_db(db_path: Path) -> None:
                 FOREIGN KEY(account_id) REFERENCES mail_accounts(account_id)
             );
             """
-        )
-        _ensure_column(
-            conn,
-            "mail_processing_runs",
-            "session_id",
-            "TEXT NOT NULL DEFAULT 'mail_process_smoke'",
         )
         conn.commit()
     finally:
