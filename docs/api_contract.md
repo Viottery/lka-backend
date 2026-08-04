@@ -283,8 +283,11 @@ POST /mail/process
 - run log 记录运行时间、用户输入、package/tool 选择、工具输入输出、完整 LLM system/user prompt、完整 LLM 输出和最终结果。
 - run log 可能包含完整邮件正文和个人信息，默认只写入本地 `data/agent_logs/`。
 - 如果 LLM provider 返回 `429` 限流，Agent Loop 会记录 `rate_limited`、`status_code`
-  和 `retry_after`，并降级使用本地 heuristic 生成 matter，processing provider 标记为
+  和 `retry_after`，先按 `Retry-After` 或本地默认等待时间重试；重试耗尽后才降级使用
+  本地 heuristic 生成 matter，processing provider 标记为
   `agent_local_heuristic_after_rate_limit`。
+- 其他 LLM 调用错误会按认证失败、网络失败、超时、非 429 HTTP 错误和 provider 响应
+  解析失败分别记录，并选择对应的本地 heuristic 降级 provider。
 - 后续通用任务入口会迁移到 `/tasks/plan` / `/tasks/run`，该接口保留为邮件链路 smoke endpoint。
 
 ---

@@ -77,8 +77,11 @@ class AgentRunLogger:
                 [
                     f"- provider: `{llm_event.get('provider')}`",
                     f"- status: `{llm_event.get('status')}`",
+                    f"- error_type: `{llm_event.get('error_type')}`",
                     f"- status_code: `{llm_event.get('status_code')}`",
                     f"- retry_after: `{llm_event.get('retry_after')}`",
+                    f"- retry_count: `{llm_event.get('retry_count')}`",
+                    f"- waited_seconds: `{llm_event.get('waited_seconds')}`",
                     f"- fallback: `{llm_event.get('fallback')}`",
                     f"- started_at: `{llm_event.get('started_at')}`",
                     f"- completed_at: `{llm_event.get('completed_at')}`",
@@ -94,6 +97,10 @@ class AgentRunLogger:
                     "Output:",
                     "",
                     self._text_block(str(llm_event.get("output", ""))),
+                    "",
+                    "Details:",
+                    "",
+                    self._json_block(llm_event),
                     "",
                 ]
             )

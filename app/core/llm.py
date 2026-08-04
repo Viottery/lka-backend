@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import socket
 import urllib.error
 import urllib.request
 from typing import Protocol
@@ -39,6 +40,22 @@ class LLMProviderHTTPError(LLMClientError):
 
 class LLMRateLimitError(LLMProviderHTTPError):
     """Raised when a provider rejects a request due rate limiting."""
+
+
+class LLMAuthenticationError(LLMProviderHTTPError):
+    """Raised when a provider rejects a request due authentication or authorization."""
+
+
+class LLMNetworkError(LLMClientError):
+    """Raised when the provider cannot be reached."""
+
+
+class LLMTimeoutError(LLMClientError):
+    """Raised when the provider request times out."""
+
+
+class LLMResponseParseError(LLMClientError):
+    """Raised when the provider response is not valid or expected JSON."""
 
 
 class LLMClient(Protocol):
@@ -152,19 +169,31 @@ class OpenAICompatibleLLMClient:
                     message=message,
                     retry_after=retry_after,
                 ) from exc
+            if exc.code in {401, 403}:
+                raise LLMAuthenticationError(
+                    status_code=exc.code,
+                    message=message,
+                    retry_after=retry_after,
+                ) from exc
             raise LLMProviderHTTPError(
                 status_code=exc.code,
                 message=message,
                 retry_after=retry_after,
             ) from exc
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-            raise LLMClientError(f"LLM provider request failed: {exc}") from exc
+        except (TimeoutError, socket.timeout) as exc:
+            raise LLMTimeoutError(f"LLM provider request timed out: {exc}") from exc
+        except urllib.error.URLError as exc:
+            raise LLMNetworkError(f"LLM provider network request failed: {exc}") from exc
+        except json.JSONDecodeError as exc:
+            raise LLMResponseParseError(f"LLM provider returned invalid JSON: {exc}") from exc
 
         try:
             message = response_payload["choices"][0]["message"]
             content = message.get("content") or ""
         except (KeyError, IndexError, TypeError) as exc:
-            raise LLMClientError("LLM provider response did not include message content.") from exc
+            raise LLMResponseParseError(
+                "LLM provider response did not include message content."
+            ) from exc
 
         return LLMResponse(
             provider=self.provider_name,
