@@ -51,7 +51,7 @@ Urgent track 的阶段目标：
 - [x] 每次邮件 Agent Loop 运行生成本地 Markdown run log，记录用户输入、工具调用、完整 LLM prompt/output 和最终结果。
 - [x] 对 LLM HTTP `429` 限流做显式识别、等待重试、run log 记录和本地 heuristic 降级。
 - [x] 对 LLM 认证、网络、超时、非 429 HTTP 和 provider 响应解析错误做分类记录和针对性降级。
-- [x] 建立第一版平行 / 多轮会话基础设施，支持创建会话、追加消息、列出会话、读取历史，并让邮件处理 run 绑定 `session_id`。
+- [x] 建立第一版平行 / 多轮会话基础设施，支持创建会话、追加消息、列出会话和读取历史；邮件工具调用只接收 `session_id` 作为访问上下文，不自动写会话历史。
 - [ ] 将邮件纳入本地持久化存储管理，补齐邮件整理、检索和概括工具。
 - [ ] 将 TaskContext / MatterContext / trace 查询进一步接入 session，让前端会话切换能恢复完整运行上下文。
 - [ ] 接入本地 `BAAI/bge-m3` embedding provider，并兼容 Windows / Linux 模型缓存路径。
@@ -75,6 +75,7 @@ Urgent track 的阶段目标：
 - LLM 限流属于 Agent Loop 的外部 provider 失败，必须被记录、等待重试并在重试耗尽后降级处理，不应交给 `MailService`。
 - 其他 LLM 调用错误必须在 Agent Loop 中分类处理，避免把所有 provider 问题折叠成不可诊断的通用失败。
 - 会话由显式 `session_id` 区分，后端不维护隐式全局当前会话；前端切换会话时必须把目标 `session_id` 传入运行入口。
+- 邮件数据源是全局本地知识源，不存在独立邮件会话引擎；mail tools 只提供一次性观察结果，各 session 是否保留邮件引用、摘要和上下文由通用 Agent turn 决定。
 
 ### 0.1 MVP 最终应具备的能力
 
@@ -639,7 +640,7 @@ Urgent track 的阶段目标：
 - [x] 建立第一版 `mail` Tool Package，并通过固定 Agent Loop 调用 `mail.search`、`mail.load_messages` 和 `mail.persist_matters`。
 - [x] 为邮件 Agent Loop 生成本地自然语言 run log。
 - [x] 为 LLM 调用加入限流等待重试和错误分类降级。
-- [x] 建立第一版平行 / 多轮会话基础设施，并将 `/mail/process` run 绑定到 session history。
+- [x] 建立第一版平行 / 多轮会话基础设施；`/mail/process` 只使用 `session_id` 作为工具访问上下文，不写 session history。
 - [ ] 将邮件作为本地持久化知识源管理，明确 account、message、attachment、chunk、matter、processing run 的生命周期。
 - [ ] 补齐邮件整理、检索和概括工具，让邮件候选集可以进入 TaskContext / MatterContext。
 - [ ] 将 session 与 TaskContext / MatterContext / trace 查询接口进一步整合。

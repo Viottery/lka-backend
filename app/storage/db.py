@@ -221,7 +221,7 @@ def init_db(db_path: Path) -> None:
 
             CREATE TABLE IF NOT EXISTS mail_processing_runs (
                 run_id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL DEFAULT 'mail_process',
+                session_id TEXT NOT NULL DEFAULT 'mail_process_smoke',
                 query TEXT,
                 status TEXT NOT NULL,
                 processed_messages INTEGER NOT NULL,
@@ -248,7 +248,7 @@ def init_db(db_path: Path) -> None:
             conn,
             "mail_processing_runs",
             "session_id",
-            "TEXT NOT NULL DEFAULT 'mail_process'",
+            "TEXT NOT NULL DEFAULT 'mail_process_smoke'",
         )
         conn.commit()
     finally:

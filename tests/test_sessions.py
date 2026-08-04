@@ -16,7 +16,7 @@ from app.api.schemas import SessionAppendMessageRequest, SessionCreateRequest
 from app.core.config import get_settings
 
 
-def test_parallel_sessions_and_mail_process_history(tmp_path, monkeypatch):
+def test_parallel_sessions_and_mail_tool_access_are_independent(tmp_path, monkeypatch):
     monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
     get_settings.cache_clear()
@@ -81,7 +81,6 @@ def test_parallel_sessions_and_mail_process_history(tmp_path, monkeypatch):
         request,
     )
 
-    assert processed.session_id == first_session_id
     assert processed.processed_messages == 1
     assert processed.matters_created == 1
 
@@ -90,14 +89,8 @@ def test_parallel_sessions_and_mail_process_history(tmp_path, monkeypatch):
 
     first_messages = first_detail.messages
     second_messages = second_detail.messages
-    assert [message.role for message in first_messages] == [
-        "user",
-        "user",
-        "user",
-        "agent",
-    ]
+    assert [message.role for message in first_messages] == ["user", "user"]
     assert [message.role for message in second_messages] == ["user"]
-    assert first_messages[-1].payload["run_id"] == processed.run_id
 
     listed = list_sessions(request, limit=50)
 

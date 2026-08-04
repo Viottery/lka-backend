@@ -56,8 +56,10 @@ LLM 推理、工具选择、观察工具结果和反馈循环属于 Agent Loop�
 会话基础设施当前由本地 SQLite 管理，使用显式 `session_id` 支撑平行会话和多轮会话。
 后端不维护隐式全局当前会话；前端切换会话时必须把目标 `session_id` 传给运行入口。
 Session Service 只负责创建会话、追加消息、读取历史和更新时间，不调用 LLM，也不选择工具。
-Agent Loop 或 runtime entrypoint 负责把用户输入、工具/LLM 结果摘要、`run_id` 和 `log_path`
-写回对应 session。
+邮件数据源是全局本地知识源，不存在独立的“邮件会话引擎”。Mail tools 只在某个 Agent turn
+中按当前 `session_id` 读取一次性信息并返回观察结果；是否把用户输入、工具观察、`run_id`
+或 `log_path` 写入会话历史，必须由通用 Agent turn / Session 层显式决定，邮件工具和
+`MailService` 不应自动写会话消息。
 
 每次 Agent Loop 运行都必须生成本地自然语言友好的 run log。run log 由代码模板生成，
 不调用 LLM，至少记录：

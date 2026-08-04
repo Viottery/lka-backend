@@ -88,7 +88,6 @@ class MailMatter(BaseModel):
 
 class MailProcessResult(BaseModel):
     run_id: str
-    session_id: str | None = None
     status: str
     processed_messages: int
     matters_created: int
@@ -526,7 +525,6 @@ class MailService:
 
         return MailProcessResult(
             run_id=run_id,
-            session_id=session_id,
             status=status,
             processed_messages=processed_messages,
             matters_created=matters_created,

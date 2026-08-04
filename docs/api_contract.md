@@ -280,8 +280,8 @@ POST /sessions/session_xxx/messages
 - `role` 当前支持 `user`、`agent`、`system`、`tool`。
 - 会话 API 只负责本地持久化和读取，不调用 LLM。
 - 前端切换会话时应使用显式 `session_id`，后端不维护隐式全局当前会话。
-- Agent 运行结果会作为 `agent` 消息追加到对应 session，payload 中保存 `run_id`
-  和 `log_path` 等可追踪字段。
+- 会话消息必须由 Session / 通用 Agent turn 显式追加；mail tools 不会因为被调用而自动
+  写入 session history。
 
 ---
 
@@ -382,7 +382,6 @@ POST /mail/process
 ```json
 {
   "run_id": "mail_run_xxx",
-  "session_id": "session_xxx",
   "status": "completed",
   "processed_messages": 1,
   "matters_created": 1,
@@ -393,8 +392,10 @@ POST /mail/process
 说明：
 
 - 该接口当前是邮件优先 MVP 的固定 Agent Loop 演示入口。
-- `session_id` 可选；未传时使用兼容默认会话 `mail_process`。传入时，run log、
-  `mail_processing_runs` 和 session message history 都会绑定到该 session。
+- `session_id` 可选；传入时只作为当前 Agent turn 的工具访问上下文，用于 run log 和
+  审计来源。未传时使用 smoke context，不会创建隐式全局会话。
+- 该接口不会自动追加 session message history；邮件工具只提供一次性搜索 / 加载结果给
+  Agent Loop。各会话如何保留邮件观察、引用或总结，后续由通用 Agent turn 决定。
 - 执行链路为 `mail.search -> mail.load_messages -> LLM reasoning -> mail.persist_matters`。
 - `MailService` 只负责本地存储、查询、完整正文加载和持久化，不直接调用 LLM。
 - 每次运行都会由本地代码生成自然语言友好的 Markdown run log，不调用 LLM 生成日志。

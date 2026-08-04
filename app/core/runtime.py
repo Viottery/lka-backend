@@ -288,38 +288,10 @@ class LocalKnowledgeAgentRuntime:
     ) -> MailProcessResult:
         """Run the fixed first agent loop for mail matter extraction."""
 
-        session = self.session_service.ensure_session(
-            session_id=session_id or "mail_process",
-            title="Mail Processing",
-            metadata={"entrypoint": "mail.process"},
-        )
-        user_input = query or "(latest mail)"
-        self.session_service.append_message(
-            session_id=session.session_id,
-            role="user",
-            content=user_input,
-            payload={"entrypoint": "mail.process", "limit": limit},
-        )
         result = self.mail_agent_loop.run(
-            session_id=session.session_id,
+            session_id=session_id or "mail_process_smoke",
             query=query,
             limit=limit,
-        )
-        self.session_service.append_message(
-            session_id=session.session_id,
-            role="agent",
-            content=(
-                f"Processed {result.processed_messages} mail messages and created "
-                f"{result.matters_created} matters."
-            ),
-            payload={
-                "entrypoint": "mail.process",
-                "run_id": result.run_id,
-                "status": result.status,
-                "processed_messages": result.processed_messages,
-                "matters_created": result.matters_created,
-                "log_path": result.log_path,
-            },
         )
         return result
 
