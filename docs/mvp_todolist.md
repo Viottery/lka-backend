@@ -47,7 +47,7 @@ Urgent track 的阶段目标：
 - [x] Outlook 第一版先同步邮件正文和附件 metadata，附件内容后续按需下载。
 - [x] 部署 / 接入真实第三方 LLM API provider；未配置 API key 时保留 mock provider，保证测试稳定。
 - [x] 建立第一版邮件 Tool Package / Tool Executor，避免 `MailService` 直接调用 LLM。
-- [ ] 建立通用 Agent turn 入口，由会话层选择是否展开 `mail` package 并记录工具调用 / LLM prompt / output。
+- [x] 建立通用 Agent turn 入口，由会话层选择是否展开 `mail` package 并记录工具调用 / LLM prompt / output。
 - [x] 对 LLM HTTP `429` 限流做显式识别、等待重试、run log 记录和本地 heuristic 降级。
 - [x] 对 LLM 认证、网络、超时、非 429 HTTP 和 provider 响应解析错误做分类记录和针对性降级。
 - [x] 建立第一版平行 / 多轮会话基础设施，支持创建会话、追加消息、列出会话和读取历史；邮件工具调用只接收 `session_id` 作为访问上下文，不自动写会话历史。

@@ -4,6 +4,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from app.core.agent_turn import AgentTurnResult
 from app.core.context import SessionContext, TaskContext
 from app.core.events import EventRecord
 from app.core.llm import LLMResponse
@@ -79,6 +80,15 @@ class RuntimeDebugResponse(BaseModel):
     tool_result: ToolResult
     llm_response: LLMResponse
     trace: TraceRecord
+
+
+class AgentTurnRequest(BaseModel):
+    session_id: str | None = None
+    user_input: str
+
+
+class AgentTurnResponse(AgentTurnResult):
+    pass
 
 
 class SessionCreateRequest(BaseModel):

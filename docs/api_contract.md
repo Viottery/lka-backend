@@ -178,9 +178,53 @@ POST /runtime/debug
 
 ---
 
-## 5. Sessions
+## 5. Agent Turn
 
-### 5.1 Create Session
+```http
+POST /agent/turn
+```
+
+请求：
+
+```json
+{
+  "session_id": "session_001",
+  "user_input": "帮我查询 NTUSO 的乐团考试相关要求"
+}
+```
+
+响应：
+
+```json
+{
+  "session_id": "session_001",
+  "trace_id": "agent_turn_xxx",
+  "answer": "我已调用本地 mail tools...",
+  "selected_package": "mail",
+  "package_catalog": [],
+  "expanded_tools": [],
+  "tool_events": [],
+  "llm_events": [],
+  "log_path": "data/agent_logs/agent_turn_xxx.md"
+}
+```
+
+### 设计说明
+
+- 这是第一版通用 Agent turn 入口，不是邮件专属 agent endpoint。
+- Agent 第一层只读取 Tool Package catalog；当前已实现的可展开 package 是 `mail`。
+- 当 turn 判断用户目标需要本地邮件上下文时，才展开 `mail.search`、
+  `mail.load_messages`、`mail.persist_matters` 等具体工具。
+- 每次调用会显式追加 user / agent session message，并写入本地 markdown run log。
+- run log 由代码模板生成，包含用户输入、package catalog、展开工具、工具调用输入输出、
+  LLM 完整 prompt / output / 错误分类和最终回答。
+- 未配置真实 LLM 或 LLM 调用失败时，Agent turn 会降级到本地 heuristic，保持链路可运行。
+
+---
+
+## 6. Sessions
+
+### 6.1 Create Session
 
 ```http
 POST /sessions
@@ -227,7 +271,7 @@ POST /sessions
 }
 ```
 
-### 5.2 List Sessions
+### 6.2 List Sessions
 
 ```http
 GET /sessions?limit=50
@@ -250,7 +294,7 @@ GET /sessions?limit=50
 }
 ```
 
-### 5.3 Get Session
+### 6.3 Get Session
 
 ```http
 GET /sessions/session_xxx
@@ -265,7 +309,7 @@ GET /sessions/session_xxx
 }
 ```
 
-### 5.4 Append Session Message
+### 6.4 Append Session Message
 
 ```http
 POST /sessions/session_xxx/messages
@@ -291,7 +335,7 @@ POST /sessions/session_xxx/messages
 
 ---
 
-## 6. Mail Import
+## 7. Mail Import
 
 ```http
 POST /mail/import
@@ -341,7 +385,7 @@ POST /mail/import
 
 ---
 
-## 7. Mail Search
+## 8. Mail Search
 
 ```http
 GET /mail/search?q=document&limit=10
@@ -377,7 +421,7 @@ GET /mail/search?q=document&limit=10
 
 ---
 
-## 8. List Mail Matters
+## 9. List Mail Matters
 
 ```http
 GET /mail/matters
@@ -401,7 +445,7 @@ GET /mail/matters
 
 ---
 
-## 9. Outlook Auth Start
+## 10. Outlook Auth Start
 
 ```http
 POST /mail/outlook/auth/start
@@ -429,7 +473,7 @@ POST /mail/outlook/auth/start
 
 ---
 
-## 10. Outlook Auth Complete
+## 11. Outlook Auth Complete
 
 ```http
 POST /mail/outlook/auth/complete
@@ -458,7 +502,7 @@ POST /mail/outlook/auth/complete
 
 ---
 
-## 11. Outlook Sync
+## 12. Outlook Sync
 
 ```http
 POST /mail/outlook/sync
@@ -495,7 +539,7 @@ POST /mail/outlook/sync
 
 ---
 
-## 12. Compatibility Notes
+## 13. Compatibility Notes
 
 - 当前后端实现是轻量骨架，因此部分返回值是规则化输出而非真实 agent 结果。
 - 这份契约保留了未来完整系统需要的字段，便于逐步替换实现。

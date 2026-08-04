@@ -9,9 +9,10 @@ from app.api.schemas import (
     CapabilityItem,
     WorkspaceIndexResponse,
 )
+from app.core.agent_turn import AgentTurnLoop, AgentTurnResult
 from app.core.config import Settings
 from app.core.context import ContextAssembler
-from app.core.llm import MockLLMClient
+from app.core.llm import MockLLMClient, build_text_llm_client
 from app.core.mail_tools import (
     MAIL_PACKAGE,
     LoadMailMessagesTool,
@@ -74,6 +75,13 @@ class LocalKnowledgeAgentRuntime:
         self.tool_registry.register_tool(LoadMailMessagesTool(self.mail_service))
         self.tool_registry.register_tool(PersistMailMattersTool(self.mail_service))
         self.tool_executor = ToolExecutor(self.tool_registry)
+        self.agent_llm_client = build_text_llm_client(self.local_app_config.llm)
+        self.agent_turn_loop = AgentTurnLoop(
+            session_service=self.session_service,
+            tool_executor=self.tool_executor,
+            llm_client=self.agent_llm_client,
+            log_dir=self.settings.data_dir / "agent_logs",
+        )
         self.outlook_service = OutlookService(
             self._conn,
             self.mail_service,
@@ -206,6 +214,19 @@ class LocalKnowledgeAgentRuntime:
         return self.debug_loop.run_debug(
             session_id=session_id,
             workspace=workspace,
+            user_input=user_input,
+        )
+
+    def run_agent_turn(
+        self,
+        *,
+        session_id: str | None,
+        user_input: str,
+    ) -> AgentTurnResult:
+        """Run the minimal general agent turn loop."""
+
+        return self.agent_turn_loop.run(
+            session_id=session_id,
             user_input=user_input,
         )
 
