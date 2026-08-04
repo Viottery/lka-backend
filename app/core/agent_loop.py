@@ -7,15 +7,22 @@ from datetime import datetime, timezone
 from hashlib import sha1
 from typing import Any
 
+from app.core.agent_logging import AgentRunLogger
 from app.core.llm import LLMClientError, TextLLMClient
 from app.core.mail import MailMatterDraft, MailMessageRecord, MailProcessResult, MailService
-from app.core.tools import ToolContext, ToolExecutor
+from app.core.tools import ToolContext, ToolExecutor, ToolResult
 
 
 def _stable_id(prefix: str, *parts: str | None) -> str:
     text = "|".join(part or "" for part in parts)
     digest = sha1(text.encode("utf-8")).hexdigest()[:12]
     return f"{prefix}_{digest}"
+
+
+class MailAgentLLMError(LLMClientError):
+    def __init__(self, message: str, llm_event: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.llm_event = llm_event
 
 
 class MailProcessingAgentLoop:
@@ -27,10 +34,12 @@ class MailProcessingAgentLoop:
         mail_service: MailService,
         tool_executor: ToolExecutor,
         llm_client: TextLLMClient | None,
+        run_logger: AgentRunLogger,
     ) -> None:
         self.mail_service = mail_service
         self.tool_executor = tool_executor
         self.llm_client = llm_client
+        self.run_logger = run_logger
 
     def run(
         self,
@@ -48,11 +57,20 @@ class MailProcessingAgentLoop:
         )
         context = ToolContext(session_id=session_id, trace_id=run_id, context_id=run_id)
 
-        search_result = self.tool_executor.execute(
-            invocation_id=_stable_id("tool_invocation", run_id, "mail.search"),
+        tool_events: list[dict[str, Any]] = []
+        llm_event: dict[str, Any] | None = None
+        package_catalog = [
+            package.model_dump(mode="json")
+            for package in self.tool_executor.registry.list_packages()
+        ]
+        user_input = f"Process local mail with query: {query or '(latest mail)'}"
+
+        search_result = self._execute_tool_with_log(
+            run_id=run_id,
             tool_name="mail.search",
             tool_input={"query": query or "", "limit": limit},
             context=context,
+            tool_events=tool_events,
         )
         message_ids = [
             str(message["message_id"])
@@ -60,11 +78,12 @@ class MailProcessingAgentLoop:
             if isinstance(message, dict) and message.get("message_id")
         ]
 
-        load_result = self.tool_executor.execute(
-            invocation_id=_stable_id("tool_invocation", run_id, "mail.load_messages"),
+        load_result = self._execute_tool_with_log(
+            run_id=run_id,
             tool_name="mail.load_messages",
             tool_input={"message_ids": message_ids},
             context=context,
+            tool_events=tool_events,
         )
         messages = [
             MailMessageRecord.model_validate(message)
@@ -76,13 +95,25 @@ class MailProcessingAgentLoop:
         drafts = self.mail_service.draft_matters_locally(messages)
         if self.llm_client is not None and messages:
             try:
-                drafts = self._draft_matters_with_llm(query=query, messages=messages)
+                drafts, llm_event = self._draft_matters_with_llm(query=query, messages=messages)
                 provider = "agent_llm"
-            except LLMClientError:
+            except MailAgentLLMError as exc:
+                llm_event = exc.llm_event
+                provider = "agent_local_heuristic_after_llm_error"
+            except LLMClientError as exc:
+                llm_event = {
+                    "provider": type(self.llm_client).__name__,
+                    "status": "failed",
+                    "started_at": None,
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                    "system_prompt": "",
+                    "user_prompt": "",
+                    "output": str(exc),
+                }
                 provider = "agent_local_heuristic_after_llm_error"
 
-        persist_result = self.tool_executor.execute(
-            invocation_id=_stable_id("tool_invocation", run_id, "mail.persist_matters"),
+        persist_result = self._execute_tool_with_log(
+            run_id=run_id,
             tool_name="mail.persist_matters",
             tool_input={
                 "drafts": [draft.model_dump(mode="json") for draft in drafts],
@@ -90,10 +121,11 @@ class MailProcessingAgentLoop:
                 "link_reason": "Agent mail processing run.",
             },
             context=context,
+            tool_events=tool_events,
         )
         matters_created = int(persist_result.output.get("matters_created") or 0)
 
-        return self.mail_service.record_processing_run(
+        result = self.mail_service.record_processing_run(
             run_id=run_id,
             query=query,
             status="completed",
@@ -101,34 +133,110 @@ class MailProcessingAgentLoop:
             matters_created=matters_created,
             provider=provider,
         )
+        log_path = self.run_logger.write_mail_process_log(
+            run_id=run_id,
+            session_id=session_id,
+            user_input=user_input,
+            package_catalog=package_catalog,
+            expanded_package="mail",
+            tool_events=tool_events,
+            llm_event=llm_event,
+            final_result=result.model_dump(mode="json"),
+        )
+        return result.model_copy(update={"log_path": str(log_path)})
+
+    def _execute_tool_with_log(
+        self,
+        *,
+        run_id: str,
+        tool_name: str,
+        tool_input: dict[str, Any],
+        context: ToolContext,
+        tool_events: list[dict[str, Any]],
+    ) -> ToolResult:
+        selected_at = datetime.now(timezone.utc).isoformat()
+        result = self.tool_executor.execute(
+            invocation_id=_stable_id("tool_invocation", run_id, tool_name),
+            tool_name=tool_name,
+            tool_input=tool_input,
+            context=context,
+        )
+        tool_events.append(
+            {
+                "tool_name": tool_name,
+                "selected_at": selected_at,
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "input": tool_input,
+                "result": result.model_dump(mode="json"),
+            }
+        )
+        return result
 
     def _draft_matters_with_llm(
         self,
         *,
         query: str | None,
         messages: list[MailMessageRecord],
-    ) -> list[MailMatterDraft]:
+    ) -> tuple[list[MailMatterDraft], dict[str, Any]]:
         if self.llm_client is None:
-            return self.mail_service.draft_matters_locally(messages)
+            return self.mail_service.draft_matters_locally(messages), {
+                "provider": "none",
+                "status": "skipped",
+                "started_at": None,
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "system_prompt": "",
+                "user_prompt": "",
+                "output": "No LLM client was configured.",
+            }
 
-        response = self.llm_client.complete_text(
-            system_prompt=(
-                "You are the agent loop for Local Knowledge Agent OS. The mail package "
-                "has already loaded complete email bodies. Extract actionable matters. "
-                "Return only strict JSON with this shape: "
-                '{"matters":[{"title":"...","summary":"...","status":"open",'
-                '"priority":"low|normal|high","source_message_ids":["mail_msg_..."]}]}. '
-                "Do not omit important deadlines, missing documents, or sender requests."
-            ),
-            user_prompt=self._mail_llm_prompt(query=query, messages=messages),
-            prompt_summary=f"mail_agent_loop query={query or ''} messages={len(messages)}",
-            temperature=0.0,
-            max_output_tokens=None,
+        system_prompt = (
+            "You are the agent loop for Local Knowledge Agent OS. The mail package "
+            "has already loaded complete email bodies. Extract actionable matters. "
+            "Return only strict JSON with this shape: "
+            '{"matters":[{"title":"...","summary":"...","status":"open",'
+            '"priority":"low|normal|high","source_message_ids":["mail_msg_..."]}]}. '
+            "Do not omit important deadlines, missing documents, or sender requests."
         )
+        user_prompt = self._mail_llm_prompt(query=query, messages=messages)
+        started_at = datetime.now(timezone.utc).isoformat()
+        try:
+            response = self.llm_client.complete_text(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                prompt_summary=f"mail_agent_loop query={query or ''} messages={len(messages)}",
+                temperature=0.0,
+                max_output_tokens=None,
+            )
+        except LLMClientError as exc:
+            raise MailAgentLLMError(
+                str(exc),
+                {
+                    "provider": type(self.llm_client).__name__,
+                    "status": "failed",
+                    "started_at": started_at,
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                    "system_prompt": system_prompt,
+                    "user_prompt": user_prompt,
+                    "output": str(exc),
+                },
+            ) from exc
+        llm_event = {
+            "provider": response.provider,
+            "status": response.status,
+            "started_at": started_at,
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "system_prompt": system_prompt,
+            "user_prompt": user_prompt,
+            "output": response.content,
+        }
         drafts = self._parse_llm_matter_drafts(response.content)
         if not drafts:
-            raise LLMClientError("LLM response did not contain any mail matters.")
-        return self._normalize_source_message_ids(drafts=drafts, messages=messages)
+            llm_event["status"] = "parse_failed"
+            raise MailAgentLLMError(
+                "LLM response did not contain any mail matters.",
+                llm_event,
+            )
+        return self._normalize_source_message_ids(drafts=drafts, messages=messages), llm_event
 
     def _normalize_source_message_ids(
         self,

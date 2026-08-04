@@ -269,7 +269,8 @@ POST /mail/process
   "run_id": "mail_run_xxx",
   "status": "completed",
   "processed_messages": 1,
-  "matters_created": 1
+  "matters_created": 1,
+  "log_path": "data/agent_logs/mail_run_xxx.md"
 }
 ```
 
@@ -278,6 +279,9 @@ POST /mail/process
 - 该接口当前是邮件优先 MVP 的固定 Agent Loop 演示入口。
 - 执行链路为 `mail.search -> mail.load_messages -> LLM reasoning -> mail.persist_matters`。
 - `MailService` 只负责本地存储、查询、完整正文加载和持久化，不直接调用 LLM。
+- 每次运行都会由本地代码生成自然语言友好的 Markdown run log，不调用 LLM 生成日志。
+- run log 记录运行时间、用户输入、package/tool 选择、工具输入输出、完整 LLM system/user prompt、完整 LLM 输出和最终结果。
+- run log 可能包含完整邮件正文和个人信息，默认只写入本地 `data/agent_logs/`。
 - 后续通用任务入口会迁移到 `/tasks/plan` / `/tasks/run`，该接口保留为邮件链路 smoke endpoint。
 
 ---

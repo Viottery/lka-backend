@@ -110,6 +110,7 @@ def test_mail_import_search_process_and_matters(tmp_path, monkeypatch):
     assert process_result.status == "completed"
     assert process_result.processed_messages == 1
     assert process_result.matters_created == 1
+    assert process_result.log_path is not None
     conn = sqlite3.connect(app.state.runtime.db_path)
     try:
         provider = conn.execute(
@@ -119,6 +120,13 @@ def test_mail_import_search_process_and_matters(tmp_path, monkeypatch):
     finally:
         conn.close()
     assert provider == "agent_local_heuristic"
+    log_text = (tmp_path / "data" / "agent_logs" / f"{process_result.run_id}.md").read_text(
+        encoding="utf-8"
+    )
+    assert "Agent Run Log" in log_text
+    assert "mail.search" in log_text
+    assert "mail.load_messages" in log_text
+    assert "mail.persist_matters" in log_text
 
     matters = list_mail_matters(request, limit=10)
 
@@ -164,6 +172,7 @@ def test_mail_process_sends_full_message_body_to_llm(tmp_path, monkeypatch):
     assert process_result.status == "completed"
     assert process_result.processed_messages == 1
     assert process_result.matters_created == 1
+    assert process_result.log_path is not None
     conn = sqlite3.connect(app.state.runtime.db_path)
     try:
         provider = conn.execute(
@@ -175,6 +184,14 @@ def test_mail_process_sends_full_message_body_to_llm(tmp_path, monkeypatch):
     assert provider == "agent_llm"
     assert long_tail in fake_llm.user_prompt
     assert fake_llm.max_output_tokens is None
+    log_text = (tmp_path / "data" / "agent_logs" / f"{process_result.run_id}.md").read_text(
+        encoding="utf-8"
+    )
+    assert "System Prompt:" in log_text
+    assert "User Prompt:" in log_text
+    assert "Output:" in log_text
+    assert "LLM visa matter" in log_text
+    assert long_tail in log_text
 
     matters = list_mail_matters(request, limit=10)
 

@@ -53,6 +53,18 @@ MailService / SQLite
 `MailService` 只提供确定性的存储、查询、加载和持久化方法，不调用 LLM，不选择执行步骤。
 LLM 推理、工具选择、观察工具结果和反馈循环属于 Agent Loop。
 
+每次 Agent Loop 运行都必须生成本地自然语言友好的 run log。run log 由代码模板生成，
+不调用 LLM，至少记录：
+
+- 运行时间、`run_id`、`session_id` 和用户输入。
+- 第一层 Tool Package catalog 和实际展开的 package。
+- 每个 tool 的选择时间、输入、输出、状态和错误。
+- 给 LLM 的完整 system prompt、user prompt 和 LLM 完整输出。
+- 最终结构化结果。
+
+这些日志默认写入 `data/agent_logs/`。由于日志可能包含完整邮件正文和个人信息，
+它们必须保持本地持久化，不应进入 git，也不应默认同步到外部服务。
+
 ---
 
 ## 3. 推荐目录结构

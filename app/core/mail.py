@@ -91,6 +91,7 @@ class MailProcessResult(BaseModel):
     status: str
     processed_messages: int
     matters_created: int
+    log_path: str | None = None
 
 
 class MailMatterList(BaseModel):

@@ -226,6 +226,30 @@ Agent 需要输出的是当前步骤可执行的结构化判断，而不是把�
 
 这些职责属于 Agent 的会话与决策-执行-反馈 loop。邮件能力应通过工具包装给 Agent 调用，LLM 推理应发生在 Agent Loop 中。
 
+### 3.4.4 Agent Run Log
+
+每次 Agent Loop 运行都应生成本地、自然语言友好的运行过程 log。
+
+该 log 不由 LLM 生成，而是由后端代码根据执行过程模板化写出。它用于调试、复盘、后续
+Verifier 和 Skill Evolution。
+
+run log 至少记录：
+
+```text
+运行时间
+session_id / run_id
+用户输入
+可见 Tool Package 列表
+展开的 Tool Package
+每个 tool 的输入、输出、状态和错误
+给 LLM 的完整 system prompt
+给 LLM 的完整 user prompt
+LLM 的完整输出
+最终结构化结果
+```
+
+因为 log 可能包含完整邮件正文、本地文件内容和其他个人信息，它默认只写入本地数据目录，不进入 git，不默认上传外部服务。
+
 ---
 
 ### 3.5 将 Claude Code / Codex 作为普通工具

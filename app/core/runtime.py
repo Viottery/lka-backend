@@ -9,6 +9,7 @@ from app.api.schemas import (
     CapabilityItem,
     WorkspaceIndexResponse,
 )
+from app.core.agent_logging import AgentRunLogger
 from app.core.agent_loop import MailProcessingAgentLoop
 from app.core.config import Settings
 from app.core.context import ContextAssembler
@@ -75,6 +76,7 @@ class LocalKnowledgeAgentRuntime:
             mail_service=self.mail_service,
             tool_executor=self.tool_executor,
             llm_client=self.mail_llm_client,
+            run_logger=AgentRunLogger(self.settings.data_dir / "agent_logs"),
         )
         self.outlook_service = OutlookService(
             self._conn,
