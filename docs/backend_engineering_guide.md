@@ -65,6 +65,10 @@ LLM 推理、工具选择、观察工具结果和反馈循环属于 Agent Loop�
 这些日志默认写入 `data/agent_logs/`。由于日志可能包含完整邮件正文和个人信息，
 它们必须保持本地持久化，不应进入 git，也不应默认同步到外部服务。
 
+LLM provider 的失败必须进入 run log。特别是 HTTP `429` 限流应被单独识别为
+`rate_limited`，记录 `status_code`、`retry_after`、完整 prompt 和错误输出，然后
+由 Agent Loop 降级到本地 heuristic 或其他后备策略，而不是让领域服务自行处理。
+
 ---
 
 ## 3. 推荐目录结构

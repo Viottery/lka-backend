@@ -77,6 +77,9 @@ class AgentRunLogger:
                 [
                     f"- provider: `{llm_event.get('provider')}`",
                     f"- status: `{llm_event.get('status')}`",
+                    f"- status_code: `{llm_event.get('status_code')}`",
+                    f"- retry_after: `{llm_event.get('retry_after')}`",
+                    f"- fallback: `{llm_event.get('fallback')}`",
                     f"- started_at: `{llm_event.get('started_at')}`",
                     f"- completed_at: `{llm_event.get('completed_at')}`",
                     "",

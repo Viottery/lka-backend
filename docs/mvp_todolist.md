@@ -49,6 +49,7 @@ Urgent track 的阶段目标：
 - [x] 部署 / 接入真实第三方 LLM API provider；未配置 API key 时保留 mock provider，保证测试稳定。
 - [x] 建立第一版邮件 Tool Package / Tool Executor / Agent Loop，避免 `MailService` 直接调用 LLM。
 - [x] 每次邮件 Agent Loop 运行生成本地 Markdown run log，记录用户输入、工具调用、完整 LLM prompt/output 和最终结果。
+- [x] 对 LLM HTTP `429` 限流做显式识别、run log 记录和本地 heuristic 降级。
 - [ ] 将邮件纳入本地持久化存储管理，补齐邮件整理、检索和概括工具。
 - [ ] 支持多轮会话和会话切换，让邮件处理结果、上下文和 trace 能按 session 组织。
 - [ ] 接入本地 `BAAI/bge-m3` embedding provider，并兼容 Windows / Linux 模型缓存路径。
@@ -69,6 +70,7 @@ Urgent track 的阶段目标：
 - 不维护覆盖所有任务类型的全局 intent 枚举；Agent 产出面向下一步动作的 routing / execution decision。
 - `MailService` 只负责确定性的本地存储、检索、完整正文加载和持久化；LLM 推理和工具编排必须发生在 Agent Loop。
 - Agent run log 由本地代码生成，不调用 LLM；日志可能包含完整邮件正文和个人信息，默认仅写入本地 `data/agent_logs/`。
+- LLM 限流属于 Agent Loop 的外部 provider 失败，必须被记录并降级处理，不应交给 `MailService`。
 
 ### 0.1 MVP 最终应具备的能力
 

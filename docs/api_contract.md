@@ -282,6 +282,9 @@ POST /mail/process
 - 每次运行都会由本地代码生成自然语言友好的 Markdown run log，不调用 LLM 生成日志。
 - run log 记录运行时间、用户输入、package/tool 选择、工具输入输出、完整 LLM system/user prompt、完整 LLM 输出和最终结果。
 - run log 可能包含完整邮件正文和个人信息，默认只写入本地 `data/agent_logs/`。
+- 如果 LLM provider 返回 `429` 限流，Agent Loop 会记录 `rate_limited`、`status_code`
+  和 `retry_after`，并降级使用本地 heuristic 生成 matter，processing provider 标记为
+  `agent_local_heuristic_after_rate_limit`。
 - 后续通用任务入口会迁移到 `/tasks/plan` / `/tasks/run`，该接口保留为邮件链路 smoke endpoint。
 
 ---

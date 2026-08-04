@@ -24,6 +24,23 @@ class LLMClientError(RuntimeError):
     """Raised when a configured LLM provider cannot complete a request."""
 
 
+class LLMProviderHTTPError(LLMClientError):
+    def __init__(
+        self,
+        *,
+        status_code: int,
+        message: str,
+        retry_after: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after = retry_after
+
+
+class LLMRateLimitError(LLMProviderHTTPError):
+    """Raised when a provider rejects a request due rate limiting."""
+
+
 class LLMClient(Protocol):
     def complete(self, *, user_input: str, task_context: TaskContext) -> LLMResponse:
         ...
@@ -127,7 +144,19 @@ class OpenAICompatibleLLMClient:
                 response_payload = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             error_body = exc.read().decode("utf-8", errors="replace")
-            raise LLMClientError(f"LLM provider returned HTTP {exc.code}: {error_body}") from exc
+            message = f"LLM provider returned HTTP {exc.code}: {error_body}"
+            retry_after = exc.headers.get("Retry-After")
+            if exc.code == 429:
+                raise LLMRateLimitError(
+                    status_code=exc.code,
+                    message=message,
+                    retry_after=retry_after,
+                ) from exc
+            raise LLMProviderHTTPError(
+                status_code=exc.code,
+                message=message,
+                retry_after=retry_after,
+            ) from exc
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
             raise LLMClientError(f"LLM provider request failed: {exc}") from exc
 

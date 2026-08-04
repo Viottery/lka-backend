@@ -8,7 +8,7 @@ from hashlib import sha1
 from typing import Any
 
 from app.core.agent_logging import AgentRunLogger
-from app.core.llm import LLMClientError, TextLLMClient
+from app.core.llm import LLMClientError, LLMRateLimitError, TextLLMClient
 from app.core.mail import MailMatterDraft, MailMessageRecord, MailProcessResult, MailService
 from app.core.tools import ToolContext, ToolExecutor, ToolResult
 
@@ -99,7 +99,10 @@ class MailProcessingAgentLoop:
                 provider = "agent_llm"
             except MailAgentLLMError as exc:
                 llm_event = exc.llm_event
-                provider = "agent_local_heuristic_after_llm_error"
+                if llm_event.get("status") == "rate_limited":
+                    provider = "agent_local_heuristic_after_rate_limit"
+                else:
+                    provider = "agent_local_heuristic_after_llm_error"
             except LLMClientError as exc:
                 llm_event = {
                     "provider": type(self.llm_client).__name__,
@@ -207,6 +210,22 @@ class MailProcessingAgentLoop:
                 temperature=0.0,
                 max_output_tokens=None,
             )
+        except LLMRateLimitError as exc:
+            raise MailAgentLLMError(
+                str(exc),
+                {
+                    "provider": type(self.llm_client).__name__,
+                    "status": "rate_limited",
+                    "status_code": exc.status_code,
+                    "retry_after": exc.retry_after,
+                    "started_at": started_at,
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                    "system_prompt": system_prompt,
+                    "user_prompt": user_prompt,
+                    "output": str(exc),
+                    "fallback": "local_heuristic",
+                },
+            ) from exc
         except LLMClientError as exc:
             raise MailAgentLLMError(
                 str(exc),
