@@ -110,6 +110,15 @@ def test_mail_import_search_process_and_matters(tmp_path, monkeypatch):
     assert process_result.status == "completed"
     assert process_result.processed_messages == 1
     assert process_result.matters_created == 1
+    conn = sqlite3.connect(app.state.runtime.db_path)
+    try:
+        provider = conn.execute(
+            "SELECT provider FROM mail_processing_runs WHERE run_id = ?",
+            (process_result.run_id,),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert provider == "agent_local_heuristic"
 
     matters = list_mail_matters(request, limit=10)
 
@@ -125,7 +134,7 @@ def test_mail_process_sends_full_message_body_to_llm(tmp_path, monkeypatch):
 
     app = create_app()
     fake_llm = FakeMailLLMClient()
-    app.state.runtime.mail_llm_client = fake_llm
+    app.state.runtime.mail_agent_loop.llm_client = fake_llm
     request = SimpleNamespace(app=app)
     long_tail = "FULL_BODY_SENTINEL_" + ("x" * 400)
 
@@ -155,6 +164,15 @@ def test_mail_process_sends_full_message_body_to_llm(tmp_path, monkeypatch):
     assert process_result.status == "completed"
     assert process_result.processed_messages == 1
     assert process_result.matters_created == 1
+    conn = sqlite3.connect(app.state.runtime.db_path)
+    try:
+        provider = conn.execute(
+            "SELECT provider FROM mail_processing_runs WHERE run_id = ?",
+            (process_result.run_id,),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert provider == "agent_llm"
     assert long_tail in fake_llm.user_prompt
     assert fake_llm.max_output_tokens is None
 

@@ -7,11 +7,8 @@ import sqlite3
 from collections.abc import Callable
 from datetime import datetime, timezone
 from hashlib import sha1
-from typing import Any
 
 from pydantic import BaseModel, Field
-
-from app.core.llm import LLMClientError, TextLLMClient
 
 
 def _now_iso() -> str:
@@ -308,112 +305,23 @@ class MailService:
         *,
         query: str | None = None,
         limit: int = 10,
-        llm_client: TextLLMClient | None = None,
     ) -> MailProcessResult:
         messages = self._messages_for_processing(query=query, limit=limit)
         now = _now_iso()
         run_id = _stable_id("mail_run", query or "", now)
-        provider = "local_heuristic"
-        if llm_client is not None and messages:
-            try:
-                drafts = self._draft_matters_with_llm(
-                    query=query,
-                    messages=messages,
-                    llm_client=llm_client,
-                )
-                provider = "llm"
-            except LLMClientError:
-                drafts = self._draft_matters_locally(messages)
-                provider = "local_heuristic_after_llm_error"
-        else:
-            drafts = self._draft_matters_locally(messages)
-
-        matters_created = 0
-        conn = self._conn_factory()
-        try:
-            for index, draft in enumerate(drafts):
-                source_message_ids = [
-                    message_id
-                    for message_id in draft.source_message_ids
-                    if any(message.message_id == message_id for message in messages)
-                ]
-                if not source_message_ids and index < len(messages):
-                    source_message_ids = [messages[index].message_id]
-                matter_id = (
-                    _stable_id("mail_matter", *source_message_ids)
-                    if source_message_ids
-                    else _stable_id("mail_matter", run_id, str(index))
-                )
-                title = draft.title.strip() or "Untitled mail matter"
-                summary = draft.summary.strip() or title
-                status = draft.status.strip() or "open"
-                priority = self._normalized_priority(draft.priority, title, summary)
-                conn.execute(
-                    """
-                    INSERT INTO mail_matters(
-                        matter_id, title, summary, status, priority, created_at, updated_at
-                    )
-                    VALUES(?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(matter_id) DO UPDATE SET
-                        title=excluded.title,
-                        summary=excluded.summary,
-                        priority=excluded.priority,
-                        updated_at=excluded.updated_at
-                    """,
-                    (
-                        matter_id,
-                        title,
-                        summary,
-                        status,
-                        priority,
-                        now,
-                        now,
-                    ),
-                )
-                for message_id in source_message_ids:
-                    conn.execute(
-                        """
-                        INSERT OR IGNORE INTO mail_matter_links(
-                            matter_id, message_id, reason, created_at
-                        )
-                        VALUES(?, ?, ?, ?)
-                        """,
-                        (
-                            matter_id,
-                            message_id,
-                            "LLM mail processing run." if provider == "llm" else "Local mail processing run.",
-                            now,
-                        ),
-                    )
-                matters_created += 1
-
-            conn.execute(
-                """
-                INSERT INTO mail_processing_runs(
-                    run_id, query, status, processed_messages,
-                    matters_created, provider, created_at
-                )
-                VALUES(?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    run_id,
-                    query,
-                    "completed",
-                    len(messages),
-                    matters_created,
-                    provider,
-                    now,
-                ),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
-        return MailProcessResult(
+        drafts = self.draft_matters_locally(messages)
+        matters_created = self.persist_matter_drafts(
+            drafts=drafts,
+            provider="local_heuristic",
+            link_reason="Local mail processing run.",
+        )
+        return self.record_processing_run(
             run_id=run_id,
+            query=query,
             status="completed",
             processed_messages=len(messages),
             matters_created=matters_created,
+            provider="local_heuristic",
         )
 
     def list_matters(self, *, limit: int = 50) -> MailMatterList:
@@ -457,9 +365,9 @@ class MailService:
         limit: int,
     ) -> list[MailMessageRecord]:
         search_result = self.search_messages(query=query or "", limit=limit)
-        return self._load_messages([message.message_id for message in search_result.messages])
+        return self.load_messages([message.message_id for message in search_result.messages])
 
-    def _load_messages(self, message_ids: list[str]) -> list[MailMessageRecord]:
+    def load_messages(self, message_ids: list[str]) -> list[MailMessageRecord]:
         if not message_ids:
             return []
 
@@ -515,7 +423,7 @@ class MailService:
         }
         return [records_by_id[message_id] for message_id in message_ids if message_id in records_by_id]
 
-    def _draft_matters_locally(self, messages: list[MailMessageRecord]) -> list[MailMatterDraft]:
+    def draft_matters_locally(self, messages: list[MailMessageRecord]) -> list[MailMatterDraft]:
         return [
             MailMatterDraft(
                 title=message.subject or "Untitled mail matter",
@@ -526,100 +434,98 @@ class MailService:
             for message in messages
         ]
 
-    def _draft_matters_with_llm(
+    def persist_matter_drafts(
         self,
         *,
-        query: str | None,
-        messages: list[MailMessageRecord],
-        llm_client: TextLLMClient,
-    ) -> list[MailMatterDraft]:
-        response = llm_client.complete_text(
-            system_prompt=(
-                "You are the mail matter organizer for Local Knowledge Agent OS. "
-                "Read the complete email bodies provided by the user. Extract actionable "
-                "matters. Return only strict JSON with this shape: "
-                '{"matters":[{"title":"...","summary":"...","status":"open",'
-                '"priority":"low|normal|high","source_message_ids":["mail_msg_..."]}]}. '
-                "Do not omit important deadlines, missing documents, or sender requests."
-            ),
-            user_prompt=self._mail_llm_prompt(query=query, messages=messages),
-            prompt_summary=f"mail_process query={query or ''} messages={len(messages)}",
-            temperature=0.0,
-            max_output_tokens=None,
-        )
-        drafts = self._parse_llm_matter_drafts(response.content)
-        if not drafts:
-            raise LLMClientError("LLM response did not contain any mail matters.")
-        return drafts
-
-    def _mail_llm_prompt(self, *, query: str | None, messages: list[MailMessageRecord]) -> str:
-        sections = [
-            f"Query: {query or '(none)'}",
-            "Use every complete email body below. Do not rely on snippets.",
-        ]
-        for index, message in enumerate(messages, start=1):
-            attachments = [
-                {
-                    "external_id": attachment.external_id,
-                    "name": attachment.name,
-                    "content_type": attachment.content_type,
-                    "size": attachment.size,
-                }
-                for attachment in message.attachments
-            ]
-            sections.append(
-                "\n".join(
-                    [
-                        f"EMAIL {index}",
-                        f"message_id: {message.message_id}",
-                        f"folder: {message.folder}",
-                        f"subject: {message.subject}",
-                        f"sender: {message.sender}",
-                        f"to: {', '.join(message.recipients)}",
-                        f"cc: {', '.join(message.cc)}",
-                        f"received_at: {message.received_at or ''}",
-                        f"attachments: {json.dumps(attachments, ensure_ascii=False)}",
-                        "body_text:",
-                        message.body_text,
-                        "END_EMAIL",
-                    ]
-                )
-            )
-        return "\n\n".join(sections)
-
-    def _parse_llm_matter_drafts(self, content: str) -> list[MailMatterDraft]:
-        payload = self._parse_json_object(content)
-        matters = payload.get("matters") if isinstance(payload, dict) else None
-        if not isinstance(matters, list):
-            return []
-
-        drafts: list[MailMatterDraft] = []
-        for item in matters:
-            if not isinstance(item, dict):
-                continue
-            try:
-                drafts.append(MailMatterDraft.model_validate(item))
-            except ValueError:
-                continue
-        return drafts
-
-    def _parse_json_object(self, content: str) -> Any:
-        clean_content = content.strip()
-        if clean_content.startswith("```"):
-            clean_content = clean_content.strip("`").strip()
-            if clean_content.startswith("json"):
-                clean_content = clean_content[4:].strip()
+        drafts: list[MailMatterDraft],
+        provider: str,
+        link_reason: str,
+    ) -> int:
+        now = _now_iso()
+        matters_created = 0
+        conn = self._conn_factory()
         try:
-            return json.loads(clean_content)
-        except json.JSONDecodeError:
-            start = clean_content.find("{")
-            end = clean_content.rfind("}")
-            if start == -1 or end == -1 or end <= start:
-                return {}
-            try:
-                return json.loads(clean_content[start : end + 1])
-            except json.JSONDecodeError:
-                return {}
+            for index, draft in enumerate(drafts):
+                source_message_ids = draft.source_message_ids
+                matter_id = (
+                    _stable_id("mail_matter", *source_message_ids)
+                    if source_message_ids
+                    else _stable_id("mail_matter", provider, str(index), now)
+                )
+                title = draft.title.strip() or "Untitled mail matter"
+                summary = draft.summary.strip() or title
+                status = draft.status.strip() or "open"
+                priority = self._normalized_priority(draft.priority, title, summary)
+                conn.execute(
+                    """
+                    INSERT INTO mail_matters(
+                        matter_id, title, summary, status, priority, created_at, updated_at
+                    )
+                    VALUES(?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(matter_id) DO UPDATE SET
+                        title=excluded.title,
+                        summary=excluded.summary,
+                        priority=excluded.priority,
+                        updated_at=excluded.updated_at
+                    """,
+                    (matter_id, title, summary, status, priority, now, now),
+                )
+                for message_id in source_message_ids:
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO mail_matter_links(
+                            matter_id, message_id, reason, created_at
+                        )
+                        VALUES(?, ?, ?, ?)
+                        """,
+                        (matter_id, message_id, link_reason, now),
+                    )
+                matters_created += 1
+            conn.commit()
+        finally:
+            conn.close()
+        return matters_created
+
+    def record_processing_run(
+        self,
+        *,
+        run_id: str,
+        query: str | None,
+        status: str,
+        processed_messages: int,
+        matters_created: int,
+        provider: str,
+    ) -> MailProcessResult:
+        conn = self._conn_factory()
+        try:
+            conn.execute(
+                """
+                INSERT INTO mail_processing_runs(
+                    run_id, query, status, processed_messages,
+                    matters_created, provider, created_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    query,
+                    status,
+                    processed_messages,
+                    matters_created,
+                    provider,
+                    _now_iso(),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        return MailProcessResult(
+            run_id=run_id,
+            status=status,
+            processed_messages=processed_messages,
+            matters_created=matters_created,
+        )
 
     def _json_list(self, value: str) -> list[str]:
         try:

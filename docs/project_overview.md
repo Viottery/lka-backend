@@ -153,6 +153,79 @@ Agent Harness 包括：
 
 Workspace File Structure Index 是知识上下文构造的基础输入之一，负责为非向量检索提供稳定的文件结构和元数据支撑。
 
+### 3.4.1 Tool Package 与懒展开
+
+Capability Registry 对 Main Agent Brain 的第一层暴露不应是很长的工具列表，而应优先暴露粗粒度 Tool Package。
+
+例如第一层只暴露：
+
+```text
+mail
+workspace
+filesystem
+code
+calendar（后续）
+browser（后续）
+```
+
+当 Agent 判断当前目标和某个 package 相关时，才展开该 package 中的具体工具。
+
+例如 `mail` package 展开后才暴露：
+
+```text
+mail.search
+mail.load_messages
+mail.persist_matters
+mail.match_related（后续）
+mail.summarize（后续）
+```
+
+这样可以避免一次性把大量工具 schema 塞进上下文，也让后续 skill / plugin / MCP 能力更容易按领域组织。
+
+### 3.4.2 不维护全局 intent 枚举
+
+本项目不应尝试为所有可能任务维护一个固定的全局 intent 标签表。
+
+Agent 需要输出的是当前步骤可执行的结构化判断，而不是把用户目标强行归入某个预设分类。例如：
+
+```text
+用户目标复述
+候选 Tool Package
+是否需要展开 package
+是否需要读取本地数据
+是否需要外部 LLM
+风险提示
+下一步动作
+```
+
+也就是说，系统可以有 `RoutingDecision`、`ExecutionDecision`、`Observation`，但不要把 `mail_matter_extraction`、`repo_analysis` 等标签设计成必须覆盖所有任务的核心枚举。
+
+### 3.4.3 Domain Service 与 Agent Loop 边界
+
+邮件、文件、workspace、代码仓库等领域服务不应该自己变成小 agent。
+
+以邮件为例，`MailService` 的职责是：
+
+```text
+导入和同步邮件
+本地持久化
+关键词检索
+加载完整邮件正文
+持久化 matter / link / processing run
+```
+
+它不负责：
+
+```text
+理解用户目标
+选择下一步动作
+调用 LLM 做推理
+决定是否继续执行
+组织多轮会话反馈
+```
+
+这些职责属于 Agent 的会话与决策-执行-反馈 loop。邮件能力应通过工具包装给 Agent 调用，LLM 推理应发生在 Agent Loop 中。
+
 ---
 
 ### 3.5 将 Claude Code / Codex 作为普通工具

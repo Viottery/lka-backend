@@ -9,9 +9,16 @@ from app.api.schemas import (
     CapabilityItem,
     WorkspaceIndexResponse,
 )
+from app.core.agent_loop import MailProcessingAgentLoop
 from app.core.config import Settings
 from app.core.context import ContextAssembler
 from app.core.llm import MockLLMClient, TextLLMClient, build_text_llm_client
+from app.core.mail_tools import (
+    MAIL_PACKAGE,
+    LoadMailMessagesTool,
+    PersistMailMattersTool,
+    SearchMailTool,
+)
 from app.core.mail import (
     MailAccountInput,
     MailImportResult,
@@ -29,7 +36,7 @@ from app.core.outlook import (
 )
 from app.core.retrieval import LocalDebugRetrievalProvider
 from app.core.runtime_loop import RuntimeDebugRun, RuntimeLoop
-from app.core.tools import MockToolExecutor
+from app.core.tools import MockToolExecutor, ToolExecutor, ToolRegistry
 from app.core.tracing import TraceRecorder
 from app.platform import FilesystemScanner, PathResolver, ScanOptions, detect_platform
 from app.storage.db import connect, get_db_path, init_db
@@ -57,6 +64,17 @@ class LocalKnowledgeAgentRuntime:
         self.local_app_config = settings.load_local_config()
         self.mail_llm_client: TextLLMClient | None = build_text_llm_client(
             self.local_app_config.llm
+        )
+        self.tool_registry = ToolRegistry()
+        self.tool_registry.register_package(MAIL_PACKAGE)
+        self.tool_registry.register_tool(SearchMailTool(self.mail_service))
+        self.tool_registry.register_tool(LoadMailMessagesTool(self.mail_service))
+        self.tool_registry.register_tool(PersistMailMattersTool(self.mail_service))
+        self.tool_executor = ToolExecutor(self.tool_registry)
+        self.mail_agent_loop = MailProcessingAgentLoop(
+            mail_service=self.mail_service,
+            tool_executor=self.tool_executor,
+            llm_client=self.mail_llm_client,
         )
         self.outlook_service = OutlookService(
             self._conn,
@@ -210,12 +228,12 @@ class LocalKnowledgeAgentRuntime:
         return self.mail_service.search_messages(query=query, limit=limit)
 
     def process_mail(self, *, query: str | None = None, limit: int = 10) -> MailProcessResult:
-        """Run the first deterministic mail matter extraction loop."""
+        """Run the fixed first agent loop for mail matter extraction."""
 
-        return self.mail_service.process_messages(
+        return self.mail_agent_loop.run(
+            session_id="mail_process",
             query=query,
             limit=limit,
-            llm_client=self.mail_llm_client,
         )
 
     def list_mail_matters(self, *, limit: int = 50) -> MailMatterList:

@@ -183,11 +183,19 @@ plan -> skills / sub agents / expert tools
 
 Capability Registry is the authoritative catalog for available capabilities. It records what can be called, what metadata is attached to each capability, and whether confirmation is required before use. It does not execute capabilities itself.
 
+Capability Registry 的第一层暴露单位应优先是 Tool Package，而不是所有具体工具。
+Agent 先根据用户目标和上下文决定是否展开某个 package，再看到其中的工具 schema。
+这能避免工具列表过长，也为后续 skill、plugin 和 MCP 能力扩展保留清晰边界。
+
+本项目不维护覆盖所有任务类型的全局 intent 枚举。Agent 应输出面向下一步动作的
+`RoutingDecision`、`ExecutionDecision` 和 `Observation`，而不是强制把每个用户目标映射到固定标签。
+
 这一层强调受控执行：
 
 - 先选择能力，再执行
 - 先构造上下文，再调用专家工具
 - 先判断风险，再决定是否需要确认
+- 领域服务只提供确定性数据能力；LLM 推理和决策-执行-反馈 loop 属于 Agent Harness
 
 ---
 

@@ -273,6 +273,13 @@ POST /mail/process
 }
 ```
 
+说明：
+
+- 该接口当前是邮件优先 MVP 的固定 Agent Loop 演示入口。
+- 执行链路为 `mail.search -> mail.load_messages -> LLM reasoning -> mail.persist_matters`。
+- `MailService` 只负责本地存储、查询、完整正文加载和持久化，不直接调用 LLM。
+- 后续通用任务入口会迁移到 `/tasks/plan` / `/tasks/run`，该接口保留为邮件链路 smoke endpoint。
+
 ---
 
 ## 8. List Mail Matters

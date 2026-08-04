@@ -47,6 +47,7 @@ Urgent track 的阶段目标：
 - [x] 接入 Outlook 只读同步，采用 Device Code Flow，权限优先限制为 `User.Read Mail.Read offline_access`。
 - [x] Outlook 第一版先同步邮件正文和附件 metadata，附件内容后续按需下载。
 - [x] 部署 / 接入真实第三方 LLM API provider；未配置 API key 时保留 mock provider，保证测试稳定。
+- [x] 建立第一版邮件 Tool Package / Tool Executor / Agent Loop，避免 `MailService` 直接调用 LLM。
 - [ ] 将邮件纳入本地持久化存储管理，补齐邮件整理、检索和概括工具。
 - [ ] 支持多轮会话和会话切换，让邮件处理结果、上下文和 trace 能按 session 组织。
 - [ ] 接入本地 `BAAI/bge-m3` embedding provider，并兼容 Windows / Linux 模型缓存路径。
@@ -63,6 +64,9 @@ Urgent track 的阶段目标：
 - Outlook Graph Device Code Flow 不保存邮箱密码；IMAP 路径如需密码，优先使用 `password_env` 引用环境变量。
 - Outlook 同步第一版提供 `POST /mail/outlook/auth/start`、`POST /mail/outlook/auth/complete`
   和 `POST /mail/outlook/sync`；先采用显式手动触发，不做后台实时同步、delta link 或 webhook。
+- Capability Registry 第一层优先暴露 Tool Package，不一次性暴露全部工具 schema；Agent 确认目标相关后再展开具体工具。
+- 不维护覆盖所有任务类型的全局 intent 枚举；Agent 产出面向下一步动作的 routing / execution decision。
+- `MailService` 只负责确定性的本地存储、检索、完整正文加载和持久化；LLM 推理和工具编排必须发生在 Agent Loop。
 
 ### 0.1 MVP 最终应具备的能力
 
@@ -624,6 +628,7 @@ Urgent track 的阶段目标：
 ### 第一阶段：邮件优先闭环
 
 - [x] 部署 / 接入真实 LLM API provider，并保留 mock fallback。
+- [x] 建立第一版 `mail` Tool Package，并通过固定 Agent Loop 调用 `mail.search`、`mail.load_messages` 和 `mail.persist_matters`。
 - [ ] 将邮件作为本地持久化知识源管理，明确 account、message、attachment、chunk、matter、processing run 的生命周期。
 - [ ] 补齐邮件整理、检索和概括工具，让邮件候选集可以进入 TaskContext / MatterContext。
 - [ ] 支持多轮会话和会话切换，让 session 能绑定邮件处理上下文、matter 和 trace。

@@ -34,6 +34,25 @@ Static Capability Catalog
 
 Workspace Index 同时需要记录 workspace 的结构化元数据和文件构成索引。文件构成索引包括目录层级、文件名、扩展名、路径位置、README、配置文件、测试命令和其他高价值元数据，用于在不依赖向量检索时提升效率和准确率。
 
+邮件优先 MVP 中，Agent Harness 的执行边界必须保持清晰：
+
+```text
+HTTP API
+  ↓
+Agent Loop / Session
+  ↓
+Tool Package Registry
+  ↓
+Tool Executor
+  ↓
+Mail Tools
+  ↓
+MailService / SQLite
+```
+
+`MailService` 只提供确定性的存储、查询、加载和持久化方法，不调用 LLM，不选择执行步骤。
+LLM 推理、工具选择、观察工具结果和反馈循环属于 Agent Loop。
+
 ---
 
 ## 3. 推荐目录结构
@@ -87,6 +106,9 @@ backend/
 - 非向量检索应优先依赖 workspace 的结构化索引、文件构成索引和本地文件系统检索。
 - Workspace 路径必须先经过 `PathResolver`，文件扫描必须优先经过 `FilesystemScanner`。
 - 后续本地命令、专家工具、测试命令应经过统一 `CommandRunner`，避免业务代码写死 shell。
+- Capability Registry 第一层应优先暴露 Tool Package，而不是一次性暴露所有具体工具。
+- 具体工具应在 Agent 决定展开某个 package 后再进入上下文。
+- 不维护全局 intent 枚举；Agent 应输出面向下一步执行的 routing / execution decision。
 
 ---
 
