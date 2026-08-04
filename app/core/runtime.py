@@ -11,7 +11,7 @@ from app.api.schemas import (
 )
 from app.core.config import Settings
 from app.core.context import ContextAssembler
-from app.core.llm import MockLLMClient
+from app.core.llm import MockLLMClient, TextLLMClient, build_text_llm_client
 from app.core.mail import (
     MailAccountInput,
     MailImportResult,
@@ -55,6 +55,9 @@ class LocalKnowledgeAgentRuntime:
         self.filesystem_scanner = FilesystemScanner(self.platform)
         self.mail_service = MailService(self._conn)
         self.local_app_config = settings.load_local_config()
+        self.mail_llm_client: TextLLMClient | None = build_text_llm_client(
+            self.local_app_config.llm
+        )
         self.outlook_service = OutlookService(
             self._conn,
             self.mail_service,
@@ -209,7 +212,11 @@ class LocalKnowledgeAgentRuntime:
     def process_mail(self, *, query: str | None = None, limit: int = 10) -> MailProcessResult:
         """Run the first deterministic mail matter extraction loop."""
 
-        return self.mail_service.process_messages(query=query, limit=limit)
+        return self.mail_service.process_messages(
+            query=query,
+            limit=limit,
+            llm_client=self.mail_llm_client,
+        )
 
     def list_mail_matters(self, *, limit: int = 50) -> MailMatterList:
         """Return locally extracted mail matters."""

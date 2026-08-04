@@ -65,6 +65,26 @@ normalize_embeddings = true
     assert config.embedding.cache_dir == Path("data/test-models")
 
 
+def test_llm_api_key_can_be_loaded_from_dotenv(tmp_path, monkeypatch):
+    config_path = tmp_path / "local.toml"
+    config_path.write_text(
+        """
+[llm]
+provider = "packyapi"
+api_key_env = "PACKY_API_KEY"
+model = "deepseek-v4-flash"
+""",
+        encoding="utf-8",
+    )
+    (tmp_path / ".env").write_text('PACKY_API_KEY="dotenv-secret"\n', encoding="utf-8")
+    monkeypatch.delenv("PACKY_API_KEY", raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    config = load_local_config(config_path)
+
+    assert config.llm.resolved_api_key() == "dotenv-secret"
+
+
 def test_outlook_client_id_can_be_loaded_directly_from_config(tmp_path):
     config_path = tmp_path / "local.toml"
     config_path.write_text(

@@ -15,6 +15,24 @@ def _is_env_var_name(value: str) -> bool:
     )
 
 
+def _dotenv_value(name: str, path: Path = Path(".env")) -> str | None:
+    if not name or not path.exists():
+        return None
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key.strip() != name:
+            continue
+        return value.strip().strip('"').strip("'")
+    return None
+
+
+def _resolved_env_value(name: str) -> str | None:
+    return os.getenv(name) or _dotenv_value(name)
+
+
 class LLMProviderConfig(BaseModel):
     provider: str = "mock"
     base_url: str = "https://api.openai.com/v1"
@@ -23,7 +41,7 @@ class LLMProviderConfig(BaseModel):
     timeout_seconds: int = 60
 
     def resolved_api_key(self) -> str | None:
-        return os.getenv(self.api_key_env) if self.api_key_env else None
+        return _resolved_env_value(self.api_key_env) if self.api_key_env else None
 
 
 class OutlookMailConfig(BaseModel):
@@ -45,7 +63,7 @@ class OutlookMailConfig(BaseModel):
         configured_value = self.client_id_env.strip()
         if not configured_value:
             return None
-        env_value = os.getenv(configured_value)
+        env_value = _resolved_env_value(configured_value)
         if env_value:
             return env_value
         if not _is_env_var_name(configured_value):
@@ -62,7 +80,7 @@ class IMAPMailConfig(BaseModel):
     use_ssl: bool = True
 
     def resolved_password(self) -> str | None:
-        return os.getenv(self.password_env) if self.password_env else None
+        return _resolved_env_value(self.password_env) if self.password_env else None
 
 
 class MailProviderConfig(BaseModel):
