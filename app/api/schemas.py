@@ -23,6 +23,13 @@ from app.core.outlook import (
     OutlookSyncResult,
 )
 from app.core.retrieval import RetrievalResult
+from app.core.sessions import (
+    AgentSession,
+    AgentSessionDetail,
+    AgentSessionList,
+    AgentSessionMessage,
+    SessionRole,
+)
 from app.core.tools import ToolInvocation, ToolResult
 from app.core.tracing import TraceRecord
 
@@ -75,6 +82,34 @@ class RuntimeDebugResponse(BaseModel):
     trace: TraceRecord
 
 
+class SessionCreateRequest(BaseModel):
+    title: str | None = None
+    initial_message: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class SessionCreateResponse(AgentSessionDetail):
+    pass
+
+
+class SessionListResponse(AgentSessionList):
+    sessions: list[AgentSession]
+
+
+class SessionDetailResponse(AgentSessionDetail):
+    pass
+
+
+class SessionAppendMessageRequest(BaseModel):
+    role: SessionRole = "user"
+    content: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class SessionAppendMessageResponse(AgentSessionMessage):
+    pass
+
+
 class MailImportRequest(BaseModel):
     account: MailAccountInput
     messages: list[MailMessageInput]
@@ -91,6 +126,7 @@ class MailSearchResponse(MailSearchResult):
 class MailProcessRequest(BaseModel):
     query: str | None = None
     limit: int = 10
+    session_id: str | None = None
 
 
 class MailProcessResponse(MailProcessResult):

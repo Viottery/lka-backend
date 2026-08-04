@@ -150,6 +150,7 @@ class MailProcessingAgentLoop:
 
         result = self.mail_service.record_processing_run(
             run_id=run_id,
+            session_id=session_id,
             query=query,
             status="completed",
             processed_messages=len(messages),

@@ -88,6 +88,7 @@ class MailMatter(BaseModel):
 
 class MailProcessResult(BaseModel):
     run_id: str
+    session_id: str | None = None
     status: str
     processed_messages: int
     matters_created: int
@@ -491,6 +492,7 @@ class MailService:
         self,
         *,
         run_id: str,
+        session_id: str,
         query: str | None,
         status: str,
         processed_messages: int,
@@ -502,13 +504,14 @@ class MailService:
             conn.execute(
                 """
                 INSERT INTO mail_processing_runs(
-                    run_id, query, status, processed_messages,
+                    run_id, session_id, query, status, processed_messages,
                     matters_created, provider, created_at
                 )
-                VALUES(?, ?, ?, ?, ?, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
+                    session_id,
                     query,
                     status,
                     processed_messages,
@@ -523,6 +526,7 @@ class MailService:
 
         return MailProcessResult(
             run_id=run_id,
+            session_id=session_id,
             status=status,
             processed_messages=processed_messages,
             matters_created=matters_created,

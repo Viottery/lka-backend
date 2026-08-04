@@ -39,7 +39,11 @@ def search_mail(
 
 @router.post("/process", response_model=MailProcessResponse)
 def process_mail(payload: MailProcessRequest, request: Request) -> MailProcessResponse:
-    result = request.app.state.runtime.process_mail(query=payload.query, limit=payload.limit)
+    result = request.app.state.runtime.process_mail(
+        query=payload.query,
+        limit=payload.limit,
+        session_id=payload.session_id,
+    )
     return MailProcessResponse(**result.model_dump())
 
 

@@ -37,6 +37,13 @@ from app.core.outlook import (
 )
 from app.core.retrieval import LocalDebugRetrievalProvider
 from app.core.runtime_loop import RuntimeDebugRun, RuntimeLoop
+from app.core.sessions import (
+    AgentSessionDetail,
+    AgentSessionList,
+    AgentSessionMessage,
+    SessionRole,
+    SessionService,
+)
 from app.core.tools import MockToolExecutor, ToolExecutor, ToolRegistry
 from app.core.tracing import TraceRecorder
 from app.platform import FilesystemScanner, PathResolver, ScanOptions, detect_platform
@@ -61,6 +68,7 @@ class LocalKnowledgeAgentRuntime:
             workspace_roots=settings.parsed_workspace_roots(),
         )
         self.filesystem_scanner = FilesystemScanner(self.platform)
+        self.session_service = SessionService(self._conn)
         self.mail_service = MailService(self._conn)
         self.local_app_config = settings.load_local_config()
         self.mail_llm_client: TextLLMClient | None = build_text_llm_client(
@@ -229,14 +237,91 @@ class LocalKnowledgeAgentRuntime:
 
         return self.mail_service.search_messages(query=query, limit=limit)
 
-    def process_mail(self, *, query: str | None = None, limit: int = 10) -> MailProcessResult:
+    def create_session(
+        self,
+        *,
+        title: str | None = None,
+        metadata: dict | None = None,
+        initial_message: str | None = None,
+    ) -> AgentSessionDetail:
+        """Create a persistent agent session for parallel/multi-turn work."""
+
+        return self.session_service.create_session(
+            title=title,
+            metadata=metadata,
+            initial_message=initial_message,
+        )
+
+    def list_sessions(self, *, limit: int = 50) -> AgentSessionList:
+        """Return recent agent sessions for frontend session switching."""
+
+        return self.session_service.list_sessions(limit=limit)
+
+    def get_session(self, *, session_id: str) -> AgentSessionDetail:
+        """Return one session with its ordered message history."""
+
+        return self.session_service.get_session(session_id=session_id)
+
+    def append_session_message(
+        self,
+        *,
+        session_id: str,
+        role: SessionRole,
+        content: str,
+        payload: dict | None = None,
+    ) -> AgentSessionMessage:
+        """Append a deterministic message to a persistent session."""
+
+        return self.session_service.append_message(
+            session_id=session_id,
+            role=role,
+            content=content,
+            payload=payload,
+        )
+
+    def process_mail(
+        self,
+        *,
+        query: str | None = None,
+        limit: int = 10,
+        session_id: str | None = None,
+    ) -> MailProcessResult:
         """Run the fixed first agent loop for mail matter extraction."""
 
-        return self.mail_agent_loop.run(
-            session_id="mail_process",
+        session = self.session_service.ensure_session(
+            session_id=session_id or "mail_process",
+            title="Mail Processing",
+            metadata={"entrypoint": "mail.process"},
+        )
+        user_input = query or "(latest mail)"
+        self.session_service.append_message(
+            session_id=session.session_id,
+            role="user",
+            content=user_input,
+            payload={"entrypoint": "mail.process", "limit": limit},
+        )
+        result = self.mail_agent_loop.run(
+            session_id=session.session_id,
             query=query,
             limit=limit,
         )
+        self.session_service.append_message(
+            session_id=session.session_id,
+            role="agent",
+            content=(
+                f"Processed {result.processed_messages} mail messages and created "
+                f"{result.matters_created} matters."
+            ),
+            payload={
+                "entrypoint": "mail.process",
+                "run_id": result.run_id,
+                "status": result.status,
+                "processed_messages": result.processed_messages,
+                "matters_created": result.matters_created,
+                "log_path": result.log_path,
+            },
+        )
+        return result
 
     def list_mail_matters(self, *, limit: int = 50) -> MailMatterList:
         """Return locally extracted mail matters."""

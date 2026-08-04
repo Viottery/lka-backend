@@ -2,7 +2,8 @@
 
 > 本文档定义 Backend Core 与 Windows/Linux Frontend 之间的最小 HTTP API 契约。
 >
-> 当前阶段只保留基础服务能力，不包含任务规划、任务执行、轨迹或确认流。
+> 当前阶段保留基础服务能力，并新增第一版本地会话 API，用于支撑平行会话、
+> 多轮消息记录和后续 session-scoped trace。
 
 ## Base URL
 
@@ -171,7 +172,120 @@ POST /runtime/debug
 
 ---
 
-## 5. Mail Import
+## 5. Sessions
+
+### 5.1 Create Session
+
+```http
+POST /sessions
+```
+
+请求：
+
+```json
+{
+  "title": "Coliwoo follow-up",
+  "initial_message": "Check Coliwoo notices.",
+  "metadata": {
+    "frontend": "linux-native"
+  }
+}
+```
+
+响应：
+
+```json
+{
+  "session": {
+    "session_id": "session_xxx",
+    "title": "Coliwoo follow-up",
+    "status": "active",
+    "metadata": {
+      "frontend": "linux-native"
+    },
+    "created_at": "2026-08-04T00:00:00Z",
+    "updated_at": "2026-08-04T00:00:00Z"
+  },
+  "messages": [
+    {
+      "message_id": "session_msg_xxx",
+      "session_id": "session_xxx",
+      "role": "user",
+      "content": "Check Coliwoo notices.",
+      "payload": {
+        "source": "session_create"
+      },
+      "created_at": "2026-08-04T00:00:00Z"
+    }
+  ]
+}
+```
+
+### 5.2 List Sessions
+
+```http
+GET /sessions?limit=50
+```
+
+响应：
+
+```json
+{
+  "sessions": [
+    {
+      "session_id": "session_xxx",
+      "title": "Coliwoo follow-up",
+      "status": "active",
+      "metadata": {},
+      "created_at": "2026-08-04T00:00:00Z",
+      "updated_at": "2026-08-04T00:00:00Z"
+    }
+  ]
+}
+```
+
+### 5.3 Get Session
+
+```http
+GET /sessions/session_xxx
+```
+
+响应：
+
+```json
+{
+  "session": {},
+  "messages": []
+}
+```
+
+### 5.4 Append Session Message
+
+```http
+POST /sessions/session_xxx/messages
+```
+
+请求：
+
+```json
+{
+  "role": "user",
+  "content": "Continue with the Coliwoo thread.",
+  "payload": {}
+}
+```
+
+说明：
+
+- `role` 当前支持 `user`、`agent`、`system`、`tool`。
+- 会话 API 只负责本地持久化和读取，不调用 LLM。
+- 前端切换会话时应使用显式 `session_id`，后端不维护隐式全局当前会话。
+- Agent 运行结果会作为 `agent` 消息追加到对应 session，payload 中保存 `run_id`
+  和 `log_path` 等可追踪字段。
+
+---
+
+## 6. Mail Import
 
 ```http
 POST /mail/import
@@ -221,7 +335,7 @@ POST /mail/import
 
 ---
 
-## 6. Mail Search
+## 7. Mail Search
 
 ```http
 GET /mail/search?q=document&limit=10
@@ -247,7 +361,7 @@ GET /mail/search?q=document&limit=10
 
 ---
 
-## 7. Mail Process
+## 8. Mail Process
 
 ```http
 POST /mail/process
@@ -257,6 +371,7 @@ POST /mail/process
 
 ```json
 {
+  "session_id": "session_xxx",
   "query": "visa document",
   "limit": 10
 }
@@ -267,6 +382,7 @@ POST /mail/process
 ```json
 {
   "run_id": "mail_run_xxx",
+  "session_id": "session_xxx",
   "status": "completed",
   "processed_messages": 1,
   "matters_created": 1,
@@ -277,6 +393,8 @@ POST /mail/process
 说明：
 
 - 该接口当前是邮件优先 MVP 的固定 Agent Loop 演示入口。
+- `session_id` 可选；未传时使用兼容默认会话 `mail_process`。传入时，run log、
+  `mail_processing_runs` 和 session message history 都会绑定到该 session。
 - 执行链路为 `mail.search -> mail.load_messages -> LLM reasoning -> mail.persist_matters`。
 - `MailService` 只负责本地存储、查询、完整正文加载和持久化，不直接调用 LLM。
 - 每次运行都会由本地代码生成自然语言友好的 Markdown run log，不调用 LLM 生成日志。
@@ -292,7 +410,7 @@ POST /mail/process
 
 ---
 
-## 8. List Mail Matters
+## 9. List Mail Matters
 
 ```http
 GET /mail/matters
@@ -316,7 +434,7 @@ GET /mail/matters
 
 ---
 
-## 9. Outlook Auth Start
+## 10. Outlook Auth Start
 
 ```http
 POST /mail/outlook/auth/start
@@ -344,7 +462,7 @@ POST /mail/outlook/auth/start
 
 ---
 
-## 10. Outlook Auth Complete
+## 11. Outlook Auth Complete
 
 ```http
 POST /mail/outlook/auth/complete
@@ -373,7 +491,7 @@ POST /mail/outlook/auth/complete
 
 ---
 
-## 11. Outlook Sync
+## 12. Outlook Sync
 
 ```http
 POST /mail/outlook/sync
@@ -410,7 +528,7 @@ POST /mail/outlook/sync
 
 ---
 
-## 12. Compatibility Notes
+## 13. Compatibility Notes
 
 - 当前后端实现是轻量骨架，因此部分返回值是规则化输出而非真实 agent 结果。
 - 这份契约保留了未来完整系统需要的字段，便于逐步替换实现。
