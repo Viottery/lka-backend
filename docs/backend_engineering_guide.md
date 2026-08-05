@@ -76,6 +76,13 @@ operation，修复失败则停止本轮执行，不能把工具调用残片当�
 每次真实工具调用后都必须生成反馈 observation。反馈至少包含执行成功 / 失败状态和可读
 message；当 LLM 可用时，还要追加独立 `tool_result_check` 调用，让 LLM 检查工具结果是否
 符合上一条 tool-call decision。底层 `ToolResult.status` 已失败时，反馈不能被升级为成功。
+Agent Loop 还会由本地 harness 生成 `progress_events`，用于前端展示用户友好的运行过程：
+package 选择、LLM 的 `assistant_message`、package 展开、工具开始 / 完成、工具反馈、最终回答
+和校验 warning 都会进入该事件流。`progress_events` 不参与后续上下文窗口压缩，也不由 LLM
+生成，避免把运行流水混入对话记忆。
+最终回答会经过一层本地轻量校验，结果写入 `verification_warnings`。当前校验只记录 warning，
+不自动改写答案；例如模型声称已经写入日历但本轮没有 calendar tool 完成时，会标记
+`unsupported_calendar_claim`，供前端和后续 verifier 使用。
 
 会话基础设施当前由本地 SQLite 管理，使用显式 `session_id` 支撑平行会话和多轮会话。
 后端不维护隐式全局当前会话；前端切换会话时必须把目标 `session_id` 传给运行入口。
@@ -106,6 +113,11 @@ Outlook 自检同步，把最新邮件写入本地 SQLite；服务运行期间�
 `calendar_event` 等都只是 `matter_source_links` 中的 source。Agent 从邮件中提取待办
 时，应先通过 mail tools 获取证据，再通过 matter tools 创建或更新事务，不能让
 `MailService` 直接替用户做事务决策。
+Agent 可见的 matter tool schema 必须明确必填字段、枚举和示例。写入类工具只能使用
+`open`、`in_progress`、`waiting`、`done`、`cancelled` 作为 status，只能使用 `low`、
+`normal`、`high`、`urgent` 作为 priority。创建事项前如果存在重复风险，Agent 应先调用
+`matter.search` 检查已有事项；发现相似事项时，应选择 update、skip/no_op，或明确说明为何
+它是独立新事项后再 create。
 旧的 `mail.persist_matters` / `mail_matters` 是邮件优先 MVP 早期遗留能力，只作为历史
 数据和迁移路径保留，不再注册进 Agent 可见的 Tool Registry。
 runtime context 也通过工具和上下文双路径提供：`runtime.now` 是可调用工具；每次
@@ -121,6 +133,7 @@ Agent turn 还会把 `current_time` 注入 session context window，包含 UTC�
 - Agent 每一步 decision，包括 action、assistant_message、operation、reason、选中的
   tool、tool input 或最终 answer。
 - 每个 tool 的选择时间、输入、输出、状态、错误和反馈。
+- 本地生成的 progress events 和最终回答 verification warnings。
 - 给 LLM 的完整 system prompt、user prompt 和 LLM 完整输出。
 - 最终结构化结果。
 

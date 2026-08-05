@@ -72,11 +72,24 @@ def test_agent_turn_expands_mail_package_and_records_log(tmp_path, monkeypatch):
         "call_tool",
         "answer",
     ]
+    assert [event.type for event in response.progress_events] == [
+        "package_selected",
+        "tool_started",
+        "tool_completed",
+        "tool_started",
+        "tool_completed",
+        "final_answer",
+    ]
+    assert response.progress_events[0].package_name == "mail"
+    assert response.progress_events[2].tool_name == "mail.search"
+    assert response.verification_warnings == []
     assert full_body_sentinel in response.answer
     assert response.log_path is not None
 
     log_text = Path(response.log_path).read_text(encoding="utf-8")
     assert "## Package Catalog" in log_text
+    assert "## Progress Events" in log_text
+    assert "## Verification Warnings" in log_text
     assert "mail.search" in log_text
     assert "mail.load_messages" in log_text
     assert full_body_sentinel in log_text
@@ -541,11 +554,47 @@ def test_agent_turn_can_expand_matter_package_after_mail_observation(tmp_path, m
     assert "matter.create_many" in [tool["name"] for tool in response.expanded_tools]
     assert response.tool_events[-1].feedback["source"] == "llm"
     assert response.tool_events[-1].result["output"]["matters_created"] == 1
+    progress_types = [event.type for event in response.progress_events]
+    assert "package_expanded" in progress_types
+    assert "tool_feedback" in progress_types
+    assert response.progress_events[-1].type == "final_answer"
+    assert response.verification_warnings == []
 
     matters = app.state.runtime.list_matters(limit=10)
     assert len(matters.matters) == 1
     assert matters.matters[0].title == "ICA Student Pass appointment"
     assert matters.matters[0].source_links[0].source_id
+
+
+def test_agent_turn_warns_when_final_answer_claims_unsupported_calendar_action(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
+    get_settings.cache_clear()
+
+    app = create_app()
+    request = SimpleNamespace(app=app)
+    app.state.runtime.agent_turn_loop.llm_client = _UnsupportedCalendarClaimLLM()
+
+    response = run_agent_turn(
+        AgentTurnRequest(
+            session_id="session_unsupported_calendar_claim",
+            user_input="把明天的讲座加入日历。",
+        ),
+        request,
+    )
+
+    assert response.tool_events == []
+    assert response.answer == "我已把明天的讲座加入日历。"
+    assert [warning.code for warning in response.verification_warnings] == [
+        "unsupported_calendar_claim",
+    ]
+    assert response.progress_events[-1].type == "verification_warning"
+
+    log_text = Path(response.log_path or "").read_text(encoding="utf-8")
+    assert "unsupported_calendar_claim" in log_text
 
 
 def test_agent_turn_summarizes_context_window_with_llm_when_full(tmp_path, monkeypatch):
@@ -659,6 +708,36 @@ class _RateLimitedThenWorkingLLM:
             content = "LLM final answer after retry."
         return LLMResponse(
             provider="fake_llm",
+            status="completed",
+            content=content,
+            prompt_summary=prompt_summary,
+        )
+
+
+class _UnsupportedCalendarClaimLLM:
+    def complete_text(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        prompt_summary: str,
+        temperature: float = 0.0,
+        max_output_tokens: int | None = None,
+    ) -> LLMResponse:
+        if "Choose at most one tool package" in system_prompt:
+            content = json.dumps(
+                {
+                    "selected_package": None,
+                    "reason": "Claiming a calendar write without a tool for verifier test.",
+                    "search_query": "",
+                }
+            )
+        elif "using only the provided session context window" in system_prompt:
+            content = json.dumps({"answer": "我已把明天的讲座加入日历。"})
+        else:
+            content = "Unexpected prompt."
+        return LLMResponse(
+            provider="fake_unsupported_calendar_claim_llm",
             status="completed",
             content=content,
             prompt_summary=prompt_summary,

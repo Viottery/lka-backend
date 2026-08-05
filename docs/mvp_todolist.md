@@ -119,6 +119,11 @@ Urgent track 的阶段目标：
 - 事务管理独立于邮件。`MatterService` 保存任务、事件、待办和提醒候选项；邮件、trace、
   文件和后续日历对象都只能作为 `source_link` 关联到 matter。Agent 从邮件归纳事务时，
   必须通过通用 loop 先读取证据，再选择 `matter` tools 写入或更新。
+- Agent turn 会输出本地生成的 `progress_events`，用于展示 package 选择、模型过程文本、
+  工具开始 / 完成、工具反馈、最终回答和校验 warning；这些运行过程不进入上下文窗口。
+- Agent turn 已有轻量最终回答校验，当前只记录 `verification_warnings`，不自动改写答案。
+  Matter tools 的 schema 已补充 required fields、allowed values 和 examples，decision
+  prompt 会要求模型遵循这些合同，并在有重复风险时先检索已有 matters。
 - 每次 Agent turn 都会注入 `current_time`，并可按需调用 `runtime.now`；相对时间解析
   应优先基于这个确定性上下文，而不是让 LLM 猜当前日期。
 - Agent 不应默认拥有裸数据库写权限。未来可以通过受控 DB inspection / query tools 让它读取

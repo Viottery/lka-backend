@@ -77,6 +77,25 @@ class AgentTurnDecisionEvent(BaseModel):
     raw_output: str | None = None
 
 
+class AgentTurnProgressEvent(BaseModel):
+    event_index: int
+    created_at: str
+    type: str
+    message: str
+    stage: str | None = None
+    tool_name: str | None = None
+    package_name: str | None = None
+    status: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentTurnVerificationWarning(BaseModel):
+    code: str
+    message: str
+    severity: str = "warning"
+    evidence: dict[str, Any] = Field(default_factory=dict)
+
+
 class AgentTurnResult(BaseModel):
     session_id: str
     trace_id: str
@@ -87,6 +106,8 @@ class AgentTurnResult(BaseModel):
     expanded_tools: list[dict[str, Any]] = Field(default_factory=list)
     decision_events: list[AgentTurnDecisionEvent] = Field(default_factory=list)
     tool_events: list[AgentTurnToolEvent] = Field(default_factory=list)
+    progress_events: list[AgentTurnProgressEvent] = Field(default_factory=list)
+    verification_warnings: list[AgentTurnVerificationWarning] = Field(default_factory=list)
     llm_events: list[AgentTurnLLMEvent] = Field(default_factory=list)
     log_path: str | None = None
 
@@ -153,6 +174,7 @@ class AgentTurnLoop:
         ]
         llm_events: list[AgentTurnLLMEvent] = []
         decision_events: list[AgentTurnDecisionEvent] = []
+        progress_events: list[AgentTurnProgressEvent] = []
         route = self._route(
             user_input=user_input,
             package_catalog=package_catalog,
@@ -161,6 +183,19 @@ class AgentTurnLoop:
             decision_events=decision_events,
         )
         selected_package = route.get("selected_package")
+        self._append_progress(
+            progress_events,
+            type="package_selected" if isinstance(selected_package, str) else "no_package",
+            stage="route",
+            package_name=selected_package if isinstance(selected_package, str) else None,
+            status="completed",
+            message=(
+                f"Selected `{selected_package}` package."
+                if isinstance(selected_package, str)
+                else "No tool package selected; answering from context if possible."
+            ),
+            metadata={"reason": route.get("reason")},
+        )
         tool_events: list[AgentTurnToolEvent] = []
         expanded_tools: list[dict[str, Any]] = []
         answer = ""
@@ -178,6 +213,7 @@ class AgentTurnLoop:
                 tool_events=tool_events,
                 llm_events=llm_events,
                 decision_events=decision_events,
+                progress_events=progress_events,
                 expanded_tools=expanded_tools,
                 selected_package=selected_package,
             )
@@ -211,6 +247,27 @@ class AgentTurnLoop:
                     reason="No supported package was selected.",
                 )
 
+        self._append_progress(
+            progress_events,
+            type="final_answer",
+            stage="answer",
+            status="completed",
+            message=self._short_text(answer),
+        )
+        verification_warnings = self._verify_final_answer(
+            answer=answer,
+            tool_events=tool_events,
+        )
+        for warning in verification_warnings:
+            self._append_progress(
+                progress_events,
+                type="verification_warning",
+                stage="verify",
+                status=warning.severity,
+                message=warning.message,
+                metadata=warning.model_dump(mode="json"),
+            )
+
         updated_context_window = self.session_service.record_context_exchange(
             session_id=session.session_id,
             user_input=user_input,
@@ -235,6 +292,8 @@ class AgentTurnLoop:
             expanded_tools=expanded_tools,
             decision_events=decision_events,
             tool_events=tool_events,
+            progress_events=progress_events,
+            verification_warnings=verification_warnings,
             llm_events=llm_events,
         )
         log_path = self._write_log(result=result, user_input=user_input)
@@ -256,6 +315,13 @@ class AgentTurnLoop:
                     event.model_dump(mode="json") for event in decision_events
                 ],
                 "tool_events": [event.model_dump(mode="json") for event in tool_events],
+                "progress_events": [
+                    event.model_dump(mode="json") for event in progress_events
+                ],
+                "verification_warnings": [
+                    warning.model_dump(mode="json")
+                    for warning in verification_warnings
+                ],
             },
         )
         return result
@@ -455,6 +521,7 @@ class AgentTurnLoop:
         tool_events: list[AgentTurnToolEvent],
         llm_events: list[AgentTurnLLMEvent],
         decision_events: list[AgentTurnDecisionEvent],
+        progress_events: list[AgentTurnProgressEvent],
         expanded_tools: list[dict[str, Any]],
         selected_package: str,
     ) -> str:
@@ -467,6 +534,7 @@ class AgentTurnLoop:
                 tool_events=tool_events,
                 llm_events=llm_events,
                 decision_events=decision_events,
+                progress_events=progress_events,
                 expanded_tools=expanded_tools,
                 selected_package=selected_package,
             )
@@ -491,6 +559,7 @@ class AgentTurnLoop:
             context=context,
             tool_events=tool_events,
             decision_events=decision_events,
+            progress_events=progress_events,
         )
 
     def _run_mail_tools_locally(
@@ -501,6 +570,7 @@ class AgentTurnLoop:
         context: ToolContext,
         tool_events: list[AgentTurnToolEvent],
         decision_events: list[AgentTurnDecisionEvent],
+        progress_events: list[AgentTurnProgressEvent],
     ) -> str:
         query = str(route.get("search_query") or user_input)
         self._record_decision(
@@ -516,6 +586,7 @@ class AgentTurnLoop:
             tool_input={"query": query, "limit": 8},
             context=context,
             tool_events=tool_events,
+            progress_events=progress_events,
         )
         messages = search_result.output.get("messages", [])
         message_ids = [
@@ -548,6 +619,7 @@ class AgentTurnLoop:
             tool_input=load_input,
             context=context,
             tool_events=tool_events,
+            progress_events=progress_events,
         )
         loaded_messages = [
             message
@@ -574,6 +646,7 @@ class AgentTurnLoop:
         tool_events: list[AgentTurnToolEvent],
         llm_events: list[AgentTurnLLMEvent],
         decision_events: list[AgentTurnDecisionEvent],
+        progress_events: list[AgentTurnProgressEvent],
         expanded_tools: list[dict[str, Any]],
         selected_package: str,
     ) -> str | None:
@@ -633,6 +706,26 @@ class AgentTurnLoop:
                 else None,
                 step_index=step_index + 1,
             )
+            assistant_message = (
+                decision.get("assistant_message")
+                if isinstance(decision.get("assistant_message"), str)
+                else None
+            )
+            if assistant_message:
+                self._append_progress(
+                    progress_events,
+                    type="assistant_message",
+                    stage="decision",
+                    status="completed",
+                    tool_name=decision.get("tool_name")
+                    if isinstance(decision.get("tool_name"), str)
+                    else None,
+                    package_name=decision.get("package_name")
+                    if isinstance(decision.get("package_name"), str)
+                    else None,
+                    message=self._short_text(assistant_message),
+                    metadata={"action": action, "step_index": step_index + 1},
+                )
 
             if action == "answer":
                 answer = str(decision.get("answer") or "").strip()
@@ -656,6 +749,15 @@ class AgentTurnLoop:
                             "error": "Tool package is not registered.",
                         }
                     )
+                    self._append_progress(
+                        progress_events,
+                        type="package_expand_rejected",
+                        stage="decision",
+                        package_name=package_name,
+                        status="rejected",
+                        message=f"Rejected package expansion for `{package_name}`.",
+                        metadata={"error": "Tool package is not registered."},
+                    )
                     continue
                 if package_name in expanded_package_names:
                     observations.append(
@@ -666,26 +768,43 @@ class AgentTurnLoop:
                             "message": "Tool package was already expanded.",
                         }
                     )
+                    self._append_progress(
+                        progress_events,
+                        type="package_expanded",
+                        stage="decision",
+                        package_name=package_name,
+                        status="completed",
+                        message=f"`{package_name}` package was already expanded.",
+                    )
                     continue
                 new_tools = self._tool_payloads_for_package(package_name)
                 expanded_tools.extend(new_tools)
                 expanded_package_names.add(package_name)
-                allowed_tool_names.update(
+                new_tool_names = [
                     str(tool.get("name"))
                     for tool in new_tools
                     if isinstance(tool.get("name"), str)
-                )
+                ]
+                allowed_tool_names.update(new_tool_names)
                 observations.append(
                     {
                         "action": "expand_package",
                         "package_name": package_name,
                         "status": "completed",
-                        "expanded_tools": [
-                            tool.get("name")
-                            for tool in new_tools
-                            if isinstance(tool.get("name"), str)
-                        ],
+                        "expanded_tools": new_tool_names,
                     }
+                )
+                self._append_progress(
+                    progress_events,
+                    type="package_expanded",
+                    stage="decision",
+                    package_name=package_name,
+                    status="completed",
+                    message=(
+                        f"Expanded `{package_name}` package with "
+                        f"{len(new_tool_names)} tools."
+                    ),
+                    metadata={"expanded_tools": new_tool_names},
                 )
                 continue
 
@@ -706,6 +825,15 @@ class AgentTurnLoop:
                         "error": "Tool is not available in the expanded package.",
                     }
                 )
+                self._append_progress(
+                    progress_events,
+                    type="tool_rejected",
+                    stage="decision",
+                    tool_name=tool_name,
+                    status="rejected",
+                    message=f"Rejected unavailable tool `{tool_name}`.",
+                    metadata={"allowed_tools": sorted(allowed_tool_names)},
+                )
                 continue
 
             tool_result = self._execute_tool(
@@ -713,6 +841,7 @@ class AgentTurnLoop:
                 tool_input=tool_input,
                 context=context,
                 tool_events=tool_events,
+                progress_events=progress_events,
             )
             feedback = self._check_tool_result_with_llm(
                 user_input=user_input,
@@ -723,6 +852,15 @@ class AgentTurnLoop:
             )
             if tool_events:
                 tool_events[-1].feedback = feedback
+            self._append_progress(
+                progress_events,
+                type="tool_feedback",
+                stage="tool_result_check",
+                tool_name=tool_name,
+                status=str(feedback.get("status") or ""),
+                message=str(feedback.get("message") or f"{tool_name} feedback recorded."),
+                metadata=feedback,
+            )
             observations.append(
                 {
                     "tool_name": tool_name,
@@ -774,7 +912,15 @@ class AgentTurnLoop:
             "such as mail message ids. If the currently expanded tools are insufficient, "
             "use operation.type expand_package with package_name set to one registered package; "
             "do not call tools from a package until that package appears in "
-            "expanded_package_names. Use the current_time in context to "
+            "expanded_package_names. Follow each expanded tool input_schema exactly: include "
+            "required fields, respect allowed_values/enums, and do not invent unsupported "
+            "field values. For matter writes, status must be one of open, in_progress, "
+            "waiting, done, cancelled; priority must be one of low, normal, high, urgent. "
+            "Do not use scheduled, todo, medium, or other unsupported values. Before "
+            "creating matters from extracted evidence, search existing matters when there "
+            "is a realistic chance of duplicates. If matter.search returns similar items, "
+            "choose update, skip/no_op, or create only with an explicit reason that the item "
+            "is distinct. Use the current_time in context to "
             "resolve relative dates. For direct time questions, use runtime.now or answer from "
             "current_time if it is sufficient. Return only strict JSON using this envelope: "
             '{"assistant_message":"short user-visible progress text or final answer",'
@@ -1192,8 +1338,19 @@ class AgentTurnLoop:
         tool_input: dict[str, Any],
         context: ToolContext,
         tool_events: list[AgentTurnToolEvent],
+        progress_events: list[AgentTurnProgressEvent] | None = None,
     ) -> ToolResult:
         selected_at = _now_iso()
+        if progress_events is not None:
+            self._append_progress(
+                progress_events,
+                type="tool_started",
+                stage="tool_execute",
+                tool_name=tool_name,
+                status="running",
+                message=f"Calling `{tool_name}`.",
+                metadata={"input": tool_input},
+            )
         result = self.tool_executor.execute(
             invocation_id=_stable_id("tool_invocation", context.trace_id, tool_name, selected_at),
             tool_name=tool_name,
@@ -1210,7 +1367,124 @@ class AgentTurnLoop:
                 feedback=self._local_tool_feedback(tool_name=tool_name, result=result),
             )
         )
+        if progress_events is not None:
+            self._append_progress(
+                progress_events,
+                type="tool_completed",
+                stage="tool_execute",
+                tool_name=tool_name,
+                status=result.status,
+                message=self._tool_progress_message(tool_name=tool_name, result=result),
+                metadata={"result": result.model_dump(mode="json")},
+            )
         return result
+
+    def _append_progress(
+        self,
+        progress_events: list[AgentTurnProgressEvent],
+        *,
+        type: str,
+        message: str,
+        stage: str | None = None,
+        tool_name: str | None = None,
+        package_name: str | None = None,
+        status: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        progress_events.append(
+            AgentTurnProgressEvent(
+                event_index=len(progress_events) + 1,
+                created_at=_now_iso(),
+                type=type,
+                message=message,
+                stage=stage,
+                tool_name=tool_name,
+                package_name=package_name,
+                status=status,
+                metadata=metadata or {},
+            )
+        )
+
+    def _tool_progress_message(self, *, tool_name: str, result: ToolResult) -> str:
+        if result.status != "completed":
+            return f"`{tool_name}` failed: {result.error or 'unknown error'}"
+        output = result.output
+        if tool_name == "mail.search":
+            messages = output.get("messages")
+            count = len(messages) if isinstance(messages, list) else 0
+            return f"`{tool_name}` completed with {count} matched messages."
+        if tool_name == "mail.load_messages":
+            messages = output.get("messages")
+            count = len(messages) if isinstance(messages, list) else 0
+            return f"`{tool_name}` completed with {count} loaded messages."
+        if tool_name == "matter.create_many":
+            count = output.get("matters_created")
+            return f"`{tool_name}` completed with {count or 0} created matters."
+        if tool_name == "matter.create":
+            matter = output.get("matter")
+            title = matter.get("title") if isinstance(matter, dict) else None
+            return (
+                f"`{tool_name}` completed for `{title}`."
+                if title
+                else f"`{tool_name}` completed."
+            )
+        return f"`{tool_name}` completed."
+
+    def _short_text(self, value: str, *, limit: int = 500) -> str:
+        compact = " ".join(value.strip().split())
+        if len(compact) <= limit:
+            return compact
+        return compact[: limit - 3] + "..."
+
+    def _verify_final_answer(
+        self,
+        *,
+        answer: str,
+        tool_events: list[AgentTurnToolEvent],
+    ) -> list[AgentTurnVerificationWarning]:
+        successful_tools = {
+            event.tool_name
+            for event in tool_events
+            if event.result.get("status") == "completed"
+        }
+        warnings: list[AgentTurnVerificationWarning] = []
+        lower_answer = answer.lower()
+        if ("日历" in answer or "calendar" in lower_answer) and not any(
+            tool_name.startswith("calendar.") for tool_name in successful_tools
+        ):
+            warnings.append(
+                AgentTurnVerificationWarning(
+                    code="unsupported_calendar_claim",
+                    message=(
+                        "Final answer mentions a calendar action, but no calendar tool "
+                        "was executed in this turn."
+                    ),
+                    evidence={"successful_tools": sorted(successful_tools)},
+                )
+            )
+
+        matter_claim_markers = [
+            "已创建",
+            "已写入",
+            "加入本地事务",
+            "写入本地事务",
+            "创建事务",
+        ]
+        matter_write_tools = {"matter.create", "matter.create_many", "mail.persist_matters"}
+        if any(marker in answer for marker in matter_claim_markers) and not (
+            successful_tools & matter_write_tools
+        ):
+            warnings.append(
+                AgentTurnVerificationWarning(
+                    code="unsupported_matter_write_claim",
+                    message=(
+                        "Final answer claims a local matter was written, but no matter "
+                        "write tool completed in this turn."
+                    ),
+                    evidence={"successful_tools": sorted(successful_tools)},
+                )
+            )
+        return warnings
 
     def _local_tool_feedback(
         self,
@@ -1606,6 +1880,21 @@ class AgentTurnLoop:
             "## Tool Events",
             "",
             self._json_block([event.model_dump(mode="json") for event in result.tool_events]),
+            "",
+            "## Progress Events",
+            "",
+            self._json_block(
+                [event.model_dump(mode="json") for event in result.progress_events]
+            ),
+            "",
+            "## Verification Warnings",
+            "",
+            self._json_block(
+                [
+                    warning.model_dump(mode="json")
+                    for warning in result.verification_warnings
+                ]
+            ),
             "",
             "## LLM Events",
             "",

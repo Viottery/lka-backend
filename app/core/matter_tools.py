@@ -18,6 +18,74 @@ MATTER_PACKAGE = ToolPackageSpec(
     requires_expansion=True,
 )
 
+MATTER_STATUS_VALUES = ["open", "in_progress", "waiting", "done", "cancelled"]
+MATTER_PRIORITY_VALUES = ["low", "normal", "high", "urgent"]
+MATTER_SOURCE_LINK_SCHEMA = {
+    "type": "object",
+    "required": ["source_type", "source_id", "reason"],
+    "properties": {
+        "source_type": {
+            "type": "string",
+            "description": "Evidence source type, for example mail_message.",
+        },
+        "source_id": {
+            "type": "string",
+            "description": "Stable id of the evidence source.",
+        },
+        "reason": {
+            "type": "string",
+            "description": "Why this source supports the matter.",
+        },
+    },
+}
+MATTER_CREATE_SCHEMA = {
+    "type": "object",
+    "required": ["title", "summary"],
+    "properties": {
+        "title": {"type": "string"},
+        "summary": {"type": "string"},
+        "status": {
+            "type": "string",
+            "allowed_values": MATTER_STATUS_VALUES,
+            "default": "open",
+        },
+        "priority": {
+            "type": "string",
+            "allowed_values": MATTER_PRIORITY_VALUES,
+            "default": "normal",
+        },
+        "due_at": {
+            "type": ["string", "null"],
+            "description": "ISO 8601 datetime with timezone when the time is known.",
+        },
+        "tags": {"type": "array", "items": {"type": "string"}},
+        "source_links": {
+            "type": "array",
+            "items": MATTER_SOURCE_LINK_SCHEMA,
+            "description": "Evidence links such as loaded mail message ids.",
+        },
+        "metadata": {"type": "object"},
+    },
+    "examples": [
+        {
+            "title": "ICA Student Pass appointment",
+            "summary": "Attend ICA formalities on 2026-08-14 13:00.",
+            "status": "open",
+            "priority": "normal",
+            "due_at": "2026-08-14T13:00:00+08:00",
+            "tags": ["ICA"],
+            "source_links": [
+                {
+                    "source_type": "mail_message",
+                    "source_id": "mail_msg_xxx",
+                    "reason": "Extracted from loaded ICA email.",
+                }
+            ],
+            "metadata": {"created_from": "agent_turn"},
+        }
+    ],
+}
+
 
 class CreateMatterTool:
     def __init__(self, matter_service: MatterService) -> None:
@@ -31,16 +99,7 @@ class CreateMatterTool:
         risk="medium",
         requires_confirmation=False,
         side_effects=["write_local_db"],
-        input_schema={
-            "title": "string",
-            "summary": "string",
-            "status": "string",
-            "priority": "string",
-            "due_at": "string|null",
-            "tags": "array",
-            "source_links": "array",
-            "metadata": "object",
-        },
+        input_schema=MATTER_CREATE_SCHEMA,
         output_schema={"matter": "object"},
     )
 
@@ -68,7 +127,20 @@ class CreateManyMattersTool:
         risk="medium",
         requires_confirmation=False,
         side_effects=["write_local_db"],
-        input_schema={"matters": "array"},
+        input_schema={
+            "type": "object",
+            "required": ["matters"],
+            "properties": {
+                "matters": {
+                    "type": "array",
+                    "items": MATTER_CREATE_SCHEMA,
+                    "description": (
+                        "Batch of independent matters extracted from explicit evidence."
+                    ),
+                }
+            },
+            "examples": [{"matters": MATTER_CREATE_SCHEMA["examples"]}],
+        },
         output_schema={"matters_created": "integer", "matters": "array"},
     )
 
@@ -101,7 +173,14 @@ class SearchMattersTool:
         risk="low",
         requires_confirmation=False,
         side_effects=["read_local_db"],
-        input_schema={"query": "string", "limit": "integer"},
+        input_schema={
+            "type": "object",
+            "required": ["query"],
+            "properties": {
+                "query": {"type": "string"},
+                "limit": {"type": "integer", "default": 10, "minimum": 1},
+            },
+        },
         output_schema={"query": "string", "matters": "array"},
     )
 
@@ -130,7 +209,16 @@ class ListMattersTool:
         risk="low",
         requires_confirmation=False,
         side_effects=["read_local_db"],
-        input_schema={"limit": "integer", "status": "string|null"},
+        input_schema={
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "default": 50, "minimum": 1},
+                "status": {
+                    "type": ["string", "null"],
+                    "allowed_values": MATTER_STATUS_VALUES,
+                },
+            },
+        },
         output_schema={"matters": "array"},
     )
 
@@ -161,14 +249,24 @@ class UpdateMatterTool:
         requires_confirmation=False,
         side_effects=["write_local_db"],
         input_schema={
-            "matter_id": "string",
-            "title": "string|null",
-            "summary": "string|null",
-            "status": "string|null",
-            "priority": "string|null",
-            "due_at": "string|null",
-            "tags": "array|null",
-            "metadata": "object|null",
+            "type": "object",
+            "required": ["matter_id"],
+            "properties": {
+                "matter_id": {"type": "string"},
+                "title": {"type": ["string", "null"]},
+                "summary": {"type": ["string", "null"]},
+                "status": {
+                    "type": ["string", "null"],
+                    "allowed_values": MATTER_STATUS_VALUES,
+                },
+                "priority": {
+                    "type": ["string", "null"],
+                    "allowed_values": MATTER_PRIORITY_VALUES,
+                },
+                "due_at": {"type": ["string", "null"]},
+                "tags": {"type": ["array", "null"], "items": {"type": "string"}},
+                "metadata": {"type": ["object", "null"]},
+            },
         },
         output_schema={"matter": "object"},
     )
@@ -207,10 +305,12 @@ class LinkMatterSourceTool:
         requires_confirmation=False,
         side_effects=["write_local_db"],
         input_schema={
-            "matter_id": "string",
-            "source_type": "string",
-            "source_id": "string",
-            "reason": "string",
+            "type": "object",
+            "required": ["matter_id", "source_type", "source_id", "reason"],
+            "properties": {
+                "matter_id": {"type": "string"},
+                **MATTER_SOURCE_LINK_SCHEMA["properties"],
+            },
         },
         output_schema={"matter": "object"},
     )

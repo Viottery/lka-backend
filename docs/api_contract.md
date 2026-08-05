@@ -217,6 +217,8 @@ POST /agent/turn
   "expanded_tools": [],
   "decision_events": [],
   "tool_events": [],
+  "progress_events": [],
+  "verification_warnings": [],
   "llm_events": [],
   "log_path": "data/agent_logs/agent_turn_xxx.md"
 }
@@ -252,6 +254,16 @@ POST /agent/turn
 - 每个真实 `tool_event` 都包含 `feedback`。反馈至少包含执行成功 / 失败状态和可读
   message；真实 LLM 可用时，Agent 还会记录 `tool_result_check` LLM 事件，用来确认工具
   结果是否符合上一条工具调用决策。
+- `progress_events` 是由 harness 本地代码生成的自然语言运行过程流，不调用 LLM。它会记录
+  package 选择、模型过程文本、package 展开、工具开始 / 完成、工具反馈、最终回答和校验
+  warning，供前端展示“系统正在做什么”。
+- `verification_warnings` 是本地最终回答检查结果。当前只做 warning，不自动改写 LLM
+  最终回答；例如回答声称“已加入日历”但本轮没有任何 calendar tool 完成时，会记录
+  `unsupported_calendar_claim`。
+- 展开工具时，`expanded_tools[*].input_schema` 会尽量暴露 required fields、allowed values
+  和 examples。LLM decision prompt 要求模型严格遵循这些 schema；matter 写入的 `status`
+  仅允许 `open`、`in_progress`、`waiting`、`done`、`cancelled`，`priority` 仅允许
+  `low`、`normal`、`high`、`urgent`。
 - 每个 session 维护一个本地 context window，默认预算为 `65536` token。Agent prompt
   只注入前文摘要和近期 user / agent 问答；完整工具调用、LLM prompt/output 和运行过程
   保存在本地 run log，不进入后续 prompt。
@@ -267,7 +279,8 @@ POST /agent/turn
   将旧 summary 和除最近两条消息外的历史问答重写为新 summary，原文只保留最近两条消息。
 - 每次调用会显式追加 user / agent session message，并写入本地 markdown run log。
 - run log 由代码模板生成，包含用户输入、package catalog、逐步展开工具、决策事件、
-  工具调用输入输出、工具反馈、LLM 完整 prompt / output / 错误分类和最终回答。
+  工具调用输入输出、工具反馈、progress events、verification warnings、LLM 完整 prompt /
+  output / 错误分类和最终回答。
 - 未配置真实 LLM 或 LLM 调用失败时，Agent turn 会降级到本地 heuristic，保持链路可运行。
   当前本地 heuristic 主要覆盖 mail package；matter/runtime 的多步骤决策需要真实 LLM。
 

@@ -102,6 +102,10 @@ def test_matter_tools_and_runtime_now_are_registered(tmp_path, monkeypatch):
     matter_tool_names = {
         tool.name for tool in app.state.runtime.tool_registry.list_tools(package="matter")
     }
+    matter_tool_specs = {
+        tool.name: tool
+        for tool in app.state.runtime.tool_registry.list_tools(package="matter")
+    }
     runtime_tool_names = {
         tool.name for tool in app.state.runtime.tool_registry.list_tools(package="runtime")
     }
@@ -115,6 +119,23 @@ def test_matter_tools_and_runtime_now_are_registered(tmp_path, monkeypatch):
         "matter.link_source",
     }
     assert runtime_tool_names == {"runtime.now"}
+    create_schema = matter_tool_specs["matter.create"].input_schema
+    create_many_schema = matter_tool_specs["matter.create_many"].input_schema
+    assert create_schema["required"] == ["title", "summary"]
+    assert create_schema["properties"]["status"]["allowed_values"] == [
+        "open",
+        "in_progress",
+        "waiting",
+        "done",
+        "cancelled",
+    ]
+    assert create_schema["properties"]["priority"]["allowed_values"] == [
+        "low",
+        "normal",
+        "high",
+        "urgent",
+    ]
+    assert create_many_schema["properties"]["matters"]["items"] == create_schema
 
     create_result = app.state.runtime.tool_executor.execute(
         invocation_id="matter_create_001",
