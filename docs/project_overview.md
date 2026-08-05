@@ -181,6 +181,22 @@ mail.match_related（后续）
 mail.summarize（后续）
 ```
 
+例如 `matter` package 展开后才暴露：
+
+```text
+matter.create
+matter.search
+matter.list
+matter.update
+matter.link_source
+```
+
+例如 `runtime` package 展开后才暴露：
+
+```text
+runtime.now
+```
+
 这样可以避免一次性把大量工具 schema 塞进上下文，也让后续 skill / plugin / MCP 能力更容易按领域组织。
 
 ### 3.4.2 不维护全局 intent 枚举
@@ -226,6 +242,14 @@ Agent 需要输出的是当前步骤可执行的结构化判断，而不是把�
 ```
 
 这些职责属于 Agent 的会话与决策-执行-反馈 loop。邮件能力应通过工具包装给 Agent 调用，LLM 推理应发生在 Agent Loop 中。
+
+事务管理也遵循同样边界。`MatterService` 是独立于邮件的数据服务，负责本地事务、任务、
+事件和提醒候选项的持久化、检索、状态更新和来源链接。邮件只作为 `source_link` 之一
+关联到 matter；matter 不应被建模为邮件内部状态。Agent 如果需要从邮件归纳事务，应先用
+mail tools 读取证据，再由通用 Agent Loop 决定是否调用 matter tools 写入或更新事务。
+
+实时时间属于 runtime context。后端应提供确定性的 `runtime.now` 工具，同时在每次 Agent
+turn 的 context window 中注入当前 UTC / 本地时间 / 时区 / 日期，帮助 LLM 处理相对时间。
 
 ### 3.4.4 Agent Run Log
 

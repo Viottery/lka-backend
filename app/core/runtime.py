@@ -22,6 +22,23 @@ from app.core.mail_tools import (
     SearchMailTool,
     SyncMailTool,
 )
+from app.core.matter_tools import (
+    MATTER_PACKAGE,
+    CreateMatterTool,
+    LinkMatterSourceTool,
+    ListMattersTool,
+    SearchMattersTool,
+    UpdateMatterTool,
+)
+from app.core.matters import (
+    MatterCreateInput,
+    MatterList,
+    MatterRecord,
+    MatterSearchResult,
+    MatterService,
+    MatterSourceLinkInput,
+    MatterUpdateInput,
+)
 from app.core.mail import (
     MailAccountInput,
     MailImportResult,
@@ -38,6 +55,7 @@ from app.core.outlook import (
     OutlookSyncResult,
 )
 from app.core.retrieval import LocalDebugRetrievalProvider
+from app.core.runtime_tools import RUNTIME_PACKAGE, RuntimeNowTool
 from app.core.runtime_loop import RuntimeDebugRun, RuntimeLoop
 from app.core.sessions import (
     AgentSessionDetail,
@@ -72,6 +90,7 @@ class LocalKnowledgeAgentRuntime:
         self.filesystem_scanner = FilesystemScanner(self.platform)
         self.session_service = SessionService(self._conn)
         self.mail_service = MailService(self._conn)
+        self.matter_service = MatterService(self._conn)
         self.local_app_config = settings.load_local_config()
         self.outlook_service = OutlookService(
             self._conn,
@@ -84,10 +103,18 @@ class LocalKnowledgeAgentRuntime:
         self.last_mail_sync_result: dict[str, Any] | None = None
         self.tool_registry = ToolRegistry()
         self.tool_registry.register_package(MAIL_PACKAGE)
+        self.tool_registry.register_package(MATTER_PACKAGE)
+        self.tool_registry.register_package(RUNTIME_PACKAGE)
         self.tool_registry.register_tool(SearchMailTool(self.mail_service))
         self.tool_registry.register_tool(LoadMailMessagesTool(self.mail_service))
         self.tool_registry.register_tool(PersistMailMattersTool(self.mail_service))
         self.tool_registry.register_tool(SyncMailTool(self.sync_outlook_mail))
+        self.tool_registry.register_tool(CreateMatterTool(self.matter_service))
+        self.tool_registry.register_tool(SearchMattersTool(self.matter_service))
+        self.tool_registry.register_tool(ListMattersTool(self.matter_service))
+        self.tool_registry.register_tool(UpdateMatterTool(self.matter_service))
+        self.tool_registry.register_tool(LinkMatterSourceTool(self.matter_service))
+        self.tool_registry.register_tool(RuntimeNowTool())
         self.tool_executor = ToolExecutor(self.tool_registry)
         self.agent_llm_client = build_text_llm_client(self.local_app_config.llm)
         self.agent_turn_loop = AgentTurnLoop(
@@ -279,6 +306,8 @@ class LocalKnowledgeAgentRuntime:
 
         return [
             CapabilityItem(name="mail", type="tool_package", risk="low_to_medium", requires_confirmation=False),
+            CapabilityItem(name="matter", type="tool_package", risk="low_to_medium", requires_confirmation=False),
+            CapabilityItem(name="runtime", type="tool_package", risk="low", requires_confirmation=False),
             CapabilityItem(name="summarize_folder", type="native_skill", risk="low", requires_confirmation=False),
             CapabilityItem(name="extract_tasks", type="native_skill", risk="low", requires_confirmation=False),
             CapabilityItem(name="organize_files", type="native_skill", risk="medium", requires_confirmation=True),
@@ -375,6 +404,49 @@ class LocalKnowledgeAgentRuntime:
         """Return locally extracted mail matters."""
 
         return self.mail_service.list_matters(limit=limit)
+
+    def create_matter(self, *, payload: MatterCreateInput) -> MatterRecord:
+        """Persist an independent local matter."""
+
+        return self.matter_service.create_matter(payload)
+
+    def search_matters(self, *, query: str, limit: int = 10) -> MatterSearchResult:
+        """Search independent local matters."""
+
+        return self.matter_service.search_matters(query=query, limit=limit)
+
+    def list_matters(
+        self,
+        *,
+        limit: int = 50,
+        status: str | None = None,
+    ) -> MatterList:
+        """List independent local matters."""
+
+        return self.matter_service.list_matters(limit=limit, status=status)
+
+    def update_matter(
+        self,
+        *,
+        matter_id: str,
+        payload: MatterUpdateInput,
+    ) -> MatterRecord:
+        """Update an independent local matter."""
+
+        return self.matter_service.update_matter(matter_id=matter_id, payload=payload)
+
+    def link_matter_source(
+        self,
+        *,
+        matter_id: str,
+        source_link: MatterSourceLinkInput,
+    ) -> MatterRecord:
+        """Link an independent matter to a source object."""
+
+        return self.matter_service.link_source(
+            matter_id=matter_id,
+            source_link=source_link,
+        )
 
     def start_outlook_auth(self) -> OutlookAuthStartResult:
         """Start Microsoft Graph Device Code Flow for Outlook read-only sync."""

@@ -23,6 +23,7 @@ from app.core.llm import (
     LLMTimeoutError,
     TextLLMClient,
 )
+from app.core.runtime_tools import current_time_payload
 from app.core.sessions import SessionService
 from app.core.sessions import SessionRecentMessage
 from app.core.tools import ToolContext, ToolExecutor
@@ -136,6 +137,7 @@ class AgentTurnLoop:
             token_budget=self.session_context_token_budget,
         )
         context_window_payload = context_window.model_dump(mode="json")
+        context_window_payload["current_time"] = current_time_payload()
         cached_mail_messages = self._cached_mail_messages_from_session(
             session_id=session.session_id,
         )
@@ -160,12 +162,12 @@ class AgentTurnLoop:
         expanded_tools: list[dict[str, Any]] = []
         answer = ""
 
-        if selected_package == "mail":
+        if isinstance(selected_package, str):
             expanded_tools = [
                 tool.model_dump(mode="json")
-                for tool in self.tool_executor.registry.list_tools(package="mail")
+                for tool in self.tool_executor.registry.list_tools(package=selected_package)
             ]
-            answer = self._run_mail_tools(
+            answer = self._run_package_tools(
                 user_input=user_input,
                 route=route,
                 context_window=context_window_payload,
@@ -174,6 +176,7 @@ class AgentTurnLoop:
                 llm_events=llm_events,
                 decision_events=decision_events,
                 expanded_tools=expanded_tools,
+                selected_package=selected_package,
             )
         else:
             answer = self._answer_from_context_with_llm(
@@ -278,8 +281,9 @@ class AgentTurnLoop:
             "tool package for the current turn. Do not choose concrete tools yet. Return only "
             "null when the provided session context window, including cached local resources, "
             "is sufficient to answer without another tool call. Return only "
-            'strict JSON: {"selected_package":"mail|null","reason":"...",'
-            '"search_query":"..."}'
+            'strict JSON: {"selected_package":"mail|matter|runtime|null","reason":"...",'
+            '"search_query":"..."} Use mail for email evidence, matter for local tasks/events, '
+            "and runtime for direct current-time questions."
         )
         user_prompt = json.dumps(
             {
@@ -330,7 +334,13 @@ class AgentTurnLoop:
                 raw_output=response.content,
             )
             return route
-        if parsed.get("selected_package") == "mail":
+        selected_package = parsed.get("selected_package")
+        available_packages = {
+            str(package.get("name"))
+            for package in package_catalog
+            if isinstance(package.get("name"), str)
+        }
+        if isinstance(selected_package, str) and selected_package in available_packages:
             self._record_route_decision(
                 decision_events,
                 source="llm",
@@ -382,11 +392,43 @@ class AgentTurnLoop:
             "日程",
             "通知",
         ]
+        matter_markers = [
+            "matter",
+            "task",
+            "todo",
+            "event",
+            "事务",
+            "事项",
+            "待办",
+            "任务",
+            "提醒",
+            "日程管理",
+        ]
+        runtime_markers = [
+            "current time",
+            "now",
+            "today",
+            "现在几点",
+            "当前时间",
+            "今天日期",
+        ]
         if any(marker in lower for marker in mail_markers):
             return {
                 "selected_package": "mail",
                 "reason": "Local routing matched mail-related terms.",
                 "search_query": self._local_mail_search_query(user_input),
+            }
+        if any(marker in lower for marker in matter_markers):
+            return {
+                "selected_package": "matter",
+                "reason": "Local routing matched matter-related terms.",
+                "search_query": user_input,
+            }
+        if any(marker in lower for marker in runtime_markers):
+            return {
+                "selected_package": "runtime",
+                "reason": "Local routing matched runtime context terms.",
+                "search_query": "",
             }
         return {"selected_package": None, "reason": "No local routing marker matched."}
 
@@ -400,7 +442,7 @@ class AgentTurnLoop:
             return "NTU schedule"
         return user_input
 
-    def _run_mail_tools(
+    def _run_package_tools(
         self,
         *,
         user_input: str,
@@ -411,6 +453,7 @@ class AgentTurnLoop:
         llm_events: list[AgentTurnLLMEvent],
         decision_events: list[AgentTurnDecisionEvent],
         expanded_tools: list[dict[str, Any]],
+        selected_package: str,
     ) -> str:
         if self.llm_client is not None:
             answer = self._run_llm_decision_loop(
@@ -422,9 +465,23 @@ class AgentTurnLoop:
                 llm_events=llm_events,
                 decision_events=decision_events,
                 expanded_tools=expanded_tools,
+                selected_package=selected_package,
             )
             if answer:
                 return answer
+        if selected_package != "mail":
+            answer = (
+                f"当前未配置可用 LLM，无法用本地 heuristic 完成 `{selected_package}` "
+                "package 的多步骤决策。"
+            )
+            self._record_decision(
+                decision_events,
+                source="local",
+                action="answer",
+                answer=answer,
+                reason="No local fallback is implemented for this package.",
+            )
+            return answer
         return self._run_mail_tools_locally(
             user_input=user_input,
             route=route,
@@ -515,6 +572,7 @@ class AgentTurnLoop:
         llm_events: list[AgentTurnLLMEvent],
         decision_events: list[AgentTurnDecisionEvent],
         expanded_tools: list[dict[str, Any]],
+        selected_package: str,
     ) -> str | None:
         observations: list[dict[str, Any]] = []
         cached_observation = self._cached_mail_observation_from_context_window(
@@ -535,6 +593,7 @@ class AgentTurnLoop:
                 expanded_tools=expanded_tools,
                 observations=observations,
                 llm_events=llm_events,
+                selected_package=selected_package,
             )
             if decision is None:
                 return None
@@ -611,18 +670,25 @@ class AgentTurnLoop:
         expanded_tools: list[dict[str, Any]],
         observations: list[dict[str, Any]],
         llm_events: list[AgentTurnLLMEvent],
+        selected_package: str,
     ) -> dict[str, Any] | None:
         system_prompt = (
             "You are the Main Agent Brain for Local Knowledge Agent OS. Choose the next "
             "single action for this agent turn. You may call one available tool or answer. "
-            "Use tools when more local evidence is needed. For mail questions, normally "
+            f"The currently expanded package is {selected_package}. Use tools when more "
+            "local evidence or persistence is needed. For mail questions, normally "
             "call mail.search first, then mail.load_messages for relevant message ids, then "
             "answer from observations. If observations already contain cached mail messages "
             "from the same session and they are relevant, answer from that cache instead of "
             "calling mail.search or mail.load_messages again. Call mail.sync first only when "
             "the user asks to sync, asks for the latest/current mailbox state, or the local "
             "mail store may be stale for the requested answer; after mail.sync, continue with "
-            "mail.search and mail.load_messages as needed. Return only strict JSON in one of "
+            "mail.search and mail.load_messages as needed. For matter requests, use "
+            "matter.search or matter.list to inspect existing matters, matter.create to save "
+            "new tasks/events, matter.update to change status/fields, and matter.link_source "
+            "to attach evidence such as mail message ids. Use the current_time in context to "
+            "resolve relative dates. For direct time questions, use runtime.now or answer from "
+            "current_time if it is sufficient. Return only strict JSON in one of "
             "these forms: "
             '{"action":"call_tool","tool_name":"mail.sync","tool_input":{"folder":"Inbox",'
             '"limit":25,"max_pages":1},"reason":"..."}, '
@@ -630,6 +696,17 @@ class AgentTurnLoop:
             '"limit":8},"reason":"..."}, '
             '{"action":"call_tool","tool_name":"mail.load_messages","tool_input":'
             '{"message_ids":["..."]},"reason":"..."}, '
+            '{"action":"call_tool","tool_name":"matter.create","tool_input":{"title":"...",'
+            '"summary":"...","status":"open","priority":"normal","due_at":null,'
+            '"tags":[],"source_links":[],"metadata":{}},"reason":"..."}, '
+            '{"action":"call_tool","tool_name":"matter.search","tool_input":{"query":"...",'
+            '"limit":10},"reason":"..."}, '
+            '{"action":"call_tool","tool_name":"matter.list","tool_input":{"limit":20,'
+            '"status":null},"reason":"..."}, '
+            '{"action":"call_tool","tool_name":"matter.update","tool_input":{"matter_id":"...",'
+            '"status":"done"},"reason":"..."}, '
+            '{"action":"call_tool","tool_name":"runtime.now","tool_input":{"timezone":'
+            '"Asia/Shanghai"},"reason":"..."}, '
             '{"action":"answer","answer":"...","reason":"..."}'
         )
         user_prompt = json.dumps(

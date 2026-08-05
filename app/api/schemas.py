@@ -17,6 +17,14 @@ from app.core.mail import (
     MailMessageInput,
     MailSearchResult,
 )
+from app.core.matters import (
+    MatterCreateInput,
+    MatterList,
+    MatterRecord,
+    MatterSearchResult,
+    MatterSourceLinkInput,
+    MatterUpdateInput,
+)
 from app.core.outlook import (
     OutlookAuthCompleteResult,
     OutlookAuthStartResult,
@@ -158,8 +166,35 @@ class OutlookSyncResponse(OutlookSyncResult):
     pass
 
 
+class MatterCreateRequest(MatterCreateInput):
+    pass
+
+
+class MatterRecordResponse(MatterRecord):
+    pass
+
+
+class MatterListResponse(MatterList):
+    matters: list[MatterRecord]
+
+
+class MatterSearchResponse(MatterSearchResult):
+    pass
+
+
+class MatterUpdateRequest(MatterUpdateInput):
+    pass
+
+
+class MatterLinkSourceRequest(MatterSourceLinkInput):
+    pass
+
+
 __all__ = [
     "MailAccountInput",
     "MailAttachmentInput",
     "MailMessageInput",
+    "MatterCreateInput",
+    "MatterSourceLinkInput",
+    "MatterUpdateInput",
 ]

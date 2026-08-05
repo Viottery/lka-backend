@@ -114,6 +114,18 @@ GET /capabilities
       "requires_confirmation": false
     },
     {
+      "name": "matter",
+      "type": "tool_package",
+      "risk": "low_to_medium",
+      "requires_confirmation": false
+    },
+    {
+      "name": "runtime",
+      "type": "tool_package",
+      "risk": "low",
+      "requires_confirmation": false
+    },
+    {
       "name": "summarize_folder",
       "type": "native_skill",
       "risk": "low",
@@ -213,9 +225,12 @@ POST /agent/turn
 ### 设计说明
 
 - 这是第一版通用 Agent turn 入口，不是邮件专属 agent endpoint。
-- Agent 第一层只读取 Tool Package catalog；当前已实现的可展开 package 是 `mail`。
+- Agent 第一层只读取 Tool Package catalog；当前已实现的可展开 package 包括 `mail`、
+  `matter` 和 `runtime`。
 - 当 turn 判断用户目标需要本地邮件上下文时，才展开 `mail.search`、
-  `mail.load_messages`、`mail.sync`、`mail.persist_matters` 等具体工具。
+  `mail.load_messages`、`mail.sync`、`mail.persist_matters` 等具体工具；当目标是事务
+  管理时展开 `matter.create`、`matter.search`、`matter.list`、`matter.update`、
+  `matter.link_source`；当目标是直接读取环境时间时展开 `runtime.now`。
 - 展开 package 后，Agent 会进入单次 turn 内的 step-limited loop：每一步生成一个
   `decision_event`，动作可以是调用一个工具或直接回答；工具结果作为 observation 进入下一步。
 - 如果 LLM 选择不展开 package，Agent 可以进入 `context_answer` 阶段，基于当前
@@ -227,6 +242,8 @@ POST /agent/turn
 - 每个 session 维护一个本地 context window，默认预算为 `65536` token。Agent prompt
   只注入前文摘要和近期 user / agent 问答；完整工具调用、LLM prompt/output 和运行过程
   保存在本地 run log，不进入后续 prompt。
+- 每次 Agent turn 会把确定性的 `current_time` 注入 session context window，包含 UTC、
+  本地时间、时区和当前日期；这让 LLM 能处理“今天/明天/8月5号之后”等相对时间。
 - Agent 会从同一 session 的历史工具结果中恢复已加载过的本地资源缓存。当前邮件缓存以
   `cached_mail_messages` 注入 context window；如果追问可以由缓存邮件正文回答，Agent
   应直接回答或把缓存作为已有 observation 使用，不再重复调用 `mail.load_messages`。
@@ -239,6 +256,7 @@ POST /agent/turn
 - run log 由代码模板生成，包含用户输入、package catalog、展开工具、决策事件、
   工具调用输入输出、LLM 完整 prompt / output / 错误分类和最终回答。
 - 未配置真实 LLM 或 LLM 调用失败时，Agent turn 会降级到本地 heuristic，保持链路可运行。
+  当前本地 heuristic 主要覆盖 mail package；matter/runtime 的多步骤决策需要真实 LLM。
 
 ---
 
@@ -467,7 +485,59 @@ GET /mail/matters
 
 ---
 
-## 10. Outlook Auth Start
+## 10. Matters
+
+独立事务系统用于保存任务、事件、待办和提醒候选项，不从属于邮件。邮件、Agent trace、
+本地文件或后续日历对象都可以作为 `source_links` 关联到同一个 matter。
+
+### 10.1 Create Matter
+
+```http
+POST /matters
+```
+
+请求：
+
+```json
+{
+  "title": "Submit ICA student pass documents",
+  "summary": "Prepare IPA letter and appointment documents.",
+  "status": "open",
+  "priority": "high",
+  "due_at": "2026-08-10T09:00:00+08:00",
+  "tags": ["ICA", "NTU"],
+  "source_links": [
+    {
+      "source_type": "mail_message",
+      "source_id": "mail_msg_xxx",
+      "reason": "Extracted from ICA email."
+    }
+  ],
+  "metadata": {}
+}
+```
+
+响应：返回完整 `matter` 记录。
+
+### 10.2 List / Search / Update
+
+```http
+GET /matters?limit=50&status=open
+GET /matters/search?q=ICA&limit=10
+PATCH /matters/{matter_id}
+POST /matters/{matter_id}/source-links
+```
+
+说明：
+
+- `matter` 表是独立本地持久化层，`mail_matters` 只是旧邮件内视图。
+- `matter_source_links` 负责把 matter 关联到邮件、trace、文件或后续其他数据源。
+- Agent 可以通过 `matter` tool package 创建、查询、更新和链接事务。
+- 第一版只做本地持久化和检索，不做主动提醒调度；提醒会在下一阶段接入。
+
+---
+
+## 11. Outlook Auth Start
 
 ```http
 POST /mail/outlook/auth/start
@@ -495,7 +565,7 @@ POST /mail/outlook/auth/start
 
 ---
 
-## 11. Outlook Auth Complete
+## 12. Outlook Auth Complete
 
 ```http
 POST /mail/outlook/auth/complete
@@ -524,7 +594,7 @@ POST /mail/outlook/auth/complete
 
 ---
 
-## 12. Outlook Sync
+## 13. Outlook Sync
 
 ```http
 POST /mail/outlook/sync
@@ -567,7 +637,7 @@ POST /mail/outlook/sync
 
 ---
 
-## 13. Compatibility Notes
+## 14. Compatibility Notes
 
 - 当前后端实现是轻量骨架，因此部分返回值是规则化输出而非真实 agent 结果。
 - 这份契约保留了未来完整系统需要的字段，便于逐步替换实现。

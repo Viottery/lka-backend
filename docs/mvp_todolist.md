@@ -52,6 +52,8 @@ Urgent track 的阶段目标：
 - [x] 对 LLM HTTP `429` 限流做显式识别、等待重试、run log 记录和本地 heuristic 降级。
 - [x] 对 LLM 认证、网络、超时、非 429 HTTP 和 provider 响应解析错误做分类记录和针对性降级。
 - [x] 建立第一版平行 / 多轮会话基础设施，支持创建会话、追加消息、列出会话和读取历史；邮件工具调用只接收 `session_id` 作为访问上下文，不自动写会话历史。
+- [x] 建立独立事务管理 MVP，提供 `MatterService`、`/matters` API 和 `matter` Tool Package。
+- [x] 提供 `runtime.now` 工具，并在每次 Agent turn 的 context window 中注入当前时间。
 - [ ] 将邮件纳入本地持久化存储管理，补齐邮件整理、检索和概括工具。
 - [ ] 将 TaskContext / MatterContext / trace 查询进一步接入 session，让前端会话切换能恢复完整运行上下文。
 - [ ] 接入本地 `BAAI/bge-m3` embedding provider，并兼容 Windows / Linux 模型缓存路径。
@@ -95,6 +97,11 @@ Urgent track 的阶段目标：
 - 远程邮件同步归 runtime 管理，不建立邮件专属 Agent。启动自检和后台轮询只更新本地邮件
   知识源；当用户要求最新邮箱状态或本地缓存可能过期时，Main Agent Brain 可以选择
   `mail.sync`，同步后仍通过 `mail.search` / `mail.load_messages` 获取证据并回答。
+- 事务管理独立于邮件。`MatterService` 保存任务、事件、待办和提醒候选项；邮件、trace、
+  文件和后续日历对象都只能作为 `source_link` 关联到 matter。Agent 从邮件归纳事务时，
+  必须通过通用 loop 先读取证据，再选择 `matter` tools 写入或更新。
+- 每次 Agent turn 都会注入 `current_time`，并可按需调用 `runtime.now`；相对时间解析
+  应优先基于这个确定性上下文，而不是让 LLM 猜当前日期。
 
 ### 0.1 MVP 最终应具备的能力
 

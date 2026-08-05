@@ -290,6 +290,36 @@ def init_db(db_path: Path) -> None:
                 PRIMARY KEY(provider, account_id, folder),
                 FOREIGN KEY(account_id) REFERENCES mail_accounts(account_id)
             );
+
+            CREATE TABLE IF NOT EXISTS matters (
+                matter_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                status TEXT NOT NULL,
+                priority TEXT NOT NULL,
+                due_at TEXT,
+                tags TEXT NOT NULL,
+                metadata TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS matters_fts USING fts5(
+                matter_id UNINDEXED,
+                title,
+                summary,
+                tags
+            );
+
+            CREATE TABLE IF NOT EXISTS matter_source_links (
+                matter_id TEXT NOT NULL,
+                source_type TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(matter_id, source_type, source_id),
+                FOREIGN KEY(matter_id) REFERENCES matters(matter_id)
+            );
             """
         )
         conn.commit()

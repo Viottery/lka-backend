@@ -87,6 +87,14 @@ Outlook 自检同步，把最新邮件写入本地 SQLite；服务运行期间�
 或本地邮件可能过期时选择调用。无论触发来源是 startup、background、API 还是 tool，
 同步过程都只负责更新本地邮件知识源，后续检索、加载、概括和事务整理仍通过 Agent Loop
 中的 mail tools 完成。
+事务管理是独立 domain service，不从属于邮件。`MatterService` 负责 `matter` 的本地
+持久化、关键词检索、列表、状态更新和来源链接；`mail`、`agent_trace`、`file`、后续
+`calendar_event` 等都只是 `matter_source_links` 中的 source。Agent 从邮件中提取待办
+时，应先通过 mail tools 获取证据，再通过 matter tools 创建或更新事务，不能让
+`MailService` 直接替用户做事务决策。
+runtime context 也通过工具和上下文双路径提供：`runtime.now` 是可调用工具；每次
+Agent turn 还会把 `current_time` 注入 session context window，包含 UTC、本地时间、
+时区和日期，用于处理“今天”“明天”“8月5号之后”这类相对时间。
 
 每次 Agent Loop 运行都必须生成本地自然语言友好的 run log。run log 由代码模板生成，
 不调用 LLM，至少记录：
