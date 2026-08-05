@@ -215,7 +215,7 @@ POST /agent/turn
 - 这是第一版通用 Agent turn 入口，不是邮件专属 agent endpoint。
 - Agent 第一层只读取 Tool Package catalog；当前已实现的可展开 package 是 `mail`。
 - 当 turn 判断用户目标需要本地邮件上下文时，才展开 `mail.search`、
-  `mail.load_messages`、`mail.persist_matters` 等具体工具。
+  `mail.load_messages`、`mail.sync`、`mail.persist_matters` 等具体工具。
 - 展开 package 后，Agent 会进入单次 turn 内的 step-limited loop：每一步生成一个
   `decision_event`，动作可以是调用一个工具或直接回答；工具结果作为 observation 进入下一步。
 - 如果 LLM 选择不展开 package，Agent 可以进入 `context_answer` 阶段，基于当前
@@ -230,6 +230,9 @@ POST /agent/turn
 - Agent 会从同一 session 的历史工具结果中恢复已加载过的本地资源缓存。当前邮件缓存以
   `cached_mail_messages` 注入 context window；如果追问可以由缓存邮件正文回答，Agent
   应直接回答或把缓存作为已有 observation 使用，不再重复调用 `mail.load_messages`。
+- 如果用户明确要求同步、询问最新邮箱状态，或 Agent 判断本地邮件可能过期，可以在
+  mail package 展开后调用 `mail.sync`。同步完成后，Agent 应继续通过 `mail.search`
+  和 `mail.load_messages` 使用本地持久化邮件，而不是让同步工具直接生成答案。
 - context window 未满时不做摘要；超过预算时触发独立 `context_summarize` LLM 调用，
   将旧 summary 和除最近两条消息外的历史问答重写为新 summary，原文只保留最近两条消息。
 - 每次调用会显式追加 user / agent session message，并写入本地 markdown run log。
@@ -434,7 +437,7 @@ GET /mail/search?q=document&limit=10
 
 - 当前没有 `/mail/process` 或其他邮件专属 agent endpoint。
 - 邮件能力通过 Tool Package 暴露给后续通用 Agent turn：`mail.search`、
-  `mail.load_messages`、`mail.persist_matters`。
+  `mail.load_messages`、`mail.sync`、`mail.persist_matters`。
 - 邮件整理、概括、匹配等行为应由通用 Agent turn 决定是否调用 mail tools，而不是通过
   mail 路由直接启动独立 agent loop。
 
@@ -545,7 +548,10 @@ POST /mail/outlook/sync
   "folder": "Inbox",
   "imported_messages": 25,
   "imported_attachments": 3,
-  "status": "completed"
+  "status": "completed",
+  "next_link": null,
+  "delta_link": "https://graph.microsoft.com/...",
+  "sync_mode": "delta"
 }
 ```
 
@@ -553,8 +559,11 @@ POST /mail/outlook/sync
 
 - 该接口只读拉取 Outlook 邮件正文和附件 metadata。
 - 附件内容不在第一版下载，数据库中的附件记录保持 `is_downloaded = 0`。
-- 当前为手动同步入口，`mail_sync_state` 会记录最近一次同步结果；实时同步、delta link
-  和 webhook 后续再实现。
+- Outlook 同步使用 Microsoft Graph delta query；`mail_sync_state` 会记录最近一次
+  同步结果、`next_link` 和 `delta_link`，后续同步优先从保存的 delta 状态继续。
+- 除该手动 API 外，服务启动时可按配置执行一次启动自检同步；服务运行期间可按配置后台
+  轮询同步；Agent 也可通过 `mail.sync` 工具按需触发同步。
+- Webhook / push notification 后续再实现。
 
 ---
 

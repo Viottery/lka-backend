@@ -53,7 +53,7 @@ class FakeGraphTransport:
                 "userPrincipalName": "fallback@example.com",
                 "displayName": "Outlook User",
             }
-        if "/me/mailFolders/Inbox/messages?" in url:
+        if "/me/mailFolders/Inbox/messages/delta?" in url:
             return {
                 "value": [
                     {
@@ -68,8 +68,11 @@ class FakeGraphTransport:
                         "body": {"content": "Please review the contract by Friday."},
                         "hasAttachments": True,
                     }
-                ]
+                ],
+                "@odata.deltaLink": "https://graph.test/delta-token",
             }
+        if url == "https://graph.test/delta-token":
+            return {"value": [], "@odata.deltaLink": "https://graph.test/delta-token-2"}
         if "/me/messages/message-001/attachments?" in url:
             return {
                 "value": [
@@ -142,6 +145,8 @@ def test_outlook_sync_persists_body_attachment_metadata_and_state(tmp_path, monk
     assert sync_result.status == "completed"
     assert sync_result.imported_messages == 1
     assert sync_result.imported_attachments == 1
+    assert sync_result.sync_mode == "delta"
+    assert sync_result.delta_link == "https://graph.test/delta-token"
     conn = sqlite3.connect(db_path)
     try:
         message = conn.execute(
@@ -153,7 +158,7 @@ def test_outlook_sync_persists_body_attachment_metadata_and_state(tmp_path, monk
             ("attachment-001",),
         ).fetchone()
         sync_state = conn.execute(
-            "SELECT status, folder, last_result_payload FROM mail_sync_state"
+            "SELECT status, folder, next_link, delta_link, last_result_payload FROM mail_sync_state"
         ).fetchone()
     finally:
         conn.close()
@@ -162,5 +167,32 @@ def test_outlook_sync_persists_body_attachment_metadata_and_state(tmp_path, monk
     assert attachment == ("contract.pdf", "application/pdf", 2048, 0)
     assert sync_state[0] == "completed"
     assert sync_state[1] == "Inbox"
-    assert json.loads(sync_state[2])["imported_attachments"] == 1
+    assert sync_state[2] is None
+    assert sync_state[3] == "https://graph.test/delta-token"
+    assert json.loads(sync_state[4])["imported_attachments"] == 1
+    assert any("/me/mailFolders/Inbox/messages/delta?" in url for url in transport.get_urls)
     assert any("/me/messages/message-001/attachments?" in url for url in transport.get_urls)
+
+
+def test_outlook_sync_uses_saved_delta_link_for_next_sync(tmp_path, monkeypatch):
+    transport = FakeGraphTransport()
+    service, db_path, _token_path = _service(tmp_path, monkeypatch, transport)
+
+    service.complete_device_auth(device_code="device-code")
+    first_result = service.sync_messages(folder="Inbox", limit=10, max_pages=1)
+    second_result = service.sync_messages(folder="Inbox", limit=10, max_pages=1)
+
+    assert first_result.imported_messages == 1
+    assert second_result.imported_messages == 0
+    assert second_result.delta_link == "https://graph.test/delta-token-2"
+    assert "https://graph.test/delta-token" in transport.get_urls
+    conn = sqlite3.connect(db_path)
+    try:
+        sync_state = conn.execute(
+            "SELECT delta_link, last_result_payload FROM mail_sync_state"
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert sync_state[0] == "https://graph.test/delta-token-2"
+    assert json.loads(sync_state[1])["delta_link"] == "https://graph.test/delta-token-2"

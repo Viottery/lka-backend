@@ -45,6 +45,7 @@ Urgent track 的阶段目标：
 - [x] 新增本地 provider 配置模板，覆盖 LLM、Outlook、IMAP 和 local BGE embedding 配置。
 - [x] 接入 Outlook 只读同步，采用 Device Code Flow，权限优先限制为 `User.Read Mail.Read offline_access`。
 - [x] Outlook 第一版先同步邮件正文和附件 metadata，附件内容后续按需下载。
+- [x] Outlook 同步支持 Graph delta state、服务启动自检、后台轮询和 Agent 按需 `mail.sync` 工具触发。
 - [x] 部署 / 接入真实第三方 LLM API provider；未配置 API key 时保留 mock provider，保证测试稳定。
 - [x] 建立第一版邮件 Tool Package / Tool Executor，避免 `MailService` 直接调用 LLM。
 - [x] 建立通用 Agent turn 入口，由会话层选择是否展开 `mail` package 并记录工具调用 / LLM prompt / output。
@@ -65,8 +66,10 @@ Urgent track 的阶段目标：
 - 语义检索可以先预留接口和数据结构，关键词检索先用 SQLite FTS5 落地。
 - 本地配置文件使用 `config/local.toml`，该文件不进入 git，也不会通过 WSL -> Windows 同步脚本复制。
 - Outlook Graph Device Code Flow 不保存邮箱密码；IMAP 路径如需密码，优先使用 `password_env` 引用环境变量。
-- Outlook 同步第一版提供 `POST /mail/outlook/auth/start`、`POST /mail/outlook/auth/complete`
-  和 `POST /mail/outlook/sync`；先采用显式手动触发，不做后台实时同步、delta link 或 webhook。
+- Outlook 同步提供 `POST /mail/outlook/auth/start`、`POST /mail/outlook/auth/complete`
+  和 `POST /mail/outlook/sync`；同步采用 Microsoft Graph delta query 记录 `next_link` /
+  `delta_link`，并支持 startup、background、API 和 Agent tool 四种触发来源。Webhook /
+  push notification 后续再实现。
 - Capability Registry 第一层优先暴露 Tool Package，不一次性暴露全部工具 schema；Agent 确认目标相关后再展开具体工具。
 - 不维护覆盖所有任务类型的全局 intent 枚举；Agent 产出面向下一步动作的 routing / execution decision。
 - `MailService` 只负责确定性的本地存储、检索、完整正文加载和持久化；LLM 推理和工具编排必须发生在 Agent Loop。
@@ -89,6 +92,9 @@ Urgent track 的阶段目标：
 - 每个 session 已新增本地 context window，默认预算 `65536` token；窗口未满时保留近期
   user / agent 问答，满后由独立 `context_summarize` LLM 调用重写前文摘要，并只保留最近
   两条消息原文。完整运行过程仍保存在本地 run log，后续再接入可检索历史 trace。
+- 远程邮件同步归 runtime 管理，不建立邮件专属 Agent。启动自检和后台轮询只更新本地邮件
+  知识源；当用户要求最新邮箱状态或本地缓存可能过期时，Main Agent Brain 可以选择
+  `mail.sync`，同步后仍通过 `mail.search` / `mail.load_messages` 获取证据并回答。
 
 ### 0.1 MVP 最终应具备的能力
 

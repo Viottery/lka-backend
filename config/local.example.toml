@@ -25,6 +25,11 @@ scopes = ["User.Read", "Mail.Read", "offline_access"]
 token_store_path = "./data/secrets/outlook_token.json"
 sync_folder = "Inbox"
 download_attachment_content = false
+startup_sync_enabled = true
+background_sync_enabled = true
+sync_interval_seconds = 300
+sync_limit = 25
+sync_max_pages = 1
 
 [mail.imap]
 enabled = false

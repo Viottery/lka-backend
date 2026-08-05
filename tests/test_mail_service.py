@@ -8,7 +8,9 @@ from app.api.routes.mail import import_mail, list_mail_matters, search_mail
 from app.api.schemas import MailImportRequest
 from app.core.config import get_settings
 from app.core.mail import MailMatterDraft
-from app.core.tools import ToolContext
+from app.core.mail_tools import SyncMailTool
+from app.core.outlook import OutlookSyncResult
+from app.core.tools import ToolContext, ToolInvocation
 
 
 def test_mail_import_search_and_matters_endpoints(tmp_path, monkeypatch):
@@ -22,6 +24,9 @@ def test_mail_import_search_and_matters_endpoints(tmp_path, monkeypatch):
     assert "/mail/search" in app.openapi()["paths"]
     assert "/mail/process" not in app.openapi()["paths"]
     assert "/mail/matters" in app.openapi()["paths"]
+    assert "mail.sync" in [
+        tool.name for tool in app.state.runtime.tool_registry.list_tools(package="mail")
+    ]
 
     imported = import_mail(
         MailImportRequest(
@@ -168,3 +173,55 @@ def test_mail_tools_search_load_and_persist_without_mail_agent_endpoint(tmp_path
     assert len(matters.matters) == 1
     assert matters.matters[0].title == "Visa document reminder"
     assert matters.matters[0].priority == "high"
+
+
+def test_mail_sync_tool_invokes_runtime_sync_with_tool_trigger():
+    calls: list[dict] = []
+
+    def sync_mail(*, folder, limit, max_pages, trigger):
+        calls.append(
+            {
+                "folder": folder,
+                "limit": limit,
+                "max_pages": max_pages,
+                "trigger": trigger,
+            }
+        )
+        return OutlookSyncResult(
+            account_id="mail_account_test",
+            folder=folder or "Inbox",
+            imported_messages=2,
+            imported_attachments=1,
+            delta_link="https://graph.test/delta",
+        )
+
+    tool = SyncMailTool(sync_mail)
+    context = ToolContext(
+        session_id="session_mail_sync_tool",
+        trace_id="trace_mail_sync_tool",
+        context_id="ctx_mail_sync_tool",
+    )
+
+    result = tool.invoke(
+        invocation=ToolInvocation(
+            invocation_id="sync_invocation_001",
+            tool=tool.spec,
+            session_id=context.session_id,
+            context_id=context.context_id or "",
+            input={"folder": "Inbox", "limit": 5, "max_pages": 2},
+        ),
+        context=context,
+    )
+
+    assert calls == [
+        {
+            "folder": "Inbox",
+            "limit": 5,
+            "max_pages": 2,
+            "trigger": "tool",
+        }
+    ]
+    assert result.status == "completed"
+    assert result.output["provider"] == "outlook"
+    assert result.output["imported_messages"] == 2
+    assert result.output["delta_link"] == "https://graph.test/delta"

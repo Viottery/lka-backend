@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 
 from app.api.routes.agent import router as agent_router
@@ -13,8 +15,19 @@ from app.core.runtime import LocalKnowledgeAgentRuntime
 
 def create_app() -> FastAPI:
     settings = get_settings()
-    app = FastAPI(title=settings.app_name, version=settings.version)
-    app.state.runtime = LocalKnowledgeAgentRuntime(settings)
+    runtime = LocalKnowledgeAgentRuntime(settings)
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        app.state.runtime = runtime
+        runtime.start()
+        try:
+            yield
+        finally:
+            runtime.stop()
+
+    app = FastAPI(title=settings.app_name, version=settings.version, lifespan=lifespan)
+    app.state.runtime = runtime
 
     app.include_router(health_router)
     app.include_router(workspaces_router)

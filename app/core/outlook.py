@@ -9,6 +9,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
+from hashlib import sha1
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -134,6 +135,9 @@ class OutlookSyncResult(BaseModel):
     imported_messages: int
     imported_attachments: int
     status: str = "completed"
+    next_link: str | None = None
+    delta_link: str | None = None
+    sync_mode: str = "delta"
 
 
 class OutlookService:
@@ -200,18 +204,29 @@ class OutlookService:
         access_token = self._valid_access_token(config)
         account = self._load_account(access_token)
         sync_folder = folder or config.sync_folder
-        messages = self._fetch_messages(
+        sync_state = self._load_sync_state(
+            provider="outlook",
+            account_id=_stable_account_id(account),
+            folder=sync_folder,
+        )
+        sync_payload = self._fetch_delta_messages(
             access_token=access_token,
             folder=sync_folder,
             limit=limit,
             max_pages=max_pages,
+            sync_state=sync_state,
         )
-        import_result = self._mail_service.import_messages(account=account, messages=messages)
+        import_result = self._mail_service.import_messages(
+            account=account,
+            messages=sync_payload["messages"],
+        )
         result = OutlookSyncResult(
             account_id=import_result.account_id,
             folder=sync_folder,
             imported_messages=import_result.imported_messages,
             imported_attachments=import_result.imported_attachments,
+            next_link=sync_payload["next_link"],
+            delta_link=sync_payload["delta_link"],
         )
         self._record_sync_state(result)
         return result
@@ -301,6 +316,44 @@ class OutlookService:
             display_name=payload.get("displayName"),
         )
 
+    def _fetch_delta_messages(
+        self,
+        *,
+        access_token: str,
+        folder: str,
+        limit: int,
+        max_pages: int,
+        sync_state: dict[str, str | None] | None,
+    ) -> dict[str, Any]:
+        messages: list[MailMessageInput] = []
+        next_link = sync_state.get("next_link") if sync_state else None
+        delta_link = sync_state.get("delta_link") if sync_state else None
+        page_url = next_link or delta_link or self._messages_delta_url(
+            folder=folder,
+            limit=limit,
+        )
+        latest_next_link: str | None = None
+        latest_delta_link: str | None = None
+        for _ in range(max_pages):
+            if not page_url:
+                break
+            payload = self._transport.get_json(
+                page_url,
+                access_token=access_token,
+                headers={"Prefer": 'outlook.body-content-type="text"'},
+            )
+            for raw_message in payload.get("value", []):
+                if isinstance(raw_message, dict) and "@removed" not in raw_message:
+                    messages.append(self._map_message(access_token, folder, raw_message))
+            latest_next_link = payload.get("@odata.nextLink")
+            latest_delta_link = payload.get("@odata.deltaLink")
+            page_url = latest_next_link
+        return {
+            "messages": messages,
+            "next_link": latest_next_link,
+            "delta_link": latest_delta_link or (None if latest_next_link else delta_link),
+        }
+
     def _fetch_messages(
         self,
         *,
@@ -323,6 +376,27 @@ class OutlookService:
                 messages.append(self._map_message(access_token, folder, raw_message))
             page_url = payload.get("@odata.nextLink")
         return messages
+
+    def _messages_delta_url(self, *, folder: str, limit: int) -> str:
+        encoded_folder = urllib.parse.quote(folder, safe="")
+        query = urllib.parse.urlencode(
+            {
+                "$top": str(limit),
+                "$select": ",".join(
+                    [
+                        "id",
+                        "subject",
+                        "from",
+                        "toRecipients",
+                        "ccRecipients",
+                        "receivedDateTime",
+                        "body",
+                        "hasAttachments",
+                    ]
+                ),
+            }
+        )
+        return f"{GRAPH_BASE_URL}/me/mailFolders/{encoded_folder}/messages/delta?{query}"
 
     def _messages_url(self, *, folder: str, limit: int) -> str:
         encoded_folder = urllib.parse.quote(folder, safe="")
@@ -426,11 +500,42 @@ class OutlookService:
                     result.folder,
                     result.status,
                     _now_iso(),
-                    None,
-                    None,
+                    result.next_link,
+                    result.delta_link,
                     result.model_dump_json(),
                 ),
             )
             conn.commit()
         finally:
             conn.close()
+
+    def _load_sync_state(
+        self,
+        *,
+        provider: str,
+        account_id: str,
+        folder: str,
+    ) -> dict[str, str | None] | None:
+        conn = self._conn_factory()
+        try:
+            row = conn.execute(
+                """
+                SELECT next_link, delta_link
+                FROM mail_sync_state
+                WHERE provider = ? AND account_id = ? AND folder = ?
+                """,
+                (provider, account_id, folder),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return None
+        return {
+            "next_link": row["next_link"],
+            "delta_link": row["delta_link"],
+        }
+
+
+def _stable_account_id(account: MailAccountInput) -> str:
+    digest = sha1(f"{account.provider}|{account.email_address.lower()}".encode("utf-8"))
+    return f"mail_account_{digest.hexdigest()[:12]}"

@@ -619,8 +619,13 @@ class AgentTurnLoop:
             "call mail.search first, then mail.load_messages for relevant message ids, then "
             "answer from observations. If observations already contain cached mail messages "
             "from the same session and they are relevant, answer from that cache instead of "
-            "calling mail.search or mail.load_messages again. Return only strict JSON in one of "
+            "calling mail.search or mail.load_messages again. Call mail.sync first only when "
+            "the user asks to sync, asks for the latest/current mailbox state, or the local "
+            "mail store may be stale for the requested answer; after mail.sync, continue with "
+            "mail.search and mail.load_messages as needed. Return only strict JSON in one of "
             "these forms: "
+            '{"action":"call_tool","tool_name":"mail.sync","tool_input":{"folder":"Inbox",'
+            '"limit":25,"max_pages":1},"reason":"..."}, '
             '{"action":"call_tool","tool_name":"mail.search","tool_input":{"query":"...",'
             '"limit":8},"reason":"..."}, '
             '{"action":"call_tool","tool_name":"mail.load_messages","tool_input":'

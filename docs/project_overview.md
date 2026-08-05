@@ -175,6 +175,7 @@ browser（后续）
 ```text
 mail.search
 mail.load_messages
+mail.sync
 mail.persist_matters
 mail.match_related（后续）
 mail.summarize（后续）

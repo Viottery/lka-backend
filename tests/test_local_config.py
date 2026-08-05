@@ -12,6 +12,11 @@ def test_missing_local_config_uses_safe_defaults(tmp_path):
     assert config.llm.provider == "mock"
     assert config.mail.outlook.auth_method == "device_code"
     assert config.mail.outlook.scopes == ["User.Read", "Mail.Read", "offline_access"]
+    assert config.mail.outlook.startup_sync_enabled is True
+    assert config.mail.outlook.background_sync_enabled is True
+    assert config.mail.outlook.sync_interval_seconds == 300
+    assert config.mail.outlook.sync_limit == 25
+    assert config.mail.outlook.sync_max_pages == 1
     assert config.embedding.provider == "local_bge"
     assert config.embedding.model_name == "BAAI/bge-m3"
 
@@ -31,6 +36,11 @@ client_id_env = "TEST_MS_GRAPH_CLIENT_ID"
 tenant_id = "consumers"
 scopes = ["User.Read", "Mail.Read", "offline_access"]
 download_attachment_content = false
+startup_sync_enabled = false
+background_sync_enabled = true
+sync_interval_seconds = 120
+sync_limit = 15
+sync_max_pages = 3
 
 [mail.imap]
 enabled = true
@@ -59,6 +69,11 @@ normalize_embeddings = true
     assert config.mail.outlook.enabled is True
     assert config.mail.outlook.resolved_client_id() == "client-id"
     assert config.mail.outlook.download_attachment_content is False
+    assert config.mail.outlook.startup_sync_enabled is False
+    assert config.mail.outlook.background_sync_enabled is True
+    assert config.mail.outlook.sync_interval_seconds == 120
+    assert config.mail.outlook.sync_limit == 15
+    assert config.mail.outlook.sync_max_pages == 3
     assert config.mail.imap.enabled is True
     assert config.mail.imap.resolved_password() == "mail-secret"
     assert config.embedding.device == "cpu"

@@ -56,6 +56,11 @@ class OutlookMailConfig(BaseModel):
     token_store_path: Path = Path("./data/secrets/outlook_token.json")
     sync_folder: str = "Inbox"
     download_attachment_content: bool = False
+    startup_sync_enabled: bool = True
+    background_sync_enabled: bool = True
+    sync_interval_seconds: int = 300
+    sync_limit: int = 25
+    sync_max_pages: int = 1
 
     def resolved_client_id(self) -> str | None:
         if self.client_id.strip():

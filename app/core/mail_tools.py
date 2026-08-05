@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import Any
+
 from app.core.mail import MailMatterDraft, MailService
 from app.core.tools import ToolContext, ToolInvocation, ToolPackageSpec, ToolResult, ToolSpec
 
@@ -102,4 +105,50 @@ class PersistMailMattersTool:
             tool_name=self.spec.name,
             status="completed",
             output={"matters_created": matters_created},
+        )
+
+
+class SyncMailTool:
+    def __init__(self, sync_mail: Callable[..., Any]) -> None:
+        self._sync_mail = sync_mail
+
+    spec = ToolSpec(
+        name="mail.sync",
+        package="mail",
+        type="local_tool",
+        description=(
+            "Synchronize the configured remote mail provider and import changed "
+            "messages into the local mail store."
+        ),
+        risk="low_to_medium",
+        requires_confirmation=False,
+        side_effects=["read_remote_mail", "write_local_db"],
+        input_schema={"folder": "string", "limit": "integer", "max_pages": "integer"},
+        output_schema={
+            "provider": "string",
+            "folder": "string",
+            "imported_messages": "integer",
+            "imported_attachments": "integer",
+            "status": "string",
+            "sync_mode": "string",
+            "next_link": "string|null",
+            "delta_link": "string|null",
+        },
+    )
+
+    def invoke(self, *, invocation: ToolInvocation, context: ToolContext) -> ToolResult:
+        folder_value = invocation.input.get("folder")
+        result = self._sync_mail(
+            folder=str(folder_value) if folder_value else None,
+            limit=int(invocation.input.get("limit") or 25),
+            max_pages=int(invocation.input.get("max_pages") or 1),
+            trigger="tool",
+        )
+        output = result.model_dump(mode="json") if hasattr(result, "model_dump") else dict(result)
+        output["provider"] = "outlook"
+        return ToolResult(
+            invocation_id=invocation.invocation_id,
+            tool_name=self.spec.name,
+            status=str(output.get("status") or "completed"),
+            output=output,
         )

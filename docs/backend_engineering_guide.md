@@ -81,6 +81,12 @@ Agent 应直接基于缓存回答，或把缓存作为已有 observation 使用�
 中按当前 `session_id` 读取一次性信息并返回观察结果；是否把用户输入、工具观察、`run_id`
 或 `log_path` 写入会话历史，必须由通用 Agent turn / Session 层显式决定，邮件工具和
 `MailService` 不应自动写会话消息。
+远程邮箱同步由 runtime 管理，不属于独立邮件 Agent。服务启动时 runtime 可以执行一次
+Outlook 自检同步，把最新邮件写入本地 SQLite；服务运行期间可以通过后台轮询继续同步。
+按需同步则暴露为 `mail.sync` 工具，由 Main Agent Brain 在用户要求“最新/同步/当前邮箱”
+或本地邮件可能过期时选择调用。无论触发来源是 startup、background、API 还是 tool，
+同步过程都只负责更新本地邮件知识源，后续检索、加载、概括和事务整理仍通过 Agent Loop
+中的 mail tools 完成。
 
 每次 Agent Loop 运行都必须生成本地自然语言友好的 run log。run log 由代码模板生成，
 不调用 LLM，至少记录：

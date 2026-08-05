@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 from hashlib import sha1
+from typing import Any
 
 from app.api.schemas import (
     CapabilityItem,
@@ -18,6 +20,7 @@ from app.core.mail_tools import (
     LoadMailMessagesTool,
     PersistMailMattersTool,
     SearchMailTool,
+    SyncMailTool,
 )
 from app.core.mail import (
     MailAccountInput,
@@ -30,6 +33,7 @@ from app.core.mail import (
 from app.core.outlook import (
     OutlookAuthCompleteResult,
     OutlookAuthStartResult,
+    OutlookServiceError,
     OutlookService,
     OutlookSyncResult,
 )
@@ -69,11 +73,21 @@ class LocalKnowledgeAgentRuntime:
         self.session_service = SessionService(self._conn)
         self.mail_service = MailService(self._conn)
         self.local_app_config = settings.load_local_config()
+        self.outlook_service = OutlookService(
+            self._conn,
+            self.mail_service,
+            self.local_app_config,
+        )
+        self._mail_sync_lock = threading.Lock()
+        self._mail_sync_stop_event = threading.Event()
+        self._mail_sync_thread: threading.Thread | None = None
+        self.last_mail_sync_result: dict[str, Any] | None = None
         self.tool_registry = ToolRegistry()
         self.tool_registry.register_package(MAIL_PACKAGE)
         self.tool_registry.register_tool(SearchMailTool(self.mail_service))
         self.tool_registry.register_tool(LoadMailMessagesTool(self.mail_service))
         self.tool_registry.register_tool(PersistMailMattersTool(self.mail_service))
+        self.tool_registry.register_tool(SyncMailTool(self.sync_outlook_mail))
         self.tool_executor = ToolExecutor(self.tool_registry)
         self.agent_llm_client = build_text_llm_client(self.local_app_config.llm)
         self.agent_turn_loop = AgentTurnLoop(
@@ -81,11 +95,6 @@ class LocalKnowledgeAgentRuntime:
             tool_executor=self.tool_executor,
             llm_client=self.agent_llm_client,
             log_dir=self.settings.data_dir / "agent_logs",
-        )
-        self.outlook_service = OutlookService(
-            self._conn,
-            self.mail_service,
-            self.local_app_config,
         )
         self.debug_loop = RuntimeLoop(
             context_assembler=ContextAssembler(),
@@ -101,6 +110,81 @@ class LocalKnowledgeAgentRuntime:
 
     def _conn(self) -> sqlite3.Connection:
         return connect(self.db_path)
+
+    def start(self) -> None:
+        """Start runtime services that should run while the API process is alive."""
+
+        self._run_startup_mail_sync()
+        self._start_background_mail_sync()
+
+    def stop(self) -> None:
+        """Stop runtime background services."""
+
+        self._mail_sync_stop_event.set()
+        if self._mail_sync_thread and self._mail_sync_thread.is_alive():
+            self._mail_sync_thread.join(timeout=5)
+        self._mail_sync_thread = None
+
+    def _run_startup_mail_sync(self) -> None:
+        config = self.local_app_config.mail.outlook
+        if not config.enabled or not config.startup_sync_enabled:
+            self.last_mail_sync_result = {
+                "provider": "outlook",
+                "status": "skipped",
+                "trigger": "startup",
+                "reason": "Outlook startup sync is disabled.",
+            }
+            return
+        self._sync_outlook_mail_safely(trigger="startup")
+
+    def _start_background_mail_sync(self) -> None:
+        config = self.local_app_config.mail.outlook
+        if (
+            not config.enabled
+            or not config.background_sync_enabled
+            or config.sync_interval_seconds <= 0
+            or (self._mail_sync_thread is not None and self._mail_sync_thread.is_alive())
+        ):
+            return
+
+        self._mail_sync_stop_event.clear()
+        self._mail_sync_thread = threading.Thread(
+            target=self._background_mail_sync_loop,
+            name="lka-outlook-sync",
+            daemon=True,
+        )
+        self._mail_sync_thread.start()
+
+    def _background_mail_sync_loop(self) -> None:
+        config = self.local_app_config.mail.outlook
+        while not self._mail_sync_stop_event.wait(config.sync_interval_seconds):
+            self._sync_outlook_mail_safely(trigger="background")
+
+    def _sync_outlook_mail_safely(self, *, trigger: str) -> None:
+        config = self.local_app_config.mail.outlook
+        try:
+            self.sync_outlook_mail(
+                folder=config.sync_folder,
+                limit=config.sync_limit,
+                max_pages=config.sync_max_pages,
+                trigger=trigger,
+            )
+        except OutlookServiceError as exc:
+            self.last_mail_sync_result = {
+                "provider": "outlook",
+                "status": "failed",
+                "trigger": trigger,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+        except Exception as exc:
+            self.last_mail_sync_result = {
+                "provider": "outlook",
+                "status": "failed",
+                "trigger": trigger,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
 
     def health(self) -> dict[str, str]:
         """Return a small health payload used by the `/health` route."""
@@ -308,11 +392,18 @@ class LocalKnowledgeAgentRuntime:
         folder: str | None = None,
         limit: int = 25,
         max_pages: int = 1,
+        trigger: str = "api",
     ) -> OutlookSyncResult:
         """Read Outlook mail through Microsoft Graph and persist it locally."""
 
-        return self.outlook_service.sync_messages(
-            folder=folder,
-            limit=limit,
-            max_pages=max_pages,
-        )
+        with self._mail_sync_lock:
+            result = self.outlook_service.sync_messages(
+                folder=folder,
+                limit=limit,
+                max_pages=max_pages,
+            )
+            payload = result.model_dump(mode="json")
+            payload["provider"] = "outlook"
+            payload["trigger"] = trigger
+            self.last_mail_sync_result = payload
+            return result
