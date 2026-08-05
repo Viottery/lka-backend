@@ -78,6 +78,7 @@ class AgentTurnResult(BaseModel):
     answer: str
     selected_package: str | None = None
     package_catalog: list[dict[str, Any]] = Field(default_factory=list)
+    session_context_window: dict[str, Any] = Field(default_factory=dict)
     expanded_tools: list[dict[str, Any]] = Field(default_factory=list)
     decision_events: list[AgentTurnDecisionEvent] = Field(default_factory=list)
     tool_events: list[AgentTurnToolEvent] = Field(default_factory=list)
@@ -104,6 +105,7 @@ class AgentTurnLoop:
         self.default_rate_limit_wait_seconds = 1.0
         self.max_decision_steps = 6
         self.llm_generation_token_budget = 8192
+        self.session_context_token_budget = 65_536
 
     def run(
         self,
@@ -128,6 +130,11 @@ class AgentTurnLoop:
             content=user_input,
             payload={"trace_id": trace_id, "entrypoint": "agent.turn"},
         )
+        context_window = self.session_service.get_context_window(
+            session_id=session.session_id,
+            token_budget=self.session_context_token_budget,
+        )
+        context_window_payload = context_window.model_dump(mode="json")
 
         package_catalog = [
             package.model_dump(mode="json")
@@ -138,6 +145,7 @@ class AgentTurnLoop:
         route = self._route(
             user_input=user_input,
             package_catalog=package_catalog,
+            context_window=context_window_payload,
             llm_events=llm_events,
             decision_events=decision_events,
         )
@@ -154,6 +162,7 @@ class AgentTurnLoop:
             answer = self._run_mail_tools(
                 user_input=user_input,
                 route=route,
+                context_window=context_window_payload,
                 context=context,
                 tool_events=tool_events,
                 llm_events=llm_events,
@@ -179,12 +188,20 @@ class AgentTurnLoop:
             answer=answer,
             selected_package=selected_package if isinstance(selected_package, str) else None,
             package_catalog=package_catalog,
+            session_context_window=context_window_payload,
             expanded_tools=expanded_tools,
             decision_events=decision_events,
             tool_events=tool_events,
             llm_events=llm_events,
         )
         log_path = self._write_log(result=result, user_input=user_input)
+        updated_context_window = self.session_service.record_context_exchange(
+            session_id=session.session_id,
+            user_input=user_input,
+            agent_answer=answer,
+            trace_id=trace_id,
+            token_budget=self.session_context_token_budget,
+        )
         result = result.model_copy(update={"log_path": str(log_path)})
         self.session_service.append_message(
             session_id=session.session_id,
@@ -194,6 +211,11 @@ class AgentTurnLoop:
                 "trace_id": trace_id,
                 "selected_package": result.selected_package,
                 "log_path": result.log_path,
+                "context_window": {
+                    "token_budget": updated_context_window.token_budget,
+                    "token_estimate": updated_context_window.token_estimate,
+                    "core_message_count": len(updated_context_window.core_messages),
+                },
                 "decision_events": [
                     event.model_dump(mode="json") for event in decision_events
                 ],
@@ -207,6 +229,7 @@ class AgentTurnLoop:
         *,
         user_input: str,
         package_catalog: list[dict[str, Any]],
+        context_window: dict[str, Any],
         llm_events: list[AgentTurnLLMEvent],
         decision_events: list[AgentTurnDecisionEvent],
     ) -> dict[str, Any]:
@@ -229,6 +252,7 @@ class AgentTurnLoop:
         user_prompt = json.dumps(
             {
                 "user_input": user_input,
+                "session_context_window": context_window,
                 "package_catalog": package_catalog,
             },
             ensure_ascii=False,
@@ -322,6 +346,7 @@ class AgentTurnLoop:
         *,
         user_input: str,
         route: dict[str, Any],
+        context_window: dict[str, Any],
         context: ToolContext,
         tool_events: list[AgentTurnToolEvent],
         llm_events: list[AgentTurnLLMEvent],
@@ -332,6 +357,7 @@ class AgentTurnLoop:
             answer = self._run_llm_decision_loop(
                 user_input=user_input,
                 route=route,
+                context_window=context_window,
                 context=context,
                 tool_events=tool_events,
                 llm_events=llm_events,
@@ -424,6 +450,7 @@ class AgentTurnLoop:
         *,
         user_input: str,
         route: dict[str, Any],
+        context_window: dict[str, Any],
         context: ToolContext,
         tool_events: list[AgentTurnToolEvent],
         llm_events: list[AgentTurnLLMEvent],
@@ -440,6 +467,7 @@ class AgentTurnLoop:
             decision = self._decide_next_action(
                 user_input=user_input,
                 route=route,
+                context_window=context_window,
                 expanded_tools=expanded_tools,
                 observations=observations,
                 llm_events=llm_events,
@@ -515,6 +543,7 @@ class AgentTurnLoop:
         *,
         user_input: str,
         route: dict[str, Any],
+        context_window: dict[str, Any],
         expanded_tools: list[dict[str, Any]],
         observations: list[dict[str, Any]],
         llm_events: list[AgentTurnLLMEvent],
@@ -534,6 +563,7 @@ class AgentTurnLoop:
         user_prompt = json.dumps(
             {
                 "user_input": user_input,
+                "session_context_window": context_window,
                 "route": route,
                 "expanded_tools": expanded_tools,
                 "observations": observations,
@@ -844,6 +874,10 @@ class AgentTurnLoop:
             "## Package Catalog",
             "",
             self._json_block(result.package_catalog),
+            "",
+            "## Session Context Window",
+            "",
+            self._json_block(result.session_context_window),
             "",
             "## Expanded Tools",
             "",

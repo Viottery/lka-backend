@@ -43,6 +43,22 @@ class AgentSessionMessage(BaseModel):
     created_at: str
 
 
+class SessionCoreMessage(BaseModel):
+    role: SessionRole
+    content: str
+    created_at: str
+    trace_id: str | None = None
+
+
+class AgentSessionContextWindow(BaseModel):
+    session_id: str
+    token_budget: int = 65_536
+    summary: str = ""
+    core_messages: list[SessionCoreMessage] = Field(default_factory=list)
+    token_estimate: int = 0
+    updated_at: str
+
+
 class AgentSessionList(BaseModel):
     sessions: list[AgentSession]
 
@@ -54,6 +70,8 @@ class AgentSessionDetail(BaseModel):
 
 class SessionService:
     """Deterministic storage service for parallel and multi-turn agent sessions."""
+
+    default_context_token_budget = 65_536
 
     def __init__(self, conn_factory: Callable[[], sqlite3.Connection]) -> None:
         self._conn_factory = conn_factory
@@ -245,6 +263,195 @@ class SessionService:
             payload=payload,
             created_at=now,
         )
+
+    def get_context_window(
+        self,
+        *,
+        session_id: str,
+        token_budget: int | None = None,
+    ) -> AgentSessionContextWindow:
+        self.ensure_session(session_id=session_id)
+        budget = token_budget or self.default_context_token_budget
+        conn = self._conn_factory()
+        try:
+            row = conn.execute(
+                """
+                SELECT session_id, token_budget, summary, core_messages, token_estimate, updated_at
+                FROM agent_session_context_windows
+                WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        if row is None:
+            return AgentSessionContextWindow(
+                session_id=session_id,
+                token_budget=budget,
+                summary="",
+                core_messages=[],
+                token_estimate=0,
+                updated_at=_now_iso(),
+            )
+        return AgentSessionContextWindow(
+            session_id=row["session_id"],
+            token_budget=row["token_budget"],
+            summary=row["summary"],
+            core_messages=self._core_messages_from_json(row["core_messages"]),
+            token_estimate=row["token_estimate"],
+            updated_at=row["updated_at"],
+        )
+
+    def record_context_exchange(
+        self,
+        *,
+        session_id: str,
+        user_input: str,
+        agent_answer: str,
+        trace_id: str,
+        token_budget: int | None = None,
+    ) -> AgentSessionContextWindow:
+        window = self.get_context_window(
+            session_id=session_id,
+            token_budget=token_budget,
+        )
+        now = _now_iso()
+        messages = [
+            *window.core_messages,
+            SessionCoreMessage(
+                role="user",
+                content=user_input,
+                created_at=now,
+                trace_id=trace_id,
+            ),
+            SessionCoreMessage(
+                role="agent",
+                content=agent_answer,
+                created_at=now,
+                trace_id=trace_id,
+            ),
+        ]
+        summary, kept_messages, token_estimate = self._fit_context_window(
+            summary=window.summary,
+            messages=messages,
+            token_budget=window.token_budget,
+        )
+        updated = AgentSessionContextWindow(
+            session_id=session_id,
+            token_budget=window.token_budget,
+            summary=summary,
+            core_messages=kept_messages,
+            token_estimate=token_estimate,
+            updated_at=now,
+        )
+        self._upsert_context_window(updated)
+        return updated
+
+    def _upsert_context_window(self, window: AgentSessionContextWindow) -> None:
+        conn = self._conn_factory()
+        try:
+            conn.execute(
+                """
+                INSERT INTO agent_session_context_windows(
+                    session_id, token_budget, summary, core_messages, token_estimate, updated_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    token_budget=excluded.token_budget,
+                    summary=excluded.summary,
+                    core_messages=excluded.core_messages,
+                    token_estimate=excluded.token_estimate,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    window.session_id,
+                    window.token_budget,
+                    window.summary,
+                    json.dumps(
+                        [message.model_dump(mode="json") for message in window.core_messages],
+                        ensure_ascii=False,
+                    ),
+                    window.token_estimate,
+                    window.updated_at,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _fit_context_window(
+        self,
+        *,
+        summary: str,
+        messages: list[SessionCoreMessage],
+        token_budget: int,
+    ) -> tuple[str, list[SessionCoreMessage], int]:
+        kept = list(messages)
+        current_summary = summary
+        while kept and self._context_token_estimate(current_summary, kept) > token_budget:
+            current_summary = self._append_summary_message(current_summary, kept.pop(0))
+            current_summary = self._trim_summary_for_budget(
+                summary=current_summary,
+                messages=kept,
+                token_budget=token_budget,
+            )
+        return (
+            current_summary,
+            kept,
+            self._context_token_estimate(current_summary, kept),
+        )
+
+    def _append_summary_message(self, summary: str, message: SessionCoreMessage) -> str:
+        prefix = f"{message.created_at} {message.role}: "
+        line = prefix + self._compact_text(message.content, max_chars=500)
+        return f"{summary.rstrip()}\n{line}".strip()
+
+    def _context_token_estimate(
+        self,
+        summary: str,
+        messages: list[SessionCoreMessage],
+    ) -> int:
+        text = summary + "\n" + "\n".join(message.content for message in messages)
+        return self._estimate_tokens(text)
+
+    def _estimate_tokens(self, text: str) -> int:
+        return max(1, (len(text) + 3) // 4) if text else 0
+
+    def _compact_text(self, text: str, *, max_chars: int) -> str:
+        compact = " ".join(text.split())
+        if len(compact) <= max_chars:
+            return compact
+        return compact[: max_chars - 3].rstrip() + "..."
+
+    def _trim_summary_for_budget(
+        self,
+        *,
+        summary: str,
+        messages: list[SessionCoreMessage],
+        token_budget: int,
+    ) -> str:
+        message_tokens = self._context_token_estimate("", messages)
+        available_summary_tokens = max(token_budget - message_tokens, 0)
+        max_summary_chars = available_summary_tokens * 4
+        if max_summary_chars <= 0:
+            return ""
+        if len(summary) <= max_summary_chars:
+            return summary
+        return summary[-max_summary_chars:].lstrip()
+
+    def _core_messages_from_json(self, value: str) -> list[SessionCoreMessage]:
+        try:
+            payload = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(payload, list):
+            return []
+        return [
+            SessionCoreMessage.model_validate(item)
+            for item in payload
+            if isinstance(item, dict)
+        ]
 
     def _default_title(self, *, title: str | None, initial_message: str | None) -> str:
         if title and title.strip():

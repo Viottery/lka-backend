@@ -78,6 +78,8 @@ Urgent track 的阶段目标：
 - 不提供 `/mail/process` 这类邮件专属 agent endpoint；邮件整理必须通过通用 Agent turn 调用 `mail` tools 完成。
 - 通用 Agent turn 已扩展为单次查询内的 step-limited 决策循环：先选择 Tool Package，
   再按观察结果多次决定是否调用工具或最终回答；当前可执行 package 仍以 `mail` 为主。
+- 每个 session 已新增本地 context window，默认预算 `65536` token，只保存前文摘要和核心
+  user / agent 问答；完整运行过程仍保存在本地 run log，后续再接入可检索历史 trace。
 
 ### 0.1 MVP 最终应具备的能力
 

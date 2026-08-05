@@ -102,3 +102,34 @@ def test_parallel_sessions_and_mail_tool_access_are_independent(tmp_path, monkey
 
     listed_ids = {session.session_id for session in listed.sessions}
     assert {first_session_id, second_session_id}.issubset(listed_ids)
+
+
+def test_session_context_window_summarizes_old_core_messages(tmp_path, monkeypatch):
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
+    get_settings.cache_clear()
+
+    app = create_app()
+    service = app.state.runtime.session_service
+
+    service.ensure_session(session_id="session_small_window")
+    window = service.record_context_exchange(
+        session_id="session_small_window",
+        user_input="first user message " + ("alpha " * 10),
+        agent_answer="first agent answer " + ("beta " * 10),
+        trace_id="trace_first",
+        token_budget=75,
+    )
+    window = service.record_context_exchange(
+        session_id="session_small_window",
+        user_input="second user message " + ("gamma " * 10),
+        agent_answer="second agent answer " + ("delta " * 10),
+        trace_id="trace_second",
+        token_budget=75,
+    )
+
+    assert window.token_budget == 75
+    assert window.token_estimate <= 75
+    assert "alpha" in window.summary
+    assert window.core_messages
+    assert any("second" in message.content for message in window.core_messages)

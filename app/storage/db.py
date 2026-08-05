@@ -129,6 +129,16 @@ def init_db(db_path: Path) -> None:
             CREATE INDEX IF NOT EXISTS idx_agent_session_messages_session_id
                 ON agent_session_messages(session_id, created_at);
 
+            CREATE TABLE IF NOT EXISTS agent_session_context_windows (
+                session_id TEXT PRIMARY KEY,
+                token_budget INTEGER NOT NULL,
+                summary TEXT NOT NULL,
+                core_messages TEXT NOT NULL,
+                token_estimate INTEGER NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES agent_sessions(session_id)
+            );
+
             CREATE TABLE IF NOT EXISTS mail_accounts (
                 account_id TEXT PRIMARY KEY,
                 provider TEXT NOT NULL,

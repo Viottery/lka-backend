@@ -60,6 +60,9 @@ LLM 推理、工具选择、观察工具结果和反馈循环属于 Agent Loop�
 会话基础设施当前由本地 SQLite 管理，使用显式 `session_id` 支撑平行会话和多轮会话。
 后端不维护隐式全局当前会话；前端切换会话时必须把目标 `session_id` 传给运行入口。
 Session Service 只负责创建会话、追加消息、读取历史和更新时间，不调用 LLM，也不选择工具。
+每个 session 还维护一个本地 context window，默认预算为 `65536` token。窗口只保存
+前文摘要和核心 user / agent 问答，用于下一轮 prompt 注入；完整工具结果、LLM prompt /
+output、错误和运行过程保留在 `data/agent_logs/`，必要时再通过日志或历史检索恢复。
 邮件数据源是全局本地知识源，不存在独立的“邮件会话引擎”。Mail tools 只在某个 Agent turn
 中按当前 `session_id` 读取一次性信息并返回观察结果；是否把用户输入、工具观察、`run_id`
 或 `log_path` 写入会话历史，必须由通用 Agent turn / Session 层显式决定，邮件工具和
@@ -70,6 +73,7 @@ Session Service 只负责创建会话、追加消息、读取历史和更新时�
 
 - 运行时间、`run_id`、`session_id` 和用户输入。
 - 第一层 Tool Package catalog 和实际展开的 package。
+- 本轮使用的 session context window 快照。
 - Agent 每一步 decision，包括 action、reason、选中的 tool、tool input 或最终 answer。
 - 每个 tool 的选择时间、输入、输出、状态和错误。
 - 给 LLM 的完整 system prompt、user prompt 和 LLM 完整输出。

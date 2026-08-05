@@ -218,6 +218,9 @@ POST /agent/turn
   `mail.load_messages`、`mail.persist_matters` 等具体工具。
 - 展开 package 后，Agent 会进入单次 turn 内的 step-limited loop：每一步生成一个
   `decision_event`，动作可以是调用一个工具或直接回答；工具结果作为 observation 进入下一步。
+- 每个 session 维护一个本地 context window，默认预算为 `65536` token。Agent prompt
+  只注入前文摘要和核心 user / agent 问答；完整工具调用、LLM prompt/output 和运行过程
+  保存在本地 run log，不进入后续 prompt。
 - 每次调用会显式追加 user / agent session message，并写入本地 markdown run log。
 - run log 由代码模板生成，包含用户输入、package catalog、展开工具、决策事件、
   工具调用输入输出、LLM 完整 prompt / output / 错误分类和最终回答。
@@ -332,6 +335,8 @@ POST /sessions/session_xxx/messages
 
 - `role` 当前支持 `user`、`agent`、`system`、`tool`。
 - 会话 API 只负责本地持久化和读取，不调用 LLM。
+- Agent turn 会额外维护 session context window，用于后续多轮 prompt 注入；它只保存核心
+  问答和前文摘要，不保存完整 run log。
 - 前端切换会话时应使用显式 `session_id`，后端不维护隐式全局当前会话。
 - 会话消息必须由 Session / 通用 Agent turn 显式追加；mail tools 不会因为被调用而自动
   写入 session history。

@@ -160,6 +160,56 @@ def test_agent_turn_retries_rate_limited_llm_and_logs_failure(tmp_path, monkeypa
     assert "## Decision Events" in log_text
 
 
+def test_agent_turn_maintains_core_session_context_window(tmp_path, monkeypatch):
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
+    get_settings.cache_clear()
+
+    app = create_app()
+    request = SimpleNamespace(app=app)
+    fake_llm = _ContextAwareLLM()
+    app.state.runtime.agent_turn_loop.llm_client = fake_llm
+
+    first = run_agent_turn(
+        AgentTurnRequest(
+            session_id="session_context_window",
+            user_input="第一轮问题：记住我的关注点是ICA学生签证。",
+        ),
+        request,
+    )
+    second = run_agent_turn(
+        AgentTurnRequest(
+            session_id="session_context_window",
+            user_input="第二轮问题：继续刚才的话题。",
+        ),
+        request,
+    )
+
+    assert first.answer == "第一轮回答：已记录ICA学生签证关注点。"
+    assert second.answer == "第二轮回答：我看到了上一轮关于ICA学生签证的核心问答。"
+    assert fake_llm.route_contexts[0]["core_messages"] == []
+    second_context = fake_llm.route_contexts[1]
+    assert second_context["token_budget"] == 65_536
+    assert second_context["token_estimate"] > 0
+    assert [message["role"] for message in second_context["core_messages"]] == [
+        "user",
+        "agent",
+    ]
+    assert "第一轮问题" in second_context["core_messages"][0]["content"]
+    assert "第一轮回答" in second_context["core_messages"][1]["content"]
+    assert "tool_events" not in json.dumps(second_context, ensure_ascii=False)
+
+    window = app.state.runtime.session_service.get_context_window(
+        session_id="session_context_window"
+    )
+    assert len(window.core_messages) == 4
+    assert "第二轮回答" in window.core_messages[-1].content
+
+    log_text = Path(second.log_path or "").read_text(encoding="utf-8")
+    assert "## Session Context Window" in log_text
+    assert "第一轮问题" in log_text
+
+
 class _RateLimitedThenWorkingLLM:
     def __init__(self) -> None:
         self.calls = 0
@@ -222,6 +272,54 @@ class _RateLimitedThenWorkingLLM:
             content = "LLM final answer after retry."
         return LLMResponse(
             provider="fake_llm",
+            status="completed",
+            content=content,
+            prompt_summary=prompt_summary,
+        )
+
+
+class _ContextAwareLLM:
+    def __init__(self) -> None:
+        self.route_contexts: list[dict] = []
+        self.decision_calls = 0
+
+    def complete_text(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        prompt_summary: str,
+        temperature: float = 0.0,
+        max_output_tokens: int | None = None,
+    ) -> LLMResponse:
+        if "Choose at most one tool package" in system_prompt:
+            payload = json.loads(user_prompt)
+            self.route_contexts.append(payload["session_context_window"])
+            content = json.dumps(
+                {
+                    "selected_package": "mail",
+                    "reason": "Use mail package for context-window test.",
+                    "search_query": "ICA",
+                }
+            )
+        elif "Choose the next single action" in system_prompt:
+            self.decision_calls += 1
+            answer = (
+                "第一轮回答：已记录ICA学生签证关注点。"
+                if self.decision_calls == 1
+                else "第二轮回答：我看到了上一轮关于ICA学生签证的核心问答。"
+            )
+            content = json.dumps(
+                {
+                    "action": "answer",
+                    "answer": answer,
+                    "reason": "Context window is enough for this test.",
+                }
+            )
+        else:
+            content = "Unexpected prompt."
+        return LLMResponse(
+            provider="fake_context_llm",
             status="completed",
             content=content,
             prompt_summary=prompt_summary,
