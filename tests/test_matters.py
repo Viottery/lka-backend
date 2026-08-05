@@ -170,6 +170,8 @@ def test_agent_turn_can_create_matter_and_receives_current_time(tmp_path, monkey
 
     assert response.selected_package == "matter"
     assert [event.tool_name for event in response.tool_events] == ["matter.create"]
+    assert response.tool_events[0].feedback["status"] == "accepted"
+    assert response.tool_events[0].feedback["source"] == "llm"
     assert response.answer == "已创建 ICA 学生签证材料准备事项。"
     assert fake_llm.route_context is not None
     assert fake_llm.decision_context is not None
@@ -199,7 +201,15 @@ class _MatterCreatingLLM:
         max_output_tokens: int | None = None,
     ) -> LLMResponse:
         payload = json.loads(user_prompt)
-        if "Choose at most one tool package" in system_prompt:
+        if "Tool Result Checker" in system_prompt:
+            content = json.dumps(
+                {
+                    "status": "accepted",
+                    "message": "Tool result is a valid observation.",
+                    "remaining_work": "Answer the user.",
+                }
+            )
+        elif "Choose at most one tool package" in system_prompt:
             self.route_context = payload["session_context_window"]
             content = json.dumps(
                 {

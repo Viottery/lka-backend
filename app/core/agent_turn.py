@@ -26,7 +26,7 @@ from app.core.llm import (
 from app.core.runtime_tools import current_time_payload
 from app.core.sessions import SessionService
 from app.core.sessions import SessionRecentMessage
-from app.core.tools import ToolContext, ToolExecutor
+from app.core.tools import ToolContext, ToolExecutor, ToolResult
 
 
 def _now_iso() -> str:
@@ -45,6 +45,7 @@ class AgentTurnToolEvent(BaseModel):
     completed_at: str
     input: dict[str, Any] = Field(default_factory=dict)
     result: dict[str, Any] = Field(default_factory=dict)
+    feedback: dict[str, Any] = Field(default_factory=dict)
 
 
 class AgentTurnLLMEvent(BaseModel):
@@ -71,6 +72,8 @@ class AgentTurnDecisionEvent(BaseModel):
     tool_input: dict[str, Any] = Field(default_factory=dict)
     answer: str | None = None
     reason: str | None = None
+    assistant_message: str | None = None
+    operation: dict[str, Any] = Field(default_factory=dict)
     raw_output: str | None = None
 
 
@@ -106,7 +109,7 @@ class AgentTurnLoop:
         self.llm_max_attempts = 2
         self.default_rate_limit_wait_seconds = 1.0
         self.max_decision_steps = 6
-        self.llm_generation_token_budget = 8192
+        self.llm_generation_token_budget: int | None = None
         self.session_context_token_budget = 65_536
 
     def run(
@@ -609,6 +612,12 @@ class AgentTurnLoop:
                 else {},
                 answer=decision.get("answer") if isinstance(decision.get("answer"), str) else None,
                 reason=decision.get("reason") if isinstance(decision.get("reason"), str) else None,
+                assistant_message=decision.get("assistant_message")
+                if isinstance(decision.get("assistant_message"), str)
+                else None,
+                operation=decision.get("operation")
+                if isinstance(decision.get("operation"), dict)
+                else {},
                 raw_output=decision.get("_raw_output")
                 if isinstance(decision.get("_raw_output"), str)
                 else None,
@@ -618,6 +627,13 @@ class AgentTurnLoop:
             if action == "answer":
                 answer = str(decision.get("answer") or "").strip()
                 return answer or None
+
+            if action == "malformed_tool_call":
+                answer = (
+                    "LLM 返回了疑似工具调用的损坏 JSON，系统已停止执行，避免把未执行的"
+                    "工具操作误当作最终结果。请重试该请求。"
+                )
+                return answer
 
             if action != "call_tool":
                 return None
@@ -644,11 +660,21 @@ class AgentTurnLoop:
                 context=context,
                 tool_events=tool_events,
             )
+            feedback = self._check_tool_result_with_llm(
+                user_input=user_input,
+                selected_package=selected_package,
+                decision=decision,
+                tool_result=tool_result,
+                llm_events=llm_events,
+            )
+            if tool_events:
+                tool_events[-1].feedback = feedback
             observations.append(
                 {
                     "tool_name": tool_name,
                     "input": tool_input,
                     "result": tool_result.model_dump(mode="json"),
+                    "feedback": feedback,
                 }
             )
 
@@ -688,26 +714,17 @@ class AgentTurnLoop:
             "new tasks/events, matter.update to change status/fields, and matter.link_source "
             "to attach evidence such as mail message ids. Use the current_time in context to "
             "resolve relative dates. For direct time questions, use runtime.now or answer from "
-            "current_time if it is sufficient. Return only strict JSON in one of "
-            "these forms: "
-            '{"action":"call_tool","tool_name":"mail.sync","tool_input":{"folder":"Inbox",'
-            '"limit":25,"max_pages":1},"reason":"..."}, '
-            '{"action":"call_tool","tool_name":"mail.search","tool_input":{"query":"...",'
-            '"limit":8},"reason":"..."}, '
-            '{"action":"call_tool","tool_name":"mail.load_messages","tool_input":'
-            '{"message_ids":["..."]},"reason":"..."}, '
-            '{"action":"call_tool","tool_name":"matter.create","tool_input":{"title":"...",'
-            '"summary":"...","status":"open","priority":"normal","due_at":null,'
-            '"tags":[],"source_links":[],"metadata":{}},"reason":"..."}, '
-            '{"action":"call_tool","tool_name":"matter.search","tool_input":{"query":"...",'
-            '"limit":10},"reason":"..."}, '
-            '{"action":"call_tool","tool_name":"matter.list","tool_input":{"limit":20,'
-            '"status":null},"reason":"..."}, '
-            '{"action":"call_tool","tool_name":"matter.update","tool_input":{"matter_id":"...",'
-            '"status":"done"},"reason":"..."}, '
-            '{"action":"call_tool","tool_name":"runtime.now","tool_input":{"timezone":'
-            '"Asia/Shanghai"},"reason":"..."}, '
-            '{"action":"answer","answer":"...","reason":"..."}'
+            "current_time if it is sufficient. Return only strict JSON using this envelope: "
+            '{"assistant_message":"short user-visible progress text or final answer",'
+            '"operation":{"type":"tool_call|final_answer|request_confirmation|no_op",'
+            '"tool_name":"mail.search","tool_input":{"query":"...","limit":8},'
+            '"final_answer":null,"reason":"...","confidence":"low|medium|high"}}. '
+            "For a final answer, set operation.type to final_answer and put the answer in "
+            "operation.final_answer. For a tool call, put only progress text in "
+            "assistant_message and put all executable details in operation. Do not put a "
+            "tool-call JSON object inside assistant_message. Legacy JSON with action, "
+            "tool_name, tool_input, answer, and reason is accepted, but the envelope is "
+            "preferred."
         )
         user_prompt = json.dumps(
             {
@@ -732,17 +749,38 @@ class AgentTurnLoop:
             return None
         parsed = self._parse_json_object(response.content)
         if not isinstance(parsed, dict) or not parsed:
+            if self._looks_like_tool_operation(response.content):
+                repaired = self._repair_malformed_decision_output(
+                    raw_output=response.content,
+                    user_input=user_input,
+                    route=route,
+                    expanded_tools=expanded_tools,
+                    observations=observations,
+                    llm_events=llm_events,
+                )
+                if repaired is not None:
+                    return repaired
+                return {
+                    "action": "malformed_tool_call",
+                    "reason": "LLM returned malformed JSON that looked like a tool call.",
+                    "_raw_output": response.content,
+                }
             answer = response.content.strip()
             if not answer:
                 return None
             return {
                 "action": "answer",
                 "answer": answer,
+                "assistant_message": answer,
+                "operation": {
+                    "type": "final_answer",
+                    "final_answer": answer,
+                    "reason": "Recovered answer from non-JSON decision output.",
+                },
                 "reason": "Recovered answer from non-JSON decision output.",
                 "_raw_output": response.content,
             }
-        parsed["_raw_output"] = response.content
-        return parsed
+        return self._normalize_decision_output(parsed, raw_output=response.content)
 
     def _record_route_decision(
         self,
@@ -775,6 +813,8 @@ class AgentTurnLoop:
         tool_input: dict[str, Any] | None = None,
         answer: str | None = None,
         reason: str | None = None,
+        assistant_message: str | None = None,
+        operation: dict[str, Any] | None = None,
         raw_output: str | None = None,
         step_index: int | None = None,
     ) -> None:
@@ -789,9 +829,170 @@ class AgentTurnLoop:
                 tool_input=tool_input or {},
                 answer=answer,
                 reason=reason,
+                assistant_message=assistant_message,
+                operation=operation or {},
                 raw_output=raw_output,
             )
         )
+
+    def _normalize_decision_output(
+        self,
+        parsed: dict[str, Any],
+        *,
+        raw_output: str,
+    ) -> dict[str, Any]:
+        operation = parsed.get("operation")
+        if isinstance(operation, dict):
+            operation_type = str(operation.get("type") or "").strip()
+            assistant_message = (
+                parsed.get("assistant_message")
+                if isinstance(parsed.get("assistant_message"), str)
+                else None
+            )
+            reason = (
+                operation.get("reason")
+                if isinstance(operation.get("reason"), str)
+                else parsed.get("reason")
+                if isinstance(parsed.get("reason"), str)
+                else None
+            )
+            if operation_type in {"tool_call", "call_tool"}:
+                return {
+                    "action": "call_tool",
+                    "tool_name": operation.get("tool_name"),
+                    "tool_input": operation.get("tool_input")
+                    if isinstance(operation.get("tool_input"), dict)
+                    else {},
+                    "assistant_message": assistant_message,
+                    "operation": operation,
+                    "reason": reason,
+                    "_raw_output": raw_output,
+                }
+            if operation_type == "final_answer":
+                answer = (
+                    operation.get("final_answer")
+                    if isinstance(operation.get("final_answer"), str)
+                    else assistant_message
+                )
+                return {
+                    "action": "answer",
+                    "answer": answer,
+                    "assistant_message": assistant_message,
+                    "operation": operation,
+                    "reason": reason,
+                    "_raw_output": raw_output,
+                }
+            if operation_type in {"request_confirmation", "no_op"}:
+                answer = assistant_message or reason or ""
+                return {
+                    "action": operation_type,
+                    "answer": answer,
+                    "assistant_message": assistant_message,
+                    "operation": operation,
+                    "reason": reason,
+                    "_raw_output": raw_output,
+                }
+
+        action = parsed.get("action")
+        if isinstance(action, str):
+            normalized = dict(parsed)
+            normalized["_raw_output"] = raw_output
+            if "assistant_message" not in normalized and isinstance(parsed.get("answer"), str):
+                normalized["assistant_message"] = parsed["answer"]
+            if "operation" not in normalized:
+                if action == "call_tool":
+                    normalized["operation"] = {
+                        "type": "tool_call",
+                        "tool_name": parsed.get("tool_name"),
+                        "tool_input": parsed.get("tool_input")
+                        if isinstance(parsed.get("tool_input"), dict)
+                        else {},
+                        "final_answer": None,
+                        "reason": parsed.get("reason"),
+                    }
+                elif action == "answer":
+                    normalized["operation"] = {
+                        "type": "final_answer",
+                        "tool_name": None,
+                        "tool_input": {},
+                        "final_answer": parsed.get("answer"),
+                        "reason": parsed.get("reason"),
+                    }
+            return normalized
+
+        parsed["_raw_output"] = raw_output
+        return parsed
+
+    def _looks_like_tool_operation(self, raw_output: str) -> bool:
+        compact = "".join(raw_output.lower().split())
+        return any(
+            marker in compact
+            for marker in [
+                '"action":"call_tool"',
+                '"type":"tool_call"',
+                '"tool_name"',
+                '"tool_input"',
+            ]
+        )
+
+    def _repair_malformed_decision_output(
+        self,
+        *,
+        raw_output: str,
+        user_input: str,
+        route: dict[str, Any],
+        expanded_tools: list[dict[str, Any]],
+        observations: list[dict[str, Any]],
+        llm_events: list[AgentTurnLLMEvent],
+    ) -> dict[str, Any] | None:
+        if self.llm_client is None:
+            return None
+        system_prompt = (
+            "You repair one malformed Main Agent Brain decision. Return only strict JSON "
+            "using the envelope: {\"assistant_message\":\"...\",\"operation\":{\"type\":"
+            "\"tool_call|final_answer|request_confirmation|no_op\",\"tool_name\":null,"
+            "\"tool_input\":{},\"final_answer\":null,\"reason\":\"...\","
+            "\"confidence\":\"low|medium|high\"}}. Preserve a tool call only when the "
+            "malformed output clearly includes the tool name and complete tool input. Do not "
+            "invent missing required tool arguments."
+        )
+        user_prompt = json.dumps(
+            {
+                "user_input": user_input,
+                "route": route,
+                "expanded_tools": expanded_tools,
+                "observations": observations,
+                "malformed_output": raw_output,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        response = self._complete_text_with_retry(
+            stage="decision_repair",
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            prompt_summary="agent_turn_decision_repair",
+            max_output_tokens=self.llm_generation_token_budget,
+            llm_events=llm_events,
+        )
+        if response is None:
+            return None
+        parsed = self._parse_json_object(response.content)
+        if not isinstance(parsed, dict) or not parsed:
+            return None
+        normalized = self._normalize_decision_output(
+            parsed,
+            raw_output=response.content,
+        )
+        if normalized.get("action") != "call_tool":
+            return None
+        normalized["_raw_output"] = raw_output
+        normalized["_repair_output"] = response.content
+        normalized["reason"] = (
+            normalized.get("reason")
+            or "Repaired malformed tool-call decision output."
+        )
+        return normalized
 
     def _cached_mail_messages_from_session(
         self,
@@ -891,7 +1092,7 @@ class AgentTurnLoop:
         tool_input: dict[str, Any],
         context: ToolContext,
         tool_events: list[AgentTurnToolEvent],
-    ) -> Any:
+    ) -> ToolResult:
         selected_at = _now_iso()
         result = self.tool_executor.execute(
             invocation_id=_stable_id("tool_invocation", context.trace_id, tool_name, selected_at),
@@ -906,9 +1107,105 @@ class AgentTurnLoop:
                 completed_at=_now_iso(),
                 input=tool_input,
                 result=result.model_dump(mode="json"),
+                feedback=self._local_tool_feedback(tool_name=tool_name, result=result),
             )
         )
         return result
+
+    def _local_tool_feedback(
+        self,
+        *,
+        tool_name: str,
+        result: ToolResult,
+    ) -> dict[str, Any]:
+        if result.status == "completed":
+            return {
+                "source": "local",
+                "status": "accepted",
+                "message": f"{tool_name} executed successfully.",
+            }
+        return {
+            "source": "local",
+            "status": "failed",
+            "message": f"{tool_name} execution failed.",
+            "error": result.error,
+        }
+
+    def _check_tool_result_with_llm(
+        self,
+        *,
+        user_input: str,
+        selected_package: str,
+        decision: dict[str, Any],
+        tool_result: ToolResult,
+        llm_events: list[AgentTurnLLMEvent],
+    ) -> dict[str, Any]:
+        local_feedback = self._local_tool_feedback(
+            tool_name=tool_result.tool_name,
+            result=tool_result,
+        )
+        if self.llm_client is None:
+            return local_feedback
+
+        system_prompt = (
+            "You are the Tool Result Checker for Local Knowledge Agent OS. Check whether "
+            "the just-executed tool result is a valid observation for the prior tool-call "
+            "decision. Do not make a final user answer. Do not claim success when "
+            "ToolResult.status is failed. Return only strict JSON: {\"status\":"
+            "\"accepted|needs_retry|failed\",\"message\":\"...\",\"remaining_work\":\"...\"}."
+        )
+        user_prompt = json.dumps(
+            {
+                "user_input": user_input,
+                "selected_package": selected_package,
+                "decision": decision,
+                "tool_result": tool_result.model_dump(mode="json"),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        response = self._complete_text_with_retry(
+            stage="tool_result_check",
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            prompt_summary=f"tool_result_check tool={tool_result.tool_name}",
+            max_output_tokens=self.llm_generation_token_budget,
+            llm_events=llm_events,
+        )
+        if response is None:
+            return local_feedback
+
+        parsed = self._parse_json_object(response.content)
+        if not isinstance(parsed, dict) or not parsed:
+            checked = dict(local_feedback)
+            checked.update(
+                {
+                    "source": "local",
+                    "llm_check_status": "unparsed",
+                    "llm_output": response.content,
+                }
+            )
+            return checked
+
+        status = parsed.get("status")
+        if status not in {"accepted", "needs_retry", "failed"}:
+            status = local_feedback["status"]
+        if tool_result.status != "completed" and status == "accepted":
+            status = "failed"
+        message = parsed.get("message") if isinstance(parsed.get("message"), str) else None
+        remaining_work = (
+            parsed.get("remaining_work")
+            if isinstance(parsed.get("remaining_work"), str)
+            else None
+        )
+        return {
+            "source": "llm",
+            "status": status,
+            "message": message or local_feedback["message"],
+            "remaining_work": remaining_work,
+            "local_status": local_feedback["status"],
+            "llm_output": response.content,
+        }
 
     def _answer_with_llm(
         self,

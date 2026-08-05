@@ -56,12 +56,22 @@ LLM 推理、工具选择、观察工具结果和反馈循环属于 Agent Loop�
 再展开具体工具，然后反复执行 `decision -> tool call -> observation`，直到 Agent
 给出最终回答或达到步数上限。每一步只能调用一个工具或回答，避免在领域服务里隐藏
 多步骤自动化。
+decision 输出必须区分自然语言和内部操作：`assistant_message` 只保存用户可见的过程说明
+或最终回答，`operation` 才保存 `tool_call` / `final_answer` / `request_confirmation`
+等结构化动作。这样工具调用中途的模型文本可以被展示和记录，但不会和真实执行动作混在
+同一个字段里。
 如果 LLM 判断当前 turn 不需要展开任何 Tool Package，Agent Loop 仍应允许 LLM 基于当前
 session context window 直接回答；“不需要工具”和“系统无法处理”不能混为一谈。
 当 provider 返回不完整 JSON 但明确选择了某个 package 时，Agent Loop 可以做保守恢复，
 并在 run log 中保留原始输出，避免模型格式问题直接破坏工具链路。
 如果 decision 阶段返回了非 JSON 的自然语言最终回答，Agent Loop 可以将其恢复为
 `answer` decision，并记录原始输出，避免已有高质量回答被本地 fallback 覆盖。
+如果 decision 阶段返回的非 JSON 内容疑似工具调用，例如包含 `tool_name`、`tool_input`
+或 `tool_call`，Agent Loop 必须 fail closed：先尝试 `decision_repair` 修复为合法
+operation，修复失败则停止本轮执行，不能把工具调用残片当作最终 answer。
+每次真实工具调用后都必须生成反馈 observation。反馈至少包含执行成功 / 失败状态和可读
+message；当 LLM 可用时，还要追加独立 `tool_result_check` 调用，让 LLM 检查工具结果是否
+符合上一条 tool-call decision。底层 `ToolResult.status` 已失败时，反馈不能被升级为成功。
 
 会话基础设施当前由本地 SQLite 管理，使用显式 `session_id` 支撑平行会话和多轮会话。
 后端不维护隐式全局当前会话；前端切换会话时必须把目标 `session_id` 传给运行入口。
@@ -102,8 +112,9 @@ Agent turn 还会把 `current_time` 注入 session context window，包含 UTC�
 - 运行时间、`run_id`、`session_id` 和用户输入。
 - 第一层 Tool Package catalog 和实际展开的 package。
 - 本轮使用的 session context window 快照。
-- Agent 每一步 decision，包括 action、reason、选中的 tool、tool input 或最终 answer。
-- 每个 tool 的选择时间、输入、输出、状态和错误。
+- Agent 每一步 decision，包括 action、assistant_message、operation、reason、选中的
+  tool、tool input 或最终 answer。
+- 每个 tool 的选择时间、输入、输出、状态、错误和反馈。
 - 给 LLM 的完整 system prompt、user prompt 和 LLM 完整输出。
 - 最终结构化结果。
 

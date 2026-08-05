@@ -62,6 +62,10 @@ def test_agent_turn_expands_mail_package_and_records_log(tmp_path, monkeypatch):
         "mail.search",
         "mail.load_messages",
     ]
+    assert [event.feedback["status"] for event in response.tool_events] == [
+        "accepted",
+        "accepted",
+    ]
     assert [event.action for event in response.decision_events] == [
         "select_package",
         "call_tool",
@@ -123,11 +127,13 @@ def test_agent_turn_retries_rate_limited_llm_and_logs_failure(tmp_path, monkeypa
         request,
     )
 
-    assert fake_llm.calls == 5
-    assert fake_llm.max_output_tokens_seen == [8192, 8192, 8192, 8192, 8192]
+    assert fake_llm.calls == 7
+    assert fake_llm.max_output_tokens_seen == [None, None, None, None, None, None, None]
     assert response.answer == "LLM final answer after retry."
     assert [event.status for event in response.llm_events] == [
         "rate_limited",
+        "completed",
+        "completed",
         "completed",
         "completed",
         "completed",
@@ -137,7 +143,9 @@ def test_agent_turn_retries_rate_limited_llm_and_logs_failure(tmp_path, monkeypa
         "route",
         "route",
         "decision",
+        "tool_result_check",
         "decision",
+        "tool_result_check",
         "decision",
     ]
     assert response.llm_events[0].status_code == 429
@@ -151,6 +159,10 @@ def test_agent_turn_retries_rate_limited_llm_and_logs_failure(tmp_path, monkeypa
     assert [event.tool_name for event in response.tool_events] == [
         "mail.search",
         "mail.load_messages",
+    ]
+    assert [event.feedback["source"] for event in response.tool_events] == [
+        "llm",
+        "llm",
     ]
 
     log_text = Path(response.log_path or "").read_text(encoding="utf-8")
@@ -310,6 +322,7 @@ def test_agent_turn_reuses_cached_loaded_mail_for_follow_up(tmp_path, monkeypatc
         "mail.search",
         "mail.load_messages",
     ]
+    assert all(event.feedback["status"] == "accepted" for event in first.tool_events)
     assert second.selected_package == "mail"
     assert second.tool_events == []
     assert second.answer == "第二轮回答：我复用了缓存邮件正文。"
@@ -400,6 +413,80 @@ def test_agent_turn_recovers_plain_text_decision_as_answer(tmp_path, monkeypatch
     assert "当前未配置可用 LLM" not in response.answer
 
 
+def test_agent_turn_accepts_operation_envelope_decisions(tmp_path, monkeypatch):
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
+    get_settings.cache_clear()
+
+    app = create_app()
+    request = SimpleNamespace(app=app)
+    import_mail(
+        MailImportRequest(
+            account={
+                "provider": "local_json",
+                "email_address": "user@example.com",
+            },
+            messages=[
+                {
+                    "external_id": "agent_turn_envelope_001",
+                    "folder": "Inbox",
+                    "subject": "NTUSO Audition envelope",
+                    "sender": "ntuso@example.com",
+                    "to": ["user@example.com"],
+                    "received_at": "2026-08-05T09:30:00Z",
+                    "body_text": "Envelope decision test body.",
+                },
+            ],
+        ),
+        request,
+    )
+    fake_llm = _EnvelopeDecisionLLM()
+    app.state.runtime.agent_turn_loop.llm_client = fake_llm
+
+    response = run_agent_turn(
+        AgentTurnRequest(
+            session_id="session_operation_envelope",
+            user_input="帮我查一下NTUSO考试。",
+        ),
+        request,
+    )
+
+    assert response.answer == "Envelope final answer."
+    assert [event.action for event in response.decision_events] == [
+        "select_package",
+        "call_tool",
+        "answer",
+    ]
+    assert response.decision_events[1].assistant_message == "我先检索相关邮件。"
+    assert response.decision_events[1].operation["type"] == "tool_call"
+    assert response.tool_events[0].feedback["source"] == "llm"
+
+
+def test_agent_turn_does_not_recover_malformed_tool_call_as_answer(tmp_path, monkeypatch):
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
+    get_settings.cache_clear()
+
+    app = create_app()
+    request = SimpleNamespace(app=app)
+    fake_llm = _MalformedToolCallDecisionLLM()
+    app.state.runtime.agent_turn_loop.llm_client = fake_llm
+
+    response = run_agent_turn(
+        AgentTurnRequest(
+            session_id="session_malformed_tool_call",
+            user_input="帮我创建一个NTU事项。",
+        ),
+        request,
+    )
+
+    assert response.tool_events == []
+    assert response.decision_events[-1].action == "malformed_tool_call"
+    assert '"tool_name":"matter.create"' in (response.decision_events[-1].raw_output or "")
+    assert '"tool_name":"matter.create"' not in response.answer
+    assert "损坏 JSON" in response.answer
+
+
 def test_agent_turn_summarizes_context_window_with_llm_when_full(tmp_path, monkeypatch):
     monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
@@ -469,7 +556,9 @@ class _RateLimitedThenWorkingLLM:
                 message="LLM provider returned HTTP 429: retry later",
                 retry_after="0",
             )
-        if "Choose at most one tool package" in system_prompt:
+        if "Tool Result Checker" in system_prompt:
+            content = _tool_check_content()
+        elif "Choose at most one tool package" in system_prompt:
             content = (
                 '{"selected_package":"mail","reason":"test route",'
                 '"search_query":"NTUSO"}'
@@ -642,6 +731,8 @@ class _MailCacheReuseLLM:
                     "search_query": "NTUSO",
                 }
             )
+        elif "Tool Result Checker" in system_prompt:
+            content = _tool_check_content()
         elif "Choose the next single action" in system_prompt:
             payload = json.loads(user_prompt)
             observations = payload["observations"]
@@ -746,6 +837,8 @@ class _PlainTextDecisionAnswerLLM:
                     "search_query": "ICA Student Pass checklist",
                 }
             )
+        elif "Tool Result Checker" in system_prompt:
+            content = _tool_check_content()
         elif "Choose the next single action" in system_prompt:
             payload = json.loads(user_prompt)
             if not payload["observations"]:
@@ -766,6 +859,101 @@ class _PlainTextDecisionAnswerLLM:
             content = "Unexpected prompt."
         return LLMResponse(
             provider="fake_plain_text_decision_llm",
+            status="completed",
+            content=content,
+            prompt_summary=prompt_summary,
+        )
+
+
+class _EnvelopeDecisionLLM:
+    def complete_text(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        prompt_summary: str,
+        temperature: float = 0.0,
+        max_output_tokens: int | None = None,
+    ) -> LLMResponse:
+        if "Choose at most one tool package" in system_prompt:
+            content = json.dumps(
+                {
+                    "selected_package": "mail",
+                    "reason": "Use mail for NTUSO.",
+                    "search_query": "NTUSO",
+                }
+            )
+        elif "Tool Result Checker" in system_prompt:
+            content = _tool_check_content()
+        elif "Choose the next single action" in system_prompt:
+            payload = json.loads(user_prompt)
+            if not payload["observations"]:
+                content = json.dumps(
+                    {
+                        "assistant_message": "我先检索相关邮件。",
+                        "operation": {
+                            "type": "tool_call",
+                            "tool_name": "mail.search",
+                            "tool_input": {"query": "NTUSO", "limit": 8},
+                            "final_answer": None,
+                            "reason": "Search relevant local mail first.",
+                            "confidence": "high",
+                        },
+                    }
+                )
+            else:
+                content = json.dumps(
+                    {
+                        "assistant_message": "Envelope final answer.",
+                        "operation": {
+                            "type": "final_answer",
+                            "tool_name": None,
+                            "tool_input": {},
+                            "final_answer": "Envelope final answer.",
+                            "reason": "Search result is enough for this test.",
+                            "confidence": "high",
+                        },
+                    }
+                )
+        else:
+            content = "Unexpected prompt."
+        return LLMResponse(
+            provider="fake_envelope_llm",
+            status="completed",
+            content=content,
+            prompt_summary=prompt_summary,
+        )
+
+
+class _MalformedToolCallDecisionLLM:
+    def complete_text(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        prompt_summary: str,
+        temperature: float = 0.0,
+        max_output_tokens: int | None = None,
+    ) -> LLMResponse:
+        if "Choose at most one tool package" in system_prompt:
+            content = json.dumps(
+                {
+                    "selected_package": "matter",
+                    "reason": "User asks to create a matter.",
+                    "search_query": "NTU",
+                }
+            )
+        elif "You repair one malformed Main Agent Brain decision" in system_prompt:
+            content = "I cannot safely repair the incomplete tool call."
+        elif "Choose the next single action" in system_prompt:
+            content = (
+                '{"action":"call_tool","tool_name":"matter.create",'
+                '"tool_input":{"title":"NTU matter","summary":"broken'
+            )
+        else:
+            content = "Unexpected prompt."
+        return LLMResponse(
+            provider="fake_malformed_tool_call_llm",
             status="completed",
             content=content,
             prompt_summary=prompt_summary,
@@ -809,3 +997,13 @@ class _ContextSummarizingLLM:
             content=content,
             prompt_summary=prompt_summary,
         )
+
+
+def _tool_check_content() -> str:
+    return json.dumps(
+        {
+            "status": "accepted",
+            "message": "Tool result is a valid observation.",
+            "remaining_work": "Continue the agent loop.",
+        }
+    )

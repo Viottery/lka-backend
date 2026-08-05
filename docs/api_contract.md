@@ -233,12 +233,22 @@ POST /agent/turn
   `matter.link_source`；当目标是直接读取环境时间时展开 `runtime.now`。
 - 展开 package 后，Agent 会进入单次 turn 内的 step-limited loop：每一步生成一个
   `decision_event`，动作可以是调用一个工具或直接回答；工具结果作为 observation 进入下一步。
+- `decision_event` 会同时记录 `assistant_message` 和 `operation`。`assistant_message`
+  是用户可见的过程文本或最终回答；`operation` 是内部结构化动作，例如
+  `tool_call`、`final_answer`、`request_confirmation` 或 `no_op`。前端展示过程文本时
+  应读取 `assistant_message`，不要把工具调用 JSON 当作用户最终回答展示。
 - 如果 LLM 选择不展开 package，Agent 可以进入 `context_answer` 阶段，基于当前
   session context window 直接回答，不应把“无需工具”当成“无法处理”。
 - 如果 LLM 返回不完整 JSON 但原始输出明确选择了 `mail` package，Agent 会保守恢复该
   package 选择，并继续记录原始 LLM 输出以便回放。
 - 如果 decision 阶段返回非 JSON 的自然语言最终回答，Agent 会把该文本恢复为 `answer`
   decision，避免已有回答被本地 fallback 覆盖。
+- 如果 decision 阶段返回疑似工具调用的损坏 JSON，Agent 会先进入 `decision_repair`
+  阶段尝试修复；修复失败时记录 `malformed_tool_call` 并停止执行，不会把该残片恢复为
+  `answer`。
+- 每个真实 `tool_event` 都包含 `feedback`。反馈至少包含执行成功 / 失败状态和可读
+  message；真实 LLM 可用时，Agent 还会记录 `tool_result_check` LLM 事件，用来确认工具
+  结果是否符合上一条工具调用决策。
 - 每个 session 维护一个本地 context window，默认预算为 `65536` token。Agent prompt
   只注入前文摘要和近期 user / agent 问答；完整工具调用、LLM prompt/output 和运行过程
   保存在本地 run log，不进入后续 prompt。
@@ -254,7 +264,7 @@ POST /agent/turn
   将旧 summary 和除最近两条消息外的历史问答重写为新 summary，原文只保留最近两条消息。
 - 每次调用会显式追加 user / agent session message，并写入本地 markdown run log。
 - run log 由代码模板生成，包含用户输入、package catalog、展开工具、决策事件、
-  工具调用输入输出、LLM 完整 prompt / output / 错误分类和最终回答。
+  工具调用输入输出、工具反馈、LLM 完整 prompt / output / 错误分类和最终回答。
 - 未配置真实 LLM 或 LLM 调用失败时，Agent turn 会降级到本地 heuristic，保持链路可运行。
   当前本地 heuristic 主要覆盖 mail package；matter/runtime 的多步骤决策需要真实 LLM。
 

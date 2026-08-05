@@ -86,6 +86,18 @@ Urgent track 的阶段目标：
 - 不提供 `/mail/process` 这类邮件专属 agent endpoint；邮件整理必须通过通用 Agent turn 调用 `mail` tools 完成。
 - 通用 Agent turn 已扩展为单次查询内的 step-limited 决策循环：先选择 Tool Package，
   再按观察结果多次决定是否调用工具或最终回答；当前可执行 package 仍以 `mail` 为主。
+- Agent decision 输出已区分 `assistant_message` 和 `operation`。自然语言过程文本或最终
+  回答只进入 `assistant_message` / `final_answer`，工具调用只进入结构化 `operation`；
+  前端和日志可以展示模型过程文本，但不能把工具调用 JSON 当作最终回答。
+- 每个真实工具调用后都会生成 `feedback`，至少记录成功 / 失败状态和可读 message；LLM
+  可用时还会通过独立 `tool_result_check` 阶段检查工具结果是否符合上一条调用决策，并把
+  检查结果写回 tool event 和后续 observation。
+- decision 阶段的普通非 JSON 自然语言仍可恢复为 `answer`；但疑似工具调用的损坏 JSON
+  必须先尝试 `decision_repair`，修复失败则记录 `malformed_tool_call` 并停止，避免出现
+  “看起来调用了工具、实际没有执行”的假成功。
+- Agent Loop 对 route、decision、decision repair、tool result check 和 answer 阶段不再
+  主动设置 `max_tokens`，避免本地 harness 侧截断模型输出；真实 provider 自身限制仍需
+  通过错误处理和日志观察。
 - 多轮追问中，如果当前 session context window 已足够回答，Agent 可以不展开工具包，
   直接进入 `context_answer` LLM 阶段；如果 route LLM 返回不完整 JSON 但明确选择
   `mail`，Agent 会保守恢复该 package 选择并继续执行工具链。
