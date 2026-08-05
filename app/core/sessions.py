@@ -311,6 +311,11 @@ class SessionService:
         agent_answer: str,
         trace_id: str,
         token_budget: int | None = None,
+        context_summarizer: Callable[
+            [str, list[SessionRecentMessage], list[SessionRecentMessage], int],
+            str | None,
+        ]
+        | None = None,
     ) -> AgentSessionContextWindow:
         window = self.get_context_window(
             session_id=session_id,
@@ -336,6 +341,7 @@ class SessionService:
             summary=window.summary,
             messages=messages,
             token_budget=window.token_budget,
+            context_summarizer=context_summarizer,
         )
         updated = AgentSessionContextWindow(
             session_id=session_id,
@@ -386,21 +392,44 @@ class SessionService:
         summary: str,
         messages: list[SessionRecentMessage],
         token_budget: int,
+        context_summarizer: Callable[
+            [str, list[SessionRecentMessage], list[SessionRecentMessage], int],
+            str | None,
+        ]
+        | None = None,
     ) -> tuple[str, list[SessionRecentMessage], int]:
-        kept = list(messages)
-        current_summary = summary
-        while kept and self._context_token_estimate(current_summary, kept) > token_budget:
-            current_summary = self._append_summary_message(current_summary, kept.pop(0))
-            current_summary = self._trim_summary_for_budget(
-                summary=current_summary,
-                messages=kept,
-                token_budget=token_budget,
+        if self._context_token_estimate(summary, messages) <= token_budget:
+            return summary, messages, self._context_token_estimate(summary, messages)
+
+        kept = messages[-2:] if len(messages) > 2 else list(messages)
+        messages_to_summarize = messages[:-2] if len(messages) > 2 else []
+        if context_summarizer is not None and messages_to_summarize:
+            current_summary = (
+                context_summarizer(summary, messages_to_summarize, kept, token_budget)
+                or self._summarize_messages_locally(summary, messages_to_summarize)
             )
+        else:
+            current_summary = self._summarize_messages_locally(summary, messages_to_summarize)
+        current_summary = self._trim_summary_for_budget(
+            summary=current_summary,
+            messages=kept,
+            token_budget=token_budget,
+        )
         return (
             current_summary,
             kept,
             self._context_token_estimate(current_summary, kept),
         )
+
+    def _summarize_messages_locally(
+        self,
+        summary: str,
+        messages: list[SessionRecentMessage],
+    ) -> str:
+        current_summary = summary
+        for message in messages:
+            current_summary = self._append_summary_message(current_summary, message)
+        return current_summary
 
     def _append_summary_message(self, summary: str, message: SessionRecentMessage) -> str:
         prefix = f"{message.created_at} {message.role}: "

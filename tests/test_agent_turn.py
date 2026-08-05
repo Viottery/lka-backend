@@ -160,7 +160,7 @@ def test_agent_turn_retries_rate_limited_llm_and_logs_failure(tmp_path, monkeypa
     assert "## Decision Events" in log_text
 
 
-def test_agent_turn_maintains_core_session_context_window(tmp_path, monkeypatch):
+def test_agent_turn_maintains_recent_session_context_window(tmp_path, monkeypatch):
     monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
     get_settings.cache_clear()
@@ -208,6 +208,53 @@ def test_agent_turn_maintains_core_session_context_window(tmp_path, monkeypatch)
     log_text = Path(second.log_path or "").read_text(encoding="utf-8")
     assert "## Session Context Window" in log_text
     assert "第一轮问题" in log_text
+
+
+def test_agent_turn_summarizes_context_window_with_llm_when_full(tmp_path, monkeypatch):
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
+    get_settings.cache_clear()
+
+    app = create_app()
+    request = SimpleNamespace(app=app)
+    fake_llm = _ContextSummarizingLLM()
+    app.state.runtime.agent_turn_loop.llm_client = fake_llm
+    app.state.runtime.agent_turn_loop.session_context_token_budget = 60
+
+    first = run_agent_turn(
+        AgentTurnRequest(
+            session_id="session_context_summarize",
+            user_input="first historical topic " + ("alpha " * 15),
+        ),
+        request,
+    )
+    second = run_agent_turn(
+        AgentTurnRequest(
+            session_id="session_context_summarize",
+            user_input="second current topic " + ("beta " * 15),
+        ),
+        request,
+    )
+
+    window = app.state.runtime.session_service.get_context_window(
+        session_id="session_context_summarize"
+    )
+    assert fake_llm.summary_inputs
+    assert fake_llm.summary_inputs[0]["existing_summary"] == ""
+    assert len(fake_llm.summary_inputs[0]["messages_to_summarize"]) == 2
+    assert window.summary.startswith("LLM SUMMARY:")
+    assert len(window.recent_messages) == 2
+    assert "second current topic" in window.recent_messages[0].content
+    assert "first historical topic" not in json.dumps(
+        [message.model_dump(mode="json") for message in window.recent_messages],
+        ensure_ascii=False,
+    )
+
+    assert not any(event.stage == "context_summarize" for event in first.llm_events)
+    assert any(event.stage == "context_summarize" for event in second.llm_events)
+    log_text = Path(second.log_path or "").read_text(encoding="utf-8")
+    assert "context_summarize" in log_text
+    assert "Session Context Compressor" in log_text
 
 
 class _RateLimitedThenWorkingLLM:
@@ -320,6 +367,45 @@ class _ContextAwareLLM:
             content = "Unexpected prompt."
         return LLMResponse(
             provider="fake_context_llm",
+            status="completed",
+            content=content,
+            prompt_summary=prompt_summary,
+        )
+
+
+class _ContextSummarizingLLM:
+    def __init__(self) -> None:
+        self.summary_inputs: list[dict] = []
+
+    def complete_text(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        prompt_summary: str,
+        temperature: float = 0.0,
+        max_output_tokens: int | None = None,
+    ) -> LLMResponse:
+        if "Choose at most one tool package" in system_prompt:
+            content = json.dumps(
+                {
+                    "selected_package": None,
+                    "reason": "No package needed for context summarize test.",
+                    "search_query": "",
+                }
+            )
+        elif "Session Context Compressor" in system_prompt:
+            payload = json.loads(user_prompt)
+            self.summary_inputs.append(payload)
+            content = json.dumps(
+                {
+                    "summary": "LLM SUMMARY: prior first topic."
+                }
+            )
+        else:
+            content = "Unexpected prompt."
+        return LLMResponse(
+            provider="fake_context_summarizer",
             status="completed",
             content=content,
             prompt_summary=prompt_summary,

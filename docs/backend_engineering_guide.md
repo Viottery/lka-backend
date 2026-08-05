@@ -63,6 +63,8 @@ Session Service 只负责创建会话、追加消息、读取历史和更新时�
 每个 session 还维护一个本地 context window，默认预算为 `65536` token。窗口只保存
 前文摘要和近期 user / agent 问答，用于下一轮 prompt 注入；完整工具结果、LLM prompt /
 output、错误和运行过程保留在 `data/agent_logs/`，必要时再通过日志或历史检索恢复。
+窗口未满时不触发摘要；超过预算时由独立 `context_summarize` LLM 调用重新生成 summary，
+并只保留最近两条 user / agent 消息原文。
 邮件数据源是全局本地知识源，不存在独立的“邮件会话引擎”。Mail tools 只在某个 Agent turn
 中按当前 `session_id` 读取一次性信息并返回观察结果；是否把用户输入、工具观察、`run_id`
 或 `log_path` 写入会话历史，必须由通用 Agent turn / Session 层显式决定，邮件工具和

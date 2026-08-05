@@ -221,6 +221,8 @@ POST /agent/turn
 - 每个 session 维护一个本地 context window，默认预算为 `65536` token。Agent prompt
   只注入前文摘要和近期 user / agent 问答；完整工具调用、LLM prompt/output 和运行过程
   保存在本地 run log，不进入后续 prompt。
+- context window 未满时不做摘要；超过预算时触发独立 `context_summarize` LLM 调用，
+  将旧 summary 和除最近两条消息外的历史问答重写为新 summary，原文只保留最近两条消息。
 - 每次调用会显式追加 user / agent session message，并写入本地 markdown run log。
 - run log 由代码模板生成，包含用户输入、package catalog、展开工具、决策事件、
   工具调用输入输出、LLM 完整 prompt / output / 错误分类和最终回答。

@@ -24,6 +24,7 @@ from app.core.llm import (
     TextLLMClient,
 )
 from app.core.sessions import SessionService
+from app.core.sessions import SessionRecentMessage
 from app.core.tools import ToolContext, ToolExecutor
 
 
@@ -182,6 +183,20 @@ class AgentTurnLoop:
                 reason="No supported package was selected.",
             )
 
+        updated_context_window = self.session_service.record_context_exchange(
+            session_id=session.session_id,
+            user_input=user_input,
+            agent_answer=answer,
+            trace_id=trace_id,
+            token_budget=self.session_context_token_budget,
+            context_summarizer=lambda summary, messages, recent_messages, token_budget: self._summarize_context_window(
+                summary=summary,
+                messages_to_summarize=messages,
+                retained_recent_messages=recent_messages,
+                token_budget=token_budget,
+                llm_events=llm_events,
+            ),
+        )
         result = AgentTurnResult(
             session_id=session.session_id,
             trace_id=trace_id,
@@ -195,13 +210,6 @@ class AgentTurnLoop:
             llm_events=llm_events,
         )
         log_path = self._write_log(result=result, user_input=user_input)
-        updated_context_window = self.session_service.record_context_exchange(
-            session_id=session.session_id,
-            user_input=user_input,
-            agent_answer=answer,
-            trace_id=trace_id,
-            token_budget=self.session_context_token_budget,
-        )
         result = result.model_copy(update={"log_path": str(log_path)})
         self.session_service.append_message(
             session_id=session.session_id,
@@ -714,6 +722,53 @@ class AgentTurnLoop:
         if response is None:
             return None
         return response.content
+
+    def _summarize_context_window(
+        self,
+        *,
+        summary: str,
+        messages_to_summarize: list[SessionRecentMessage],
+        retained_recent_messages: list[SessionRecentMessage],
+        token_budget: int,
+        llm_events: list[AgentTurnLLMEvent],
+    ) -> str | None:
+        if self.llm_client is None:
+            return None
+        system_prompt = (
+            "You are the Session Context Compressor for Local Knowledge Agent OS. "
+            "Summarize older conversation history for future turns. Preserve user goals, "
+            "preferences, constraints, unresolved tasks, important facts, and references to "
+            "trace ids when useful. Do not include tool execution logs, raw prompts, or verbose "
+            "transcripts. Return only strict JSON: {\"summary\":\"...\"}"
+        )
+        user_prompt = json.dumps(
+            {
+                "existing_summary": summary,
+                "messages_to_summarize": [
+                    message.model_dump(mode="json") for message in messages_to_summarize
+                ],
+                "retained_recent_messages": [
+                    message.model_dump(mode="json") for message in retained_recent_messages
+                ],
+                "token_budget": token_budget,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        response = self._complete_text_with_retry(
+            stage="context_summarize",
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            prompt_summary=f"context_summarize messages={len(messages_to_summarize)}",
+            max_output_tokens=self.llm_generation_token_budget,
+            llm_events=llm_events,
+        )
+        if response is None:
+            return None
+        parsed = self._parse_json_object(response.content)
+        if isinstance(parsed, dict) and isinstance(parsed.get("summary"), str):
+            return parsed["summary"].strip() or None
+        return response.content.strip() or None
 
     def _complete_text_with_retry(
         self,
