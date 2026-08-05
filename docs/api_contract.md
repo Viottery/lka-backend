@@ -228,15 +228,18 @@ POST /agent/turn
 - Agent 第一层只读取 Tool Package catalog；当前已实现的可展开 package 包括 `mail`、
   `matter` 和 `runtime`。
 - 当 turn 判断用户目标需要本地邮件上下文时，才展开 `mail.search`、
-  `mail.load_messages`、`mail.sync`、`mail.persist_matters` 等具体工具；当目标是事务
-  管理时展开 `matter.create`、`matter.search`、`matter.list`、`matter.update`、
-  `matter.link_source`；当目标是直接读取环境时间时展开 `runtime.now`。
+  `mail.load_messages`、`mail.sync` 等具体工具；当目标是事务管理时展开
+  `matter.create`、`matter.create_many`、`matter.search`、`matter.list`、
+  `matter.update`、`matter.link_source`；当目标是直接读取环境时间时展开 `runtime.now`。
 - 展开 package 后，Agent 会进入单次 turn 内的 step-limited loop：每一步生成一个
   `decision_event`，动作可以是调用一个工具或直接回答；工具结果作为 observation 进入下一步。
 - `decision_event` 会同时记录 `assistant_message` 和 `operation`。`assistant_message`
   是用户可见的过程文本或最终回答；`operation` 是内部结构化动作，例如
-  `tool_call`、`final_answer`、`request_confirmation` 或 `no_op`。前端展示过程文本时
-  应读取 `assistant_message`，不要把工具调用 JSON 当作用户最终回答展示。
+  `tool_call`、`expand_package`、`final_answer`、`request_confirmation` 或 `no_op`。
+  前端展示过程文本时应读取 `assistant_message`，不要把工具调用 JSON 当作用户最终回答展示。
+- route 只决定起始 package；在 ReAct loop 中，如果已展开工具不足，LLM 可以输出
+  `expand_package` 来展开另一个已注册 package。邮件事务整理应先用 `mail` 读取证据，
+  再展开 `matter` 写入独立事务表。
 - 如果 LLM 选择不展开 package，Agent 可以进入 `context_answer` 阶段，基于当前
   session context window 直接回答，不应把“无需工具”当成“无法处理”。
 - 如果 LLM 返回不完整 JSON 但原始输出明确选择了 `mail` package，Agent 会保守恢复该
@@ -263,7 +266,7 @@ POST /agent/turn
 - context window 未满时不做摘要；超过预算时触发独立 `context_summarize` LLM 调用，
   将旧 summary 和除最近两条消息外的历史问答重写为新 summary，原文只保留最近两条消息。
 - 每次调用会显式追加 user / agent session message，并写入本地 markdown run log。
-- run log 由代码模板生成，包含用户输入、package catalog、展开工具、决策事件、
+- run log 由代码模板生成，包含用户输入、package catalog、逐步展开工具、决策事件、
   工具调用输入输出、工具反馈、LLM 完整 prompt / output / 错误分类和最终回答。
 - 未配置真实 LLM 或 LLM 调用失败时，Agent turn 会降级到本地 heuristic，保持链路可运行。
   当前本地 heuristic 主要覆盖 mail package；matter/runtime 的多步骤决策需要真实 LLM。
@@ -465,7 +468,7 @@ GET /mail/search?q=document&limit=10
 
 - 当前没有 `/mail/process` 或其他邮件专属 agent endpoint。
 - 邮件能力通过 Tool Package 暴露给后续通用 Agent turn：`mail.search`、
-  `mail.load_messages`、`mail.sync`、`mail.persist_matters`。
+  `mail.load_messages`、`mail.sync`。
 - 邮件整理、概括、匹配等行为应由通用 Agent turn 决定是否调用 mail tools，而不是通过
   mail 路由直接启动独立 agent loop。
 

@@ -487,6 +487,67 @@ def test_agent_turn_does_not_recover_malformed_tool_call_as_answer(tmp_path, mon
     assert "损坏 JSON" in response.answer
 
 
+def test_agent_turn_can_expand_matter_package_after_mail_observation(tmp_path, monkeypatch):
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
+    get_settings.cache_clear()
+
+    app = create_app()
+    request = SimpleNamespace(app=app)
+    import_mail(
+        MailImportRequest(
+            account={
+                "provider": "local_json",
+                "email_address": "user@example.com",
+            },
+            messages=[
+                {
+                    "external_id": "agent_turn_cross_package_001",
+                    "folder": "Inbox",
+                    "subject": "ICA Student Pass appointment",
+                    "sender": "ica@example.com",
+                    "to": ["user@example.com"],
+                    "received_at": "2026-08-05T09:30:00Z",
+                    "body_text": "Attend ICA formalities on 2026-08-14 13:00.",
+                },
+            ],
+        ),
+        request,
+    )
+    fake_llm = _CrossPackageMatterLLM()
+    app.state.runtime.agent_turn_loop.llm_client = fake_llm
+
+    response = run_agent_turn(
+        AgentTurnRequest(
+            session_id="session_cross_package_matter",
+            user_input="从ICA邮件里提取确定日程并加入本地事务。",
+        ),
+        request,
+    )
+
+    assert [event.action for event in response.decision_events] == [
+        "select_package",
+        "call_tool",
+        "call_tool",
+        "expand_package",
+        "call_tool",
+        "answer",
+    ]
+    assert [event.tool_name for event in response.tool_events] == [
+        "mail.search",
+        "mail.load_messages",
+        "matter.create_many",
+    ]
+    assert "matter.create_many" in [tool["name"] for tool in response.expanded_tools]
+    assert response.tool_events[-1].feedback["source"] == "llm"
+    assert response.tool_events[-1].result["output"]["matters_created"] == 1
+
+    matters = app.state.runtime.list_matters(limit=10)
+    assert len(matters.matters) == 1
+    assert matters.matters[0].title == "ICA Student Pass appointment"
+    assert matters.matters[0].source_links[0].source_id
+
+
 def test_agent_turn_summarizes_context_window_with_llm_when_full(tmp_path, monkeypatch):
     monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
@@ -954,6 +1015,149 @@ class _MalformedToolCallDecisionLLM:
             content = "Unexpected prompt."
         return LLMResponse(
             provider="fake_malformed_tool_call_llm",
+            status="completed",
+            content=content,
+            prompt_summary=prompt_summary,
+        )
+
+
+class _CrossPackageMatterLLM:
+    def complete_text(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        prompt_summary: str,
+        temperature: float = 0.0,
+        max_output_tokens: int | None = None,
+    ) -> LLMResponse:
+        if "Choose at most one tool package" in system_prompt:
+            content = json.dumps(
+                {
+                    "selected_package": "mail",
+                    "reason": "Read email evidence first.",
+                    "search_query": "ICA Student Pass appointment",
+                }
+            )
+        elif "Tool Result Checker" in system_prompt:
+            content = _tool_check_content()
+        elif "Choose the next single action" in system_prompt:
+            payload = json.loads(user_prompt)
+            observations = payload["observations"]
+            expanded_package_names = payload["expanded_package_names"]
+            if not observations:
+                content = json.dumps(
+                    {
+                        "assistant_message": "先检索 ICA 邮件。",
+                        "operation": {
+                            "type": "tool_call",
+                            "package_name": None,
+                            "tool_name": "mail.search",
+                            "tool_input": {
+                                "query": "ICA Student Pass appointment",
+                                "limit": 8,
+                            },
+                            "final_answer": None,
+                            "reason": "Find candidate mail.",
+                            "confidence": "high",
+                        },
+                    }
+                )
+            elif observations[-1].get("tool_name") == "mail.search":
+                messages = observations[-1]["result"]["output"]["messages"]
+                content = json.dumps(
+                    {
+                        "assistant_message": "加载 ICA 邮件正文。",
+                        "operation": {
+                            "type": "tool_call",
+                            "package_name": None,
+                            "tool_name": "mail.load_messages",
+                            "tool_input": {
+                                "message_ids": [messages[0]["message_id"]],
+                            },
+                            "final_answer": None,
+                            "reason": "Need full evidence.",
+                            "confidence": "high",
+                        },
+                    }
+                )
+            elif "matter" not in expanded_package_names:
+                content = json.dumps(
+                    {
+                        "assistant_message": "邮件证据已读取，展开事务工具。",
+                        "operation": {
+                            "type": "expand_package",
+                            "package_name": "matter",
+                            "tool_name": None,
+                            "tool_input": {},
+                            "final_answer": None,
+                            "reason": "Need matter tools to persist extracted schedule.",
+                            "confidence": "high",
+                        },
+                    }
+                )
+            elif not any(
+                observation.get("tool_name") == "matter.create_many"
+                for observation in observations
+            ):
+                loaded = next(
+                    observation
+                    for observation in observations
+                    if observation.get("tool_name") == "mail.load_messages"
+                )
+                message_id = loaded["result"]["output"]["messages"][0]["message_id"]
+                content = json.dumps(
+                    {
+                        "assistant_message": "写入本地事务。",
+                        "operation": {
+                            "type": "tool_call",
+                            "package_name": None,
+                            "tool_name": "matter.create_many",
+                            "tool_input": {
+                                "matters": [
+                                    {
+                                        "title": "ICA Student Pass appointment",
+                                        "summary": "Attend ICA formalities on 2026-08-14 13:00.",
+                                        "status": "open",
+                                        "priority": "normal",
+                                        "due_at": "2026-08-14T13:00:00+08:00",
+                                        "tags": ["ICA"],
+                                        "source_links": [
+                                            {
+                                                "source_type": "mail_message",
+                                                "source_id": message_id,
+                                                "reason": "Extracted from ICA email.",
+                                            }
+                                        ],
+                                        "metadata": {"source": "agent_turn_test"},
+                                    }
+                                ],
+                            },
+                            "final_answer": None,
+                            "reason": "Persist extracted matter.",
+                            "confidence": "high",
+                        },
+                    }
+                )
+            else:
+                content = json.dumps(
+                    {
+                        "assistant_message": "已写入 ICA 事务。",
+                        "operation": {
+                            "type": "final_answer",
+                            "package_name": None,
+                            "tool_name": None,
+                            "tool_input": {},
+                            "final_answer": "已写入 ICA 事务。",
+                            "reason": "matter.create_many completed.",
+                            "confidence": "high",
+                        },
+                    }
+                )
+        else:
+            content = "Unexpected prompt."
+        return LLMResponse(
+            provider="fake_cross_package_llm",
             status="completed",
             content=content,
             prompt_summary=prompt_summary,

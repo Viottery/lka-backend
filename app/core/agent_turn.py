@@ -583,6 +583,11 @@ class AgentTurnLoop:
         )
         if cached_observation is not None:
             observations.append(cached_observation)
+        package_catalog = [
+            package.model_dump(mode="json")
+            for package in self.tool_executor.registry.list_packages()
+        ]
+        expanded_package_names = {selected_package}
         allowed_tool_names = {
             str(tool.get("name"))
             for tool in expanded_tools
@@ -593,6 +598,8 @@ class AgentTurnLoop:
                 user_input=user_input,
                 route=route,
                 context_window=context_window,
+                package_catalog=package_catalog,
+                expanded_package_names=sorted(expanded_package_names),
                 expanded_tools=expanded_tools,
                 observations=observations,
                 llm_events=llm_events,
@@ -606,6 +613,9 @@ class AgentTurnLoop:
                 decision_events,
                 source="llm",
                 action=action,
+                selected_package=decision.get("package_name")
+                if isinstance(decision.get("package_name"), str)
+                else None,
                 tool_name=decision.get("tool_name"),
                 tool_input=decision.get("tool_input")
                 if isinstance(decision.get("tool_input"), dict)
@@ -634,6 +644,50 @@ class AgentTurnLoop:
                     "工具操作误当作最终结果。请重试该请求。"
                 )
                 return answer
+
+            if action == "expand_package":
+                package_name = str(decision.get("package_name") or "")
+                if not self._package_exists(package_name):
+                    observations.append(
+                        {
+                            "action": "expand_package",
+                            "package_name": package_name,
+                            "status": "rejected",
+                            "error": "Tool package is not registered.",
+                        }
+                    )
+                    continue
+                if package_name in expanded_package_names:
+                    observations.append(
+                        {
+                            "action": "expand_package",
+                            "package_name": package_name,
+                            "status": "completed",
+                            "message": "Tool package was already expanded.",
+                        }
+                    )
+                    continue
+                new_tools = self._tool_payloads_for_package(package_name)
+                expanded_tools.extend(new_tools)
+                expanded_package_names.add(package_name)
+                allowed_tool_names.update(
+                    str(tool.get("name"))
+                    for tool in new_tools
+                    if isinstance(tool.get("name"), str)
+                )
+                observations.append(
+                    {
+                        "action": "expand_package",
+                        "package_name": package_name,
+                        "status": "completed",
+                        "expanded_tools": [
+                            tool.get("name")
+                            for tool in new_tools
+                            if isinstance(tool.get("name"), str)
+                        ],
+                    }
+                )
+                continue
 
             if action != "call_tool":
                 return None
@@ -693,6 +747,8 @@ class AgentTurnLoop:
         user_input: str,
         route: dict[str, Any],
         context_window: dict[str, Any],
+        package_catalog: list[dict[str, Any]],
+        expanded_package_names: list[str],
         expanded_tools: list[dict[str, Any]],
         observations: list[dict[str, Any]],
         llm_events: list[AgentTurnLLMEvent],
@@ -701,7 +757,7 @@ class AgentTurnLoop:
         system_prompt = (
             "You are the Main Agent Brain for Local Knowledge Agent OS. Choose the next "
             "single action for this agent turn. You may call one available tool or answer. "
-            f"The currently expanded package is {selected_package}. Use tools when more "
+            f"The initially expanded package is {selected_package}. Use tools when more "
             "local evidence or persistence is needed. For mail questions, normally "
             "call mail.search first, then mail.load_messages for relevant message ids, then "
             "answer from observations. If observations already contain cached mail messages "
@@ -709,15 +765,21 @@ class AgentTurnLoop:
             "calling mail.search or mail.load_messages again. Call mail.sync first only when "
             "the user asks to sync, asks for the latest/current mailbox state, or the local "
             "mail store may be stale for the requested answer; after mail.sync, continue with "
-            "mail.search and mail.load_messages as needed. For matter requests, use "
-            "matter.search or matter.list to inspect existing matters, matter.create to save "
-            "new tasks/events, matter.update to change status/fields, and matter.link_source "
-            "to attach evidence such as mail message ids. Use the current_time in context to "
+            "mail.search and mail.load_messages as needed. The mail package does not persist "
+            "matters. After reading mail evidence, expand the matter package before creating "
+            "or updating tasks/events. For matter requests, use matter.search or matter.list "
+            "to inspect existing matters, matter.create to save one task/event, "
+            "matter.create_many to save multiple tasks/events in one controlled batch, "
+            "matter.update to change status/fields, and matter.link_source to attach evidence "
+            "such as mail message ids. If the currently expanded tools are insufficient, "
+            "use operation.type expand_package with package_name set to one registered package; "
+            "do not call tools from a package until that package appears in "
+            "expanded_package_names. Use the current_time in context to "
             "resolve relative dates. For direct time questions, use runtime.now or answer from "
             "current_time if it is sufficient. Return only strict JSON using this envelope: "
             '{"assistant_message":"short user-visible progress text or final answer",'
-            '"operation":{"type":"tool_call|final_answer|request_confirmation|no_op",'
-            '"tool_name":"mail.search","tool_input":{"query":"...","limit":8},'
+            '"operation":{"type":"tool_call|expand_package|final_answer|request_confirmation|no_op",'
+            '"package_name":null,"tool_name":"mail.search","tool_input":{"query":"...","limit":8},'
             '"final_answer":null,"reason":"...","confidence":"low|medium|high"}}. '
             "For a final answer, set operation.type to final_answer and put the answer in "
             "operation.final_answer. For a tool call, put only progress text in "
@@ -731,6 +793,8 @@ class AgentTurnLoop:
                 "user_input": user_input,
                 "session_context_window": context_window,
                 "route": route,
+                "package_catalog": package_catalog,
+                "expanded_package_names": expanded_package_names,
                 "expanded_tools": expanded_tools,
                 "observations": observations,
             },
@@ -868,6 +932,15 @@ class AgentTurnLoop:
                     "reason": reason,
                     "_raw_output": raw_output,
                 }
+            if operation_type == "expand_package":
+                return {
+                    "action": "expand_package",
+                    "package_name": operation.get("package_name"),
+                    "assistant_message": assistant_message,
+                    "operation": operation,
+                    "reason": reason,
+                    "_raw_output": raw_output,
+                }
             if operation_type == "final_answer":
                 answer = (
                     operation.get("final_answer")
@@ -897,6 +970,13 @@ class AgentTurnLoop:
         if isinstance(action, str):
             normalized = dict(parsed)
             normalized["_raw_output"] = raw_output
+            if action == "expand_package" and not isinstance(
+                normalized.get("package_name"),
+                str,
+            ):
+                package_name = parsed.get("selected_package")
+                if isinstance(package_name, str):
+                    normalized["package_name"] = package_name
             if "assistant_message" not in normalized and isinstance(parsed.get("answer"), str):
                 normalized["assistant_message"] = parsed["answer"]
             if "operation" not in normalized:
@@ -908,6 +988,13 @@ class AgentTurnLoop:
                         if isinstance(parsed.get("tool_input"), dict)
                         else {},
                         "final_answer": None,
+                        "reason": parsed.get("reason"),
+                    }
+                elif action == "expand_package":
+                    normalized["operation"] = {
+                        "type": "expand_package",
+                        "package_name": parsed.get("package_name")
+                        or parsed.get("selected_package"),
                         "reason": parsed.get("reason"),
                     }
                 elif action == "answer":
@@ -950,8 +1037,9 @@ class AgentTurnLoop:
         system_prompt = (
             "You repair one malformed Main Agent Brain decision. Return only strict JSON "
             "using the envelope: {\"assistant_message\":\"...\",\"operation\":{\"type\":"
-            "\"tool_call|final_answer|request_confirmation|no_op\",\"tool_name\":null,"
-            "\"tool_input\":{},\"final_answer\":null,\"reason\":\"...\","
+            "\"tool_call|expand_package|final_answer|request_confirmation|no_op\","
+            "\"package_name\":null,\"tool_name\":null,\"tool_input\":{},"
+            "\"final_answer\":null,\"reason\":\"...\","
             "\"confidence\":\"low|medium|high\"}}. Preserve a tool call only when the "
             "malformed output clearly includes the tool name and complete tool input. Do not "
             "invent missing required tool arguments."
@@ -984,7 +1072,7 @@ class AgentTurnLoop:
             parsed,
             raw_output=response.content,
         )
-        if normalized.get("action") != "call_tool":
+        if normalized.get("action") not in {"call_tool", "expand_package"}:
             return None
         normalized["_raw_output"] = raw_output
         normalized["_repair_output"] = response.content
@@ -993,6 +1081,18 @@ class AgentTurnLoop:
             or "Repaired malformed tool-call decision output."
         )
         return normalized
+
+    def _package_exists(self, package_name: str) -> bool:
+        return any(
+            package.name == package_name
+            for package in self.tool_executor.registry.list_packages()
+        )
+
+    def _tool_payloads_for_package(self, package_name: str) -> list[dict[str, Any]]:
+        return [
+            tool.model_dump(mode="json")
+            for tool in self.tool_executor.registry.list_tools(package=package_name)
+        ]
 
     def _cached_mail_messages_from_session(
         self,

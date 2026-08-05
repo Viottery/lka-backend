@@ -11,7 +11,7 @@ from app.core.tools import ToolContext, ToolInvocation, ToolPackageSpec, ToolRes
 
 MAIL_PACKAGE = ToolPackageSpec(
     name="mail",
-    description="Search, load, and persist local mail knowledge and mail matters.",
+    description="Search, load, and sync local mail knowledge. Matter persistence lives in the matter package.",
     risk="low_to_medium",
     requires_expansion=True,
 )

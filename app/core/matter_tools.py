@@ -56,6 +56,39 @@ class CreateMatterTool:
         )
 
 
+class CreateManyMattersTool:
+    def __init__(self, matter_service: MatterService) -> None:
+        self.matter_service = matter_service
+
+    spec = ToolSpec(
+        name="matter.create_many",
+        package="matter",
+        type="local_tool",
+        description="Create multiple independent local matters in one controlled batch.",
+        risk="medium",
+        requires_confirmation=False,
+        side_effects=["write_local_db"],
+        input_schema={"matters": "array"},
+        output_schema={"matters_created": "integer", "matters": "array"},
+    )
+
+    def invoke(self, *, invocation: ToolInvocation, context: ToolContext) -> ToolResult:
+        created = [
+            self.matter_service.create_matter(MatterCreateInput.model_validate(payload))
+            for payload in invocation.input.get("matters", [])
+            if isinstance(payload, dict)
+        ]
+        return ToolResult(
+            invocation_id=invocation.invocation_id,
+            tool_name=self.spec.name,
+            status="completed",
+            output={
+                "matters_created": len(created),
+                "matters": [matter.model_dump(mode="json") for matter in created],
+            },
+        )
+
+
 class SearchMattersTool:
     def __init__(self, matter_service: MatterService) -> None:
         self.matter_service = matter_service

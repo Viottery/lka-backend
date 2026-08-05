@@ -56,6 +56,10 @@ LLM 推理、工具选择、观察工具结果和反馈循环属于 Agent Loop�
 再展开具体工具，然后反复执行 `decision -> tool call -> observation`，直到 Agent
 给出最终回答或达到步数上限。每一步只能调用一个工具或回答，避免在领域服务里隐藏
 多步骤自动化。
+ReAct 过程中可以通过 `expand_package` decision 继续展开其他 Tool Package；第一次 route
+只决定起始 package，不应把整个 turn 锁死在单一领域工具里。典型邮件事务流程应是先展开
+`mail` 检索 / 加载证据，再展开 `matter` 调用 `matter.create` 或 `matter.create_many`
+写入独立事务。
 decision 输出必须区分自然语言和内部操作：`assistant_message` 只保存用户可见的过程说明
 或最终回答，`operation` 才保存 `tool_call` / `final_answer` / `request_confirmation`
 等结构化动作。这样工具调用中途的模型文本可以被展示和记录，但不会和真实执行动作混在
@@ -102,6 +106,8 @@ Outlook 自检同步，把最新邮件写入本地 SQLite；服务运行期间�
 `calendar_event` 等都只是 `matter_source_links` 中的 source。Agent 从邮件中提取待办
 时，应先通过 mail tools 获取证据，再通过 matter tools 创建或更新事务，不能让
 `MailService` 直接替用户做事务决策。
+旧的 `mail.persist_matters` / `mail_matters` 是邮件优先 MVP 早期遗留能力，只作为历史
+数据和迁移路径保留，不再注册进 Agent 可见的 Tool Registry。
 runtime context 也通过工具和上下文双路径提供：`runtime.now` 是可调用工具；每次
 Agent turn 还会把 `current_time` 注入 session context window，包含 UTC、本地时间、
 时区和日期，用于处理“今天”“明天”“8月5号之后”这类相对时间。

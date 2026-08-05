@@ -8,7 +8,7 @@ from app.api.routes.mail import import_mail, list_mail_matters, search_mail
 from app.api.schemas import MailImportRequest
 from app.core.config import get_settings
 from app.core.mail import MailMatterDraft
-from app.core.mail_tools import SyncMailTool
+from app.core.mail_tools import PersistMailMattersTool, SyncMailTool
 from app.core.outlook import OutlookSyncResult
 from app.core.tools import ToolContext, ToolInvocation
 
@@ -24,9 +24,11 @@ def test_mail_import_search_and_matters_endpoints(tmp_path, monkeypatch):
     assert "/mail/search" in app.openapi()["paths"]
     assert "/mail/process" not in app.openapi()["paths"]
     assert "/mail/matters" in app.openapi()["paths"]
-    assert "mail.sync" in [
+    mail_tool_names = [
         tool.name for tool in app.state.runtime.tool_registry.list_tools(package="mail")
     ]
+    assert "mail.sync" in mail_tool_names
+    assert "mail.persist_matters" not in mail_tool_names
 
     imported = import_mail(
         MailImportRequest(
@@ -154,14 +156,19 @@ def test_mail_tools_search_load_and_persist_without_mail_agent_endpoint(tmp_path
         priority="high",
         source_message_ids=message_ids,
     )
-    persist_result = app.state.runtime.tool_executor.execute(
-        invocation_id="tool_persist_001",
-        tool_name="mail.persist_matters",
-        tool_input={
-            "drafts": [draft.model_dump(mode="json")],
-            "provider": "test_tool_executor",
-            "link_reason": "Tool executor test.",
-        },
+    legacy_tool = PersistMailMattersTool(app.state.runtime.mail_service)
+    persist_result = legacy_tool.invoke(
+        invocation=ToolInvocation(
+            invocation_id="tool_persist_001",
+            tool=legacy_tool.spec,
+            session_id=context.session_id,
+            context_id=context.context_id or "",
+            input={
+                "drafts": [draft.model_dump(mode="json")],
+                "provider": "test_tool_executor",
+                "link_reason": "Tool executor test.",
+            },
+        ),
         context=context,
     )
 

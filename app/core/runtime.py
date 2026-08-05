@@ -18,12 +18,12 @@ from app.core.llm import MockLLMClient, build_text_llm_client
 from app.core.mail_tools import (
     MAIL_PACKAGE,
     LoadMailMessagesTool,
-    PersistMailMattersTool,
     SearchMailTool,
     SyncMailTool,
 )
 from app.core.matter_tools import (
     MATTER_PACKAGE,
+    CreateManyMattersTool,
     CreateMatterTool,
     LinkMatterSourceTool,
     ListMattersTool,
@@ -107,9 +107,9 @@ class LocalKnowledgeAgentRuntime:
         self.tool_registry.register_package(RUNTIME_PACKAGE)
         self.tool_registry.register_tool(SearchMailTool(self.mail_service))
         self.tool_registry.register_tool(LoadMailMessagesTool(self.mail_service))
-        self.tool_registry.register_tool(PersistMailMattersTool(self.mail_service))
         self.tool_registry.register_tool(SyncMailTool(self.sync_outlook_mail))
         self.tool_registry.register_tool(CreateMatterTool(self.matter_service))
+        self.tool_registry.register_tool(CreateManyMattersTool(self.matter_service))
         self.tool_registry.register_tool(SearchMattersTool(self.matter_service))
         self.tool_registry.register_tool(ListMattersTool(self.matter_service))
         self.tool_registry.register_tool(UpdateMatterTool(self.matter_service))

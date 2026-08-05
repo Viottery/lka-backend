@@ -89,6 +89,10 @@ Urgent track 的阶段目标：
 - Agent decision 输出已区分 `assistant_message` 和 `operation`。自然语言过程文本或最终
   回答只进入 `assistant_message` / `final_answer`，工具调用只进入结构化 `operation`；
   前端和日志可以展示模型过程文本，但不能把工具调用 JSON 当作最终回答。
+- ReAct loop 已支持 `expand_package`，route 只选择起始 package，不再把整个 turn 锁死在
+  一个工具包里。邮件事务整理应先展开 `mail` 读取证据，再展开 `matter` 写入独立事务。
+- 旧 `mail.persist_matters` 已从 Agent 可见 Tool Registry 中隐藏；它只作为
+  `mail_matters` 历史兼容 / 迁移路径保留。
 - 每个真实工具调用后都会生成 `feedback`，至少记录成功 / 失败状态和可读 message；LLM
   可用时还会通过独立 `tool_result_check` 阶段检查工具结果是否符合上一条调用决策，并把
   检查结果写回 tool event 和后续 observation。
@@ -681,8 +685,8 @@ Urgent track 的阶段目标：
 ### 第一阶段：邮件优先闭环
 
 - [x] 部署 / 接入真实 LLM API provider，并保留 mock fallback。
-- [x] 建立第一版 `mail` Tool Package，包含 `mail.search`、`mail.load_messages` 和 `mail.persist_matters`。
-- [ ] 建立通用 Agent turn，并在其中生成本地自然语言 run log。
+- [x] 建立第一版 `mail` Tool Package，包含 `mail.search`、`mail.load_messages` 和 `mail.sync`；旧 `mail.persist_matters` 不再暴露给 Agent。
+- [x] 建立通用 Agent turn，并在其中生成本地自然语言 run log。
 - [x] 为 LLM 调用加入限流等待重试和错误分类降级。
 - [x] 建立第一版平行 / 多轮会话基础设施；mail tools 只使用 `session_id` 作为工具访问上下文，不写 session history。
 - [ ] 将邮件作为本地持久化知识源管理，明确 account、message、attachment、chunk、matter、processing run 的生命周期。

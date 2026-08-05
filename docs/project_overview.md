@@ -176,7 +176,6 @@ browser（后续）
 mail.search
 mail.load_messages
 mail.sync
-mail.persist_matters
 mail.match_related（后续）
 mail.summarize（后续）
 ```
@@ -185,6 +184,7 @@ mail.summarize（后续）
 
 ```text
 matter.create
+matter.create_many
 matter.search
 matter.list
 matter.update
@@ -228,7 +228,7 @@ Agent 需要输出的是当前步骤可执行的结构化判断，而不是把�
 本地持久化
 关键词检索
 加载完整邮件正文
-持久化 matter / link / processing run
+同步远程邮件
 ```
 
 它不负责：
@@ -247,6 +247,8 @@ Agent 需要输出的是当前步骤可执行的结构化判断，而不是把�
 事件和提醒候选项的持久化、检索、状态更新和来源链接。邮件只作为 `source_link` 之一
 关联到 matter；matter 不应被建模为邮件内部状态。Agent 如果需要从邮件归纳事务，应先用
 mail tools 读取证据，再由通用 Agent Loop 决定是否调用 matter tools 写入或更新事务。
+旧的 `mail.persist_matters` / `mail_matters` 只作为历史兼容和迁移对象保留，不再暴露给
+Main Agent Brain 的 Tool Registry。
 
 实时时间属于 runtime context。后端应提供确定性的 `runtime.now` 工具，同时在每次 Agent
 turn 的 context window 中注入当前 UTC / 本地时间 / 时区 / 日期，帮助 LLM 处理相对时间。

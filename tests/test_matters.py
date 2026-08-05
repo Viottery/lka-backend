@@ -108,6 +108,7 @@ def test_matter_tools_and_runtime_now_are_registered(tmp_path, monkeypatch):
 
     assert matter_tool_names == {
         "matter.create",
+        "matter.create_many",
         "matter.search",
         "matter.list",
         "matter.update",
@@ -131,6 +132,37 @@ def test_matter_tools_and_runtime_now_are_registered(tmp_path, monkeypatch):
 
     assert create_result.status == "completed"
 
+    create_many_result = app.state.runtime.tool_executor.execute(
+        invocation_id="matter_create_many_001",
+        tool_name="matter.create_many",
+        tool_input={
+            "matters": [
+                {
+                    "title": "ICA appointment",
+                    "summary": "Attend ICA student pass formalities.",
+                    "due_at": "2026-08-14T13:00:00+08:00",
+                    "tags": ["ICA"],
+                    "source_links": [
+                        {
+                            "source_type": "mail_message",
+                            "source_id": "mail_msg_ica",
+                            "reason": "Extracted from ICA email.",
+                        }
+                    ],
+                    "metadata": {},
+                },
+                {
+                    "title": "NTUSO audition",
+                    "summary": "Prepare audition materials.",
+                    "due_at": "2026-08-12T19:20:00+08:00",
+                    "tags": ["NTUSO"],
+                    "source_links": [],
+                    "metadata": {},
+                },
+            ],
+        },
+        context=context,
+    )
     search_result = app.state.runtime.tool_executor.execute(
         invocation_id="matter_search_001",
         tool_name="matter.search",
@@ -145,6 +177,11 @@ def test_matter_tools_and_runtime_now_are_registered(tmp_path, monkeypatch):
     )
 
     assert search_result.output["matters"][0]["matter_id"] == matter_id
+    assert create_many_result.status == "completed"
+    assert create_many_result.output["matters_created"] == 2
+    assert create_many_result.output["matters"][0]["source_links"][0]["source_id"] == (
+        "mail_msg_ica"
+    )
     assert now_result.status == "completed"
     assert now_result.output["timezone"] == "Asia/Shanghai"
     assert "T" in now_result.output["local"]
