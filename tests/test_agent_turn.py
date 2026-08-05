@@ -257,6 +257,71 @@ def test_agent_turn_answers_follow_up_from_context_without_tool(tmp_path, monkey
     assert "context_answer" in log_text
 
 
+def test_agent_turn_reuses_cached_loaded_mail_for_follow_up(tmp_path, monkeypatch):
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
+    get_settings.cache_clear()
+
+    app = create_app()
+    request = SimpleNamespace(app=app)
+    full_body_sentinel = "CACHE_BODY_SENTINEL_NTUSO_REQUIREMENTS"
+    import_mail(
+        MailImportRequest(
+            account={
+                "provider": "local_json",
+                "email_address": "user@example.com",
+            },
+            messages=[
+                {
+                    "external_id": "agent_turn_cached_mail_001",
+                    "folder": "Inbox",
+                    "subject": "NTUSO Audition requirements",
+                    "sender": "ntuso@example.com",
+                    "to": ["user@example.com"],
+                    "received_at": "2026-08-05T09:30:00Z",
+                    "body_text": (
+                        "NTUSO audition requires G major scale. "
+                        f"{full_body_sentinel}"
+                    ),
+                },
+            ],
+        ),
+        request,
+    )
+    fake_llm = _MailCacheReuseLLM(full_body_sentinel)
+    app.state.runtime.agent_turn_loop.llm_client = fake_llm
+
+    first = run_agent_turn(
+        AgentTurnRequest(
+            session_id="session_cached_mail_follow_up",
+            user_input="帮我查询 NTUSO 的乐团考试相关要求。",
+        ),
+        request,
+    )
+    second = run_agent_turn(
+        AgentTurnRequest(
+            session_id="session_cached_mail_follow_up",
+            user_input="继续刚才NTUSO话题，按今天到考试当天排清单。",
+        ),
+        request,
+    )
+
+    assert [event.tool_name for event in first.tool_events] == [
+        "mail.search",
+        "mail.load_messages",
+    ]
+    assert second.selected_package == "mail"
+    assert second.tool_events == []
+    assert second.answer == "第二轮回答：我复用了缓存邮件正文。"
+    assert fake_llm.second_route_context is not None
+    assert "cached_mail_messages" in fake_llm.second_route_context
+    assert full_body_sentinel in json.dumps(
+        fake_llm.second_decision_observations,
+        ensure_ascii=False,
+    )
+    assert second.decision_events[1].action == "answer"
+
+
 def test_agent_turn_recovers_mail_route_from_malformed_llm_json(tmp_path, monkeypatch):
     monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
@@ -546,6 +611,87 @@ class _FollowUpContextAnswerLLM:
             status="completed",
             content=content,
             prompt_summary=prompt_summary,
+        )
+
+
+class _MailCacheReuseLLM:
+    def __init__(self, sentinel: str) -> None:
+        self.sentinel = sentinel
+        self.route_calls = 0
+        self.second_route_context: dict | None = None
+        self.second_decision_observations: list[dict] = []
+
+    def complete_text(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        prompt_summary: str,
+        temperature: float = 0.0,
+        max_output_tokens: int | None = None,
+    ) -> LLMResponse:
+        if "Choose at most one tool package" in system_prompt:
+            self.route_calls += 1
+            payload = json.loads(user_prompt)
+            if self.route_calls == 2:
+                self.second_route_context = payload["session_context_window"]
+            content = json.dumps(
+                {
+                    "selected_package": "mail",
+                    "reason": "Use mail package for cache reuse test.",
+                    "search_query": "NTUSO",
+                }
+            )
+        elif "Choose the next single action" in system_prompt:
+            payload = json.loads(user_prompt)
+            observations = payload["observations"]
+            if self.route_calls == 1:
+                content = self._first_turn_decision(observations)
+            else:
+                self.second_decision_observations = observations
+                content = json.dumps(
+                    {
+                        "action": "answer",
+                        "answer": "第二轮回答：我复用了缓存邮件正文。",
+                        "reason": "Cached mail observation is sufficient.",
+                    }
+                )
+        else:
+            content = "Unexpected prompt."
+        return LLMResponse(
+            provider="fake_mail_cache_reuse_llm",
+            status="completed",
+            content=content,
+            prompt_summary=prompt_summary,
+        )
+
+    def _first_turn_decision(self, observations: list[dict]) -> str:
+        if not observations:
+            return json.dumps(
+                {
+                    "action": "call_tool",
+                    "tool_name": "mail.search",
+                    "tool_input": {"query": "NTUSO", "limit": 8},
+                    "reason": "Search first.",
+                }
+            )
+        if observations[-1]["tool_name"] == "mail.search":
+            messages = observations[-1]["result"]["output"]["messages"]
+            message_ids = [message["message_id"] for message in messages[:1]]
+            return json.dumps(
+                {
+                    "action": "call_tool",
+                    "tool_name": "mail.load_messages",
+                    "tool_input": {"message_ids": message_ids},
+                    "reason": "Load the matching message.",
+                }
+            )
+        return json.dumps(
+            {
+                "action": "answer",
+                "answer": f"第一轮回答：已读取邮件正文 {self.sentinel}",
+                "reason": "Loaded message is enough.",
+            }
         )
 
 

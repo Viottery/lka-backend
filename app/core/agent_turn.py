@@ -136,6 +136,11 @@ class AgentTurnLoop:
             token_budget=self.session_context_token_budget,
         )
         context_window_payload = context_window.model_dump(mode="json")
+        cached_mail_messages = self._cached_mail_messages_from_session(
+            session_id=session.session_id,
+        )
+        if cached_mail_messages:
+            context_window_payload["cached_mail_messages"] = cached_mail_messages
 
         package_catalog = [
             package.model_dump(mode="json")
@@ -271,6 +276,8 @@ class AgentTurnLoop:
         system_prompt = (
             "You are the Main Agent Brain for Local Knowledge Agent OS. Choose at most one "
             "tool package for the current turn. Do not choose concrete tools yet. Return only "
+            "null when the provided session context window, including cached local resources, "
+            "is sufficient to answer without another tool call. Return only "
             'strict JSON: {"selected_package":"mail|null","reason":"...",'
             '"search_query":"..."}'
         )
@@ -510,6 +517,11 @@ class AgentTurnLoop:
         expanded_tools: list[dict[str, Any]],
     ) -> str | None:
         observations: list[dict[str, Any]] = []
+        cached_observation = self._cached_mail_observation_from_context_window(
+            context_window,
+        )
+        if cached_observation is not None:
+            observations.append(cached_observation)
         allowed_tool_names = {
             str(tool.get("name"))
             for tool in expanded_tools
@@ -605,7 +617,10 @@ class AgentTurnLoop:
             "single action for this agent turn. You may call one available tool or answer. "
             "Use tools when more local evidence is needed. For mail questions, normally "
             "call mail.search first, then mail.load_messages for relevant message ids, then "
-            "answer from observations. Return only strict JSON in one of these forms: "
+            "answer from observations. If observations already contain cached mail messages "
+            "from the same session and they are relevant, answer from that cache instead of "
+            "calling mail.search or mail.load_messages again. Return only strict JSON in one of "
+            "these forms: "
             '{"action":"call_tool","tool_name":"mail.search","tool_input":{"query":"...",'
             '"limit":8},"reason":"..."}, '
             '{"action":"call_tool","tool_name":"mail.load_messages","tool_input":'
@@ -695,6 +710,78 @@ class AgentTurnLoop:
                 raw_output=raw_output,
             )
         )
+
+    def _cached_mail_messages_from_session(
+        self,
+        *,
+        session_id: str,
+        limit: int = 8,
+    ) -> list[dict[str, Any]]:
+        detail = self.session_service.get_session(session_id=session_id)
+        cached_messages: list[dict[str, Any]] = []
+        seen_message_ids: set[str] = set()
+        for session_message in reversed(detail.messages):
+            tool_events = session_message.payload.get("tool_events")
+            if not isinstance(tool_events, list):
+                continue
+            for tool_event in reversed(tool_events):
+                if not isinstance(tool_event, dict):
+                    continue
+                if tool_event.get("tool_name") != "mail.load_messages":
+                    continue
+                result = tool_event.get("result")
+                if not isinstance(result, dict):
+                    continue
+                output = result.get("output")
+                if not isinstance(output, dict):
+                    continue
+                messages = output.get("messages")
+                if not isinstance(messages, list):
+                    continue
+                for message in reversed(messages):
+                    if not isinstance(message, dict):
+                        continue
+                    message_id = str(message.get("message_id") or "")
+                    if not message_id or message_id in seen_message_ids:
+                        continue
+                    cached_message = dict(message)
+                    cached_message["_cache"] = {
+                        "source": "session_tool_result",
+                        "trace_id": session_message.payload.get("trace_id"),
+                        "log_path": session_message.payload.get("log_path"),
+                    }
+                    cached_messages.append(cached_message)
+                    seen_message_ids.add(message_id)
+                    if len(cached_messages) >= limit:
+                        return list(reversed(cached_messages))
+        return list(reversed(cached_messages))
+
+    def _cached_mail_observation_from_context_window(
+        self,
+        context_window: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        cached_messages = context_window.get("cached_mail_messages")
+        if not isinstance(cached_messages, list) or not cached_messages:
+            return None
+        message_ids = [
+            str(message.get("message_id"))
+            for message in cached_messages
+            if isinstance(message, dict) and message.get("message_id")
+        ]
+        return {
+            "tool_name": "mail.load_messages",
+            "input": {
+                "message_ids": message_ids,
+                "source": "session_cache",
+            },
+            "result": {
+                "invocation_id": "session_cache",
+                "tool_name": "mail.load_messages",
+                "status": "completed",
+                "output": {"messages": cached_messages},
+                "error": None,
+            },
+        }
 
     def _loaded_messages_from_observations(
         self,

@@ -83,6 +83,9 @@ Urgent track 的阶段目标：
   `mail`，Agent 会保守恢复该 package 选择并继续执行工具链。
 - 如果 decision LLM 返回非 JSON 的自然语言最终回答，Agent 会保守恢复为 `answer`
   decision，防止高质量模型回答被本地 fallback 覆盖。
+- 同一 session 中已经通过 `mail.load_messages` 读取过的完整邮件会作为
+  `cached_mail_messages` 注入后续 turn；追问应优先复用缓存或把缓存作为已有
+  observation，而不是重复加载同一邮件原文。
 - 每个 session 已新增本地 context window，默认预算 `65536` token；窗口未满时保留近期
   user / agent 问答，满后由独立 `context_summarize` LLM 调用重写前文摘要，并只保留最近
   两条消息原文。完整运行过程仍保存在本地 run log，后续再接入可检索历史 trace。

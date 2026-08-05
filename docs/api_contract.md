@@ -227,6 +227,9 @@ POST /agent/turn
 - 每个 session 维护一个本地 context window，默认预算为 `65536` token。Agent prompt
   只注入前文摘要和近期 user / agent 问答；完整工具调用、LLM prompt/output 和运行过程
   保存在本地 run log，不进入后续 prompt。
+- Agent 会从同一 session 的历史工具结果中恢复已加载过的本地资源缓存。当前邮件缓存以
+  `cached_mail_messages` 注入 context window；如果追问可以由缓存邮件正文回答，Agent
+  应直接回答或把缓存作为已有 observation 使用，不再重复调用 `mail.load_messages`。
 - context window 未满时不做摘要；超过预算时触发独立 `context_summarize` LLM 调用，
   将旧 summary 和除最近两条消息外的历史问答重写为新 summary，原文只保留最近两条消息。
 - 每次调用会显式追加 user / agent session message，并写入本地 markdown run log。
