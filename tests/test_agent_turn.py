@@ -283,6 +283,58 @@ def test_agent_turn_recovers_mail_route_from_malformed_llm_json(tmp_path, monkey
     assert response.answer == "Recovered route answer."
 
 
+def test_agent_turn_recovers_plain_text_decision_as_answer(tmp_path, monkeypatch):
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
+    get_settings.cache_clear()
+
+    app = create_app()
+    request = SimpleNamespace(app=app)
+    import_mail(
+        MailImportRequest(
+            account={
+                "provider": "local_json",
+                "email_address": "user@example.com",
+            },
+            messages=[
+                {
+                    "external_id": "agent_turn_plain_text_answer_001",
+                    "folder": "Inbox",
+                    "subject": "ICA Student Pass checklist",
+                    "sender": "ica@example.com",
+                    "to": ["user@example.com"],
+                    "received_at": "2026-08-05T09:30:00Z",
+                    "body_text": "Bring IPA letter, passport, SG Arrival Card, and photo.",
+                },
+            ],
+        ),
+        request,
+    )
+    fake_llm = _PlainTextDecisionAnswerLLM()
+    app.state.runtime.agent_turn_loop.llm_client = fake_llm
+
+    response = run_agent_turn(
+        AgentTurnRequest(
+            session_id="session_plain_text_answer",
+            user_input="继续刚才ICA签证话题，列出材料清单。",
+        ),
+        request,
+    )
+
+    assert response.answer == "纯文本最终回答：带 IPA、护照、SGAC 和照片。"
+    assert [event.action for event in response.decision_events] == [
+        "select_package",
+        "call_tool",
+        "answer",
+    ]
+    assert response.decision_events[-1].source == "llm"
+    assert response.decision_events[-1].reason == (
+        "Recovered answer from non-JSON decision output."
+    )
+    assert "纯文本最终回答" in (response.decision_events[-1].raw_output or "")
+    assert "当前未配置可用 LLM" not in response.answer
+
+
 def test_agent_turn_summarizes_context_window_with_llm_when_full(tmp_path, monkeypatch):
     monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
@@ -524,6 +576,50 @@ class _MalformedRouteLLM:
             content = "Unexpected prompt."
         return LLMResponse(
             provider="fake_malformed_route_llm",
+            status="completed",
+            content=content,
+            prompt_summary=prompt_summary,
+        )
+
+
+class _PlainTextDecisionAnswerLLM:
+    def complete_text(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        prompt_summary: str,
+        temperature: float = 0.0,
+        max_output_tokens: int | None = None,
+    ) -> LLMResponse:
+        if "Choose at most one tool package" in system_prompt:
+            content = json.dumps(
+                {
+                    "selected_package": "mail",
+                    "reason": "Use mail for checklist.",
+                    "search_query": "ICA Student Pass checklist",
+                }
+            )
+        elif "Choose the next single action" in system_prompt:
+            payload = json.loads(user_prompt)
+            if not payload["observations"]:
+                content = json.dumps(
+                    {
+                        "action": "call_tool",
+                        "tool_name": "mail.search",
+                        "tool_input": {
+                            "query": "ICA Student Pass checklist",
+                            "limit": 8,
+                        },
+                        "reason": "Search checklist mail.",
+                    }
+                )
+            else:
+                content = "纯文本最终回答：带 IPA、护照、SGAC 和照片。"
+        else:
+            content = "Unexpected prompt."
+        return LLMResponse(
+            provider="fake_plain_text_decision_llm",
             status="completed",
             content=content,
             prompt_summary=prompt_summary,

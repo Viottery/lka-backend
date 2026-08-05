@@ -60,6 +60,8 @@ LLM 推理、工具选择、观察工具结果和反馈循环属于 Agent Loop�
 session context window 直接回答；“不需要工具”和“系统无法处理”不能混为一谈。
 当 provider 返回不完整 JSON 但明确选择了某个 package 时，Agent Loop 可以做保守恢复，
 并在 run log 中保留原始输出，避免模型格式问题直接破坏工具链路。
+如果 decision 阶段返回了非 JSON 的自然语言最终回答，Agent Loop 可以将其恢复为
+`answer` decision，并记录原始输出，避免已有高质量回答被本地 fallback 覆盖。
 
 会话基础设施当前由本地 SQLite 管理，使用显式 `session_id` 支撑平行会话和多轮会话。
 后端不维护隐式全局当前会话；前端切换会话时必须把目标 `session_id` 传给运行入口。

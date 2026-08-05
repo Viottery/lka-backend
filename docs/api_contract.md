@@ -222,6 +222,8 @@ POST /agent/turn
   session context window 直接回答，不应把“无需工具”当成“无法处理”。
 - 如果 LLM 返回不完整 JSON 但原始输出明确选择了 `mail` package，Agent 会保守恢复该
   package 选择，并继续记录原始 LLM 输出以便回放。
+- 如果 decision 阶段返回非 JSON 的自然语言最终回答，Agent 会把该文本恢复为 `answer`
+  decision，避免已有回答被本地 fallback 覆盖。
 - 每个 session 维护一个本地 context window，默认预算为 `65536` token。Agent prompt
   只注入前文摘要和近期 user / agent 问答；完整工具调用、LLM prompt/output 和运行过程
   保存在本地 run log，不进入后续 prompt。

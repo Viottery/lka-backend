@@ -634,8 +634,16 @@ class AgentTurnLoop:
         if response is None:
             return None
         parsed = self._parse_json_object(response.content)
-        if not isinstance(parsed, dict):
-            return None
+        if not isinstance(parsed, dict) or not parsed:
+            answer = response.content.strip()
+            if not answer:
+                return None
+            return {
+                "action": "answer",
+                "answer": answer,
+                "reason": "Recovered answer from non-JSON decision output.",
+                "_raw_output": response.content,
+            }
         parsed["_raw_output"] = response.content
         return parsed
 

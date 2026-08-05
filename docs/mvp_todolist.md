@@ -81,6 +81,8 @@ Urgent track 的阶段目标：
 - 多轮追问中，如果当前 session context window 已足够回答，Agent 可以不展开工具包，
   直接进入 `context_answer` LLM 阶段；如果 route LLM 返回不完整 JSON 但明确选择
   `mail`，Agent 会保守恢复该 package 选择并继续执行工具链。
+- 如果 decision LLM 返回非 JSON 的自然语言最终回答，Agent 会保守恢复为 `answer`
+  decision，防止高质量模型回答被本地 fallback 覆盖。
 - 每个 session 已新增本地 context window，默认预算 `65536` token；窗口未满时保留近期
   user / agent 问答，满后由独立 `context_summarize` LLM 调用重写前文摘要，并只保留最近
   两条消息原文。完整运行过程仍保存在本地 run log，后续再接入可检索历史 trace。
