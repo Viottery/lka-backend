@@ -16,6 +16,15 @@ CURRENT_TRACE_COLUMNS = {
     "created_at",
 }
 
+CURRENT_SESSION_CONTEXT_WINDOW_COLUMNS = {
+    "session_id",
+    "token_budget",
+    "summary",
+    "recent_messages",
+    "token_estimate",
+    "updated_at",
+}
+
 
 def get_db_path(data_dir: Path) -> Path:
     """Return the database path inside the configured data directory."""
@@ -63,23 +72,58 @@ def _prepare_schema_migrations(conn: sqlite3.Connection) -> None:
         legacy_name = _next_legacy_table_name(conn, "traces")
         conn.execute(f"ALTER TABLE traces RENAME TO {legacy_name}")
 
-    if _table_exists(conn, "agent_session_context_windows"):
-        columns = _table_columns(conn, "agent_session_context_windows")
-        if "recent_messages" not in columns:
-            conn.execute(
-                """
-                ALTER TABLE agent_session_context_windows
-                ADD COLUMN recent_messages TEXT NOT NULL DEFAULT '[]'
-                """
-            )
-        if "core_messages" in columns:
-            conn.execute(
-                """
-                UPDATE agent_session_context_windows
-                SET recent_messages = core_messages
-                WHERE recent_messages = '[]' AND core_messages != '[]'
-                """
-            )
+    _migrate_agent_session_context_windows(conn)
+
+
+def _migrate_agent_session_context_windows(conn: sqlite3.Connection) -> None:
+    if not _table_exists(conn, "agent_session_context_windows"):
+        return
+
+    columns = _table_columns(conn, "agent_session_context_windows")
+    if "recent_messages" not in columns:
+        conn.execute(
+            """
+            ALTER TABLE agent_session_context_windows
+            ADD COLUMN recent_messages TEXT NOT NULL DEFAULT '[]'
+            """
+        )
+    if "core_messages" in columns:
+        conn.execute(
+            """
+            UPDATE agent_session_context_windows
+            SET recent_messages = core_messages
+            WHERE recent_messages = '[]' AND core_messages != '[]'
+            """
+        )
+
+    columns = _table_columns(conn, "agent_session_context_windows")
+    if columns == CURRENT_SESSION_CONTEXT_WINDOW_COLUMNS:
+        return
+
+    legacy_name = _next_legacy_table_name(conn, "agent_session_context_windows")
+    conn.execute(f"ALTER TABLE agent_session_context_windows RENAME TO {legacy_name}")
+    conn.execute(
+        """
+        CREATE TABLE agent_session_context_windows (
+            session_id TEXT PRIMARY KEY,
+            token_budget INTEGER NOT NULL,
+            summary TEXT NOT NULL,
+            recent_messages TEXT NOT NULL,
+            token_estimate INTEGER NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(session_id) REFERENCES agent_sessions(session_id)
+        )
+        """
+    )
+    conn.execute(
+        f"""
+        INSERT INTO agent_session_context_windows(
+            session_id, token_budget, summary, recent_messages, token_estimate, updated_at
+        )
+        SELECT session_id, token_budget, summary, recent_messages, token_estimate, updated_at
+        FROM {legacy_name}
+        """
+    )
 
 
 def init_db(db_path: Path) -> None:

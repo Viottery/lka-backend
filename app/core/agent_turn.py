@@ -171,17 +171,34 @@ class AgentTurnLoop:
                 expanded_tools=expanded_tools,
             )
         else:
-            answer = (
-                "我还没有为这个请求选择到可执行工具。当前最小 Agent turn 只支持在需要"
-                "本地邮件上下文时展开 mail package。"
+            answer = self._answer_from_context_with_llm(
+                user_input=user_input,
+                route=route,
+                context_window=context_window_payload,
+                llm_events=llm_events,
             )
-            self._record_decision(
-                decision_events,
-                source="local",
-                action="answer",
-                answer=answer,
-                reason="No supported package was selected.",
-            )
+            if answer:
+                self._record_decision(
+                    decision_events,
+                    source="llm",
+                    action="answer",
+                    answer=answer,
+                    reason=route.get("reason")
+                    if isinstance(route.get("reason"), str)
+                    else "No tool package was needed.",
+                )
+            else:
+                answer = (
+                    "我还没有为这个请求选择到可执行工具。当前最小 Agent turn 只支持在需要"
+                    "本地邮件上下文时展开 mail package。"
+                )
+                self._record_decision(
+                    decision_events,
+                    source="local",
+                    action="answer",
+                    answer=answer,
+                    reason="No supported package was selected.",
+                )
 
         updated_context_window = self.session_service.record_context_exchange(
             session_id=session.session_id,
@@ -285,7 +302,19 @@ class AgentTurnLoop:
             return route
 
         parsed = self._parse_json_object(response.content)
-        if not isinstance(parsed, dict):
+        if not isinstance(parsed, dict) or not parsed:
+            recovered_route = self._recover_route_from_raw_output(
+                raw_output=response.content,
+                user_input=user_input,
+            )
+            if recovered_route is not None:
+                self._record_route_decision(
+                    decision_events,
+                    source="llm",
+                    route=recovered_route,
+                    raw_output=response.content,
+                )
+                return recovered_route
             route = self._route_locally(user_input)
             self._record_route_decision(
                 decision_events,
@@ -313,6 +342,21 @@ class AgentTurnLoop:
             raw_output=response.content,
         )
         return route
+
+    def _recover_route_from_raw_output(
+        self,
+        *,
+        raw_output: str,
+        user_input: str,
+    ) -> dict[str, Any] | None:
+        compact_output = "".join(raw_output.lower().split())
+        if '"selected_package":"mail"' not in compact_output:
+            return None
+        return {
+            "selected_package": "mail",
+            "reason": "Recovered mail package from malformed route output.",
+            "search_query": self._local_mail_search_query(user_input),
+        }
 
     def _route_locally(self, user_input: str) -> dict[str, Any]:
         lower = user_input.lower()
@@ -722,6 +766,47 @@ class AgentTurnLoop:
         if response is None:
             return None
         return response.content
+
+    def _answer_from_context_with_llm(
+        self,
+        *,
+        user_input: str,
+        route: dict[str, Any],
+        context_window: dict[str, Any],
+        llm_events: list[AgentTurnLLMEvent],
+    ) -> str | None:
+        if self.llm_client is None:
+            return None
+        system_prompt = (
+            "You are the Main Agent Brain for Local Knowledge Agent OS. Answer the "
+            "current user turn using only the provided session context window when it "
+            "is sufficient. Do not invent unavailable local facts. If the context is "
+            "insufficient and no tool package was selected, explain what information is "
+            "missing. Return only strict JSON: {\"answer\":\"...\"}"
+        )
+        user_prompt = json.dumps(
+            {
+                "user_input": user_input,
+                "route": route,
+                "session_context_window": context_window,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        response = self._complete_text_with_retry(
+            stage="context_answer",
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            prompt_summary=f"agent_turn_context_answer user_input={user_input[:80]}",
+            max_output_tokens=self.llm_generation_token_budget,
+            llm_events=llm_events,
+        )
+        if response is None:
+            return None
+        parsed = self._parse_json_object(response.content)
+        if isinstance(parsed, dict) and isinstance(parsed.get("answer"), str):
+            return parsed["answer"].strip() or None
+        return response.content.strip() or None
 
     def _summarize_context_window(
         self,

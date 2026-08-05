@@ -15,7 +15,9 @@ from app.api.routes.sessions import (
 from app.api.schemas import MailImportRequest
 from app.api.schemas import SessionAppendMessageRequest, SessionCreateRequest
 from app.core.config import get_settings
+from app.core.sessions import SessionService
 from app.core.tools import ToolContext
+from app.storage.db import connect
 from app.storage.db import init_db
 
 
@@ -198,3 +200,26 @@ def test_context_window_migration_copies_legacy_core_messages(tmp_path):
 
     assert row is not None
     assert json.loads(row["recent_messages"])[0]["content"] == "legacy core message"
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        columns = {
+            row["name"]
+            for row in conn.execute(
+                "PRAGMA table_info(agent_session_context_windows)"
+            ).fetchall()
+        }
+    finally:
+        conn.close()
+    assert "core_messages" not in columns
+
+    service = SessionService(lambda: connect(db_path))
+    window = service.record_context_exchange(
+        session_id="session_legacy",
+        user_input="new user message",
+        agent_answer="new agent answer",
+        trace_id="trace_new",
+        token_budget=65_536,
+    )
+    assert any(message.content == "new user message" for message in window.recent_messages)

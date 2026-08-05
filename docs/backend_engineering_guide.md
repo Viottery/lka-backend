@@ -56,6 +56,10 @@ LLM 推理、工具选择、观察工具结果和反馈循环属于 Agent Loop�
 再展开具体工具，然后反复执行 `decision -> tool call -> observation`，直到 Agent
 给出最终回答或达到步数上限。每一步只能调用一个工具或回答，避免在领域服务里隐藏
 多步骤自动化。
+如果 LLM 判断当前 turn 不需要展开任何 Tool Package，Agent Loop 仍应允许 LLM 基于当前
+session context window 直接回答；“不需要工具”和“系统无法处理”不能混为一谈。
+当 provider 返回不完整 JSON 但明确选择了某个 package 时，Agent Loop 可以做保守恢复，
+并在 run log 中保留原始输出，避免模型格式问题直接破坏工具链路。
 
 会话基础设施当前由本地 SQLite 管理，使用显式 `session_id` 支撑平行会话和多轮会话。
 后端不维护隐式全局当前会话；前端切换会话时必须把目标 `session_id` 传给运行入口。

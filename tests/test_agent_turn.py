@@ -210,6 +210,79 @@ def test_agent_turn_maintains_recent_session_context_window(tmp_path, monkeypatc
     assert "第一轮问题" in log_text
 
 
+def test_agent_turn_answers_follow_up_from_context_without_tool(tmp_path, monkeypatch):
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
+    get_settings.cache_clear()
+
+    app = create_app()
+    request = SimpleNamespace(app=app)
+    fake_llm = _FollowUpContextAnswerLLM()
+    app.state.runtime.agent_turn_loop.llm_client = fake_llm
+
+    first = run_agent_turn(
+        AgentTurnRequest(
+            session_id="session_follow_up_context",
+            user_input="第一轮：帮我整理ICA学生签证进度。",
+        ),
+        request,
+    )
+    second = run_agent_turn(
+        AgentTurnRequest(
+            session_id="session_follow_up_context",
+            user_input="继续刚才的话题，只列出已完成和待完成事项。",
+        ),
+        request,
+    )
+
+    assert first.answer == "第一轮回答：ICA进度已整理。"
+    assert second.answer == "第二轮回答：已完成申请递交；待完成OSE办理。"
+    assert [event.stage for event in second.llm_events] == [
+        "route",
+        "context_answer",
+    ]
+    assert [event.action for event in second.decision_events] == [
+        "select_package",
+        "answer",
+    ]
+    assert second.decision_events[1].source == "llm"
+    assert second.tool_events == []
+    assert fake_llm.context_answer_inputs
+    assert "第一轮回答：ICA进度已整理。" in json.dumps(
+        fake_llm.context_answer_inputs[-1]["session_context_window"],
+        ensure_ascii=False,
+    )
+
+    log_text = Path(second.log_path or "").read_text(encoding="utf-8")
+    assert "context_answer" in log_text
+
+
+def test_agent_turn_recovers_mail_route_from_malformed_llm_json(tmp_path, monkeypatch):
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
+    get_settings.cache_clear()
+
+    app = create_app()
+    request = SimpleNamespace(app=app)
+    fake_llm = _MalformedRouteLLM()
+    app.state.runtime.agent_turn_loop.llm_client = fake_llm
+
+    response = run_agent_turn(
+        AgentTurnRequest(
+            session_id="session_malformed_route",
+            user_input="现在是8月5号，还有什么NTU相关的日程没有完成",
+        ),
+        request,
+    )
+
+    assert response.selected_package == "mail"
+    assert response.decision_events[0].source == "llm"
+    assert response.decision_events[0].reason == (
+        "Recovered mail package from malformed route output."
+    )
+    assert response.answer == "Recovered route answer."
+
+
 def test_agent_turn_summarizes_context_window_with_llm_when_full(tmp_path, monkeypatch):
     monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
@@ -367,6 +440,90 @@ class _ContextAwareLLM:
             content = "Unexpected prompt."
         return LLMResponse(
             provider="fake_context_llm",
+            status="completed",
+            content=content,
+            prompt_summary=prompt_summary,
+        )
+
+
+class _FollowUpContextAnswerLLM:
+    def __init__(self) -> None:
+        self.route_calls = 0
+        self.context_answer_inputs: list[dict] = []
+
+    def complete_text(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        prompt_summary: str,
+        temperature: float = 0.0,
+        max_output_tokens: int | None = None,
+    ) -> LLMResponse:
+        if "Choose at most one tool package" in system_prompt:
+            self.route_calls += 1
+            if self.route_calls == 1:
+                content = json.dumps(
+                    {
+                        "selected_package": None,
+                        "reason": "No tool needed for seed answer.",
+                        "search_query": "",
+                    }
+                )
+            else:
+                content = json.dumps(
+                    {
+                        "selected_package": None,
+                        "reason": "Session context is sufficient.",
+                        "search_query": "",
+                    }
+                )
+        elif "using only the provided session context window" in system_prompt:
+            payload = json.loads(user_prompt)
+            self.context_answer_inputs.append(payload)
+            answer = (
+                "第一轮回答：ICA进度已整理。"
+                if self.route_calls == 1
+                else "第二轮回答：已完成申请递交；待完成OSE办理。"
+            )
+            content = json.dumps({"answer": answer})
+        else:
+            content = "Unexpected prompt."
+        return LLMResponse(
+            provider="fake_follow_up_context_llm",
+            status="completed",
+            content=content,
+            prompt_summary=prompt_summary,
+        )
+
+
+class _MalformedRouteLLM:
+    def complete_text(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        prompt_summary: str,
+        temperature: float = 0.0,
+        max_output_tokens: int | None = None,
+    ) -> LLMResponse:
+        if "Choose at most one tool package" in system_prompt:
+            content = (
+                '{"selected_package":"mail","reason":"needs NTU schedule mail",'
+                '"search_query":"NTU schedule"'
+            )
+        elif "Choose the next single action" in system_prompt:
+            content = json.dumps(
+                {
+                    "action": "answer",
+                    "answer": "Recovered route answer.",
+                    "reason": "Route recovery selected mail package.",
+                }
+            )
+        else:
+            content = "Unexpected prompt."
+        return LLMResponse(
+            provider="fake_malformed_route_llm",
             status="completed",
             content=content,
             prompt_summary=prompt_summary,

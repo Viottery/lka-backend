@@ -218,6 +218,10 @@ POST /agent/turn
   `mail.load_messages`、`mail.persist_matters` 等具体工具。
 - 展开 package 后，Agent 会进入单次 turn 内的 step-limited loop：每一步生成一个
   `decision_event`，动作可以是调用一个工具或直接回答；工具结果作为 observation 进入下一步。
+- 如果 LLM 选择不展开 package，Agent 可以进入 `context_answer` 阶段，基于当前
+  session context window 直接回答，不应把“无需工具”当成“无法处理”。
+- 如果 LLM 返回不完整 JSON 但原始输出明确选择了 `mail` package，Agent 会保守恢复该
+  package 选择，并继续记录原始 LLM 输出以便回放。
 - 每个 session 维护一个本地 context window，默认预算为 `65536` token。Agent prompt
   只注入前文摘要和近期 user / agent 问答；完整工具调用、LLM prompt/output 和运行过程
   保存在本地 run log，不进入后续 prompt。
