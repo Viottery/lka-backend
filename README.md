@@ -68,6 +68,19 @@ uv run uvicorn app.api.main:app --host 127.0.0.1 --port 8765
 
 The service listens on `http://127.0.0.1:8765` by default.
 
+## Quick Start: Windows Pet Frontend With WSL Backend
+
+The current backend still runs in WSL. The adapted pet frontend should be
+started from Windows PowerShell:
+
+```powershell
+D:\agent-bot-frontend\run-lka-windows.ps1
+```
+
+The script starts this backend inside WSL at `http://127.0.0.1:8765`, serves
+the Windows-side pet chat frontend at `http://127.0.0.1:8780`, and opens the
+chat UI with `backend=http://127.0.0.1:8765`.
+
 ## Local Provider Config
 
 Provider, mail, and embedding settings live in a local TOML file:

@@ -22,6 +22,15 @@ class Settings(BaseSettings):
     platform: str = Field(default="auto", alias="LKA_PLATFORM")
     default_shell: str = Field(default="auto", alias="LKA_DEFAULT_SHELL")
     workspace_roots: str = Field(default="", alias="LKA_WORKSPACE_ROOTS")
+    cors_origins: str = Field(
+        default=(
+            "http://127.0.0.1:8780;"
+            "http://localhost:8780;"
+            "http://127.0.0.1:8000;"
+            "http://localhost:8000"
+        ),
+        alias="LKA_CORS_ORIGINS",
+    )
     allow_symlinks: bool = Field(default=False, alias="LKA_ALLOW_SYMLINKS")
     skip_hidden: bool = Field(default=True, alias="LKA_SKIP_HIDDEN")
     max_scan_files: int = Field(default=50_000, alias="LKA_MAX_SCAN_FILES")
@@ -37,6 +46,15 @@ class Settings(BaseSettings):
             Path(root.strip()).expanduser()
             for root in self.workspace_roots.split(";")
             if root.strip()
+        ]
+
+    def parsed_cors_origins(self) -> list[str]:
+        """Return configured local frontend origins."""
+
+        return [
+            origin.strip().rstrip("/")
+            for origin in self.cors_origins.split(";")
+            if origin.strip()
         ]
 
     def load_local_config(self) -> LocalAppConfig:
