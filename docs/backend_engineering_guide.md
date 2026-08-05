@@ -61,7 +61,7 @@ LLM 推理、工具选择、观察工具结果和反馈循环属于 Agent Loop�
 后端不维护隐式全局当前会话；前端切换会话时必须把目标 `session_id` 传给运行入口。
 Session Service 只负责创建会话、追加消息、读取历史和更新时间，不调用 LLM，也不选择工具。
 每个 session 还维护一个本地 context window，默认预算为 `65536` token。窗口只保存
-前文摘要和核心 user / agent 问答，用于下一轮 prompt 注入；完整工具结果、LLM prompt /
+前文摘要和近期 user / agent 问答，用于下一轮 prompt 注入；完整工具结果、LLM prompt /
 output、错误和运行过程保留在 `data/agent_logs/`，必要时再通过日志或历史检索恢复。
 邮件数据源是全局本地知识源，不存在独立的“邮件会话引擎”。Mail tools 只在某个 Agent turn
 中按当前 `session_id` 读取一次性信息并返回观察结果；是否把用户输入、工具观察、`run_id`

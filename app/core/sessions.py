@@ -43,7 +43,7 @@ class AgentSessionMessage(BaseModel):
     created_at: str
 
 
-class SessionCoreMessage(BaseModel):
+class SessionRecentMessage(BaseModel):
     role: SessionRole
     content: str
     created_at: str
@@ -54,7 +54,7 @@ class AgentSessionContextWindow(BaseModel):
     session_id: str
     token_budget: int = 65_536
     summary: str = ""
-    core_messages: list[SessionCoreMessage] = Field(default_factory=list)
+    recent_messages: list[SessionRecentMessage] = Field(default_factory=list)
     token_estimate: int = 0
     updated_at: str
 
@@ -276,7 +276,7 @@ class SessionService:
         try:
             row = conn.execute(
                 """
-                SELECT session_id, token_budget, summary, core_messages, token_estimate, updated_at
+                SELECT session_id, token_budget, summary, recent_messages, token_estimate, updated_at
                 FROM agent_session_context_windows
                 WHERE session_id = ?
                 """,
@@ -290,7 +290,7 @@ class SessionService:
                 session_id=session_id,
                 token_budget=budget,
                 summary="",
-                core_messages=[],
+                recent_messages=[],
                 token_estimate=0,
                 updated_at=_now_iso(),
             )
@@ -298,7 +298,7 @@ class SessionService:
             session_id=row["session_id"],
             token_budget=row["token_budget"],
             summary=row["summary"],
-            core_messages=self._core_messages_from_json(row["core_messages"]),
+            recent_messages=self._recent_messages_from_json(row["recent_messages"]),
             token_estimate=row["token_estimate"],
             updated_at=row["updated_at"],
         )
@@ -318,14 +318,14 @@ class SessionService:
         )
         now = _now_iso()
         messages = [
-            *window.core_messages,
-            SessionCoreMessage(
+            *window.recent_messages,
+            SessionRecentMessage(
                 role="user",
                 content=user_input,
                 created_at=now,
                 trace_id=trace_id,
             ),
-            SessionCoreMessage(
+            SessionRecentMessage(
                 role="agent",
                 content=agent_answer,
                 created_at=now,
@@ -341,7 +341,7 @@ class SessionService:
             session_id=session_id,
             token_budget=window.token_budget,
             summary=summary,
-            core_messages=kept_messages,
+            recent_messages=kept_messages,
             token_estimate=token_estimate,
             updated_at=now,
         )
@@ -354,13 +354,13 @@ class SessionService:
             conn.execute(
                 """
                 INSERT INTO agent_session_context_windows(
-                    session_id, token_budget, summary, core_messages, token_estimate, updated_at
+                    session_id, token_budget, summary, recent_messages, token_estimate, updated_at
                 )
                 VALUES(?, ?, ?, ?, ?, ?)
                 ON CONFLICT(session_id) DO UPDATE SET
                     token_budget=excluded.token_budget,
                     summary=excluded.summary,
-                    core_messages=excluded.core_messages,
+                    recent_messages=excluded.recent_messages,
                     token_estimate=excluded.token_estimate,
                     updated_at=excluded.updated_at
                 """,
@@ -369,7 +369,7 @@ class SessionService:
                     window.token_budget,
                     window.summary,
                     json.dumps(
-                        [message.model_dump(mode="json") for message in window.core_messages],
+                        [message.model_dump(mode="json") for message in window.recent_messages],
                         ensure_ascii=False,
                     ),
                     window.token_estimate,
@@ -384,9 +384,9 @@ class SessionService:
         self,
         *,
         summary: str,
-        messages: list[SessionCoreMessage],
+        messages: list[SessionRecentMessage],
         token_budget: int,
-    ) -> tuple[str, list[SessionCoreMessage], int]:
+    ) -> tuple[str, list[SessionRecentMessage], int]:
         kept = list(messages)
         current_summary = summary
         while kept and self._context_token_estimate(current_summary, kept) > token_budget:
@@ -402,7 +402,7 @@ class SessionService:
             self._context_token_estimate(current_summary, kept),
         )
 
-    def _append_summary_message(self, summary: str, message: SessionCoreMessage) -> str:
+    def _append_summary_message(self, summary: str, message: SessionRecentMessage) -> str:
         prefix = f"{message.created_at} {message.role}: "
         line = prefix + self._compact_text(message.content, max_chars=500)
         return f"{summary.rstrip()}\n{line}".strip()
@@ -410,7 +410,7 @@ class SessionService:
     def _context_token_estimate(
         self,
         summary: str,
-        messages: list[SessionCoreMessage],
+        messages: list[SessionRecentMessage],
     ) -> int:
         text = summary + "\n" + "\n".join(message.content for message in messages)
         return self._estimate_tokens(text)
@@ -428,7 +428,7 @@ class SessionService:
         self,
         *,
         summary: str,
-        messages: list[SessionCoreMessage],
+        messages: list[SessionRecentMessage],
         token_budget: int,
     ) -> str:
         message_tokens = self._context_token_estimate("", messages)
@@ -440,7 +440,7 @@ class SessionService:
             return summary
         return summary[-max_summary_chars:].lstrip()
 
-    def _core_messages_from_json(self, value: str) -> list[SessionCoreMessage]:
+    def _recent_messages_from_json(self, value: str) -> list[SessionRecentMessage]:
         try:
             payload = json.loads(value)
         except json.JSONDecodeError:
@@ -448,7 +448,7 @@ class SessionService:
         if not isinstance(payload, list):
             return []
         return [
-            SessionCoreMessage.model_validate(item)
+            SessionRecentMessage.model_validate(item)
             for item in payload
             if isinstance(item, dict)
         ]

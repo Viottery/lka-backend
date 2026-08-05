@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import sqlite3
 from types import SimpleNamespace
 
 from app.api.main import create_app
@@ -14,6 +16,7 @@ from app.api.schemas import MailImportRequest
 from app.api.schemas import SessionAppendMessageRequest, SessionCreateRequest
 from app.core.config import get_settings
 from app.core.tools import ToolContext
+from app.storage.db import init_db
 
 
 def test_parallel_sessions_and_mail_tool_access_are_independent(tmp_path, monkeypatch):
@@ -104,7 +107,7 @@ def test_parallel_sessions_and_mail_tool_access_are_independent(tmp_path, monkey
     assert {first_session_id, second_session_id}.issubset(listed_ids)
 
 
-def test_session_context_window_summarizes_old_core_messages(tmp_path, monkeypatch):
+def test_session_context_window_summarizes_old_messages(tmp_path, monkeypatch):
     monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
     get_settings.cache_clear()
@@ -131,5 +134,67 @@ def test_session_context_window_summarizes_old_core_messages(tmp_path, monkeypat
     assert window.token_budget == 75
     assert window.token_estimate <= 75
     assert "alpha" in window.summary
-    assert window.core_messages
-    assert any("second" in message.content for message in window.core_messages)
+    assert window.recent_messages
+    assert any("second" in message.content for message in window.recent_messages)
+
+
+def test_context_window_migration_copies_legacy_core_messages(tmp_path):
+    db_path = tmp_path / "legacy.sqlite3"
+    legacy_message = {
+        "role": "user",
+        "content": "legacy core message",
+        "created_at": "2026-08-05T00:00:00+00:00",
+        "trace_id": "trace_legacy",
+    }
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE agent_session_context_windows (
+                session_id TEXT PRIMARY KEY,
+                token_budget INTEGER NOT NULL,
+                summary TEXT NOT NULL,
+                core_messages TEXT NOT NULL,
+                token_estimate INTEGER NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO agent_session_context_windows(
+                session_id, token_budget, summary, core_messages, token_estimate, updated_at
+            )
+            VALUES(?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "session_legacy",
+                65_536,
+                "",
+                json.dumps([legacy_message]),
+                10,
+                "2026-08-05T00:00:00+00:00",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    init_db(db_path)
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            """
+            SELECT recent_messages
+            FROM agent_session_context_windows
+            WHERE session_id = ?
+            """,
+            ("session_legacy",),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert row is not None
+    assert json.loads(row["recent_messages"])[0]["content"] == "legacy core message"

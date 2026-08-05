@@ -186,24 +186,24 @@ def test_agent_turn_maintains_core_session_context_window(tmp_path, monkeypatch)
     )
 
     assert first.answer == "第一轮回答：已记录ICA学生签证关注点。"
-    assert second.answer == "第二轮回答：我看到了上一轮关于ICA学生签证的核心问答。"
-    assert fake_llm.route_contexts[0]["core_messages"] == []
+    assert second.answer == "第二轮回答：我看到了上一轮关于ICA学生签证的近期问答。"
+    assert fake_llm.route_contexts[0]["recent_messages"] == []
     second_context = fake_llm.route_contexts[1]
     assert second_context["token_budget"] == 65_536
     assert second_context["token_estimate"] > 0
-    assert [message["role"] for message in second_context["core_messages"]] == [
+    assert [message["role"] for message in second_context["recent_messages"]] == [
         "user",
         "agent",
     ]
-    assert "第一轮问题" in second_context["core_messages"][0]["content"]
-    assert "第一轮回答" in second_context["core_messages"][1]["content"]
+    assert "第一轮问题" in second_context["recent_messages"][0]["content"]
+    assert "第一轮回答" in second_context["recent_messages"][1]["content"]
     assert "tool_events" not in json.dumps(second_context, ensure_ascii=False)
 
     window = app.state.runtime.session_service.get_context_window(
         session_id="session_context_window"
     )
-    assert len(window.core_messages) == 4
-    assert "第二轮回答" in window.core_messages[-1].content
+    assert len(window.recent_messages) == 4
+    assert "第二轮回答" in window.recent_messages[-1].content
 
     log_text = Path(second.log_path or "").read_text(encoding="utf-8")
     assert "## Session Context Window" in log_text
@@ -307,7 +307,7 @@ class _ContextAwareLLM:
             answer = (
                 "第一轮回答：已记录ICA学生签证关注点。"
                 if self.decision_calls == 1
-                else "第二轮回答：我看到了上一轮关于ICA学生签证的核心问答。"
+                else "第二轮回答：我看到了上一轮关于ICA学生签证的近期问答。"
             )
             content = json.dumps(
                 {

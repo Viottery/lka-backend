@@ -57,13 +57,29 @@ def _next_legacy_table_name(conn: sqlite3.Connection, base_name: str) -> str:
 def _prepare_schema_migrations(conn: sqlite3.Connection) -> None:
     """Preserve incompatible legacy tables before creating current schema."""
 
-    if not _table_exists(conn, "traces"):
-        return
-    if CURRENT_TRACE_COLUMNS.issubset(_table_columns(conn, "traces")):
-        return
+    if _table_exists(conn, "traces") and not CURRENT_TRACE_COLUMNS.issubset(
+        _table_columns(conn, "traces")
+    ):
+        legacy_name = _next_legacy_table_name(conn, "traces")
+        conn.execute(f"ALTER TABLE traces RENAME TO {legacy_name}")
 
-    legacy_name = _next_legacy_table_name(conn, "traces")
-    conn.execute(f"ALTER TABLE traces RENAME TO {legacy_name}")
+    if _table_exists(conn, "agent_session_context_windows"):
+        columns = _table_columns(conn, "agent_session_context_windows")
+        if "recent_messages" not in columns:
+            conn.execute(
+                """
+                ALTER TABLE agent_session_context_windows
+                ADD COLUMN recent_messages TEXT NOT NULL DEFAULT '[]'
+                """
+            )
+        if "core_messages" in columns:
+            conn.execute(
+                """
+                UPDATE agent_session_context_windows
+                SET recent_messages = core_messages
+                WHERE recent_messages = '[]' AND core_messages != '[]'
+                """
+            )
 
 
 def init_db(db_path: Path) -> None:
@@ -133,7 +149,7 @@ def init_db(db_path: Path) -> None:
                 session_id TEXT PRIMARY KEY,
                 token_budget INTEGER NOT NULL,
                 summary TEXT NOT NULL,
-                core_messages TEXT NOT NULL,
+                recent_messages TEXT NOT NULL,
                 token_estimate INTEGER NOT NULL,
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY(session_id) REFERENCES agent_sessions(session_id)

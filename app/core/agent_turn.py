@@ -214,7 +214,7 @@ class AgentTurnLoop:
                 "context_window": {
                     "token_budget": updated_context_window.token_budget,
                     "token_estimate": updated_context_window.token_estimate,
-                    "core_message_count": len(updated_context_window.core_messages),
+                    "recent_message_count": len(updated_context_window.recent_messages),
                 },
                 "decision_events": [
                     event.model_dump(mode="json") for event in decision_events
