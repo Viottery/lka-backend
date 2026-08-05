@@ -57,6 +57,9 @@ Urgent track 的阶段目标：
 - [ ] 将邮件纳入本地持久化存储管理，补齐邮件整理、检索和概括工具。
 - [ ] 将 TaskContext / MatterContext / trace 查询进一步接入 session，让前端会话切换能恢复完整运行上下文。
 - [ ] 接入本地 `BAAI/bge-m3` embedding provider，并兼容 Windows / Linux 模型缓存路径。
+- [ ] 设计 harness skill evolution 路径：允许 Agent 在受控权限下从数据库 schema、历史 run log
+  和工具结果中归纳可复用遍历 / 批处理策略，沉淀为可审计 skill proposal，而不是直接绕过
+  Tool Registry 任意访问数据库。
 - [ ] 后续再把 Codex / Claude Code Expert Tools 放回邮件任务后的优化路径。
 
 决策记录：
@@ -102,6 +105,9 @@ Urgent track 的阶段目标：
   必须通过通用 loop 先读取证据，再选择 `matter` tools 写入或更新。
 - 每次 Agent turn 都会注入 `current_time`，并可按需调用 `runtime.now`；相对时间解析
   应优先基于这个确定性上下文，而不是让 LLM 猜当前日期。
+- Agent 不应默认拥有裸数据库写权限。未来可以通过受控 DB inspection / query tools 让它读取
+  schema、统计量和历史轨迹，再由 Skill Evolution Layer 生成遍历、批处理和去重策略的
+  skill proposal；真正落库仍应走明确注册的 domain tools 和风险控制。
 
 ### 0.1 MVP 最终应具备的能力
 
