@@ -29,7 +29,14 @@ class SearchMailTool:
         risk="low",
         requires_confirmation=False,
         side_effects=["read_local_db"],
-        input_schema={"query": "string", "limit": "integer"},
+        input_schema={
+            "type": "object",
+            "required": ["query"],
+            "properties": {
+                "query": {"type": "string"},
+                "limit": {"type": "integer", "minimum": 1},
+            },
+        },
         output_schema={"query": "string", "messages": "array"},
     )
 
@@ -58,7 +65,13 @@ class LoadMailMessagesTool:
         risk="low",
         requires_confirmation=False,
         side_effects=["read_local_db"],
-        input_schema={"message_ids": "array"},
+        input_schema={
+            "type": "object",
+            "required": ["message_ids"],
+            "properties": {
+                "message_ids": {"type": "array", "items": {"type": "string"}},
+            },
+        },
         output_schema={"messages": "array"},
     )
 
@@ -85,7 +98,15 @@ class PersistMailMattersTool:
         risk="medium",
         requires_confirmation=False,
         side_effects=["write_local_db"],
-        input_schema={"drafts": "array", "provider": "string", "link_reason": "string"},
+        input_schema={
+            "type": "object",
+            "required": ["drafts"],
+            "properties": {
+                "drafts": {"type": "array"},
+                "provider": {"type": "string"},
+                "link_reason": {"type": "string"},
+            },
+        },
         output_schema={"matters_created": "integer"},
     )
 
@@ -123,7 +144,14 @@ class SyncMailTool:
         risk="low_to_medium",
         requires_confirmation=False,
         side_effects=["read_remote_mail", "write_local_db"],
-        input_schema={"folder": "string", "limit": "integer", "max_pages": "integer"},
+        input_schema={
+            "type": "object",
+            "properties": {
+                "folder": {"type": "string"},
+                "limit": {"type": "integer", "minimum": 1},
+                "max_pages": {"type": "integer", "minimum": 1},
+            },
+        },
         output_schema={
             "provider": "string",
             "folder": "string",

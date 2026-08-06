@@ -207,6 +207,33 @@ def test_matter_tools_and_runtime_now_are_registered(tmp_path, monkeypatch):
     assert now_result.output["timezone"] == "Asia/Shanghai"
     assert "T" in now_result.output["local"]
 
+    invalid_create = app.state.runtime.tool_executor.execute(
+        invocation_id="matter_create_invalid_001",
+        tool_name="matter.create",
+        tool_input={
+            "title": "Invalid matter",
+            "summary": "Should be rejected before persistence.",
+            "priority": "medium",
+        },
+        context=context,
+    )
+    missing_search_query = app.state.runtime.tool_executor.execute(
+        invocation_id="matter_search_invalid_001",
+        tool_name="matter.search",
+        tool_input={"limit": 10},
+        context=context,
+    )
+
+    assert invalid_create.status == "rejected"
+    assert invalid_create.error == "Tool input failed schema validation."
+    assert "tool_input.priority must be one of" in (
+        invalid_create.output["validation_errors"][0]
+    )
+    assert missing_search_query.status == "rejected"
+    assert "tool_input.query is required." in missing_search_query.output[
+        "validation_errors"
+    ]
+
 
 def test_agent_turn_can_create_matter_and_receives_current_time(tmp_path, monkeypatch):
     monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))

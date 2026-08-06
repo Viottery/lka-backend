@@ -41,7 +41,12 @@ class RuntimeNowTool:
         risk="low",
         requires_confirmation=False,
         side_effects=[],
-        input_schema={"timezone": "string"},
+        input_schema={
+            "type": "object",
+            "properties": {
+                "timezone": {"type": "string"},
+            },
+        },
         output_schema={
             "utc": "string",
             "local": "string",

@@ -106,8 +106,10 @@ Urgent track 的阶段目标：
 - 多轮追问中，如果当前 session context window 已足够回答，Agent 可以不展开工具包，
   直接进入 `context_answer` LLM 阶段；如果 route LLM 返回不完整 JSON 但明确选择
   `mail`，Agent 会保守恢复该 package 选择并继续执行工具链。
-- 如果 decision LLM 返回非 JSON 的自然语言最终回答，Agent 会保守恢复为 `answer`
-  decision，防止高质量模型回答被本地 fallback 覆盖。
+- Tool Executor 已在执行前统一校验 `input_schema`，包括 required fields、基础类型、
+  数组元素、嵌套 object、枚举值和 minimum。校验失败会返回 `status=rejected` 和
+  `validation_errors`，不执行工具副作用；Agent Loop 会把 rejection 作为 observation
+  反馈给 LLM，让模型修正参数后继续。
 - 同一 session 中已经通过 `mail.load_messages` 读取过的完整邮件会作为
   `cached_mail_messages` 注入后续 turn；追问应优先复用缓存或把缓存作为已有
   observation，而不是重复加载同一邮件原文。

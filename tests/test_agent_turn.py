@@ -741,6 +741,41 @@ def test_agent_turn_can_expand_matter_package_after_mail_observation(tmp_path, m
     assert matters.matters[0].source_links[0].source_id
 
 
+def test_agent_turn_feeds_tool_input_validation_errors_back_to_llm(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
+    get_settings.cache_clear()
+
+    app = create_app()
+    request = SimpleNamespace(app=app)
+    fake_llm = _InvalidMatterInputThenRepairLLM()
+    app.state.runtime.agent_turn_loop.llm_client = fake_llm
+
+    response = run_agent_turn(
+        AgentTurnRequest(
+            session_id="session_invalid_tool_input_repair",
+            user_input="创建一个NTUSO audition准备事项。",
+        ),
+        request,
+    )
+
+    assert [event.tool_name for event in response.tool_events] == [
+        "matter.create_many",
+        "matter.create_many",
+    ]
+    assert response.tool_events[0].result["status"] == "rejected"
+    assert "tool_input.matters[0].priority must be one of" in (
+        response.tool_events[0].result["output"]["validation_errors"][0]
+    )
+    assert response.tool_events[0].feedback["status"] == "failed"
+    assert response.tool_events[1].result["status"] == "completed"
+    assert response.tool_events[1].result["output"]["matters_created"] == 1
+    assert response.answer == "已创建 NTUSO audition 准备事项。"
+
+
 def test_agent_turn_warns_when_final_answer_claims_unsupported_calendar_action(
     tmp_path,
     monkeypatch,
@@ -1563,6 +1598,107 @@ class _CrossPackageMatterLLM:
             content = "Unexpected prompt."
         return LLMResponse(
             provider="fake_cross_package_llm",
+            status="completed",
+            content=content,
+            prompt_summary=prompt_summary,
+        )
+
+
+class _InvalidMatterInputThenRepairLLM:
+    def complete_text(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        prompt_summary: str,
+        temperature: float = 0.0,
+        max_output_tokens: int | None = None,
+    ) -> LLMResponse:
+        if "Choose at most one tool package" in system_prompt:
+            content = json.dumps(
+                {
+                    "selected_package": "matter",
+                    "reason": "User asks to create a local matter.",
+                    "search_query": "NTUSO audition",
+                }
+            )
+        elif "Tool Result Checker" in system_prompt:
+            payload = json.loads(user_prompt)
+            status = payload["tool_result"]["status"]
+            content = json.dumps(
+                {
+                    "status": "accepted" if status == "completed" else "failed",
+                    "message": f"Tool result status is {status}.",
+                    "remaining_work": (
+                        "Fix invalid enum values and retry."
+                        if status != "completed"
+                        else "Answer the user."
+                    ),
+                }
+            )
+        elif "Choose the next single action" in system_prompt:
+            payload = json.loads(user_prompt)
+            observations = payload["observations"]
+            rejected = any(
+                observation.get("tool_name") == "matter.create_many"
+                and observation.get("result", {}).get("status") == "rejected"
+                for observation in observations
+            )
+            completed = any(
+                observation.get("tool_name") == "matter.create_many"
+                and observation.get("result", {}).get("status") == "completed"
+                for observation in observations
+            )
+            if completed:
+                content = json.dumps(
+                    {
+                        "operation": {
+                            "type": "final_answer",
+                            "package_name": None,
+                            "tool_name": None,
+                            "tool_input": {},
+                            "final_answer": "已创建 NTUSO audition 准备事项。",
+                            "reason": "matter.create_many completed after repair.",
+                            "confidence": "high",
+                        },
+                        "assistant_message": "已创建事项。",
+                    }
+                )
+            else:
+                priority = "normal" if rejected else "medium"
+                content = json.dumps(
+                    {
+                        "operation": {
+                            "type": "tool_call",
+                            "package_name": "matter",
+                            "tool_name": "matter.create_many",
+                            "tool_input": {
+                                "matters": [
+                                    {
+                                        "title": "NTUSO audition preparation",
+                                        "summary": (
+                                            "Prepare G major scale, excerpts, and "
+                                            "choice piece."
+                                        ),
+                                        "status": "open",
+                                        "priority": priority,
+                                        "tags": ["NTUSO"],
+                                        "source_links": [],
+                                        "metadata": {"source": "agent_turn_test"},
+                                    }
+                                ]
+                            },
+                            "final_answer": None,
+                            "reason": "Create the requested local matter.",
+                            "confidence": "high",
+                        },
+                        "assistant_message": "正在创建 NTUSO audition 准备事项。",
+                    }
+                )
+        else:
+            content = "Unexpected prompt."
+        return LLMResponse(
+            provider="fake_invalid_matter_input_then_repair_llm",
             status="completed",
             content=content,
             prompt_summary=prompt_summary,

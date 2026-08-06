@@ -60,6 +60,10 @@ ReAct 过程中可以通过 `expand_package` decision 继续展开其他 Tool Pa
 只决定起始 package，不应把整个 turn 锁死在单一领域工具里。典型邮件事务流程应是先展开
 `mail` 检索 / 加载证据，再展开 `matter` 调用 `matter.create` 或 `matter.create_many`
 写入独立事务。
+Tool Executor 在真正执行工具前会基于 Tool Registry 中的 `input_schema` 做统一校验，当前
+支持必填字段、基础类型、数组元素类型、嵌套 object、枚举值和最小数值。校验失败时工具不会
+执行，而是返回 `status=rejected`、`validation_errors` 和本地失败反馈；Agent Loop 会把这类
+结果作为 observation 反馈给 LLM，让其修正参数或改选其他工具。
 decision 输出必须区分自然语言和内部操作，并采用 operation-first envelope：`operation`
 是唯一控制通道，保存 `tool_call` / `final_answer` / `request_confirmation` 等结构化动作；
 `assistant_message` 只保存用户可见的过程说明，不能选择工具，也不能补成最终回答。最终回答

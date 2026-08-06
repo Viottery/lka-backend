@@ -87,6 +87,9 @@ class ToolRegistry:
     def get_tool(self, name: str) -> Tool:
         return self._tools[name]
 
+    def get_tool_or_none(self, name: str) -> Tool | None:
+        return self._tools.get(name)
+
 
 class ToolExecutor:
     """Execute registered tools and normalize failures into ToolResult."""
@@ -102,7 +105,27 @@ class ToolExecutor:
         tool_input: dict[str, Any],
         context: ToolContext,
     ) -> ToolResult:
-        tool = self.registry.get_tool(tool_name)
+        tool = self.registry.get_tool_or_none(tool_name)
+        if tool is None:
+            return ToolResult(
+                invocation_id=invocation_id,
+                tool_name=tool_name,
+                status="rejected",
+                error="Tool is not registered.",
+            )
+        validation_errors = self._validate_input(
+            schema=tool.spec.input_schema,
+            value=tool_input,
+            path="tool_input",
+        )
+        if validation_errors:
+            return ToolResult(
+                invocation_id=invocation_id,
+                tool_name=tool_name,
+                status="rejected",
+                output={"validation_errors": validation_errors},
+                error="Tool input failed schema validation.",
+            )
         invocation = ToolInvocation(
             invocation_id=invocation_id,
             tool=tool.spec,
@@ -119,6 +142,140 @@ class ToolExecutor:
                 status="failed",
                 error=str(exc),
             )
+
+    def _validate_input(
+        self,
+        *,
+        schema: dict[str, Any],
+        value: Any,
+        path: str,
+    ) -> list[str]:
+        normalized_schema = self._normalize_schema(schema)
+        return self._validate_value(
+            schema=normalized_schema,
+            value=value,
+            path=path,
+        )
+
+    def _normalize_schema(self, schema: dict[str, Any]) -> dict[str, Any]:
+        if schema.get("type") == "object":
+            return schema
+        return {
+            "type": "object",
+            "required": [],
+            "properties": {
+                key: self._normalize_type_schema(spec)
+                for key, spec in schema.items()
+            },
+        }
+
+    def _normalize_type_schema(self, spec: Any) -> dict[str, Any]:
+        if isinstance(spec, dict):
+            return spec
+        if isinstance(spec, str):
+            return {"type": spec}
+        if isinstance(spec, list):
+            return {"type": spec}
+        return {}
+
+    def _validate_value(
+        self,
+        *,
+        schema: dict[str, Any],
+        value: Any,
+        path: str,
+    ) -> list[str]:
+        expected_type = schema.get("type")
+        errors: list[str] = []
+        if expected_type is not None and not self._matches_type(value, expected_type):
+            errors.append(
+                f"{path} must be {self._format_expected_type(expected_type)}, "
+                f"got {type(value).__name__}."
+            )
+            return errors
+
+        allowed_values = schema.get("allowed_values")
+        if (
+            isinstance(allowed_values, list)
+            and value is not None
+            and value not in allowed_values
+        ):
+            errors.append(
+                f"{path} must be one of {allowed_values}, got {value!r}."
+            )
+
+        minimum = schema.get("minimum")
+        if (
+            isinstance(minimum, int | float)
+            and isinstance(value, int | float)
+            and not isinstance(value, bool)
+            and value < minimum
+        ):
+            errors.append(f"{path} must be >= {minimum}, got {value!r}.")
+
+        if self._type_allows(expected_type, "object") and isinstance(value, dict):
+            properties = schema.get("properties")
+            if isinstance(properties, dict):
+                required = schema.get("required")
+                if isinstance(required, list):
+                    for key in required:
+                        if isinstance(key, str) and key not in value:
+                            errors.append(f"{path}.{key} is required.")
+                for key, item in value.items():
+                    property_schema = properties.get(key)
+                    if isinstance(property_schema, dict):
+                        errors.extend(
+                            self._validate_value(
+                                schema=property_schema,
+                                value=item,
+                                path=f"{path}.{key}",
+                            )
+                        )
+
+        if self._type_allows(expected_type, "array") and isinstance(value, list):
+            item_schema = schema.get("items")
+            if isinstance(item_schema, dict):
+                for index, item in enumerate(value):
+                    errors.extend(
+                        self._validate_value(
+                            schema=item_schema,
+                            value=item,
+                            path=f"{path}[{index}]",
+                        )
+                    )
+
+        return errors
+
+    def _matches_type(self, value: Any, expected_type: Any) -> bool:
+        if expected_type == "null":
+            return value is None
+        if isinstance(expected_type, list):
+            return any(self._matches_type(value, item) for item in expected_type)
+        if expected_type == "string":
+            return isinstance(value, str)
+        if expected_type == "integer":
+            return isinstance(value, int) and not isinstance(value, bool)
+        if expected_type == "number":
+            return (isinstance(value, int | float) and not isinstance(value, bool))
+        if expected_type == "boolean":
+            return isinstance(value, bool)
+        if expected_type == "array":
+            return isinstance(value, list)
+        if expected_type == "object":
+            return isinstance(value, dict)
+        return True
+
+    def _type_allows(self, expected_type: Any, candidate: str) -> bool:
+        if expected_type is None:
+            return True
+        if isinstance(expected_type, list):
+            return candidate in expected_type
+        return expected_type == candidate
+
+    def _format_expected_type(self, expected_type: Any) -> str:
+        if isinstance(expected_type, list):
+            return " or ".join(str(item) for item in expected_type)
+        return str(expected_type)
 
 
 class MockToolExecutor:
