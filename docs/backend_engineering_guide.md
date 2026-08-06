@@ -83,6 +83,10 @@ operation，修复失败则停止本轮执行，不能把工具调用残片当�
 每次真实工具调用后都必须生成反馈 observation。反馈至少包含执行成功 / 失败状态和可读
 message；当 LLM 可用时，还要追加独立 `tool_result_check` 调用，让 LLM 检查工具结果是否
 符合上一条 tool-call decision。底层 `ToolResult.status` 已失败时，反馈不能被升级为成功。
+部分工具可以按领域适配额外的 `domain_summary`，但这不是所有工具的强制合同。当前仅
+`matter.*` 工具会附加 matter 数量、状态计数、优先级计数和 due date 数量，用于避免
+LLM 把 `ToolResult.status=completed` 误解为业务对象已经完成。邮件和 runtime 工具暂时只
+使用各自的原始工具结果与通用反馈。
 Agent Loop 还会由本地 harness 生成 `progress_events`，用于前端展示用户友好的运行过程：
 package 选择、LLM 的 `assistant_message`、package 展开、工具开始 / 完成、工具反馈、最终回答
 和校验 warning 都会进入该事件流。`progress_events` 不参与后续上下文窗口压缩，也不由 LLM

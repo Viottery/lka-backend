@@ -124,6 +124,9 @@ Urgent track 的阶段目标：
   必须通过通用 loop 先读取证据，再选择 `matter` tools 写入或更新。
 - Agent turn 会输出本地生成的 `progress_events`，用于展示 package 选择、模型过程文本、
   工具开始 / 完成、工具反馈、最终回答和校验 warning；这些运行过程不进入上下文窗口。
+- 工具反馈支持按工具适配的可选 `domain_summary`，不要求每个工具都实现。当前仅
+  `matter.*` 工具提供 matter 数量、状态计数、优先级计数和 due date 数量，用于区分
+  工具执行状态和业务对象状态。
 - Agent turn 已有轻量最终回答校验，当前只记录 `verification_warnings`，不自动改写答案。
   Matter tools 的 schema 已补充 required fields、allowed values 和 examples，decision
   prompt 会要求模型遵循这些合同，并在有重复风险时先检索已有 matters。

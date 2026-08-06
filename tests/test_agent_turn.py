@@ -11,6 +11,7 @@ from app.api.routes.sessions import get_session
 from app.api.schemas import AgentTurnRequest, MailImportRequest
 from app.core.config import get_settings
 from app.core.llm import LLMRateLimitError, LLMResponse
+from app.core.matters import MatterCreateInput
 
 
 def test_agent_turn_expands_mail_package_and_records_log(tmp_path, monkeypatch):
@@ -774,6 +775,58 @@ def test_agent_turn_feeds_tool_input_validation_errors_back_to_llm(
     assert response.tool_events[1].result["status"] == "completed"
     assert response.tool_events[1].result["output"]["matters_created"] == 1
     assert response.answer == "已创建 NTUSO audition 准备事项。"
+
+
+def test_agent_turn_adds_matter_domain_summary_to_tool_feedback(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
+    get_settings.cache_clear()
+
+    app = create_app()
+    request = SimpleNamespace(app=app)
+    app.state.runtime.create_matter(
+        payload=MatterCreateInput(
+            title="NTU incomplete task",
+            summary="Open item.",
+            status="open",
+            priority="high",
+        )
+    )
+    app.state.runtime.create_matter(
+        payload=MatterCreateInput(
+            title="NTU completed task",
+            summary="Done item.",
+            status="done",
+            priority="normal",
+        )
+    )
+    fake_llm = _MatterFeedbackSummaryLLM()
+    app.state.runtime.agent_turn_loop.llm_client = fake_llm
+
+    response = run_agent_turn(
+        AgentTurnRequest(
+            session_id="session_matter_feedback_summary",
+            user_input="有哪些NTU事项？",
+        ),
+        request,
+    )
+
+    feedback = response.tool_events[0].feedback
+    assert feedback["status"] == "accepted"
+    assert feedback["message"] == "Tool ran; domain summary is authoritative."
+    assert feedback["domain_summary"]["matter_count"] == 2
+    assert feedback["domain_summary"]["matter_status_counts"] == {
+        "done": 1,
+        "open": 1,
+    }
+    assert feedback["domain_summary"]["open_count"] == 1
+    assert feedback["domain_summary"]["done_count"] == 1
+    assert fake_llm.checker_payloads[0]["tool_feedback"]["domain_summary"] == (
+        feedback["domain_summary"]
+    )
 
 
 def test_agent_turn_warns_when_final_answer_claims_unsupported_calendar_action(
@@ -1699,6 +1752,80 @@ class _InvalidMatterInputThenRepairLLM:
             content = "Unexpected prompt."
         return LLMResponse(
             provider="fake_invalid_matter_input_then_repair_llm",
+            status="completed",
+            content=content,
+            prompt_summary=prompt_summary,
+        )
+
+
+class _MatterFeedbackSummaryLLM:
+    def __init__(self) -> None:
+        self.checker_payloads: list[dict] = []
+
+    def complete_text(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        prompt_summary: str,
+        temperature: float = 0.0,
+        max_output_tokens: int | None = None,
+    ) -> LLMResponse:
+        if "Choose at most one tool package" in system_prompt:
+            content = json.dumps(
+                {
+                    "selected_package": "matter",
+                    "reason": "User asks for local NTU matters.",
+                    "search_query": "NTU",
+                }
+            )
+        elif "Tool Result Checker" in system_prompt:
+            payload = json.loads(user_prompt)
+            self.checker_payloads.append(payload)
+            content = json.dumps(
+                {
+                    "status": "accepted",
+                    "message": "Tool ran; domain summary is authoritative.",
+                    "remaining_work": "Answer from matter results.",
+                }
+            )
+        elif "Choose the next single action" in system_prompt:
+            payload = json.loads(user_prompt)
+            observations = payload["observations"]
+            if not observations:
+                content = json.dumps(
+                    {
+                        "operation": {
+                            "type": "tool_call",
+                            "package_name": "matter",
+                            "tool_name": "matter.search",
+                            "tool_input": {"query": "NTU", "limit": 10},
+                            "final_answer": None,
+                            "reason": "Search local NTU matters.",
+                            "confidence": "high",
+                        },
+                        "assistant_message": "正在查找 NTU 事项。",
+                    }
+                )
+            else:
+                content = json.dumps(
+                    {
+                        "operation": {
+                            "type": "final_answer",
+                            "package_name": None,
+                            "tool_name": None,
+                            "tool_input": {},
+                            "final_answer": "找到 2 个 NTU 事项。",
+                            "reason": "matter.search completed.",
+                            "confidence": "high",
+                        },
+                        "assistant_message": "已找到 NTU 事项。",
+                    }
+                )
+        else:
+            content = "Unexpected prompt."
+        return LLMResponse(
+            provider="fake_matter_feedback_summary_llm",
             status="completed",
             content=content,
             prompt_summary=prompt_summary,

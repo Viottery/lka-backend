@@ -1519,18 +1519,73 @@ class AgentTurnLoop:
         tool_name: str,
         result: ToolResult,
     ) -> dict[str, Any]:
+        domain_summary = self._tool_domain_summary(tool_name=tool_name, result=result)
         if result.status == "completed":
-            return {
+            feedback = {
                 "source": "local",
                 "status": "accepted",
                 "message": f"{tool_name} executed successfully.",
             }
-        return {
+            if domain_summary:
+                feedback["domain_summary"] = domain_summary
+            return feedback
+        feedback = {
             "source": "local",
             "status": "failed",
             "message": f"{tool_name} execution failed.",
             "error": result.error,
         }
+        if domain_summary:
+            feedback["domain_summary"] = domain_summary
+        return feedback
+
+    def _tool_domain_summary(
+        self,
+        *,
+        tool_name: str,
+        result: ToolResult,
+    ) -> dict[str, Any]:
+        if not tool_name.startswith("matter."):
+            return {}
+        output = result.output
+        matters = self._extract_matter_records_from_tool_output(output)
+        if not matters:
+            summary: dict[str, Any] = {"tool_family": "matter", "matter_count": 0}
+            if result.status == "rejected" and output.get("validation_errors"):
+                summary["validation_errors"] = output["validation_errors"]
+            return summary
+        status_counts: dict[str, int] = {}
+        priority_counts: dict[str, int] = {}
+        due_count = 0
+        for matter in matters:
+            status = str(matter.get("status") or "unknown")
+            priority = str(matter.get("priority") or "unknown")
+            status_counts[status] = status_counts.get(status, 0) + 1
+            priority_counts[priority] = priority_counts.get(priority, 0) + 1
+            if matter.get("due_at"):
+                due_count += 1
+        return {
+            "tool_family": "matter",
+            "matter_count": len(matters),
+            "matter_status_counts": status_counts,
+            "matter_priority_counts": priority_counts,
+            "open_count": status_counts.get("open", 0),
+            "in_progress_count": status_counts.get("in_progress", 0),
+            "done_count": status_counts.get("done", 0),
+            "due_count": due_count,
+        }
+
+    def _extract_matter_records_from_tool_output(
+        self,
+        output: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        matter = output.get("matter")
+        if isinstance(matter, dict):
+            return [matter]
+        matters = output.get("matters")
+        if isinstance(matters, list):
+            return [item for item in matters if isinstance(item, dict)]
+        return []
 
     def _check_tool_result_with_llm(
         self,
@@ -1552,7 +1607,10 @@ class AgentTurnLoop:
             "You are the Tool Result Checker for Local Knowledge Agent OS. Check whether "
             "the just-executed tool result is a valid observation for the prior tool-call "
             "decision. Do not make a final user answer. Do not claim success when "
-            "ToolResult.status is failed. Return only strict JSON: {\"status\":"
+            "ToolResult.status is failed. Distinguish tool execution status from domain "
+            "record status: ToolResult.status=completed means the tool ran, not that a "
+            "matter/task is done. If tool_feedback.domain_summary is present, use it as "
+            "the authoritative structured summary for business records. Return only strict JSON: {\"status\":"
             "\"accepted|needs_retry|failed\",\"message\":\"...\",\"remaining_work\":\"...\"}."
         )
         user_prompt = json.dumps(
@@ -1561,6 +1619,7 @@ class AgentTurnLoop:
                 "selected_package": selected_package,
                 "decision": decision,
                 "tool_result": tool_result.model_dump(mode="json"),
+                "tool_feedback": local_feedback,
             },
             ensure_ascii=False,
             indent=2,
@@ -1599,7 +1658,7 @@ class AgentTurnLoop:
             if isinstance(parsed.get("remaining_work"), str)
             else None
         )
-        return {
+        feedback = {
             "source": "llm",
             "status": status,
             "message": message or local_feedback["message"],
@@ -1607,6 +1666,9 @@ class AgentTurnLoop:
             "local_status": local_feedback["status"],
             "llm_output": response.content,
         }
+        if local_feedback.get("domain_summary"):
+            feedback["domain_summary"] = local_feedback["domain_summary"]
+        return feedback
 
     def _answer_with_llm(
         self,
