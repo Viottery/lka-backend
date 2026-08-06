@@ -18,6 +18,7 @@ native Windows/Linux execution support, and a clear path for future expansion.
 
 - `app/`: backend application code, including API routes, runtime orchestration, schemas, platform helpers, and storage helpers.
 - `docs/`: canonical project documentation, execution rules, API contract, and implementation tracking.
+- `scripts/`: local developer utilities, including smoke-test helpers.
 - `Dockerfile`: builds the backend container image and starts the API server inside the container.
 - `docker-compose.yml`: optional local container stack with Qdrant and local port binding.
 - `pyproject.toml`: defines package metadata, Python version, runtime dependencies, and developer tooling.
@@ -48,6 +49,8 @@ docs/
   platform_support.md
   ai_coding_standard.md
   mvp_todolist.md
+scripts/
+  run_agent_turn.py  # Run one real agent turn without starting the HTTP API
 ```
 
 ## Quick Start: Linux
@@ -67,6 +70,21 @@ uv run uvicorn app.api.main:app --host 127.0.0.1 --port 8765
 ```
 
 The service listens on `http://127.0.0.1:8765` by default.
+
+## Agent Turn Smoke Test
+
+Run one real agent turn from the backend workspace without starting the HTTP API
+or frontend:
+
+```bash
+uv run python scripts/run_agent_turn.py --session-id smoke_ntuso "搜索一下NTUSO的audition要求，我要怎么做？"
+```
+
+Use `--json` to print the full structured `AgentTurnResult`, including decision
+events, tool events, progress events, and the local run log path. By default the
+script does not call `runtime.start()`, so configured startup/background mail
+sync will not run during the smoke test. Add `--start-runtime` only when that is
+the behavior being tested.
 
 ## Quick Start: Windows Pet Frontend With WSL Backend
 
@@ -160,12 +178,17 @@ The default compose file starts the API and a local Qdrant container.
 - `POST /workspaces/index`
 - `GET /capabilities`
 - `POST /runtime/debug`
+- `POST /agent/turn`
+- `GET /sessions`
+- `POST /sessions`
 - `POST /mail/import`
 - `GET /mail/search`
 - `GET /mail/matters`
 - `POST /mail/outlook/auth/start`
 - `POST /mail/outlook/auth/complete`
 - `POST /mail/outlook/sync`
+- `GET /matters`
+- `POST /matters`
 
 ## Platform Support
 
