@@ -738,6 +738,26 @@ class AgentTurnLoop:
                 )
                 return answer
 
+            if action == "invalid_plain_text_decision":
+                loaded_messages = self._loaded_messages_from_observations(observations)
+                if loaded_messages:
+                    return self._answer_with_llm(
+                        user_input=user_input,
+                        loaded_messages=loaded_messages,
+                        llm_events=llm_events,
+                    )
+                return None
+
+            if action == "invalid_final_answer":
+                loaded_messages = self._loaded_messages_from_observations(observations)
+                if loaded_messages:
+                    return self._answer_with_llm(
+                        user_input=user_input,
+                        loaded_messages=loaded_messages,
+                        llm_events=llm_events,
+                    )
+                return None
+
             if action == "expand_package":
                 package_name = str(decision.get("package_name") or "")
                 if not self._package_exists(package_name):
@@ -922,17 +942,18 @@ class AgentTurnLoop:
             "choose update, skip/no_op, or create only with an explicit reason that the item "
             "is distinct. Use the current_time in context to "
             "resolve relative dates. For direct time questions, use runtime.now or answer from "
-            "current_time if it is sufficient. Return only strict JSON using this envelope: "
-            '{"assistant_message":"short user-visible progress text or final answer",'
-            '"operation":{"type":"tool_call|expand_package|final_answer|request_confirmation|no_op",'
+            "current_time if it is sufficient. Return only strict JSON using this operation-first "
+            "envelope: "
+            '{"operation":{"type":"tool_call|expand_package|final_answer|request_confirmation|no_op",'
             '"package_name":null,"tool_name":"mail.search","tool_input":{"query":"...","limit":8},'
-            '"final_answer":null,"reason":"...","confidence":"low|medium|high"}}. '
-            "For a final answer, set operation.type to final_answer and put the answer in "
-            "operation.final_answer. For a tool call, put only progress text in "
-            "assistant_message and put all executable details in operation. Do not put a "
-            "tool-call JSON object inside assistant_message. Legacy JSON with action, "
-            "tool_name, tool_input, answer, and reason is accepted, but the envelope is "
-            "preferred."
+            '"final_answer":null,"reason":"...","confidence":"low|medium|high"},'
+            '"assistant_message":"short user-visible progress text or final answer"}. '
+            "The operation object is the only executable control channel and must come first. "
+            "assistant_message is display-only progress text; it never selects tools and never "
+            "becomes the final answer. For a final answer, set operation.type to final_answer "
+            "and put the answer in operation.final_answer. For a tool call, put all executable "
+            "details in operation and only optional progress text in assistant_message. Never "
+            "return plain text outside JSON."
         )
         user_prompt = json.dumps(
             {
@@ -979,15 +1000,13 @@ class AgentTurnLoop:
             if not answer:
                 return None
             return {
-                "action": "answer",
-                "answer": answer,
+                "action": "invalid_plain_text_decision",
                 "assistant_message": answer,
                 "operation": {
-                    "type": "final_answer",
-                    "final_answer": answer,
-                    "reason": "Recovered answer from non-JSON decision output.",
+                    "type": "invalid",
+                    "reason": "Decision output must be strict JSON with operation first.",
                 },
-                "reason": "Recovered answer from non-JSON decision output.",
+                "reason": "Rejected non-JSON decision output.",
                 "_raw_output": response.content,
             }
         return self._normalize_decision_output(parsed, raw_output=response.content)
@@ -1088,11 +1107,18 @@ class AgentTurnLoop:
                     "_raw_output": raw_output,
                 }
             if operation_type == "final_answer":
-                answer = (
-                    operation.get("final_answer")
-                    if isinstance(operation.get("final_answer"), str)
-                    else assistant_message
-                )
+                answer = operation.get("final_answer")
+                if not isinstance(answer, str) or not answer.strip():
+                    return {
+                        "action": "invalid_final_answer",
+                        "assistant_message": assistant_message,
+                        "operation": operation,
+                        "reason": (
+                            reason
+                            or "operation.final_answer is required for final_answer."
+                        ),
+                        "_raw_output": raw_output,
+                    }
                 return {
                     "action": "answer",
                     "answer": answer,
@@ -1182,11 +1208,12 @@ class AgentTurnLoop:
             return None
         system_prompt = (
             "You repair one malformed Main Agent Brain decision. Return only strict JSON "
-            "using the envelope: {\"assistant_message\":\"...\",\"operation\":{\"type\":"
+            "using the operation-first envelope: {\"operation\":{\"type\":"
             "\"tool_call|expand_package|final_answer|request_confirmation|no_op\","
             "\"package_name\":null,\"tool_name\":null,\"tool_input\":{},"
             "\"final_answer\":null,\"reason\":\"...\","
-            "\"confidence\":\"low|medium|high\"}}. Preserve a tool call only when the "
+            "\"confidence\":\"low|medium|high\"},\"assistant_message\":\"...\"}. "
+            "Preserve a tool call only when the "
             "malformed output clearly includes the tool name and complete tool input. Do not "
             "invent missing required tool arguments."
         )

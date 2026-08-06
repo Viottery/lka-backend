@@ -416,14 +416,140 @@ def test_agent_turn_recovers_plain_text_decision_as_answer(tmp_path, monkeypatch
     assert [event.action for event in response.decision_events] == [
         "select_package",
         "call_tool",
-        "answer",
+        "call_tool",
+        "invalid_plain_text_decision",
     ]
     assert response.decision_events[-1].source == "llm"
     assert response.decision_events[-1].reason == (
-        "Recovered answer from non-JSON decision output."
+        "Rejected non-JSON decision output."
     )
     assert "纯文本最终回答" in (response.decision_events[-1].raw_output or "")
+    assert any(event.stage == "answer" for event in response.llm_events)
     assert "当前未配置可用 LLM" not in response.answer
+
+
+def test_agent_turn_does_not_final_plain_text_progress_before_tool_execution(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
+    get_settings.cache_clear()
+
+    app = create_app()
+    request = SimpleNamespace(app=app)
+    sentinel = "NTUSO_PLAIN_PROGRESS_SENTINEL"
+    import_mail(
+        MailImportRequest(
+            account={
+                "provider": "local_json",
+                "email_address": "user@example.com",
+            },
+            messages=[
+                {
+                    "external_id": "agent_turn_plain_progress_001",
+                    "folder": "Inbox",
+                    "subject": "NTUSO Audition requirements",
+                    "sender": "ntuso@example.com",
+                    "to": ["user@example.com"],
+                    "received_at": "2026-08-05T09:30:00Z",
+                    "body_text": (
+                        "NTUSO audition requires scales and one prepared piece. "
+                        f"{sentinel}"
+                    ),
+                },
+            ],
+        ),
+        request,
+    )
+    app.state.runtime.agent_turn_loop.llm_client = _PlainTextProgressBeforeToolLLM()
+
+    response = run_agent_turn(
+        AgentTurnRequest(
+            session_id="session_plain_text_progress",
+            user_input="搜索一下NTUSO的audition要求，我要怎么做？",
+        ),
+        request,
+    )
+
+    assert response.answer != "搜索本地邮箱中与 NTUSO audition 相关的邮件。"
+    assert sentinel in response.answer
+    assert [event.tool_name for event in response.tool_events] == [
+        "mail.search",
+        "mail.load_messages",
+    ]
+    assert [event.action for event in response.decision_events] == [
+        "select_package",
+        "invalid_plain_text_decision",
+        "call_tool",
+        "call_tool",
+        "answer",
+    ]
+    assert response.decision_events[1].source == "llm"
+    assert response.decision_events[1].reason == (
+        "Rejected non-JSON decision output."
+    )
+
+
+def test_agent_turn_does_not_final_plain_text_progress_after_mail_search(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
+    get_settings.cache_clear()
+
+    app = create_app()
+    request = SimpleNamespace(app=app)
+    sentinel = "NTUSO_AFTER_SEARCH_PROGRESS_SENTINEL"
+    import_mail(
+        MailImportRequest(
+            account={
+                "provider": "local_json",
+                "email_address": "user@example.com",
+            },
+            messages=[
+                {
+                    "external_id": "agent_turn_after_search_progress_001",
+                    "folder": "Inbox",
+                    "subject": "Fw: NTUSO Audition",
+                    "sender": "ntuso@example.com",
+                    "to": ["user@example.com"],
+                    "received_at": "2026-08-05T09:30:00Z",
+                    "body_text": (
+                        "NTUSO audition requires scales and one prepared piece. "
+                        f"{sentinel}"
+                    ),
+                },
+            ],
+        ),
+        request,
+    )
+    app.state.runtime.agent_turn_loop.llm_client = _PlainTextProgressAfterSearchLLM()
+
+    response = run_agent_turn(
+        AgentTurnRequest(
+            session_id="session_plain_text_after_search",
+            user_input="搜索一下NTUSO的audition要求，我要怎么做？",
+        ),
+        request,
+    )
+
+    assert response.answer != "找到一封相关的邮件“Fw: NTUSO Audition”，正在读取完整内容以获取 audition 要求。"
+    assert sentinel in response.answer
+    assert [event.tool_name for event in response.tool_events] == [
+        "mail.search",
+        "mail.search",
+        "mail.load_messages",
+    ]
+    assert [event.action for event in response.decision_events] == [
+        "select_package",
+        "call_tool",
+        "invalid_plain_text_decision",
+        "call_tool",
+        "call_tool",
+        "answer",
+    ]
 
 
 def test_agent_turn_accepts_operation_envelope_decisions(tmp_path, monkeypatch):
@@ -473,6 +599,55 @@ def test_agent_turn_accepts_operation_envelope_decisions(tmp_path, monkeypatch):
     assert response.decision_events[1].assistant_message == "我先检索相关邮件。"
     assert response.decision_events[1].operation["type"] == "tool_call"
     assert response.tool_events[0].feedback["source"] == "llm"
+
+
+def test_agent_turn_does_not_use_assistant_message_as_missing_final_answer(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
+    get_settings.cache_clear()
+
+    app = create_app()
+    request = SimpleNamespace(app=app)
+    sentinel = "MISSING_FINAL_ANSWER_SENTINEL"
+    import_mail(
+        MailImportRequest(
+            account={
+                "provider": "local_json",
+                "email_address": "user@example.com",
+            },
+            messages=[
+                {
+                    "external_id": "agent_turn_missing_final_001",
+                    "folder": "Inbox",
+                    "subject": "NTUSO Audition missing final",
+                    "sender": "ntuso@example.com",
+                    "to": ["user@example.com"],
+                    "received_at": "2026-08-05T09:30:00Z",
+                    "body_text": f"Full mail body for fallback answer. {sentinel}",
+                },
+            ],
+        ),
+        request,
+    )
+    app.state.runtime.agent_turn_loop.llm_client = _MissingFinalAnswerEnvelopeLLM()
+
+    response = run_agent_turn(
+        AgentTurnRequest(
+            session_id="session_missing_final_answer",
+            user_input="帮我查一下NTUSO考试。",
+        ),
+        request,
+    )
+
+    assert response.answer != "这是 assistant_message，不应该成为最终答案。"
+    assert sentinel in response.answer
+    assert response.decision_events[2].action == "invalid_final_answer"
+    assert response.decision_events[2].assistant_message == (
+        "这是 assistant_message，不应该成为最终答案。"
+    )
 
 
 def test_agent_turn_does_not_recover_malformed_tool_call_as_answer(tmp_path, monkeypatch):
@@ -981,7 +1156,8 @@ class _PlainTextDecisionAnswerLLM:
             content = _tool_check_content()
         elif "Choose the next single action" in system_prompt:
             payload = json.loads(user_prompt)
-            if not payload["observations"]:
+            observations = payload["observations"]
+            if not observations:
                 content = json.dumps(
                     {
                         "action": "call_tool",
@@ -993,12 +1169,102 @@ class _PlainTextDecisionAnswerLLM:
                         "reason": "Search checklist mail.",
                     }
                 )
+            elif observations[-1]["tool_name"] == "mail.search":
+                messages = observations[-1]["result"]["output"]["messages"]
+                message_ids = [message["message_id"] for message in messages[:1]]
+                content = json.dumps(
+                    {
+                        "action": "call_tool",
+                        "tool_name": "mail.load_messages",
+                        "tool_input": {"message_ids": message_ids},
+                        "reason": "Load full checklist mail body.",
+                    }
+                )
             else:
                 content = "纯文本最终回答：带 IPA、护照、SGAC 和照片。"
+        elif "Use the loaded local mail messages as observations" in system_prompt:
+            content = "纯文本最终回答：带 IPA、护照、SGAC 和照片。"
         else:
             content = "Unexpected prompt."
         return LLMResponse(
             provider="fake_plain_text_decision_llm",
+            status="completed",
+            content=content,
+            prompt_summary=prompt_summary,
+        )
+
+
+class _PlainTextProgressBeforeToolLLM:
+    def complete_text(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        prompt_summary: str,
+        temperature: float = 0.0,
+        max_output_tokens: int | None = None,
+    ) -> LLMResponse:
+        if "Choose at most one tool package" in system_prompt:
+            content = json.dumps(
+                {
+                    "selected_package": "mail",
+                    "reason": "Use mail for NTUSO audition.",
+                    "search_query": "NTUSO audition",
+                }
+            )
+        elif "Choose the next single action" in system_prompt:
+            content = "搜索本地邮箱中与 NTUSO audition 相关的邮件。"
+        else:
+            content = "Unexpected prompt."
+        return LLMResponse(
+            provider="fake_plain_text_progress_before_tool_llm",
+            status="completed",
+            content=content,
+            prompt_summary=prompt_summary,
+        )
+
+
+class _PlainTextProgressAfterSearchLLM:
+    def complete_text(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        prompt_summary: str,
+        temperature: float = 0.0,
+        max_output_tokens: int | None = None,
+    ) -> LLMResponse:
+        if "Choose at most one tool package" in system_prompt:
+            content = json.dumps(
+                {
+                    "selected_package": "mail",
+                    "reason": "Use mail for NTUSO audition.",
+                    "search_query": "NTUSO audition",
+                }
+            )
+        elif "Tool Result Checker" in system_prompt:
+            content = _tool_check_content()
+        elif "Choose the next single action" in system_prompt:
+            payload = json.loads(user_prompt)
+            observations = payload["observations"]
+            if not observations:
+                content = json.dumps(
+                    {
+                        "action": "call_tool",
+                        "tool_name": "mail.search",
+                        "tool_input": {
+                            "query": "NTUSO audition",
+                            "limit": 8,
+                        },
+                        "reason": "Search for NTUSO audition mail.",
+                    }
+                )
+            else:
+                content = "找到一封相关的邮件“Fw: NTUSO Audition”，正在读取完整内容以获取 audition 要求。"
+        else:
+            content = "Unexpected prompt."
+        return LLMResponse(
+            provider="fake_plain_text_progress_after_search_llm",
             status="completed",
             content=content,
             prompt_summary=prompt_summary,
@@ -1030,7 +1296,6 @@ class _EnvelopeDecisionLLM:
             if not payload["observations"]:
                 content = json.dumps(
                     {
-                        "assistant_message": "我先检索相关邮件。",
                         "operation": {
                             "type": "tool_call",
                             "tool_name": "mail.search",
@@ -1039,12 +1304,12 @@ class _EnvelopeDecisionLLM:
                             "reason": "Search relevant local mail first.",
                             "confidence": "high",
                         },
+                        "assistant_message": "我先检索相关邮件。",
                     }
                 )
             else:
                 content = json.dumps(
                     {
-                        "assistant_message": "Envelope final answer.",
                         "operation": {
                             "type": "final_answer",
                             "tool_name": None,
@@ -1053,12 +1318,73 @@ class _EnvelopeDecisionLLM:
                             "reason": "Search result is enough for this test.",
                             "confidence": "high",
                         },
+                        "assistant_message": "Envelope final answer.",
                     }
                 )
         else:
             content = "Unexpected prompt."
         return LLMResponse(
             provider="fake_envelope_llm",
+            status="completed",
+            content=content,
+            prompt_summary=prompt_summary,
+        )
+
+
+class _MissingFinalAnswerEnvelopeLLM:
+    def complete_text(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        prompt_summary: str,
+        temperature: float = 0.0,
+        max_output_tokens: int | None = None,
+    ) -> LLMResponse:
+        if "Choose at most one tool package" in system_prompt:
+            content = json.dumps(
+                {
+                    "selected_package": "mail",
+                    "reason": "Use mail for missing final answer test.",
+                    "search_query": "NTUSO",
+                }
+            )
+        elif "Tool Result Checker" in system_prompt:
+            content = _tool_check_content()
+        elif "Choose the next single action" in system_prompt:
+            payload = json.loads(user_prompt)
+            if not payload["observations"]:
+                content = json.dumps(
+                    {
+                        "operation": {
+                            "type": "tool_call",
+                            "tool_name": "mail.search",
+                            "tool_input": {"query": "NTUSO", "limit": 8},
+                            "final_answer": None,
+                            "reason": "Search relevant local mail first.",
+                            "confidence": "high",
+                        },
+                        "assistant_message": "我先检索相关邮件。",
+                    }
+                )
+            else:
+                content = json.dumps(
+                    {
+                        "operation": {
+                            "type": "final_answer",
+                            "tool_name": None,
+                            "tool_input": {},
+                            "final_answer": None,
+                            "reason": "Missing final answer should be rejected.",
+                            "confidence": "medium",
+                        },
+                        "assistant_message": "这是 assistant_message，不应该成为最终答案。",
+                    }
+                )
+        else:
+            content = "Unexpected prompt."
+        return LLMResponse(
+            provider="fake_missing_final_answer_envelope_llm",
             status="completed",
             content=content,
             prompt_summary=prompt_summary,

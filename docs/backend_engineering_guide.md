@@ -60,16 +60,19 @@ ReAct 过程中可以通过 `expand_package` decision 继续展开其他 Tool Pa
 只决定起始 package，不应把整个 turn 锁死在单一领域工具里。典型邮件事务流程应是先展开
 `mail` 检索 / 加载证据，再展开 `matter` 调用 `matter.create` 或 `matter.create_many`
 写入独立事务。
-decision 输出必须区分自然语言和内部操作：`assistant_message` 只保存用户可见的过程说明
-或最终回答，`operation` 才保存 `tool_call` / `final_answer` / `request_confirmation`
-等结构化动作。这样工具调用中途的模型文本可以被展示和记录，但不会和真实执行动作混在
-同一个字段里。
+decision 输出必须区分自然语言和内部操作，并采用 operation-first envelope：`operation`
+是唯一控制通道，保存 `tool_call` / `final_answer` / `request_confirmation` 等结构化动作；
+`assistant_message` 只保存用户可见的过程说明，不能选择工具，也不能补成最终回答。最终回答
+只能来自 `operation.final_answer` 或旧格式 JSON 中显式的 `answer` 字段。这样工具调用中途的
+模型文本可以被展示和记录，但不会和真实执行动作混在同一个字段里。
 如果 LLM 判断当前 turn 不需要展开任何 Tool Package，Agent Loop 仍应允许 LLM 基于当前
 session context window 直接回答；“不需要工具”和“系统无法处理”不能混为一谈。
 当 provider 返回不完整 JSON 但明确选择了某个 package 时，Agent Loop 可以做保守恢复，
 并在 run log 中保留原始输出，避免模型格式问题直接破坏工具链路。
-如果 decision 阶段返回了非 JSON 的自然语言最终回答，Agent Loop 可以将其恢复为
-`answer` decision，并记录原始输出，避免已有高质量回答被本地 fallback 覆盖。
+如果 decision 阶段返回非 JSON 的自然语言文本，Agent Loop 必须记录为
+`invalid_plain_text_decision`，不能将其恢复为最终回答。若本轮已经通过工具读取到足够证据，
+Agent Loop 可以进入独立 `answer` 阶段让 LLM 基于观察结果重新生成自然语言回答；否则应继续
+保守降级或回退到本地工具链。
 如果 decision 阶段返回的非 JSON 内容疑似工具调用，例如包含 `tool_name`、`tool_input`
 或 `tool_call`，Agent Loop 必须 fail closed：先尝试 `decision_repair` 修复为合法
 operation，修复失败则停止本轮执行，不能把工具调用残片当作最终 answer。
