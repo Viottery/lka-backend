@@ -1608,24 +1608,35 @@ config/local.toml
 
 ### 25.2 LLM 配置
 
-当前 LLM client 由：
+当前 LLM 调用由应用级 LLM service 管理：
 
 ```text
 Settings.load_local_config()
 build_text_llm_client(self.local_app_config.llm)
+  -> LLMClientRegistry
+  -> LLMService
 ```
 
 构造。
 
-用户当前选择的是 DeepSeek 官方渠道。
-
 关键配置一般包括：
 
-- provider
+- named client
+- provider type
 - base_url
-- api_key
-- model
+- api_key env
+- default model
+- available models
 - timeout
+- stream / JSON mode capability
+
+旧的单 provider 配置仍保持兼容；新的配置可以声明多个 `llm.clients`。单次
+`/agent/turn` 请求可以通过 `llm.client_name` 和 `llm.model` 覆盖默认选择，使 model
+成为用户可切换选项，而不是后端代码里的固定值。
+
+当前 LLM provider 调用已经通过 async service 执行；runtime 也提供 async agent turn 入口，
+可把现有同步 turn 放入后台线程，避免阻塞 async 调用链。`LLMService` 已提供 stream event 抽象，但用户可见
+SSE `/agent/turn/stream` 尚未实现。
 
 ### 25.3 Outlook 配置
 

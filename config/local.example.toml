@@ -14,6 +14,30 @@ base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"
 model = "gpt-4.1-mini"
 timeout_seconds = 60
+default_client = ""
+fallback_client = ""
+default_response_mode = "json"
+max_attempts = 2
+
+# Optional named clients. Keep commented until configured locally.
+# [[llm.clients]]
+# name = "mock"
+# provider = "mock"
+# default_model = "mock"
+# available_models = ["mock"]
+# supports_stream = true
+# supports_json_mode = true
+#
+# [[llm.clients]]
+# name = "openai"
+# provider = "openai_compatible"
+# base_url = "https://api.openai.com/v1"
+# api_key_env = "OPENAI_API_KEY"
+# default_model = "gpt-4.1-mini"
+# available_models = ["gpt-4.1-mini", "gpt-4.1"]
+# timeout_seconds = 60
+# supports_stream = true
+# supports_json_mode = true
 
 [mail.outlook]
 enabled = false

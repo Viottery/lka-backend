@@ -201,9 +201,18 @@ POST /agent/turn
 ```json
 {
   "session_id": "session_001",
-  "user_input": "帮我查询 NTUSO 的乐团考试相关要求"
+  "user_input": "帮我查询 NTUSO 的乐团考试相关要求",
+  "llm": {
+    "client_name": "packyapi",
+    "model": "deepseek-v4-flash",
+    "response_mode": "json"
+  }
 }
 ```
+
+`llm` 是可选字段；不传时使用会话 / 配置默认值。`model` 是运行时可切换选项，不应由
+后端代码写死。当前 `/agent/turn` 仍返回完整非流式结果；`response_mode=stream` 先作为
+LLM service 层能力预留，用户可见 stream endpoint 后续单独提供。
 
 响应：
 

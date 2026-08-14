@@ -123,7 +123,9 @@ cp config/local.example.toml config/local.toml
 `config/local.toml` is ignored by git. Use it for local provider choices and
 secret environment variable names:
 
-- `llm`: third-party LLM API provider, model, base URL, and API key env var.
+- `llm`: named LLM clients, default/fallback client, model options, base URL,
+  response mode, stream capability, and API key env var. A request can override
+  `client_name` and `model` when the user switches models.
 - `mail.outlook`: Microsoft Graph Device Code Flow settings. Outlook does not
   require storing an email password for this path.
 - `mail.imap`: optional IMAP settings for providers that require an app password.

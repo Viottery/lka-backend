@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import asyncio
+import inspect
 import time
+from contextvars import ContextVar
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timezone
 from hashlib import sha1
@@ -20,6 +23,8 @@ from app.core.llm import (
     LLMRateLimitError,
     LLMResponse,
     LLMResponseParseError,
+    LLMResponseMode,
+    LLMService,
     LLMTimeoutError,
     TextLLMClient,
 )
@@ -37,6 +42,17 @@ def _stable_id(prefix: str, *parts: str | None) -> str:
     text = "|".join(part or "" for part in parts)
     digest = sha1(text.encode("utf-8")).hexdigest()[:12]
     return f"{prefix}_{digest}"
+
+
+_turn_llm_client_name: ContextVar[str | None] = ContextVar(
+    "turn_llm_client_name",
+    default=None,
+)
+_turn_llm_model: ContextVar[str | None] = ContextVar("turn_llm_model", default=None)
+_turn_llm_response_mode: ContextVar[LLMResponseMode] = ContextVar(
+    "turn_llm_response_mode",
+    default=LLMResponseMode.TEXT,
+)
 
 
 class AgentTurnToolEvent(BaseModel):
@@ -120,7 +136,7 @@ class AgentTurnLoop:
         *,
         session_service: SessionService,
         tool_executor: ToolExecutor,
-        llm_client: TextLLMClient | None,
+        llm_client: TextLLMClient | LLMService | None,
         log_dir: Path,
     ) -> None:
         self.session_service = session_service
@@ -134,6 +150,46 @@ class AgentTurnLoop:
         self.session_context_token_budget = 65_536
 
     def run(
+        self,
+        *,
+        session_id: str | None,
+        user_input: str,
+        llm_client_name: str | None = None,
+        llm_model: str | None = None,
+        llm_response_mode: LLMResponseMode = LLMResponseMode.TEXT,
+    ) -> AgentTurnResult:
+        client_token = _turn_llm_client_name.set(llm_client_name)
+        model_token = _turn_llm_model.set(llm_model)
+        mode_token = _turn_llm_response_mode.set(llm_response_mode)
+        try:
+            return self._run(
+                session_id=session_id,
+                user_input=user_input,
+            )
+        finally:
+            _turn_llm_client_name.reset(client_token)
+            _turn_llm_model.reset(model_token)
+            _turn_llm_response_mode.reset(mode_token)
+
+    async def run_async(
+        self,
+        *,
+        session_id: str | None,
+        user_input: str,
+        llm_client_name: str | None = None,
+        llm_model: str | None = None,
+        llm_response_mode: LLMResponseMode = LLMResponseMode.TEXT,
+    ) -> AgentTurnResult:
+        return await asyncio.to_thread(
+            self.run,
+            session_id=session_id,
+            user_input=user_input,
+            llm_client_name=llm_client_name,
+            llm_model=llm_model,
+            llm_response_mode=llm_response_mode,
+        )
+
+    def _run(
         self,
         *,
         session_id: str | None,
@@ -1808,12 +1864,12 @@ class AgentTurnLoop:
         provider = type(self.llm_client).__name__
         for attempt in range(1, self.llm_max_attempts + 1):
             try:
-                response = self.llm_client.complete_text(
+                response = self._complete_text_once(
                     system_prompt=system_prompt,
                     user_prompt=user_prompt,
                     prompt_summary=prompt_summary,
-                    temperature=0.0,
                     max_output_tokens=max_output_tokens,
+                    stage=stage,
                 )
             except LLMRateLimitError as exc:
                 llm_events.append(
@@ -1856,6 +1912,42 @@ class AgentTurnLoop:
             )
             return response
         return None
+
+    def _complete_text_once(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        prompt_summary: str,
+        max_output_tokens: int | None,
+        stage: str,
+    ) -> LLMResponse:
+        if self.llm_client is None:
+            raise LLMClientError("No LLM client is configured.")
+        try:
+            result = self.llm_client.complete_text(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                prompt_summary=prompt_summary,
+                temperature=0.0,
+                max_output_tokens=max_output_tokens,
+                client_name=_turn_llm_client_name.get(),
+                model=_turn_llm_model.get(),
+                response_mode=_turn_llm_response_mode.get(),
+                require_json=stage not in {"answer"},
+                metadata={"stage": stage},
+            )
+        except TypeError:
+            result = self.llm_client.complete_text(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                prompt_summary=prompt_summary,
+                temperature=0.0,
+                max_output_tokens=max_output_tokens,
+            )
+        if inspect.isawaitable(result):
+            return asyncio.run(result)
+        return result
 
     def _llm_error_event(
         self,

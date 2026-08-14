@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 from app.core.agent_turn import AgentTurnResult
 from app.core.context import SessionContext, TaskContext
 from app.core.events import EventRecord
-from app.core.llm import LLMResponse
+from app.core.llm import LLMResponse, LLMResponseMode
 from app.domains.mail import (
     MailAccountInput,
     MailAttachmentInput,
@@ -90,9 +90,16 @@ class RuntimeDebugResponse(BaseModel):
     trace: TraceRecord
 
 
+class AgentTurnLLMOptions(BaseModel):
+    client_name: str | None = None
+    model: str | None = None
+    response_mode: LLMResponseMode = LLMResponseMode.TEXT
+
+
 class AgentTurnRequest(BaseModel):
     session_id: str | None = None
     user_input: str
+    llm: AgentTurnLLMOptions | None = None
 
 
 class AgentTurnResponse(AgentTurnResult):

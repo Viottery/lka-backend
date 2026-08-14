@@ -186,6 +186,36 @@ def test_agent_turn_retries_rate_limited_llm_and_logs_failure(tmp_path, monkeypa
     assert "## Decision Events" in log_text
 
 
+def test_agent_turn_passes_request_llm_options_to_client(tmp_path, monkeypatch):
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
+    get_settings.cache_clear()
+
+    app = create_app()
+    request = SimpleNamespace(app=app)
+    fake_llm = _LLMOptionsRecordingLLM()
+    app.state.runtime.agent_turn_loop.llm_client = fake_llm
+
+    response = run_agent_turn(
+        AgentTurnRequest(
+            session_id="session_llm_options",
+            user_input="直接回答当前问题，不需要工具。",
+            llm={
+                "client_name": "mock-client",
+                "model": "user-selected-model",
+                "response_mode": "json",
+            },
+        ),
+        request,
+    )
+
+    assert response.answer == "request llm options received"
+    assert fake_llm.calls
+    assert {call["client_name"] for call in fake_llm.calls} == {"mock-client"}
+    assert {call["model"] for call in fake_llm.calls} == {"user-selected-model"}
+    assert {call["response_mode"].value for call in fake_llm.calls} == {"json"}
+
+
 def test_agent_turn_maintains_recent_session_context_window(tmp_path, monkeypatch):
     monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
@@ -971,6 +1001,45 @@ class _RateLimitedThenWorkingLLM:
             content = "LLM final answer after retry."
         return LLMResponse(
             provider="fake_llm",
+            status="completed",
+            content=content,
+            prompt_summary=prompt_summary,
+        )
+
+
+class _LLMOptionsRecordingLLM:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def complete_text(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        prompt_summary: str,
+        temperature: float = 0.0,
+        max_output_tokens: int | None = None,
+        client_name: str | None = None,
+        model: str | None = None,
+        response_mode=None,
+        require_json: bool = False,
+        metadata: dict | None = None,
+    ) -> LLMResponse:
+        self.calls.append(
+            {
+                "client_name": client_name,
+                "model": model,
+                "response_mode": response_mode,
+                "require_json": require_json,
+                "metadata": metadata,
+            }
+        )
+        if "Choose at most one tool package" in system_prompt:
+            content = '{"selected_package":null,"reason":"context is enough"}'
+        else:
+            content = '{"answer":"request llm options received"}'
+        return LLMResponse(
+            provider="fake_llm_options",
             status="completed",
             content=content,
             prompt_summary=prompt_summary,

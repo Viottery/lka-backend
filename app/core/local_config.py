@@ -33,15 +33,63 @@ def _resolved_env_value(name: str) -> str | None:
     return os.getenv(name) or _dotenv_value(name)
 
 
+class LLMClientConfig(BaseModel):
+    name: str
+    provider: str = "openai_compatible"
+    base_url: str = "https://api.openai.com/v1"
+    api_key_env: str = "OPENAI_API_KEY"
+    default_model: str = "gpt-4.1-mini"
+    available_models: list[str] = Field(default_factory=list)
+    timeout_seconds: int = 60
+    supports_stream: bool = True
+    supports_json_mode: bool = False
+
+    def resolved_api_key(self) -> str | None:
+        return _resolved_env_value(self.api_key_env) if self.api_key_env else None
+
+
 class LLMProviderConfig(BaseModel):
     provider: str = "mock"
     base_url: str = "https://api.openai.com/v1"
     api_key_env: str = "OPENAI_API_KEY"
     model: str = "gpt-4.1-mini"
     timeout_seconds: int = 60
+    default_client: str | None = None
+    fallback_client: str | None = None
+    default_response_mode: str = "json"
+    max_attempts: int = 2
+    clients: list[LLMClientConfig] = Field(default_factory=list)
 
     def resolved_api_key(self) -> str | None:
         return _resolved_env_value(self.api_key_env) if self.api_key_env else None
+
+    def is_disabled(self) -> bool:
+        if self.clients:
+            return False
+        return self.provider == "mock" or not self.resolved_api_key()
+
+    def client_configs(self) -> list[LLMClientConfig]:
+        if self.clients:
+            return self.clients
+        if self.provider == "mock":
+            return []
+        provider_type = (
+            self.provider
+            if self.provider in {"mock", "openai_compatible"}
+            else "openai_compatible"
+        )
+        client_name = self.default_client or self.provider
+        return [
+            LLMClientConfig(
+                name=client_name,
+                provider=provider_type,
+                base_url=self.base_url,
+                api_key_env=self.api_key_env,
+                default_model=self.model,
+                available_models=[self.model],
+                timeout_seconds=self.timeout_seconds,
+            )
+        ]
 
 
 class OutlookMailConfig(BaseModel):

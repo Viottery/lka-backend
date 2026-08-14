@@ -100,6 +100,49 @@ model = "deepseek-v4-flash"
     assert config.llm.resolved_api_key() == "dotenv-secret"
 
 
+def test_llm_config_loads_named_clients(tmp_path, monkeypatch):
+    config_path = tmp_path / "local.toml"
+    config_path.write_text(
+        """
+[llm]
+default_client = "packyapi"
+fallback_client = "mock"
+default_response_mode = "json"
+max_attempts = 3
+
+[[llm.clients]]
+name = "packyapi"
+provider = "openai_compatible"
+base_url = "https://www.packyapi.ai/v1"
+api_key_env = "PACKY_API_KEY"
+default_model = "deepseek-v4-flash"
+available_models = ["deepseek-v4-flash", "gpt-4.1-mini"]
+supports_stream = true
+supports_json_mode = false
+
+[[llm.clients]]
+name = "mock"
+provider = "mock"
+default_model = "mock"
+available_models = ["mock"]
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PACKY_API_KEY", "secret")
+
+    config = load_local_config(config_path)
+
+    assert config.llm.default_client == "packyapi"
+    assert config.llm.fallback_client == "mock"
+    assert config.llm.max_attempts == 3
+    assert [client.name for client in config.llm.clients] == ["packyapi", "mock"]
+    assert config.llm.clients[0].resolved_api_key() == "secret"
+    assert config.llm.clients[0].available_models == [
+        "deepseek-v4-flash",
+        "gpt-4.1-mini",
+    ]
+
+
 def test_outlook_client_id_can_be_loaded_directly_from_config(tmp_path):
     config_path = tmp_path / "local.toml"
     config_path.write_text(

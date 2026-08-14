@@ -14,7 +14,7 @@ from app.api.schemas import (
 from app.core.agent_turn import AgentTurnLoop, AgentTurnResult
 from app.core.config import Settings
 from app.core.context import ContextAssembler
-from app.core.llm import MockLLMClient, build_text_llm_client
+from app.core.llm import LLMResponseMode, MockLLMClient, build_text_llm_client
 from app.tool_packages.mail import (
     MAIL_PACKAGE,
     LoadMailMessagesTool,
@@ -335,12 +335,37 @@ class LocalKnowledgeAgentRuntime:
         *,
         session_id: str | None,
         user_input: str,
+        llm_client_name: str | None = None,
+        llm_model: str | None = None,
+        llm_response_mode: LLMResponseMode = LLMResponseMode.TEXT,
     ) -> AgentTurnResult:
         """Run the minimal general agent turn loop."""
 
         return self.agent_turn_loop.run(
             session_id=session_id,
             user_input=user_input,
+            llm_client_name=llm_client_name,
+            llm_model=llm_model,
+            llm_response_mode=llm_response_mode,
+        )
+
+    async def run_agent_turn_async(
+        self,
+        *,
+        session_id: str | None,
+        user_input: str,
+        llm_client_name: str | None = None,
+        llm_model: str | None = None,
+        llm_response_mode: LLMResponseMode = LLMResponseMode.TEXT,
+    ) -> AgentTurnResult:
+        """Run one agent turn without blocking the event loop."""
+
+        return await self.agent_turn_loop.run_async(
+            session_id=session_id,
+            user_input=user_input,
+            llm_client_name=llm_client_name,
+            llm_model=llm_model,
+            llm_response_mode=llm_response_mode,
         )
 
     def import_mail(
