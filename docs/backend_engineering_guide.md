@@ -177,12 +177,28 @@ backend/
         capabilities.py
 
     core/
+      agent_turn.py
+      llm.py
       runtime.py
       context.py
       retrieval.py
       runtime_loop.py
       tools.py
+      sessions.py
+      runtime_context.py
       tracing.py
+
+    domains/
+      mail.py
+      matters.py
+
+    integrations/
+      outlook.py
+
+    tool_packages/
+      mail.py
+      matter.py
+      runtime.py
 
     platform/
       base.py
@@ -201,6 +217,14 @@ backend/
 - 上面这份结构是“目标结构”，不是当前实现的全部内容。
 - 当前仓库只实现了其中很小一部分，但目录规划保留了后续演进路径。
 - 这份结构的价值在于：它让后续扩展不会每次都重新发明分层方式。
+- `app/core/` 只放 Agent Harness 核心结构、LLM 调用、会话 / 上下文、安全校验 / trace
+  等通用运行时能力；具体领域服务和工具包实现不放在 `core`。
+- `app/domains/` 放确定性领域服务与领域数据模型，例如邮件和事务。领域服务不调用 LLM，
+  不选择工具，不隐藏多步骤 agent 行为。
+- `app/tool_packages/` 放 Agent 可见的工具包适配层，例如 `mail`、`matter`、`runtime`。
+  这些模块可以依赖领域服务和核心 tool 协议，但不应把具体工具实现放回 `core`。
+- `app/integrations/` 放 Outlook / Graph 等外部 provider 接入，避免 provider 代码污染
+  Agent Harness 核心层。
 - `app/platform/` 是跨平台边界，用于集中处理路径、文件系统和后续命令执行差异。
 
 ### 存储与检索约定

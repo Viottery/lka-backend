@@ -23,7 +23,7 @@ from app.core.llm import (
     LLMTimeoutError,
     TextLLMClient,
 )
-from app.core.runtime_tools import current_time_payload
+from app.core.runtime_context import current_time_payload
 from app.core.sessions import SessionService
 from app.core.sessions import SessionRecentMessage
 from app.core.tools import ToolContext, ToolExecutor, ToolResult

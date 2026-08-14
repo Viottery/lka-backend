@@ -102,24 +102,31 @@ app/
     schemas.py         HTTP request/response schema
     routes/            各业务路由
 
-  core/                Agent、工具、领域服务、LLM、配置
+  core/                Agent Harness 核心、LLM、会话、上下文、trace、配置
     agent_turn.py      当前主 Agent turn loop
     runtime.py         后端运行时组装器
     tools.py           工具协议、工具包、注册表、执行器
-    mail.py            邮件领域服务
-    mail_tools.py      邮件工具适配层
-    matters.py         独立事务领域服务
-    matter_tools.py    事务工具适配层
-    runtime_tools.py   运行时工具，例如当前时间
     sessions.py        会话与上下文窗口服务
     llm.py             LLM client、错误分类、provider 调用
-    outlook.py         Microsoft Graph / Outlook 同步服务
+    runtime_context.py 当前时间等确定性运行时上下文 helper
     local_config.py    config/local.toml 解析
     config.py          应用设置
     runtime_loop.py    legacy debug loop
     tracing.py         legacy trace recorder
     retrieval.py       workspace debug retrieval
     context.py         legacy context models
+
+  domains/             确定性领域服务和领域数据模型
+    mail.py            邮件领域服务
+    matters.py         独立事务领域服务
+
+  integrations/        外部 provider 接入
+    outlook.py         Microsoft Graph / Outlook 同步服务
+
+  tool_packages/       Agent 可展开的工具包实现
+    mail.py            邮件工具适配层
+    matter.py          事务工具适配层
+    runtime.py         运行时工具，例如当前时间
 
   platform/            本地平台与文件系统抽象
     detect.py
@@ -142,13 +149,13 @@ app/api/main.py
   -> app/core/runtime.py
     -> app/core/agent_turn.py
       -> app/core/tools.py
-      -> app/core/mail_tools.py
-      -> app/core/matter_tools.py
-      -> app/core/runtime_tools.py
+      -> app/tool_packages/mail.py
+      -> app/tool_packages/matter.py
+      -> app/tool_packages/runtime.py
       -> app/core/sessions.py
       -> app/core/llm.py
-      -> app/core/mail.py
-      -> app/core/matters.py
+      -> app/domains/mail.py
+      -> app/domains/matters.py
       -> app/storage/db.py
 ```
 
@@ -751,7 +758,7 @@ validate_input
 
 ### 11.1 工具包定义
 
-文件：`app/core/mail_tools.py`
+文件：`app/tool_packages/mail.py`
 
 ```python
 MAIL_PACKAGE = ToolPackageSpec(
@@ -895,7 +902,7 @@ MAIL_PACKAGE = ToolPackageSpec(
 
 ### 12.1 文件职责
 
-文件：`app/core/mail.py`
+文件：`app/domains/mail.py`
 
 `MailService` 是纯邮件领域服务，不负责 LLM，不负责 Agent 决策。
 
@@ -935,7 +942,7 @@ MAIL_PACKAGE = ToolPackageSpec(
 
 ### 13.1 文件职责
 
-文件：`app/core/outlook.py`
+文件：`app/integrations/outlook.py`
 
 `OutlookService` 负责 Microsoft Graph / Outlook 邮件同步。
 
@@ -1006,7 +1013,7 @@ _background_mail_sync_loop()
 
 ### 14.2 matter package
 
-文件：`app/core/matter_tools.py`
+文件：`app/tool_packages/matter.py`
 
 当前工具：
 
@@ -1100,7 +1107,7 @@ low, normal, high, urgent
 
 ## 15. MatterService 事务领域服务
 
-文件：`app/core/matters.py`
+文件：`app/domains/matters.py`
 
 职责：
 
@@ -1124,7 +1131,7 @@ low, normal, high, urgent
 
 ## 16. Runtime 工具包
 
-文件：`app/core/runtime_tools.py`
+文件：`app/tool_packages/runtime.py`
 
 当前工具：
 

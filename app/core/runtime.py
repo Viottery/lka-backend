@@ -15,13 +15,13 @@ from app.core.agent_turn import AgentTurnLoop, AgentTurnResult
 from app.core.config import Settings
 from app.core.context import ContextAssembler
 from app.core.llm import MockLLMClient, build_text_llm_client
-from app.core.mail_tools import (
+from app.tool_packages.mail import (
     MAIL_PACKAGE,
     LoadMailMessagesTool,
     SearchMailTool,
     SyncMailTool,
 )
-from app.core.matter_tools import (
+from app.tool_packages.matter import (
     MATTER_PACKAGE,
     CreateManyMattersTool,
     CreateMatterTool,
@@ -30,7 +30,7 @@ from app.core.matter_tools import (
     SearchMattersTool,
     UpdateMatterTool,
 )
-from app.core.matters import (
+from app.domains.matters import (
     MatterCreateInput,
     MatterList,
     MatterRecord,
@@ -39,7 +39,7 @@ from app.core.matters import (
     MatterSourceLinkInput,
     MatterUpdateInput,
 )
-from app.core.mail import (
+from app.domains.mail import (
     MailAccountInput,
     MailImportResult,
     MailMatterList,
@@ -47,7 +47,7 @@ from app.core.mail import (
     MailSearchResult,
     MailService,
 )
-from app.core.outlook import (
+from app.integrations.outlook import (
     OutlookAuthCompleteResult,
     OutlookAuthStartResult,
     OutlookServiceError,
@@ -55,7 +55,7 @@ from app.core.outlook import (
     OutlookSyncResult,
 )
 from app.core.retrieval import LocalDebugRetrievalProvider
-from app.core.runtime_tools import RUNTIME_PACKAGE, RuntimeNowTool
+from app.tool_packages.runtime import RUNTIME_PACKAGE, RuntimeNowTool
 from app.core.runtime_loop import RuntimeDebugRun, RuntimeLoop
 from app.core.sessions import (
     AgentSessionDetail,

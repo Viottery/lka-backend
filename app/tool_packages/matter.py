@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from app.core.matters import (
+from app.domains.matters import (
     MatterCreateInput,
     MatterService,
     MatterSourceLinkInput,

@@ -11,7 +11,7 @@ from app.api.routes.sessions import get_session
 from app.api.schemas import AgentTurnRequest, MailImportRequest
 from app.core.config import get_settings
 from app.core.llm import LLMRateLimitError, LLMResponse
-from app.core.matters import MatterCreateInput
+from app.domains.matters import MatterCreateInput
 
 
 def test_agent_turn_expands_mail_package_and_records_log(tmp_path, monkeypatch):

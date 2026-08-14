@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from app.api.main import create_app
 from app.core.config import get_settings
-from app.core.outlook import OutlookSyncResult
+from app.integrations.outlook import OutlookSyncResult
 
 
 def test_runtime_start_runs_configured_outlook_startup_sync(tmp_path, monkeypatch):

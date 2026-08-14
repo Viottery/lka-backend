@@ -11,7 +11,7 @@ from app.api.schemas import (
     OutlookSyncRequest,
     OutlookSyncResponse,
 )
-from app.core.outlook import OutlookConfigError, OutlookRemoteError, OutlookServiceError
+from app.integrations.outlook import OutlookConfigError, OutlookRemoteError, OutlookServiceError
 
 router = APIRouter(prefix="/mail", tags=["mail"])
 

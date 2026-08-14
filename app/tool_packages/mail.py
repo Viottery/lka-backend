@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from app.core.mail import MailMatterDraft, MailService
+from app.domains.mail import MailMatterDraft, MailService
 from app.core.tools import ToolContext, ToolInvocation, ToolPackageSpec, ToolResult, ToolSpec
 
 

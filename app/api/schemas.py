@@ -8,7 +8,7 @@ from app.core.agent_turn import AgentTurnResult
 from app.core.context import SessionContext, TaskContext
 from app.core.events import EventRecord
 from app.core.llm import LLMResponse
-from app.core.mail import (
+from app.domains.mail import (
     MailAccountInput,
     MailAttachmentInput,
     MailImportResult,
@@ -17,7 +17,7 @@ from app.core.mail import (
     MailMessageInput,
     MailSearchResult,
 )
-from app.core.matters import (
+from app.domains.matters import (
     MatterCreateInput,
     MatterList,
     MatterRecord,
@@ -25,7 +25,7 @@ from app.core.matters import (
     MatterSourceLinkInput,
     MatterUpdateInput,
 )
-from app.core.outlook import (
+from app.integrations.outlook import (
     OutlookAuthCompleteResult,
     OutlookAuthStartResult,
     OutlookSyncResult,

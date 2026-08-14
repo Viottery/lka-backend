@@ -33,7 +33,20 @@ app/
     schemas.py       # Request and response models
   core/
     config.py        # Application settings
+    agent_turn.py    # Main Agent turn loop
+    llm.py           # LLM provider client and error handling
+    tools.py         # Tool registry, specs, and executor contracts
+    runtime_context.py # Deterministic runtime context helpers
     runtime.py       # Main runtime orchestration
+  domains/
+    mail.py          # Mail domain service and models
+    matters.py       # Matter domain service and models
+  integrations/
+    outlook.py       # Microsoft Graph / Outlook sync integration
+  tool_packages/
+    mail.py          # Agent-visible mail tool package
+    matter.py        # Agent-visible matter tool package
+    runtime.py       # Deterministic runtime context tools
   platform/
     detect.py        # Runtime platform detection
     paths.py         # Workspace path resolution

@@ -16,7 +16,7 @@ from typing import Any, Protocol
 from pydantic import BaseModel
 
 from app.core.local_config import LocalAppConfig, OutlookMailConfig
-from app.core.mail import MailAccountInput, MailAttachmentInput, MailMessageInput, MailService
+from app.domains.mail import MailAccountInput, MailAttachmentInput, MailMessageInput, MailService
 
 DEVICE_CODE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"

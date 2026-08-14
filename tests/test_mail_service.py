@@ -7,9 +7,9 @@ from app.api.main import create_app
 from app.api.routes.mail import import_mail, list_mail_matters, search_mail
 from app.api.schemas import MailImportRequest
 from app.core.config import get_settings
-from app.core.mail import MailMatterDraft
-from app.core.mail_tools import PersistMailMattersTool, SyncMailTool
-from app.core.outlook import OutlookSyncResult
+from app.domains.mail import MailMatterDraft
+from app.tool_packages.mail import PersistMailMattersTool, SyncMailTool
+from app.integrations.outlook import OutlookSyncResult
 from app.core.tools import ToolContext, ToolInvocation
 
 

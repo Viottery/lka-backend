@@ -8,8 +8,8 @@ from typing import Any
 import pytest
 
 from app.core.local_config import LocalAppConfig, MailProviderConfig, OutlookMailConfig
-from app.core.mail import MailService
-from app.core.outlook import OutlookAuthError, OutlookService
+from app.domains.mail import MailService
+from app.integrations.outlook import OutlookAuthError, OutlookService
 from app.storage.db import connect, init_db
 
 
