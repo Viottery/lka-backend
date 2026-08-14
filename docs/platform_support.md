@@ -3,7 +3,7 @@
 本文档定义 Local Knowledge Agent OS Backend Core 的跨平台支持方案。
 
 当前目标不是维护两套后端，而是保留一套 Python 后端核心，并把 Windows、
-Linux、macOS、WSL、Docker 的差异集中到平台适配层中。
+Linux、macOS 和 WSL 的差异集中到平台适配层中。
 
 ---
 
@@ -17,7 +17,7 @@ Backend Core 应能在以下环境中直接运行：
 - Linux + Python 3.12+ + sh/bash
 - macOS + Python 3.12+ + sh/zsh
 
-Docker 和 WSL 是可选运行方式，不是 Windows 支持的前提。
+WSL 是可选运行方式，不是 Windows 支持的前提。当前项目不再维护 Docker 运行路径。
 
 ### 1.2 架构目标
 
@@ -166,7 +166,7 @@ Invoke-RestMethod `
 - API 的 `workspace` 表示后端进程可访问的本地路径。
 - Windows 原生后端直接使用 Windows 路径。
 - Linux 原生后端直接使用 POSIX 路径。
-- Docker/WSL 场景应通过挂载路径或后续 path mapping 处理。
+- WSL 场景应通过挂载路径或后续 path mapping 处理。
 - 存储层保存规范化后的后端路径，便于复查和复用。
 
 ### 6.2 文件系统
@@ -240,4 +240,4 @@ Windows:
 3. 增加 `CommandRunner`，为本地工具和专家工具做准备。
 4. 扩展 Capability Registry，增加平台可用性字段。
 5. 将 Windows/Linux smoke test 写入运行文档。
-6. 只有在确有需要时才加入 Docker/WSL path mapping。
+6. 只有在确有需要时才加入 WSL path mapping。

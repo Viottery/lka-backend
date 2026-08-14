@@ -117,7 +117,7 @@ class FilesystemScanner:
         lowered = filename.lower()
         if lowered.startswith("readme"):
             return "readme"
-        if lowered in {"pyproject.toml", "package.json", "cargo.toml", "docker-compose.yml"}:
+        if lowered in {"pyproject.toml", "package.json", "cargo.toml"}:
             return "config"
         return "workspace_file"
 

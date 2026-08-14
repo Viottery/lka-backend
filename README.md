@@ -10,7 +10,6 @@ native Windows/Linux execution support, and a clear path for future expansion.
 - SQLite-backed storage for workspaces
 - Local-only default binding for development
 - Native Windows/Linux backend execution
-- Docker and Docker Compose support as an optional runtime path
 - Platform support for workspace path resolution and read-only filesystem scanning
 - Documentation for the current architecture and API contract
 
@@ -19,8 +18,6 @@ native Windows/Linux execution support, and a clear path for future expansion.
 - `app/`: backend application code, including API routes, runtime orchestration, schemas, platform helpers, and storage helpers.
 - `docs/`: canonical project documentation, execution rules, API contract, and implementation tracking.
 - `scripts/`: local developer utilities, including smoke-test helpers.
-- `Dockerfile`: builds the backend container image and starts the API server inside the container.
-- `docker-compose.yml`: optional local container stack with Qdrant and local port binding.
 - `pyproject.toml`: defines package metadata, Python version, runtime dependencies, and developer tooling.
 
 ## Project Layout
@@ -178,14 +175,6 @@ The default mode is a dry run. Add `--delete` only when the WSL copy is the
 source of truth and the Windows target should mirror deletions.
 Local secrets such as `config/local.toml`, token files, and `.env` are excluded;
 create a separate `config/local.toml` on Windows when needed.
-
-## Docker
-
-```bash
-docker compose up --build
-```
-
-The default compose file starts the API and a local Qdrant container.
 
 ## Implemented APIs
 

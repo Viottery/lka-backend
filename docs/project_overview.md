@@ -308,7 +308,8 @@ MVP 默认绑定地址是 `127.0.0.1:8765`，但必须通过配置项覆盖，�
 
 Backend Core 应支持 Windows 和 Linux 原生 Python 运行。平台差异应集中在
 `app/platform/`，包括路径解析、文件系统扫描、后续命令执行和本地工具调用。
-Docker/WSL 可以作为可选部署或开发方式，但不应成为 Windows 支持的前提。
+WSL 可以作为可选部署或开发方式，但不应成为 Windows 支持的前提。当前项目不再维护
+Docker 运行路径。
 
 本地持久化默认使用 SQLite，作为任务、轨迹、确认和 workspace 索引元数据的主存储。
 
@@ -380,7 +381,7 @@ Windows Frontend / Linux Frontend
           │
           │ HTTP
           ▼
-WSL / Docker Local Backend Server
+Native Python Backend Server
           │
           ├─ Main Agent Brain（主代理大脑）
           ├─ Knowledge Context Engine
@@ -392,12 +393,12 @@ WSL / Docker Local Backend Server
           ├─ Trace Recorder
           ├─ Skill Evolution
           ├─ SQLite
-          └─ Qdrant
+          └─ Optional Semantic Store
 ```
 
 其中：
 
-* Linux 后端运行在 WSL / Docker 中，负责所有核心智能逻辑。
+* 后端以 Windows / Linux 原生 Python 运行为当前支持路径，WSL 可以作为可选开发环境。
 * Windows 前端是主要用户入口，负责路径映射、用户交互和 Windows 桌面动作。
 * Linux 前端主要用于调试、开发和后端测试。
 
@@ -853,9 +854,9 @@ MVP 阶段不要求自动生成可执行 skill，但要能展示 Skill Evolution
 
 ### 必须完成
 
-* WSL / Docker 后端环境
+* Windows / Linux 原生后端环境
 * FastAPI 本地 HTTP API
-* Qdrant / SQLite 基础存储
+* SQLite 基础存储
 * 文件夹索引
 * Knowledge Object
 * TaskContext
@@ -1031,7 +1032,7 @@ Skill Evolution Proposal
 * Tool Calling
 * 多端架构设计
 * 后端 API 设计
-* Docker / WSL 部署
+* Windows / Linux / WSL 部署
 * 安全边界设计
 * 执行验证机制
 * Trace / Memory 设计

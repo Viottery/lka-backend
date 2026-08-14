@@ -5,8 +5,8 @@
 Backend Core 是整个 Local Knowledge Agent OS 的核心执行层。它承载 HTTP API、
 运行时调度、知识上下文构建、能力选择、技能执行、验证与轨迹记录等核心职责。
 
-Backend Core 目标是支持 Windows 和 Linux 原生 Python 运行。Docker/WSL 可以作为
-可选运行方式，但不应成为 Windows 支持的前提。
+Backend Core 目标是支持 Windows 和 Linux 原生 Python 运行。当前项目不再维护 Docker
+运行路径；WSL 可以作为可选运行环境，但不应成为 Windows 支持的前提。
 
 这个文档既描述当前已实现的后端骨架，也保留项目的中长期愿景，方便后续分阶段落地。
 
@@ -163,8 +163,6 @@ Agent Loop 按 `Retry-After` 或本地默认等待时间重试；重试耗尽后
 
 ```text
 backend/
-  Dockerfile
-  docker-compose.yml
   pyproject.toml
   .env.example
 

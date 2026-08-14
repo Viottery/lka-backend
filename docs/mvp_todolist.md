@@ -186,7 +186,7 @@ Urgent track 的阶段目标：
 
 ### 1.1 仓库结构确认
 
-- [x] 确认 `app/`、`docs/`、`Dockerfile`、`docker-compose.yml`、`pyproject.toml` 的职责划分清晰。
+- [x] 确认 `app/`、`docs/`、`pyproject.toml` 的职责划分清晰。
 - [x] 确认 `docs/` 内文档分层正确：
   - [x] `project_overview.md` 作为项目总纲
   - [x] `backend_engineering_guide.md` 作为后端架构说明
@@ -228,7 +228,7 @@ Urgent track 的阶段目标：
 - 不拆分 Windows Backend / Linux Backend 两套代码。
 - 一套 Backend Core 保持 FastAPI、SQLite、Context、Trace 等核心逻辑共享。
 - Windows/Linux 差异集中进入 `app/platform/`。
-- Docker/WSL 作为可选运行方式，不作为 Windows 原生支持的前提。
+- WSL 作为可选运行方式，不作为 Windows 原生支持的前提；当前项目不再维护 Docker 运行路径。
 - 后续命令执行、专家工具和本地工具调用应新增统一 `CommandRunner`，不要在业务层写死 shell。
 
 ### 完成标准
@@ -669,16 +669,9 @@ Urgent track 的阶段目标：
 - [ ] Windows PowerShell 原生启动说明可复现。
 - [ ] Linux shell 原生启动说明可复现。
 
-### 11.2 Docker 运行
-
-- [ ] `docker compose up --build` 可启动服务。
-- [ ] API 容器可访问。
-- [ ] Qdrant 容器可启动。
-
-### 11.3 运行说明
+### 11.2 运行说明
 
 - [ ] README 写清本地运行方式。
-- [ ] README 写清 Docker 运行方式。
 - [ ] README 写清默认端口和默认监听地址。
 - [x] README 写清 Windows/Linux 原生启动基础命令。
 - [x] `docs/platform_support.md` 写清平台配置、路径、API 调用和测试矩阵。

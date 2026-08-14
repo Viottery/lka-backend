@@ -14,7 +14,7 @@
 - 保持一个稳定、可启动、可验证的 Backend Core 骨架。
 - 保留最小的 HTTP 服务、workspace 索引和静态能力目录。
 - 让文档、接口和代码保持同一套术语。
-- 支持 Windows/Linux 原生 Python 运行，Docker/WSL 仅作为可选路径。
+- 支持 Windows/Linux 原生 Python 运行，WSL 仅作为可选路径；当前项目不再维护 Docker 运行路径。
 
 ### 1.2 中期目标
 
