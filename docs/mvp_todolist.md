@@ -84,12 +84,18 @@ Urgent track 的阶段目标：
 - 会话由显式 `session_id` 区分，后端不维护隐式全局当前会话；前端切换会话时必须把目标 `session_id` 传入运行入口。
 - 邮件数据源是全局本地知识源，不存在独立邮件会话引擎；mail tools 只提供一次性观察结果，各 session 是否保留邮件引用、摘要和上下文由通用 Agent turn 决定。
 - 不提供 `/mail/process` 这类邮件专属 agent endpoint；邮件整理必须通过通用 Agent turn 调用 `mail` tools 完成。
+- Agent Harness core 必须保持 package / domain agnostic。即使 MVP 当前优先邮件场景，
+  也不能在 `app/core/` prompt、fallback 或 verifier 中写死具体 package 名、工具名、
+  路由关键词、领域调用顺序或工具调用示例；这类策略必须进入 `app/tool_packages/`
+  的 package metadata、tool description、schema、routing hints、decision hints 和 cache policy。
 - 通用 Agent turn 已扩展为单次查询内的 step-limited 决策循环：先选择 Tool Package，
   再按观察结果多次决定是否调用工具或最终回答；当前可执行 package 仍以 `mail` 为主。
 - Agent decision 输出已区分 `assistant_message` 和 `operation`，并收紧为
-  operation-first envelope。`operation` 是唯一控制通道，工具调用和最终回答必须进入
-  结构化 `operation`；`assistant_message` 只作为展示文本，不能触发工具、不能补成
-  final，也不能被裸文本恢复为最终回答。
+  operation-first envelope。`operation` 是唯一控制通道，工具调用、展开 package、请求确认
+  和进入最终回答阶段都必须进入结构化 `operation`；`assistant_message` 只作为展示文本，
+  不能触发工具、不能补成 final，也不能被裸文本恢复为最终回答。`operation.type ==
+  "final_answer"` 只表示进入独立 `answer` stage；真正用户可见的最终自然语言回答必须来自
+  `answer` / `context_answer` stage。
 - ReAct loop 已支持 `expand_package`，route 只选择起始 package，不再把整个 turn 锁死在
   一个工具包里。邮件事务整理应先展开 `mail` 读取证据，再展开 `matter` 写入独立事务。
 - 旧 `mail.persist_matters` 已从 Agent 可见 Tool Registry 中隐藏；它只作为
@@ -97,22 +103,27 @@ Urgent track 的阶段目标：
 - 每个真实工具调用后都会生成 `feedback`，至少记录成功 / 失败状态和可读 message；LLM
   可用时还会通过独立 `tool_result_check` 阶段检查工具结果是否符合上一条调用决策，并把
   检查结果写回 tool event 和后续 observation。
-- decision 阶段的非 JSON 自然语言会记录为 `invalid_plain_text_decision`，不能恢复为
-  `answer`。疑似工具调用的损坏 JSON 必须先尝试 `decision_repair`，修复失败则记录
-  `malformed_tool_call` 并停止，避免出现“看起来调用了工具、实际没有执行”的假成功。
+- decision 阶段的非 JSON 自然语言会先触发一次格式重试，重试 prompt 必须带上上一条
+  plain-text 输出并强调返回 operation-first JSON；重试仍失败时记录
+  `invalid_plain_text_decision`，不能恢复为 `answer`。疑似工具调用的损坏 JSON 必须先尝试
+  `decision_repair`，修复失败则记录 `malformed_tool_call` 并停止，避免出现“看起来调用了
+  工具、实际没有执行”的假成功。
 - Agent Loop 对 route、decision、decision repair、tool result check 和 answer 阶段不再
   主动设置 `max_tokens`，避免本地 harness 侧截断模型输出；真实 provider 自身限制仍需
   通过错误处理和日志观察。
 - 多轮追问中，如果当前 session context window 已足够回答，Agent 可以不展开工具包，
   直接进入 `context_answer` LLM 阶段；如果 route LLM 返回不完整 JSON 但明确选择
   `mail`，Agent 会保守恢复该 package 选择并继续执行工具链。
+- SSE 中，最终回答实时 token 必须来自 `display_target == "assistant_answer"` 的
+  `llm_delta`；`display_target == "agent_process"` 只表示 route / decision /
+  tool_result_check 等内部过程，`final_answer` event 只做最终校准 / 补全。
 - Tool Executor 已在执行前统一校验 `input_schema`，包括 required fields、基础类型、
   数组元素、嵌套 object、枚举值和 minimum。校验失败会返回 `status=rejected` 和
   `validation_errors`，不执行工具副作用；Agent Loop 会把 rejection 作为 observation
   反馈给 LLM，让模型修正参数后继续。
-- 同一 session 中已经通过 `mail.load_messages` 读取过的完整邮件会作为
-  `cached_mail_messages` 注入后续 turn；追问应优先复用缓存或把缓存作为已有
-  observation，而不是重复加载同一邮件原文。
+- 同一 session 中由 Tool Package metadata 标记为可缓存的工具结果会作为
+  `cached_tool_observations` 注入后续 turn；追问应优先复用相关缓存或把缓存作为已有
+  observation，而不是重复调用等价工具。
 - 每个 session 已新增本地 context window，默认预算 `65536` token；窗口未满时保留近期
   user / agent 问答，满后由独立 `context_summarize` LLM 调用重写前文摘要，并只保留最近
   两条消息原文。完整运行过程仍保存在本地 run log，后续再接入可检索历史 trace。

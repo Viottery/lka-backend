@@ -14,6 +14,20 @@ MAIL_PACKAGE = ToolPackageSpec(
     description="Search, load, and sync local mail knowledge. Matter persistence lives in the matter package.",
     risk="low_to_medium",
     requires_expansion=True,
+    routing_hints=[
+        "Use this package when the user needs evidence from local or synced email.",
+        "Use this package when the user asks about mailbox contents, mail notifications, or mail-derived facts.",
+    ],
+    decision_hints=[
+        "Search candidate messages before loading full message records.",
+        "Load full messages for relevant message ids before writing the final answer.",
+        "Synchronize mail first only when the user asks to sync, asks for the latest mailbox state, or local mail may be stale.",
+        "This package reads and syncs mail evidence; use another registered persistence package for tasks, events, or matters.",
+    ],
+    observation_cache={
+        "tool_names": ["mail.load_messages"],
+        "description": "Reuse loaded complete mail records from the same session when relevant.",
+    },
 )
 
 
@@ -25,7 +39,10 @@ class SearchMailTool:
         name="mail.search",
         package="mail",
         type="local_tool",
-        description="Search local persisted mail with SQLite FTS and return candidate message ids.",
+        description=(
+            "Search local persisted mail with SQLite FTS and return candidate message ids. "
+            "Use an empty query string to match all local mail, ordered by newest first."
+        ),
         risk="low",
         requires_confirmation=False,
         side_effects=["read_local_db"],
@@ -33,8 +50,18 @@ class SearchMailTool:
             "type": "object",
             "required": ["query"],
             "properties": {
-                "query": {"type": "string"},
-                "limit": {"type": "integer", "minimum": 1},
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "Search text. Use an empty string to match all local mail; "
+                        "combine with limit to fetch the latest messages."
+                    ),
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Maximum number of candidate messages to return.",
+                },
             },
         },
         output_schema={"query": "string", "messages": "array"},

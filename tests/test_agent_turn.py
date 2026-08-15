@@ -48,6 +48,7 @@ def test_agent_turn_expands_mail_package_and_records_log(tmp_path, monkeypatch):
         ),
         request,
     )
+    app.state.runtime.agent_turn_loop.llm_client = _MailCacheReuseLLM(full_body_sentinel)
 
     response = run_agent_turn(
         AgentTurnRequest(
@@ -72,16 +73,14 @@ def test_agent_turn_expands_mail_package_and_records_log(tmp_path, monkeypatch):
         "select_package",
         "call_tool",
         "call_tool",
-        "answer",
-    ]
-    assert [event.type for event in response.progress_events] == [
-        "package_selected",
-        "tool_started",
-        "tool_completed",
-        "tool_started",
-        "tool_completed",
         "final_answer",
     ]
+    progress_types = [event.type for event in response.progress_events]
+    assert progress_types[0] == "package_selected"
+    assert progress_types[-1] == "final_answer"
+    assert progress_types.count("tool_started") == 2
+    assert progress_types.count("tool_completed") == 2
+    assert progress_types.count("tool_feedback") == 2
     assert response.progress_events[0].package_name == "mail"
     assert response.progress_events[2].tool_name == "mail.search"
     assert response.verification_warnings == []
@@ -156,11 +155,12 @@ def test_agent_turn_retries_rate_limited_llm_and_logs_failure(tmp_path, monkeypa
         request,
     )
 
-    assert fake_llm.calls == 7
-    assert fake_llm.max_output_tokens_seen == [None, None, None, None, None, None, None]
+    assert fake_llm.calls == 8
+    assert fake_llm.max_output_tokens_seen == [None, None, None, None, None, None, None, None]
     assert response.answer == "LLM final answer after retry."
     assert [event.status for event in response.llm_events] == [
         "rate_limited",
+        "completed",
         "completed",
         "completed",
         "completed",
@@ -176,6 +176,7 @@ def test_agent_turn_retries_rate_limited_llm_and_logs_failure(tmp_path, monkeypa
         "decision",
         "tool_result_check",
         "decision",
+        "answer",
     ]
     assert response.llm_events[0].status_code == 429
     assert response.llm_events[0].retry_after == "0"
@@ -189,7 +190,7 @@ def test_agent_turn_retries_rate_limited_llm_and_logs_failure(tmp_path, monkeypa
         "select_package",
         "call_tool",
         "call_tool",
-        "answer",
+        "final_answer",
     ]
     assert [event.tool_name for event in response.tool_events] == [
         "mail.search",
@@ -392,12 +393,12 @@ def test_agent_turn_reuses_cached_loaded_mail_for_follow_up(tmp_path, monkeypatc
     assert second.tool_events == []
     assert second.answer == "第二轮回答：我复用了缓存邮件正文。"
     assert fake_llm.second_route_context is not None
-    assert "cached_mail_messages" in fake_llm.second_route_context
+    assert "cached_tool_observations" in fake_llm.second_route_context
     assert full_body_sentinel in json.dumps(
         fake_llm.second_decision_observations,
         ensure_ascii=False,
     )
-    assert second.decision_events[1].action == "answer"
+    assert second.decision_events[1].action == "final_answer"
 
 
 def test_agent_turn_recovers_mail_route_from_malformed_llm_json(tmp_path, monkeypatch):
@@ -421,7 +422,7 @@ def test_agent_turn_recovers_mail_route_from_malformed_llm_json(tmp_path, monkey
     assert response.selected_package == "mail"
     assert response.decision_events[0].source == "llm"
     assert response.decision_events[0].reason == (
-        "Recovered mail package from malformed route output."
+        "Recovered registered package from malformed route output."
     )
     assert response.answer == "Recovered route answer."
 
@@ -525,21 +526,21 @@ def test_agent_turn_does_not_final_plain_text_progress_before_tool_execution(
     )
 
     assert response.answer != "搜索本地邮箱中与 NTUSO audition 相关的邮件。"
-    assert sentinel in response.answer
-    assert [event.tool_name for event in response.tool_events] == [
-        "mail.search",
-        "mail.load_messages",
-    ]
+    assert "当前运行时没有获得 `mail` package 的有效结构化决策" in response.answer
+    assert sentinel not in response.answer
+    assert response.tool_events == []
     assert [event.action for event in response.decision_events] == [
         "select_package",
         "invalid_plain_text_decision",
-        "call_tool",
-        "call_tool",
         "answer",
     ]
     assert response.decision_events[1].source == "llm"
     assert response.decision_events[1].reason == (
         "Rejected non-JSON decision output."
+    )
+    assert response.decision_events[-1].source == "local"
+    assert response.decision_events[-1].reason == (
+        "No package-specific local fallback is implemented."
     )
 
 
@@ -591,17 +592,26 @@ def test_agent_turn_does_not_final_plain_text_progress_after_mail_search(
     assert sentinel in response.answer
     assert [event.tool_name for event in response.tool_events] == [
         "mail.search",
-        "mail.search",
         "mail.load_messages",
     ]
     assert [event.action for event in response.decision_events] == [
         "select_package",
         "call_tool",
-        "invalid_plain_text_decision",
         "call_tool",
-        "call_tool",
-        "answer",
+        "final_answer",
     ]
+    retry_events = [
+        event
+        for event in response.llm_events
+        if event.stage == "decision" and "format_attempt=2" in event.prompt_summary
+    ]
+    assert retry_events
+    assert "decision_retry" in retry_events[0].user_prompt
+    assert "找到一封相关的邮件" in retry_events[0].user_prompt
+    assert not any(
+        event.action == "invalid_plain_text_decision"
+        for event in response.decision_events
+    )
 
 
 def test_agent_turn_accepts_operation_envelope_decisions(tmp_path, monkeypatch):
@@ -643,11 +653,16 @@ def test_agent_turn_accepts_operation_envelope_decisions(tmp_path, monkeypatch):
     )
 
     assert response.answer == "Envelope final answer."
+    assert response.answer != "Decision text that must be ignored."
     assert [event.action for event in response.decision_events] == [
         "select_package",
         "call_tool",
-        "answer",
+        "final_answer",
     ]
+    assert response.decision_events[-1].operation["final_answer"] == (
+        "Decision text that must be ignored."
+    )
+    assert any(event.stage == "answer" for event in response.llm_events)
     assert response.decision_events[1].assistant_message == "我先检索相关邮件。"
     assert response.decision_events[1].operation["type"] == "tool_call"
     assert response.tool_events[0].feedback["source"] == "llm"
@@ -695,11 +710,19 @@ def test_agent_turn_does_not_use_assistant_message_as_missing_final_answer(
     )
 
     assert response.answer != "这是 assistant_message，不应该成为最终答案。"
-    assert sentinel in response.answer
-    assert response.decision_events[2].action == "invalid_final_answer"
+    assert response.answer == "Answer stage generated from search evidence."
+    assert sentinel not in response.answer
+    assert [event.tool_name for event in response.tool_events] == ["mail.search"]
+    assert [event.action for event in response.decision_events] == [
+        "select_package",
+        "call_tool",
+        "final_answer",
+    ]
+    assert response.decision_events[2].action == "final_answer"
     assert response.decision_events[2].assistant_message == (
         "这是 assistant_message，不应该成为最终答案。"
     )
+    assert any(event.stage == "answer" for event in response.llm_events)
 
 
 def test_agent_turn_does_not_recover_malformed_tool_call_as_answer(tmp_path, monkeypatch):
@@ -771,7 +794,7 @@ def test_agent_turn_can_expand_matter_package_after_mail_observation(tmp_path, m
         "call_tool",
         "expand_package",
         "call_tool",
-        "answer",
+        "final_answer",
     ]
     assert [event.tool_name for event in response.tool_events] == [
         "mail.search",
@@ -867,17 +890,9 @@ def test_agent_turn_adds_matter_domain_summary_to_tool_feedback(
 
     feedback = response.tool_events[0].feedback
     assert feedback["status"] == "accepted"
-    assert feedback["message"] == "Tool ran; domain summary is authoritative."
-    assert feedback["domain_summary"]["matter_count"] == 2
-    assert feedback["domain_summary"]["matter_status_counts"] == {
-        "done": 1,
-        "open": 1,
-    }
-    assert feedback["domain_summary"]["open_count"] == 1
-    assert feedback["domain_summary"]["done_count"] == 1
-    assert fake_llm.checker_payloads[0]["tool_feedback"]["domain_summary"] == (
-        feedback["domain_summary"]
-    )
+    assert feedback["message"] == "Tool ran; raw tool result is authoritative."
+    assert "domain_summary" not in feedback
+    assert "domain_summary" not in fake_llm.checker_payloads[0]["tool_feedback"]
 
 
 def test_agent_turn_warns_when_final_answer_claims_unsupported_calendar_action(
@@ -902,13 +917,10 @@ def test_agent_turn_warns_when_final_answer_claims_unsupported_calendar_action(
 
     assert response.tool_events == []
     assert response.answer == "我已把明天的讲座加入日历。"
-    assert [warning.code for warning in response.verification_warnings] == [
-        "unsupported_calendar_claim",
-    ]
-    assert response.progress_events[-1].type == "verification_warning"
+    assert response.verification_warnings == []
+    assert response.progress_events[-1].type == "final_answer"
 
-    log_text = Path(response.log_path or "").read_text(encoding="utf-8")
-    assert "unsupported_calendar_claim" in log_text
+    assert "verification_warning" not in [event.type for event in response.progress_events]
 
 
 def test_agent_turn_summarizes_context_window_with_llm_when_full(tmp_path, monkeypatch):
@@ -1058,7 +1070,7 @@ class _LLMOptionsRecordingLLM:
         if "Choose at most one tool package" in system_prompt:
             content = '{"selected_package":null,"reason":"context is enough"}'
         else:
-            content = '{"answer":"request llm options received"}'
+            content = "request llm options received"
         return LLMResponse(
             provider="fake_llm_options",
             status="completed",
@@ -1086,7 +1098,7 @@ class _UnsupportedCalendarClaimLLM:
                 }
             )
         elif "using only the provided session context window" in system_prompt:
-            content = json.dumps({"answer": "我已把明天的讲座加入日历。"})
+            content = "我已把明天的讲座加入日历。"
         else:
             content = "Unexpected prompt."
         return LLMResponse(
@@ -1123,17 +1135,21 @@ class _ContextAwareLLM:
             )
         elif "Choose the next single action" in system_prompt:
             self.decision_calls += 1
-            answer = (
+            content = json.dumps(
+                {
+                    "operation": {
+                        "type": "final_answer",
+                        "final_answer": None,
+                        "reason": "Context window is enough for this test.",
+                    },
+                    "assistant_message": "准备生成最终回答。",
+                }
+            )
+        elif "Final Answer Writer" in system_prompt:
+            content = (
                 "第一轮回答：已记录ICA学生签证关注点。"
                 if self.decision_calls == 1
                 else "第二轮回答：我看到了上一轮关于ICA学生签证的近期问答。"
-            )
-            content = json.dumps(
-                {
-                    "action": "answer",
-                    "answer": answer,
-                    "reason": "Context window is enough for this test.",
-                }
             )
         else:
             content = "Unexpected prompt."
@@ -1180,12 +1196,11 @@ class _FollowUpContextAnswerLLM:
         elif "using only the provided session context window" in system_prompt:
             payload = json.loads(user_prompt)
             self.context_answer_inputs.append(payload)
-            answer = (
+            content = (
                 "第一轮回答：ICA进度已整理。"
                 if self.route_calls == 1
                 else "第二轮回答：已完成申请递交；待完成OSE办理。"
             )
-            content = json.dumps({"answer": answer})
         else:
             content = "Unexpected prompt."
         return LLMResponse(
@@ -1194,8 +1209,6 @@ class _FollowUpContextAnswerLLM:
             content=content,
             prompt_summary=prompt_summary,
         )
-
-
 class _MailCacheReuseLLM:
     def __init__(self, sentinel: str) -> None:
         self.sentinel = sentinel
@@ -1235,11 +1248,20 @@ class _MailCacheReuseLLM:
                 self.second_decision_observations = observations
                 content = json.dumps(
                     {
-                        "action": "answer",
-                        "answer": "第二轮回答：我复用了缓存邮件正文。",
-                        "reason": "Cached mail observation is sufficient.",
+                        "operation": {
+                            "type": "final_answer",
+                            "final_answer": None,
+                            "reason": "Cached mail observation is sufficient.",
+                        },
+                        "assistant_message": "准备基于缓存邮件生成回答。",
                     }
                 )
+        elif "Final Answer Writer" in system_prompt:
+            content = (
+                f"第一轮回答：已读取邮件正文 {self.sentinel}"
+                if self.route_calls == 1
+                else "第二轮回答：我复用了缓存邮件正文。"
+            )
         else:
             content = "Unexpected prompt."
         return LLMResponse(
@@ -1272,9 +1294,12 @@ class _MailCacheReuseLLM:
             )
         return json.dumps(
             {
-                "action": "answer",
-                "answer": f"第一轮回答：已读取邮件正文 {self.sentinel}",
-                "reason": "Loaded message is enough.",
+                "operation": {
+                    "type": "final_answer",
+                    "final_answer": None,
+                    "reason": "Loaded message is enough.",
+                },
+                "assistant_message": "准备基于邮件正文生成回答。",
             }
         )
 
@@ -1297,11 +1322,16 @@ class _MalformedRouteLLM:
         elif "Choose the next single action" in system_prompt:
             content = json.dumps(
                 {
-                    "action": "answer",
-                    "answer": "Recovered route answer.",
-                    "reason": "Route recovery selected mail package.",
+                    "operation": {
+                        "type": "final_answer",
+                        "final_answer": None,
+                        "reason": "Route recovery selected mail package.",
+                    },
+                    "assistant_message": "准备生成恢复路由后的回答。",
                 }
             )
+        elif "Final Answer Writer" in system_prompt:
+            content = "Recovered route answer."
         else:
             content = "Unexpected prompt."
         return LLMResponse(
@@ -1360,7 +1390,7 @@ class _PlainTextDecisionAnswerLLM:
                 )
             else:
                 content = "纯文本最终回答：带 IPA、护照、SGAC 和照片。"
-        elif "Use the loaded local mail messages as observations" in system_prompt:
+        elif "Final Answer Writer" in system_prompt:
             content = "纯文本最终回答：带 IPA、护照、SGAC 和照片。"
         else:
             content = "Unexpected prompt."
@@ -1437,8 +1467,45 @@ class _PlainTextProgressAfterSearchLLM:
                         "reason": "Search for NTUSO audition mail.",
                     }
                 )
+            elif observations[-1]["tool_name"] == "mail.search":
+                if payload.get("decision_retry"):
+                    messages = observations[-1]["result"]["output"]["messages"]
+                    message_ids = [message["message_id"] for message in messages[:1]]
+                    content = json.dumps(
+                        {
+                            "operation": {
+                                "type": "tool_call",
+                                "tool_name": "mail.load_messages",
+                                "tool_input": {"message_ids": message_ids},
+                                "final_answer": None,
+                                "reason": "Retry as structured JSON to load full mail.",
+                                "confidence": "high",
+                            },
+                            "assistant_message": "读取完整邮件内容。",
+                        }
+                    )
+                else:
+                    content = "找到一封相关的邮件“Fw: NTUSO Audition”，正在读取完整内容以获取 audition 要求。"
             else:
-                content = "找到一封相关的邮件“Fw: NTUSO Audition”，正在读取完整内容以获取 audition 要求。"
+                body = observations[-1]["result"]["output"]["messages"][0]["body_text"]
+                content = json.dumps(
+                    {
+                        "operation": {
+                            "type": "final_answer",
+                            "tool_name": None,
+                            "tool_input": {},
+                            "final_answer": None,
+                            "reason": "Loaded mail body is sufficient.",
+                            "confidence": "high",
+                        },
+                        "assistant_message": "已读取邮件正文。",
+                    }
+                )
+        elif "Final Answer Writer" in system_prompt:
+            payload = json.loads(user_prompt)
+            observations = payload["observations"]
+            body = observations[-1]["result"]["output"]["messages"][0]["body_text"]
+            content = f"已读取邮件正文：{body}"
         else:
             content = "Unexpected prompt."
         return LLMResponse(
@@ -1492,13 +1559,15 @@ class _EnvelopeDecisionLLM:
                             "type": "final_answer",
                             "tool_name": None,
                             "tool_input": {},
-                            "final_answer": "Envelope final answer.",
+                            "final_answer": "Decision text that must be ignored.",
                             "reason": "Search result is enough for this test.",
                             "confidence": "high",
                         },
                         "assistant_message": "Envelope final answer.",
                     }
                 )
+        elif "Final Answer Writer" in system_prompt:
+            content = "Envelope final answer."
         else:
             content = "Unexpected prompt."
         return LLMResponse(
@@ -1559,6 +1628,8 @@ class _MissingFinalAnswerEnvelopeLLM:
                         "assistant_message": "这是 assistant_message，不应该成为最终答案。",
                     }
                 )
+        elif "Final Answer Writer" in system_prompt:
+            content = "Answer stage generated from search evidence."
         else:
             content = "Unexpected prompt."
         return LLMResponse(
@@ -1731,12 +1802,14 @@ class _CrossPackageMatterLLM:
                             "package_name": None,
                             "tool_name": None,
                             "tool_input": {},
-                            "final_answer": "已写入 ICA 事务。",
+                            "final_answer": None,
                             "reason": "matter.create_many completed.",
                             "confidence": "high",
                         },
                     }
                 )
+        elif "Final Answer Writer" in system_prompt:
+            content = "已写入 ICA 事务。"
         else:
             content = "Unexpected prompt."
         return LLMResponse(
@@ -1800,7 +1873,7 @@ class _InvalidMatterInputThenRepairLLM:
                             "package_name": None,
                             "tool_name": None,
                             "tool_input": {},
-                            "final_answer": "已创建 NTUSO audition 准备事项。",
+                            "final_answer": None,
                             "reason": "matter.create_many completed after repair.",
                             "confidence": "high",
                         },
@@ -1838,6 +1911,8 @@ class _InvalidMatterInputThenRepairLLM:
                         "assistant_message": "正在创建 NTUSO audition 准备事项。",
                     }
                 )
+        elif "Final Answer Writer" in system_prompt:
+            content = "已创建 NTUSO audition 准备事项。"
         else:
             content = "Unexpected prompt."
         return LLMResponse(
@@ -1875,7 +1950,7 @@ class _MatterFeedbackSummaryLLM:
             content = json.dumps(
                 {
                     "status": "accepted",
-                    "message": "Tool ran; domain summary is authoritative.",
+                    "message": "Tool ran; raw tool result is authoritative.",
                     "remaining_work": "Answer from matter results.",
                 }
             )
@@ -1905,13 +1980,15 @@ class _MatterFeedbackSummaryLLM:
                             "package_name": None,
                             "tool_name": None,
                             "tool_input": {},
-                            "final_answer": "找到 2 个 NTU 事项。",
+                            "final_answer": None,
                             "reason": "matter.search completed.",
                             "confidence": "high",
                         },
                         "assistant_message": "已找到 NTU 事项。",
                     }
                 )
+        elif "Final Answer Writer" in system_prompt:
+            content = "找到 2 个 NTU 事项。"
         else:
             content = "Unexpected prompt."
         return LLMResponse(

@@ -29,6 +29,13 @@ def test_mail_import_search_and_matters_endpoints(tmp_path, monkeypatch):
     ]
     assert "mail.sync" in mail_tool_names
     assert "mail.persist_matters" not in mail_tool_names
+    mail_search_tool = next(
+        tool
+        for tool in app.state.runtime.tool_registry.list_tools(package="mail")
+        if tool.name == "mail.search"
+    )
+    assert "empty query string" in mail_search_tool.description
+    assert "empty string" in mail_search_tool.input_schema["properties"]["query"]["description"]
 
     imported = import_mail(
         MailImportRequest(

@@ -22,10 +22,12 @@ dev = [
   "ruff>=0.6.0",
 ]
 
+[project.scripts]
+lka = "debug_frontend.cli:main"
+
 [tool.hatch.build.targets.wheel]
-packages = ["app"]
+packages = ["app", "debug_frontend"]
 
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-

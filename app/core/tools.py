@@ -15,6 +15,9 @@ class ToolPackageSpec(BaseModel):
     risk: str = "low"
     requires_expansion: bool = True
     tool_names: list[str] = Field(default_factory=list)
+    routing_hints: list[str] = Field(default_factory=list)
+    decision_hints: list[str] = Field(default_factory=list)
+    observation_cache: dict[str, Any] = Field(default_factory=dict)
 
 
 class ToolSpec(BaseModel):

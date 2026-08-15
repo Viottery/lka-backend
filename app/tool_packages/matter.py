@@ -16,6 +16,14 @@ MATTER_PACKAGE = ToolPackageSpec(
     description="Create, search, list, update, and link independent local matters.",
     risk="low_to_medium",
     requires_expansion=True,
+    routing_hints=[
+        "Use this package when the user asks to inspect, create, update, or link local tasks, events, reminders, or matters.",
+    ],
+    decision_hints=[
+        "Inspect existing records when there is a realistic chance of duplicates before creating new records.",
+        "Use create for one record, create_many for a controlled batch, update to change existing records, and link_source to attach evidence.",
+        "Follow every tool input_schema exactly, especially required fields and allowed_values.",
+    ],
 )
 
 MATTER_STATUS_VALUES = ["open", "in_progress", "waiting", "done", "cancelled"]

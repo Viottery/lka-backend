@@ -327,11 +327,16 @@ class _MatterCreatingLLM:
             else:
                 content = json.dumps(
                     {
-                        "action": "answer",
-                        "answer": "已创建 ICA 学生签证材料准备事项。",
-                        "reason": "matter.create completed.",
+                        "operation": {
+                            "type": "final_answer",
+                            "final_answer": None,
+                            "reason": "matter.create completed.",
+                        },
+                        "assistant_message": "准备生成创建结果回答。",
                     }
                 )
+        elif "Final Answer Writer" in system_prompt:
+            content = "已创建 ICA 学生签证材料准备事项。"
         else:
             content = "Unexpected prompt."
         return LLMResponse(

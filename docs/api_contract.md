@@ -242,27 +242,31 @@ response mode、耗时、usage、finish reason、provider request id、rate-limi
 
 - 这是第一版通用 Agent turn 入口，不是邮件专属 agent endpoint。
 - 每次调用都会创建独立 Agent Run；`run_id` 用于后续 stream、取消、确认、重试和事件查询。
-- Agent 第一层只读取 Tool Package catalog；当前已实现的可展开 package 包括 `mail`、
-  `matter` 和 `runtime`。
-- 当 turn 判断用户目标需要本地邮件上下文时，才展开 `mail.search`、
-  `mail.load_messages`、`mail.sync` 等具体工具；当目标是事务管理时展开
-  `matter.create`、`matter.create_many`、`matter.search`、`matter.list`、
-  `matter.update`、`matter.link_source`；当目标是直接读取环境时间时展开 `runtime.now`。
+- Agent 第一层只读取 Tool Package catalog；可展开 package 和可调用工具来自 Tool Registry。
+- Agent core 不硬编码具体 package 名、工具名、领域流程、路由关键词或工具调用示例。
+  具体策略必须由 package metadata、tool description、input/output schema、routing hints、
+  decision hints 和 cache policy 提供。
 - 展开 package 后，Agent 会进入单次 turn 内的 step-limited loop：每一步生成一个
-  `decision_event`，动作可以是调用一个工具或直接回答；工具结果作为 observation 进入下一步。
+  `decision_event`，动作可以是调用一个工具、展开 package、请求确认，或进入最终回答阶段；
+  工具结果作为 observation 进入下一步。
 - `decision_event` 会同时记录 `assistant_message` 和 `operation`。`assistant_message`
-  是用户可见的过程文本或最终回答；`operation` 是内部结构化动作，例如
+  是用户可见的过程文本；`operation` 是内部结构化动作，例如
   `tool_call`、`expand_package`、`final_answer`、`request_confirmation` 或 `no_op`。
-  前端展示过程文本时应读取 `assistant_message`，不要把工具调用 JSON 当作用户最终回答展示。
+  `decision.operation.type == "final_answer"` 只表示后端应进入独立 `answer` stage，
+  不能把 `operation.final_answer` 或旧格式 `answer` 当作最终用户答案。前端展示过程文本时
+  可读取 `assistant_message`，不要把 decision JSON 当作用户最终回答展示。
 - route 只决定起始 package；在 ReAct loop 中，如果已展开工具不足，LLM 可以输出
-  `expand_package` 来展开另一个已注册 package。邮件事务整理应先用 `mail` 读取证据，
-  再展开 `matter` 写入独立事务表。
+  `expand_package` 来展开另一个已注册 package。跨 package 工作流必须来自 registry
+  metadata 和 tool schema，而不是 Agent core 特判。
 - 如果 LLM 选择不展开 package，Agent 可以进入 `context_answer` 阶段，基于当前
   session context window 直接回答，不应把“无需工具”当成“无法处理”。
-- 如果 LLM 返回不完整 JSON 但原始输出明确选择了 `mail` package，Agent 会保守恢复该
+- 如果 LLM 返回不完整 JSON 但原始输出明确选择了某个已注册 package，Agent 会保守恢复该
   package 选择，并继续记录原始 LLM 输出以便回放。
-- 如果 decision 阶段返回非 JSON 的自然语言最终回答，Agent 会把该文本恢复为 `answer`
-  decision，避免已有回答被本地 fallback 覆盖。
+- 如果 decision 阶段返回非 JSON 的自然语言文本，Agent 会记录
+  `invalid_plain_text_decision`，不能把该文本直接恢复为最终回答。Agent 会先做一次格式
+  重试，重试 prompt 会包含上一条 plain-text 输出并强调必须返回 operation-first JSON；
+  若重试仍失败但本轮已经读取到足够工具证据，可进入独立 answer 阶段重新生成自然语言回答，
+  否则停止继续工具调用并返回结构化决策失败提示。
 - 如果 decision 阶段返回疑似工具调用的损坏 JSON，Agent 会先进入 `decision_repair`
   阶段尝试修复；修复失败时记录 `malformed_tool_call` 并停止执行，不会把该残片恢复为
   `answer`。
@@ -273,31 +277,31 @@ response mode、耗时、usage、finish reason、provider request id、rate-limi
   package 选择、模型过程文本、package 展开、工具开始 / 完成、工具反馈、最终回答和校验
   warning，供前端展示“系统正在做什么”。
 - `verification_warnings` 是本地最终回答检查结果。当前只做 warning，不自动改写 LLM
-  最终回答；例如回答声称“已加入日历”但本轮没有任何 calendar tool 完成时，会记录
-  `unsupported_calendar_claim`。
+  最终回答；领域级校验规则必须通过 package metadata 或独立 verifier 注册，不能在
+  Agent core 中写死。
 - 展开工具时，`expanded_tools[*].input_schema` 会尽量暴露 required fields、allowed values
-  和 examples。LLM decision prompt 要求模型严格遵循这些 schema；matter 写入的 `status`
-  仅允许 `open`、`in_progress`、`waiting`、`done`、`cancelled`，`priority` 仅允许
-  `low`、`normal`、`high`、`urgent`。
+  和 examples。LLM decision prompt 要求模型严格遵循这些 schema；具体枚举值、示例和
+  领域约束由对应 Tool Package schema 提供。
 - 每个 session 维护一个本地 context window，默认预算为 `65536` token。Agent prompt
   只注入前文摘要和近期 user / agent 问答；完整工具调用、LLM prompt/output 和运行过程
   保存在本地 run log，不进入后续 prompt。
 - 每次 Agent turn 会把确定性的 `current_time` 注入 session context window，包含 UTC、
   本地时间、时区和当前日期；这让 LLM 能处理“今天/明天/8月5号之后”等相对时间。
-- Agent 会从同一 session 的历史工具结果中恢复已加载过的本地资源缓存。当前邮件缓存以
-  `cached_mail_messages` 注入 context window；如果追问可以由缓存邮件正文回答，Agent
-  应直接回答或把缓存作为已有 observation 使用，不再重复调用 `mail.load_messages`。
-- 如果用户明确要求同步、询问最新邮箱状态，或 Agent 判断本地邮件可能过期，可以在
-  mail package 展开后调用 `mail.sync`。同步完成后，Agent 应继续通过 `mail.search`
-  和 `mail.load_messages` 使用本地持久化邮件，而不是让同步工具直接生成答案。
+- Agent 会从同一 session 的历史工具结果中恢复由 Tool Package metadata 标记为可缓存的
+  本地资源。缓存以 `cached_tool_observations` 注入 context window；如果追问可以由缓存
+  observation 回答，Agent 应直接回答或把缓存作为已有 observation 使用，不再重复调用
+  等价工具。
+- 如果某个 package 需要同步、刷新或跨 package 工作流，这些策略必须写在该 package 的
+  metadata / tool descriptions / schemas 中，由 Agent core 注入 prompt 后让 LLM 决策。
 - context window 未满时不做摘要；超过预算时触发独立 `context_summarize` LLM 调用，
   将旧 summary 和除最近两条消息外的历史问答重写为新 summary，原文只保留最近两条消息。
 - 每次调用会显式追加 user / agent session message，并写入本地 markdown run log。
 - run log 由代码模板生成，包含用户输入、package catalog、逐步展开工具、决策事件、
   工具调用输入输出、工具反馈、progress events、verification warnings、LLM 完整 prompt /
   output / 错误分类和最终回答。
-- 未配置真实 LLM 或 LLM 调用失败时，Agent turn 会降级到本地 heuristic，保持链路可运行。
-  当前本地 heuristic 主要覆盖 mail package；matter/runtime 的多步骤决策需要真实 LLM。
+- 未配置真实 LLM 或 LLM 决策失败时，Agent turn 不会用 package 专属 heuristic 伪造
+  多步骤工具结果；它会记录本地 `answer` decision，说明运行时没有获得有效结构化决策。
+  route 阶段仍可做保守本地 package 选择恢复，但工具执行阶段必须依赖合法 decision。
 
 ---
 
@@ -343,9 +347,12 @@ llm_delta
 final_answer
 ```
 
-`llm_delta` 只在自然语言输出阶段发送，目前包括 `answer` 和 `context_answer`。route、
-decision、decision_repair 和 tool_result_check 仍使用完整 non-stream JSON，避免 JSON
-未完整时提前执行工具。`llm_delta.payload` 至少包含：
+`POST /agent/turn/stream` 默认以 `llm.response_mode=stream` 运行。所有 Agent runtime
+中的 LLM stage 都可以发送 provider token delta，包括 route、decision、decision_repair、
+tool_result_check、context_summarize、context_answer 和 answer。JSON 决策阶段只流式接收
+并审计 token；Agent 必须等完整内容累计完成后再解析 JSON 和执行下一步，避免半截 JSON
+驱动工具调用，也不能用 JSON stage 的 delta 解析或显示最终答案。最终自然语言回答必须来自
+`answer` / `context_answer` stage 的 `llm_delta`。`llm_delta.payload` 至少包含：
 
 ```json
 {
@@ -356,6 +363,52 @@ decision、decision_repair 和 tool_result_check 仍使用完整 non-stream JSON
   "content_snapshot": "截至当前的完整文本"
 }
 ```
+
+非最终回答类 stage 的 `display_target` 为 `agent_process`，例如 `route_decision`、
+`agent_decision`、`decision_repair` 和 `tool_result_check`；最终自然语言回答使用
+`assistant_answer`。前端只应把 `display_target == "assistant_answer"` 的 `llm_delta`
+作为最终回答实时输出；`final_answer` event 只作为最终校准 / 补全事件，不是首个显示最终
+答案的主要来源。
+
+### 6.1 Linux CLI Frontend
+
+仓库内 `debug_frontend/` 提供一个最小 Linux 命令行 HTTP 前端。它与后端保持前后端分离，
+只通过 HTTP / SSE 调用已有 API，不导入或调用 `app/core` 内部运行时代码：
+
+```bash
+uv run lka health
+uv run lka capabilities
+uv run lka sessions list
+uv run lka ask --session-id cli_smoke "帮我查询 NTUSO 的乐团考试相关要求"
+uv run lka chat --session-id cli_chat
+```
+
+CLI 默认连接 `http://127.0.0.1:8765`，也可以通过全局参数或环境变量覆盖：
+
+```bash
+uv run lka --base-url http://127.0.0.1:8765 health
+LKA_BASE_URL=http://127.0.0.1:8765 uv run lka health
+```
+
+`lka ask` 默认调用 `POST /agent/turn/stream`，并将最终回答 token delta 输出到 stdout，
+将 Agent 过程事件输出到 stderr，便于管道只消费最终回答。过程事件支持三种显示模式：
+
+```bash
+uv run lka ask --agent-events hidden "只显示最终回答"
+uv run lka ask --agent-events collapsed "显示折叠过程和最终回答"
+uv run lka ask --agent-events expanded "显示完整事件 payload"
+```
+
+CLI 不会在前端模拟逐字符输出。stdout 只显示后端实际到达的 `llm_delta` chunk 或最终
+`final_answer`；如果 provider 或后端本轮没有产生 token delta，就不会伪装成逐 token
+输出。需要观察完整运行过程时使用 expanded Agent events：
+
+```bash
+uv run lka ask --agent-events expanded "展示完整运行过程"
+```
+
+交互式 `lka chat` 会复用同一个 `session_id` 进行多轮对话，并支持 `/agent
+hidden|collapsed|expanded` 在会话中切换过程事件显示方式。
 
 ---
 

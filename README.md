@@ -16,6 +16,7 @@ native Windows/Linux execution support, and a clear path for future expansion.
 ## Repository Responsibilities
 
 - `app/`: backend application code, including API routes, runtime orchestration, schemas, platform helpers, and storage helpers.
+- `debug_frontend/`: standalone Linux CLI debug frontend that talks to the backend over HTTP/SSE.
 - `docs/`: canonical project documentation, execution rules, API contract, and implementation tracking.
 - `scripts/`: local developer utilities, including smoke-test helpers.
 - `pyproject.toml`: defines package metadata, Python version, runtime dependencies, and developer tooling.
@@ -50,6 +51,8 @@ app/
     filesystem.py    # Cross-platform workspace metadata scanning
   storage/
     db.py            # SQLite bootstrap and connection helpers
+debug_frontend/
+  cli.py             # Standalone Linux HTTP/SSE CLI frontend
 docs/
   README.md
   project_overview.md
@@ -61,6 +64,43 @@ docs/
   mvp_todolist.md
 scripts/
   run_agent_turn.py  # Run one real agent turn without starting the HTTP API
+```
+
+## Linux CLI Frontend
+
+The package exposes a small HTTP CLI frontend named `lka`. Start the backend
+first, then run CLI commands from another Linux shell:
+
+```bash
+uv run uvicorn app.api.main:app --host 127.0.0.1 --port 8765
+uv run lka health
+uv run lka capabilities
+uv run lka sessions list
+uv run lka ask --session-id cli_smoke "搜索一下NTUSO的audition要求，我要怎么做？"
+```
+
+`lka ask` uses `POST /agent/turn/stream` by default. Final answer token deltas
+are printed to stdout as they arrive; Agent progress goes to stderr. Control
+process visibility with:
+
+```bash
+uv run lka ask --agent-events hidden "只显示最终回答"
+uv run lka ask --agent-events collapsed "显示折叠过程和最终回答"
+uv run lka ask --agent-events expanded "显示完整事件 payload"
+```
+
+For a full debug run, use expanded Agent events. Answer text is printed only
+when real `llm_delta` chunks or the final answer arrive from the backend:
+
+```bash
+uv run lka ask --agent-events expanded "展示完整运行过程"
+```
+
+Interactive mode keeps a session across turns and supports `/agent
+hidden|collapsed|expanded` plus `/quit`:
+
+```bash
+uv run lka chat --session-id cli_chat
 ```
 
 ## Quick Start: Linux

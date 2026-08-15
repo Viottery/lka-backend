@@ -70,6 +70,7 @@ async def _agent_turn_event_stream(
     run_id: str,
 ) -> AsyncIterator[str]:
     llm_options = payload.llm
+    llm_response_mode = _stream_turn_llm_response_mode(payload)
     runtime = request.app.state.runtime
     run_manager = runtime.agent_run_manager
     task = asyncio.create_task(
@@ -78,9 +79,7 @@ async def _agent_turn_event_stream(
             user_input=payload.user_input,
             llm_client_name=llm_options.client_name if llm_options else None,
             llm_model=llm_options.model if llm_options else None,
-            llm_response_mode=llm_options.response_mode
-            if llm_options
-            else LLMResponseMode.TEXT,
+            llm_response_mode=llm_response_mode,
             existing_run_id=run_id,
         )
     )
@@ -121,11 +120,35 @@ async def _agent_turn_event_stream(
             run_manager.request_cancel(run_id, reason="stream_closed")
 
 
+def _stream_turn_llm_response_mode(payload: AgentTurnRequest) -> LLMResponseMode:
+    llm_options = payload.llm
+    if llm_options is None:
+        return LLMResponseMode.STREAM
+    if "response_mode" in llm_options.model_fields_set:
+        return llm_options.response_mode
+    return LLMResponseMode.STREAM
+
+
 def _sse_event_frame(event: AgentRunEvent) -> str:
     payload = event.model_dump(mode="json")
+    if event.type == "final_answer":
+        answer = _full_final_answer_from_event_payload(payload)
+        if answer is not None:
+            payload["message"] = answer
     payload["stream_part"] = _stream_part_for_event(event)
     data = json.dumps(payload, ensure_ascii=False)
     return f"id: {event.run_id}:{event.sequence}\nevent: {event.type}\ndata: {data}\n\n"
+
+
+def _full_final_answer_from_event_payload(payload: dict) -> str | None:
+    event_payload = payload.get("payload")
+    if not isinstance(event_payload, dict):
+        return None
+    metadata = event_payload.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    answer = metadata.get("answer")
+    return answer if isinstance(answer, str) else None
 
 
 def _stream_part_for_event(event: AgentRunEvent) -> str:

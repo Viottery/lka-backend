@@ -11,6 +11,12 @@ RUNTIME_PACKAGE = ToolPackageSpec(
     description="Read deterministic runtime context such as the current time.",
     risk="low",
     requires_expansion=True,
+    routing_hints=[
+        "Use this package when a direct answer requires deterministic runtime context.",
+    ],
+    decision_hints=[
+        "Use runtime tools when the session context does not already contain sufficient deterministic runtime data.",
+    ],
 )
 
 

@@ -4,8 +4,9 @@ import json
 from types import SimpleNamespace
 
 from app.api.main import create_app
-from app.api.routes.agent import stream_agent_turn
+from app.api.routes.agent import _sse_event_frame, stream_agent_turn
 from app.api.schemas import AgentTurnRequest
+from app.core.agent_runs import AgentRunEvent
 from app.core.config import get_settings
 from app.core.llm import LLMResponse, LLMStreamEvent
 from app.domains.mail import MailAccountInput, MailMessageInput
@@ -38,6 +39,7 @@ def test_agent_turn_stream_emits_run_tool_and_final_events(tmp_path, monkeypatch
             )
         ],
     )
+    app.state.runtime.agent_turn_loop.llm_client = _StreamingAnswerLLM()
     request = SimpleNamespace(app=app, is_disconnected=_is_never_disconnected)
 
     response = _run_async(
@@ -124,23 +126,90 @@ def test_agent_turn_stream_emits_provider_token_delta_events(tmp_path, monkeypat
     )
 
     delta_frames = [frame for frame in frames if frame["event"] == "llm_delta"]
-    assert [frame["data"]["payload"]["delta"] for frame in delta_frames] == [
+    answer_delta_frames = [
+        frame
+        for frame in delta_frames
+        if frame["data"]["payload"]["content_role"] == "final_answer"
+    ]
+    assert [frame["data"]["payload"]["delta"] for frame in answer_delta_frames] == [
         "流式",
         "回答",
     ]
     assert all(
-        frame["data"]["payload"]["content_role"] == "final_answer"
-        for frame in delta_frames
+        frame["data"]["payload"]["display_target"] == "assistant_answer"
+        for frame in answer_delta_frames
+    )
+    assert answer_delta_frames[-1]["data"]["payload"]["content_snapshot"] == "流式回答"
+    assert {frame["data"]["payload"]["content_role"] for frame in delta_frames}.issuperset(
+        {"route_decision", "agent_decision", "tool_result_check", "final_answer"}
     )
     assert all(
-        frame["data"]["payload"]["display_target"] == "assistant_answer"
+        frame["data"]["payload"]["display_target"] == "agent_process"
         for frame in delta_frames
+        if frame["data"]["payload"]["content_role"] != "final_answer"
     )
-    assert delta_frames[-1]["data"]["payload"]["content_snapshot"] == "流式回答"
 
     final_answer = next(frame for frame in frames if frame["event"] == "final_answer")
     assert final_answer["data"]["stream_part"] == "final_answer"
     assert "流式回答" in final_answer["data"]["message"]
+    first_answer_delta_index = frames.index(answer_delta_frames[0])
+    final_answer_index = frames.index(final_answer)
+    assert first_answer_delta_index < final_answer_index
+
+
+def test_agent_turn_stream_defaults_llm_options_without_response_mode_to_stream(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
+    get_settings.cache_clear()
+
+    app = create_app()
+    app.state.runtime.import_mail(
+        account=MailAccountInput(
+            provider="local_json",
+            email_address="user@example.com",
+        ),
+        messages=[
+            MailMessageInput(
+                external_id="agent_stream_llm_options_001",
+                folder="Inbox",
+                subject="NTUSO Delta stream with model override",
+                sender="ntuso@example.com",
+                to=["user@example.com"],
+                received_at="2026-08-05T09:30:00Z",
+                body_text="Token delta stream source mail with model override.",
+            )
+        ],
+    )
+    app.state.runtime.agent_turn_loop.llm_client = _StreamingAnswerLLM()
+    request = SimpleNamespace(app=app, is_disconnected=_is_never_disconnected)
+
+    response = _run_async(
+        stream_agent_turn(
+            AgentTurnRequest(
+                session_id="session_agent_stream_llm_options",
+                user_input="帮我查询 NTUSO 的乐团考试相关要求",
+                llm={"model": "streaming-model"},
+            ),
+            request,
+        )
+    )
+    frames = _parse_sse(_run_async(_consume_stream_response(response)))
+
+    answer_delta_frames = [
+        frame
+        for frame in frames
+        if frame["event"] == "llm_delta"
+        and frame["data"]["payload"]["display_target"] == "assistant_answer"
+    ]
+    assert [frame["data"]["payload"]["delta"] for frame in answer_delta_frames] == [
+        "流式",
+        "回答",
+    ]
+    final_answer = next(frame for frame in frames if frame["event"] == "final_answer")
+    assert frames.index(answer_delta_frames[0]) < frames.index(final_answer)
 
 
 def test_agent_turn_stream_endpoint_is_registered_without_changing_turn(tmp_path, monkeypatch):
@@ -153,6 +222,27 @@ def test_agent_turn_stream_endpoint_is_registered_without_changing_turn(tmp_path
 
     assert "/agent/turn" in openapi
     assert "/agent/turn/stream" in openapi
+
+
+def test_final_answer_sse_frame_uses_full_answer_from_metadata():
+    answer = "完整答案" * 220
+    event = AgentRunEvent(
+        event_id="agent_run_long_event_000001",
+        run_id="agent_run_long",
+        sequence=1,
+        type="final_answer",
+        stage="answer",
+        message=answer[:497] + "...",
+        payload={"metadata": {"answer": answer}},
+        created_at="2026-08-15T00:00:00+00:00",
+    )
+
+    frame = _parse_sse(_sse_event_frame(event))[0]
+
+    assert frame["event"] == "final_answer"
+    assert frame["data"]["message"] == answer
+    assert not frame["data"]["message"].endswith("...")
+    assert frame["data"]["stream_part"] == "final_answer"
 
 
 def _parse_sse(text: str) -> list[dict]:
@@ -206,20 +296,63 @@ class _StreamingAnswerLLM:
         metadata: dict | None = None,
     ) -> LLMResponse:
         self.calls += 1
+        content = self._content_for_prompts(system_prompt=system_prompt, user_prompt=user_prompt)
+        return LLMResponse(
+            provider="streaming_fake",
+            status="completed",
+            content=content,
+            prompt_summary=prompt_summary,
+        )
+
+    async def stream(self, request):
+        stage = str(request.metadata.get("stage") or "answer")
+        messages = {message.role: message.content for message in request.messages}
+        content = self._content_for_prompts(
+            system_prompt=messages.get("system", ""),
+            user_prompt=messages.get("user", ""),
+        )
+        yield LLMStreamEvent(
+            event_type="llm_started",
+            stage=stage,
+            client_name=request.client_name or "streaming_fake",
+            provider="streaming_fake",
+            model=request.model or "streaming-model",
+        )
+        snapshot = ""
+        deltas = ["流式", "回答"] if stage == "answer" else [content]
+        for delta in deltas:
+            snapshot += delta
+            yield LLMStreamEvent(
+                event_type="llm_delta",
+                stage=stage,
+                client_name=request.client_name or "streaming_fake",
+                provider="streaming_fake",
+                model=request.model or "streaming-model",
+                delta=delta,
+                content_snapshot=snapshot,
+            )
+        yield LLMStreamEvent(
+            event_type="llm_completed",
+            stage=stage,
+            client_name=request.client_name or "streaming_fake",
+            provider="streaming_fake",
+            model=request.model or "streaming-model",
+            content_snapshot=snapshot,
+        )
+
+    def _content_for_prompts(self, *, system_prompt: str, user_prompt: str) -> str:
         if "Choose at most one tool package" in system_prompt:
-            content = (
+            return (
                 '{"selected_package":"mail","reason":"test route",'
                 '"search_query":"NTUSO"}'
             )
-        elif "Tool Result Checker" in system_prompt:
-            content = (
-                '{"status":"accepted","message":"ok","remaining_work":""}'
-            )
-        elif "Choose the next single action" in system_prompt:
+        if "Tool Result Checker" in system_prompt:
+            return '{"status":"accepted","message":"ok","remaining_work":""}'
+        if "Choose the next single action" in system_prompt:
             payload = json.loads(user_prompt)
             observations = payload["observations"]
             if not observations:
-                content = json.dumps(
+                return json.dumps(
                     {
                         "operation": {
                             "type": "tool_call",
@@ -230,12 +363,12 @@ class _StreamingAnswerLLM:
                         "assistant_message": "检索邮件。",
                     }
                 )
-            elif observations[-1]["tool_name"] == "mail.search":
+            if observations[-1]["tool_name"] == "mail.search":
                 message_ids = [
                     message["message_id"]
                     for message in observations[-1]["result"]["output"]["messages"][:1]
                 ]
-                content = json.dumps(
+                return json.dumps(
                     {
                         "operation": {
                             "type": "tool_call",
@@ -246,42 +379,14 @@ class _StreamingAnswerLLM:
                         "assistant_message": "读取邮件。",
                     }
                 )
-            else:
-                content = "这是一段非 JSON 过程文本，触发 answer 阶段。"
-        else:
-            content = '{"answer":"unused"}'
-        return LLMResponse(
-            provider="streaming_fake",
-            status="completed",
-            content=content,
-            prompt_summary=prompt_summary,
-        )
-
-    async def stream(self, request):
-        yield LLMStreamEvent(
-            event_type="llm_started",
-            stage=str(request.metadata.get("stage") or "answer"),
-            client_name=request.client_name or "streaming_fake",
-            provider="streaming_fake",
-            model=request.model or "streaming-model",
-        )
-        snapshot = ""
-        for delta in ["流式", "回答"]:
-            snapshot += delta
-            yield LLMStreamEvent(
-                event_type="llm_delta",
-                stage=str(request.metadata.get("stage") or "answer"),
-                client_name=request.client_name or "streaming_fake",
-                provider="streaming_fake",
-                model=request.model or "streaming-model",
-                delta=delta,
-                content_snapshot=snapshot,
+            return json.dumps(
+                {
+                    "operation": {
+                        "type": "final_answer",
+                        "final_answer": "decision text must not stream as the answer",
+                        "reason": "Loaded mail evidence is sufficient.",
+                    },
+                    "assistant_message": "准备生成最终回答。",
+                }
             )
-        yield LLMStreamEvent(
-            event_type="llm_completed",
-            stage=str(request.metadata.get("stage") or "answer"),
-            client_name=request.client_name or "streaming_fake",
-            provider="streaming_fake",
-            model=request.model or "streaming-model",
-            content_snapshot=snapshot,
-        )
+        return "流式回答"

@@ -64,38 +64,49 @@ Tool Executor 在真正执行工具前会基于 Tool Registry 中的 `input_sche
 支持必填字段、基础类型、数组元素类型、嵌套 object、枚举值和最小数值。校验失败时工具不会
 执行，而是返回 `status=rejected`、`validation_errors` 和本地失败反馈；Agent Loop 会把这类
 结果作为 observation 反馈给 LLM，让其修正参数或改选其他工具。
+Agent Harness core 必须保持 package / domain agnostic。`app/core/` 的 prompt 和 fallback
+逻辑不能写死具体 package 名、工具名、领域流程、路由关键词或工具调用示例；具体领域策略必须
+放在 `app/tool_packages/` 的 package metadata、tool description、input/output schema、
+routing hints、decision hints 和 cache policy 中。Agent Loop 可以把 Tool Registry metadata
+注入 prompt，但不能在 core 里重新编码某个 package 的调用顺序、读写边界或跨 package 工作流。
 decision 输出必须区分自然语言和内部操作，并采用 operation-first envelope：`operation`
 是唯一控制通道，保存 `tool_call` / `final_answer` / `request_confirmation` 等结构化动作；
-`assistant_message` 只保存用户可见的过程说明，不能选择工具，也不能补成最终回答。最终回答
-只能来自 `operation.final_answer` 或旧格式 JSON 中显式的 `answer` 字段。这样工具调用中途的
-模型文本可以被展示和记录，但不会和真实执行动作混在同一个字段里。
+`assistant_message` 只保存用户可见的过程说明，不能选择工具，也不能补成最终回答。
+`decision.operation.type == "final_answer"` 只表示证据已足够、可以进入独立 `answer`
+stage；`operation.final_answer` 即使存在也不能作为最终用户答案返回。真正展示给用户的
+最终自然语言回答只能来自独立 `answer` 或 `context_answer` LLM stage。这样工具调用中途的
+模型文本可以被展示和记录，但不会和真实执行动作或最终回答混在同一个字段里。
 如果 LLM 判断当前 turn 不需要展开任何 Tool Package，Agent Loop 仍应允许 LLM 基于当前
 session context window 直接回答；“不需要工具”和“系统无法处理”不能混为一谈。
 当 provider 返回不完整 JSON 但明确选择了某个 package 时，Agent Loop 可以做保守恢复，
 并在 run log 中保留原始输出，避免模型格式问题直接破坏工具链路。
 如果 decision 阶段返回非 JSON 的自然语言文本，Agent Loop 必须记录为
-`invalid_plain_text_decision`，不能将其恢复为最终回答。若本轮已经通过工具读取到足够证据，
-Agent Loop 可以进入独立 `answer` 阶段让 LLM 基于观察结果重新生成自然语言回答；否则应继续
-保守降级或回退到本地工具链。
+`invalid_plain_text_decision`，不能将其恢复为最终回答。Agent Loop 应先做一次格式重试，
+在重试 prompt 中带上上一条 plain-text 输出并强调必须返回 operation-first JSON。若重试仍
+失败但本轮已经通过工具读取到足够证据，Agent Loop 可以进入独立 `answer` 阶段让 LLM 基于
+观察结果重新生成自然语言回答；否则应停止本轮工具执行，并返回可追踪的结构化决策失败提示。
 如果 decision 阶段返回的非 JSON 内容疑似工具调用，例如包含 `tool_name`、`tool_input`
 或 `tool_call`，Agent Loop 必须 fail closed：先尝试 `decision_repair` 修复为合法
 operation，修复失败则停止本轮执行，不能把工具调用残片当作最终 answer。
 每次真实工具调用后都必须生成反馈 observation。反馈至少包含执行成功 / 失败状态和可读
 message；当 LLM 可用时，还要追加独立 `tool_result_check` 调用，让 LLM 检查工具结果是否
 符合上一条 tool-call decision。底层 `ToolResult.status` 已失败时，反馈不能被升级为成功。
-部分工具可以按领域适配额外的 `domain_summary`，但这不是所有工具的强制合同。当前仅
-`matter.*` 工具会附加 matter 数量、状态计数、优先级计数和 due date 数量，用于避免
-LLM 把 `ToolResult.status=completed` 误解为业务对象已经完成。邮件和 runtime 工具暂时只
-使用各自的原始工具结果与通用反馈。
+工具包可以按自身 metadata 或工具输出提供额外 summary，但这不是 Agent core 的领域特判。
+Agent core 只能把工具返回的原始结果、通用反馈和 package metadata 交给 LLM；如果某个领域
+需要状态计数、去重提示、读写边界或业务摘要，应由对应 Tool Package 或 domain service 生成。
 Agent Loop 还会由本地 harness 生成 `progress_events`，用于前端展示用户友好的运行过程：
 package 选择、LLM 的 `assistant_message`、package 展开、工具开始 / 完成、工具反馈、最终回答
 和校验 warning 都会进入该事件流。`progress_events` 不参与后续上下文窗口压缩，也不由 LLM
 生成，避免把运行流水混入对话记忆。
 HTTP stream endpoint 使用 SSE 输出统一的 Agent Run event，不维护另一套事件模型。stream
 输出会用 `stream_part` 标注 lifecycle、progress、tool_result、llm_audit、llm_delta 和
-final_answer 等结构。route、decision、decision_repair 和 tool_result_check 阶段保持
-non-stream JSON；自然语言输出阶段（`answer` / `context_answer`）可以通过
-`LLMService.stream()` 把 provider token delta 作为 `llm_delta` 事件发送。
+final_answer 等结构。`POST /agent/turn/stream` 默认使用 stream response mode，Agent
+runtime 中所有 LLM stage 都通过 `LLMService.stream()` 接收 provider token delta，并作为
+`llm_delta` 事件发送。route、decision、decision_repair、tool_result_check 等 JSON stage
+只流式接收和审计 token，必须累计完整输出后再解析 JSON 和执行工具。自然语言输出 stage
+会标记为 `assistant_answer`，其他 LLM stage 会标记为 `agent_process`。前端应只把
+`llm_delta.payload.display_target == "assistant_answer"` 的 delta 当作最终回答实时输出；
+`final_answer` event 只作为最终校准 / 补全事件。
 最终回答会经过一层本地轻量校验，结果写入 `verification_warnings`。当前校验只记录 warning，
 不自动改写答案；例如模型声称已经写入日历但本轮没有 calendar tool 完成时，会标记
 `unsupported_calendar_claim`，供前端和后续 verifier 使用。
@@ -108,12 +119,12 @@ Session Service 只负责创建会话、追加消息、读取历史和更新时�
 output、错误和运行过程保留在 `data/agent_logs/`，必要时再通过日志或历史检索恢复。
 窗口未满时不触发摘要；超过预算时由独立 `context_summarize` LLM 调用重新生成 summary，
 并只保留最近两条 user / agent 消息原文。
-Agent Loop 会把同一 session 中已加载过的本地资源作为 session-scoped resource cache
-重新注入后续 turn。以邮件为例，`mail.load_messages` 返回过的完整邮件正文会作为
-`cached_mail_messages` 暴露给 route / decision prompt；后续追问如果缓存已经足够，
-Agent 应直接基于缓存回答，或把缓存作为已有 observation 使用，而不是重复调用
-`mail.search` / `mail.load_messages`。这类似代码 agent 读取本地文件后的上下文缓存：
-缓存归 harness 管理，工具仍保持一次性、无会话状态。
+Agent Loop 会把同一 session 中已加载过、且被 Tool Package metadata 标记为可缓存的本地
+资源作为 session-scoped resource cache 重新注入后续 turn。缓存以通用
+`cached_tool_observations` 形式暴露给 route / decision prompt；后续追问如果缓存已经足够，
+Agent 应直接基于缓存回答，或把缓存作为已有 observation 使用，而不是重复调用等价工具。
+缓存归 harness 管理，工具仍保持一次性、无会话状态；哪些工具结果可缓存由 Tool Package
+metadata 决定，不能在 Agent core 中写死。
 邮件数据源是全局本地知识源，不存在独立的“邮件会话引擎”。Mail tools 只在某个 Agent turn
 中按当前 `session_id` 读取一次性信息并返回观察结果；是否把用户输入、工具观察、`run_id`
 或 `log_path` 写入会话历史，必须由通用 Agent turn / Session 层显式决定，邮件工具和
@@ -159,8 +170,9 @@ Agent turn 还会把 `current_time` 注入 session context window，包含 UTC�
 LLM provider 的失败必须进入 run log。HTTP `429` 限流应被单独识别为
 `rate_limited`，记录 `status_code`、`retry_after`、完整 prompt 和错误输出，并由
 Agent Loop 按 `Retry-After` 或本地默认等待时间重试；重试耗尽后再降级到本地 heuristic
-或其他后备策略，而不是直接退出或让领域服务自行处理。认证失败、网络失败、超时、非
-429 HTTP 错误和 provider 响应解析失败也必须拆分记录，便于后续调试和策略调整。
+或其他后备策略，而不是让领域服务自行处理；对于没有明确后备策略的工具执行阶段，应停止
+继续调用工具并返回可追踪失败提示。认证失败、网络失败、超时、非 429 HTTP 错误和 provider
+响应解析失败也必须拆分记录，便于后续调试和策略调整。
 每次 LLM 调用还会生成结构化审计记录，当前落点是 `AgentTurnResult.llm_events`、
 Agent Run event payload 和 markdown run log。审计字段包括 `llm_call_id`、`run_id`、
 `trace_id`、`session_id`、stage、client、provider、model、response mode、状态、耗时、

@@ -201,6 +201,7 @@ class AgentTurnLoop:
         self.llm_max_attempts = 2
         self.default_rate_limit_wait_seconds = 1.0
         self.max_decision_steps = 6
+        self.decision_format_max_attempts = 2
         self.llm_generation_token_budget: int | None = None
         self.session_context_token_budget = 65_536
 
@@ -375,11 +376,11 @@ class AgentTurnLoop:
         )
         context_window_payload = context_window.model_dump(mode="json")
         context_window_payload["current_time"] = current_time_payload()
-        cached_mail_messages = self._cached_mail_messages_from_session(
+        cached_tool_observations = self._cached_tool_observations_from_session(
             session_id=session.session_id,
         )
-        if cached_mail_messages:
-            context_window_payload["cached_mail_messages"] = cached_mail_messages
+        if cached_tool_observations:
+            context_window_payload["cached_tool_observations"] = cached_tool_observations
 
         package_catalog = [
             package.model_dump(mode="json")
@@ -450,7 +451,7 @@ class AgentTurnLoop:
             else:
                 answer = (
                     "我还没有为这个请求选择到可执行工具。当前最小 Agent turn 只支持在需要"
-                    "本地邮件上下文时展开 mail package。"
+                    "本地上下文时展开合适的 Tool Package。"
                 )
                 self._record_decision(
                     decision_events,
@@ -466,6 +467,7 @@ class AgentTurnLoop:
             stage="answer",
             status="completed",
             message=self._short_text(answer),
+            metadata={"answer": answer},
         )
         verification_warnings = self._verify_final_answer(
             answer=answer,
@@ -565,10 +567,11 @@ class AgentTurnLoop:
             "You are the Main Agent Brain for Local Knowledge Agent OS. Choose at most one "
             "tool package for the current turn. Do not choose concrete tools yet. Return only "
             "null when the provided session context window, including cached local resources, "
-            "is sufficient to answer without another tool call. Return only "
-            'strict JSON: {"selected_package":"mail|matter|runtime|null","reason":"...",'
-            '"search_query":"..."} Use mail for email evidence, matter for local tasks/events, '
-            "and runtime for direct current-time questions."
+            "is sufficient to answer without another tool call. Use only package names present "
+            "in package_catalog, and use each package description and routing_hints as the "
+            "source of truth. Return only strict JSON: "
+            '{"selected_package":"<package name or null>","reason":"...",'
+            '"search_query":"optional query hint"}'
         )
         user_prompt = json.dumps(
             {
@@ -602,6 +605,7 @@ class AgentTurnLoop:
             recovered_route = self._recover_route_from_raw_output(
                 raw_output=response.content,
                 user_input=user_input,
+                package_catalog=package_catalog,
             )
             if recovered_route is not None:
                 self._record_route_decision(
@@ -650,82 +654,27 @@ class AgentTurnLoop:
         *,
         raw_output: str,
         user_input: str,
+        package_catalog: list[dict[str, Any]],
     ) -> dict[str, Any] | None:
         compact_output = "".join(raw_output.lower().split())
-        if '"selected_package":"mail"' not in compact_output:
-            return None
-        return {
-            "selected_package": "mail",
-            "reason": "Recovered mail package from malformed route output.",
-            "search_query": self._local_mail_search_query(user_input),
-        }
+        for package in package_catalog:
+            name = package.get("name")
+            if not isinstance(name, str):
+                continue
+            if f'"selected_package":"{name.lower()}"' in compact_output:
+                return {
+                    "selected_package": name,
+                    "reason": "Recovered registered package from malformed route output.",
+                    "search_query": user_input,
+                }
+        return None
 
     def _route_locally(self, user_input: str) -> dict[str, Any]:
-        lower = user_input.lower()
-        mail_markers = [
-            "mail",
-            "email",
-            "邮件",
-            "收件",
-            "发件",
-            "ntu",
-            "ntuso",
-            "ica",
-            "visa",
-            "student pass",
-            "签证",
-            "日程",
-            "通知",
-        ]
-        matter_markers = [
-            "matter",
-            "task",
-            "todo",
-            "event",
-            "事务",
-            "事项",
-            "待办",
-            "任务",
-            "提醒",
-            "日程管理",
-        ]
-        runtime_markers = [
-            "current time",
-            "now",
-            "today",
-            "现在几点",
-            "当前时间",
-            "今天日期",
-        ]
-        if any(marker in lower for marker in mail_markers):
-            return {
-                "selected_package": "mail",
-                "reason": "Local routing matched mail-related terms.",
-                "search_query": self._local_mail_search_query(user_input),
-            }
-        if any(marker in lower for marker in matter_markers):
-            return {
-                "selected_package": "matter",
-                "reason": "Local routing matched matter-related terms.",
-                "search_query": user_input,
-            }
-        if any(marker in lower for marker in runtime_markers):
-            return {
-                "selected_package": "runtime",
-                "reason": "Local routing matched runtime context terms.",
-                "search_query": "",
-            }
-        return {"selected_package": None, "reason": "No local routing marker matched."}
-
-    def _local_mail_search_query(self, user_input: str) -> str:
-        lower = user_input.lower()
-        if "ntuso" in lower:
-            return "NTUSO"
-        if "ica" in lower or "student pass" in lower or "签证" in lower:
-            return "ICA student pass"
-        if "ntu" in lower and ("日程" in lower or "schedule" in lower):
-            return "NTU schedule"
-        return user_input
+        return {
+            "selected_package": None,
+            "reason": "No LLM route was available; Agent core does not use domain heuristics.",
+            "search_query": user_input,
+        }
 
     def _run_package_tools(
         self,
@@ -756,99 +705,16 @@ class AgentTurnLoop:
             )
             if answer:
                 return answer
-        if selected_package != "mail":
-            answer = (
-                f"当前未配置可用 LLM，无法用本地 heuristic 完成 `{selected_package}` "
-                "package 的多步骤决策。"
-            )
-            self._record_decision(
-                decision_events,
-                source="local",
-                action="answer",
-                answer=answer,
-                reason="No local fallback is implemented for this package.",
-            )
-            return answer
-        return self._run_mail_tools_locally(
-            user_input=user_input,
-            route=route,
-            context=context,
-            tool_events=tool_events,
-            decision_events=decision_events,
-            progress_events=progress_events,
+        answer = (
+            f"当前运行时没有获得 `{selected_package}` package 的有效结构化决策，"
+            "已停止继续调用工具，避免把未完成的步骤误当作最终结果。请重试该请求。"
         )
-
-    def _run_mail_tools_locally(
-        self,
-        *,
-        user_input: str,
-        route: dict[str, Any],
-        context: ToolContext,
-        tool_events: list[AgentTurnToolEvent],
-        decision_events: list[AgentTurnDecisionEvent],
-        progress_events: list[AgentTurnProgressEvent],
-    ) -> str:
-        query = str(route.get("search_query") or user_input)
-        self._record_decision(
-            decision_events,
-            source="local",
-            action="call_tool",
-            tool_name="mail.search",
-            tool_input={"query": query, "limit": 8},
-            reason="Local fallback searches mail before loading full messages.",
-        )
-        search_result = self._execute_tool(
-            tool_name="mail.search",
-            tool_input={"query": query, "limit": 8},
-            context=context,
-            tool_events=tool_events,
-            progress_events=progress_events,
-        )
-        messages = search_result.output.get("messages", [])
-        message_ids = [
-            str(message["message_id"])
-            for message in messages
-            if isinstance(message, dict) and message.get("message_id")
-        ]
-        if not message_ids:
-            answer = f"我在本地邮件中没有找到与 `{query}` 相关的结果。"
-            self._record_decision(
-                decision_events,
-                source="local",
-                action="answer",
-                answer=answer,
-                reason="mail.search returned no message ids.",
-            )
-            return answer
-
-        load_input = {"message_ids": message_ids[:5]}
-        self._record_decision(
-            decision_events,
-            source="local",
-            action="call_tool",
-            tool_name="mail.load_messages",
-            tool_input=load_input,
-            reason="Load full message bodies for the final answer.",
-        )
-        load_result = self._execute_tool(
-            tool_name="mail.load_messages",
-            tool_input=load_input,
-            context=context,
-            tool_events=tool_events,
-            progress_events=progress_events,
-        )
-        loaded_messages = [
-            message
-            for message in load_result.output.get("messages", [])
-            if isinstance(message, dict)
-        ]
-        answer = self._answer_locally(user_input=user_input, loaded_messages=loaded_messages)
         self._record_decision(
             decision_events,
             source="local",
             action="answer",
             answer=answer,
-            reason="Local fallback answer generated from loaded messages.",
+            reason="No package-specific local fallback is implemented.",
         )
         return answer
 
@@ -867,11 +733,7 @@ class AgentTurnLoop:
         selected_package: str,
     ) -> str | None:
         observations: list[dict[str, Any]] = []
-        cached_observation = self._cached_mail_observation_from_context_window(
-            context_window,
-        )
-        if cached_observation is not None:
-            observations.append(cached_observation)
+        observations.extend(self._cached_tool_observations_from_context_window(context_window))
         package_catalog = [
             package.model_dump(mode="json")
             for package in self.tool_executor.registry.list_packages()
@@ -943,9 +805,15 @@ class AgentTurnLoop:
                     metadata={"action": action, "step_index": step_index + 1},
                 )
 
-            if action == "answer":
-                answer = str(decision.get("answer") or "").strip()
-                return answer or None
+            if action == "final_answer":
+                return self._answer_with_llm(
+                    user_input=user_input,
+                    route=route,
+                    context_window=context_window,
+                    observations=observations,
+                    final_decision=decision,
+                    llm_events=llm_events,
+                )
 
             if action == "malformed_tool_call":
                 answer = (
@@ -955,21 +823,25 @@ class AgentTurnLoop:
                 return answer
 
             if action == "invalid_plain_text_decision":
-                loaded_messages = self._loaded_messages_from_observations(observations)
-                if loaded_messages:
+                if observations:
                     return self._answer_with_llm(
                         user_input=user_input,
-                        loaded_messages=loaded_messages,
+                        route=route,
+                        context_window=context_window,
+                        observations=observations,
+                        final_decision=decision,
                         llm_events=llm_events,
                     )
                 return None
 
             if action == "invalid_final_answer":
-                loaded_messages = self._loaded_messages_from_observations(observations)
-                if loaded_messages:
+                if observations:
                     return self._answer_with_llm(
                         user_input=user_input,
-                        loaded_messages=loaded_messages,
+                        route=route,
+                        context_window=context_window,
+                        observations=observations,
+                        final_decision=decision,
                         llm_events=llm_events,
                     )
                 return None
@@ -1106,11 +978,16 @@ class AgentTurnLoop:
                 }
             )
 
-        loaded_messages = self._loaded_messages_from_observations(observations)
-        if loaded_messages:
+        if observations:
             return self._answer_with_llm(
                 user_input=user_input,
-                loaded_messages=loaded_messages,
+                route=route,
+                context_window=context_window,
+                observations=observations,
+                final_decision={
+                    "action": "final_answer",
+                    "reason": "Step limit reached after loading evidence.",
+                },
                 llm_events=llm_events,
             )
         return None
@@ -1128,51 +1005,50 @@ class AgentTurnLoop:
         llm_events: list[AgentTurnLLMEvent],
         selected_package: str,
     ) -> dict[str, Any] | None:
-        system_prompt = (
+        base_system_prompt = (
             "You are the Main Agent Brain for Local Knowledge Agent OS. Choose the next "
-            "single action for this agent turn. You may call one available tool or answer. "
-            f"The initially expanded package is {selected_package}. Use tools when more "
-            "local evidence or persistence is needed. For mail questions, normally "
-            "call mail.search first, then mail.load_messages for relevant message ids, then "
-            "answer from observations. If observations already contain cached mail messages "
-            "from the same session and they are relevant, answer from that cache instead of "
-            "calling mail.search or mail.load_messages again. Call mail.sync first only when "
-            "the user asks to sync, asks for the latest/current mailbox state, or the local "
-            "mail store may be stale for the requested answer; after mail.sync, continue with "
-            "mail.search and mail.load_messages as needed. The mail package does not persist "
-            "matters. After reading mail evidence, expand the matter package before creating "
-            "or updating tasks/events. For matter requests, use matter.search or matter.list "
-            "to inspect existing matters, matter.create to save one task/event, "
-            "matter.create_many to save multiple tasks/events in one controlled batch, "
-            "matter.update to change status/fields, and matter.link_source to attach evidence "
-            "such as mail message ids. If the currently expanded tools are insufficient, "
+            "single action for this agent turn. You may call one available tool, expand a "
+            "package, request confirmation, or enter the final answer stage. "
+            f"The initially expanded package is {selected_package}. Use package_catalog, "
+            "package decision_hints, expanded_tools, tool descriptions, input_schema, "
+            "side_effects, risk, observations, and session context as the source of truth. "
+            "Use tools when more local evidence, deterministic context, or persistence is "
+            "needed. Reuse cached observations when they are relevant. When observations and "
+            "session context are sufficient to answer the user, return operation.type "
+            "final_answer with a concise reason, then stop; do not write final natural "
+            "language prose in this decision stage. If the currently expanded tools are insufficient, "
             "use operation.type expand_package with package_name set to one registered package; "
             "do not call tools from a package until that package appears in "
             "expanded_package_names. Follow each expanded tool input_schema exactly: include "
             "required fields, respect allowed_values/enums, and do not invent unsupported "
-            "field values. For matter writes, status must be one of open, in_progress, "
-            "waiting, done, cancelled; priority must be one of low, normal, high, urgent. "
-            "Do not use scheduled, todo, medium, or other unsupported values. Before "
-            "creating matters from extracted evidence, search existing matters when there "
-            "is a realistic chance of duplicates. If matter.search returns similar items, "
-            "choose update, skip/no_op, or create only with an explicit reason that the item "
-            "is distinct. Use the current_time in context to "
-            "resolve relative dates. For direct time questions, use runtime.now or answer from "
-            "current_time if it is sufficient. Return only strict JSON using this operation-first "
+            "field values. Use the deterministic context supplied in session_context_window "
+            "when resolving relative references. Return only strict JSON using this operation-first "
             "envelope: "
             '{"operation":{"type":"tool_call|expand_package|final_answer|request_confirmation|no_op",'
-            '"package_name":null,"tool_name":"mail.search","tool_input":{"query":"...","limit":8},'
+            '"package_name":null,"tool_name":"<expanded tool name or null>","tool_input":{},'
             '"final_answer":null,"reason":"...","confidence":"low|medium|high"},'
-            '"assistant_message":"short user-visible progress text or final answer"}. '
+            '"assistant_message":"short user-visible progress text"}. '
             "The operation object is the only executable control channel and must come first. "
             "assistant_message is display-only progress text; it never selects tools and never "
-            "becomes the final answer. For a final answer, set operation.type to final_answer "
-            "and put the answer in operation.final_answer. For a tool call, put all executable "
-            "details in operation and only optional progress text in assistant_message. Never "
-            "return plain text outside JSON."
+            "becomes the final answer. For a final answer, set operation.type to final_answer, "
+            "set operation.final_answer to null if present, and explain only why the answer "
+            "stage can now run. For a tool call, put all executable details in operation and "
+            "only optional progress text in assistant_message. Never return plain text outside "
+            "JSON."
         )
-        user_prompt = json.dumps(
-            {
+        decision_retry: dict[str, Any] | None = None
+        for format_attempt in range(1, self.decision_format_max_attempts + 1):
+            system_prompt = base_system_prompt
+            if decision_retry is not None:
+                system_prompt = (
+                    f"{base_system_prompt} The previous decision output was rejected because "
+                    "it was plain text instead of strict JSON. You must now correct that "
+                    "specific output. Return only the JSON envelope. If the rejected text "
+                    "said you would read, load, fetch, or inspect details, produce a "
+                    "tool_call JSON operation using the available tools and message ids from "
+                    "observations. Do not repeat the rejected plain text."
+                )
+            prompt_payload = {
                 "user_input": user_input,
                 "session_context_window": context_window,
                 "route": route,
@@ -1180,22 +1056,30 @@ class AgentTurnLoop:
                 "expanded_package_names": expanded_package_names,
                 "expanded_tools": expanded_tools,
                 "observations": observations,
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-        response = self._complete_text_with_retry(
-            stage="decision",
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            prompt_summary=f"agent_turn_decision observations={len(observations)}",
-            max_output_tokens=self.llm_generation_token_budget,
-            llm_events=llm_events,
-        )
-        if response is None:
-            return None
-        parsed = self._parse_json_object(response.content)
-        if not isinstance(parsed, dict) or not parsed:
+            }
+            if decision_retry is not None:
+                prompt_payload["decision_retry"] = decision_retry
+            user_prompt = json.dumps(
+                prompt_payload,
+                ensure_ascii=False,
+                indent=2,
+            )
+            response = self._complete_text_with_retry(
+                stage="decision",
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                prompt_summary=(
+                    f"agent_turn_decision observations={len(observations)} "
+                    f"format_attempt={format_attempt}"
+                ),
+                max_output_tokens=self.llm_generation_token_budget,
+                llm_events=llm_events,
+            )
+            if response is None:
+                return None
+            parsed = self._parse_json_object(response.content)
+            if isinstance(parsed, dict) and parsed:
+                return self._normalize_decision_output(parsed, raw_output=response.content)
             if self._looks_like_tool_operation(response.content):
                 repaired = self._repair_malformed_decision_output(
                     raw_output=response.content,
@@ -1215,6 +1099,17 @@ class AgentTurnLoop:
             answer = response.content.strip()
             if not answer:
                 return None
+            if format_attempt < self.decision_format_max_attempts:
+                decision_retry = {
+                    "error": "previous_decision_output_was_plain_text_not_json",
+                    "invalid_output": answer,
+                    "required_response": (
+                        "Return strict JSON with operation first. Use tool_call if more "
+                        "evidence is needed; use final_answer only to enter the separate "
+                        "answer stage when observations are sufficient."
+                    ),
+                }
+                continue
             return {
                 "action": "invalid_plain_text_decision",
                 "assistant_message": answer,
@@ -1225,7 +1120,7 @@ class AgentTurnLoop:
                 "reason": "Rejected non-JSON decision output.",
                 "_raw_output": response.content,
             }
-        return self._normalize_decision_output(parsed, raw_output=response.content)
+        return None
 
     def _record_route_decision(
         self,
@@ -1323,21 +1218,9 @@ class AgentTurnLoop:
                     "_raw_output": raw_output,
                 }
             if operation_type == "final_answer":
-                answer = operation.get("final_answer")
-                if not isinstance(answer, str) or not answer.strip():
-                    return {
-                        "action": "invalid_final_answer",
-                        "assistant_message": assistant_message,
-                        "operation": operation,
-                        "reason": (
-                            reason
-                            or "operation.final_answer is required for final_answer."
-                        ),
-                        "_raw_output": raw_output,
-                    }
                 return {
-                    "action": "answer",
-                    "answer": answer,
+                    "action": "final_answer",
+                    "answer": None,
                     "assistant_message": assistant_message,
                     "operation": operation,
                     "reason": reason,
@@ -1390,9 +1273,11 @@ class AgentTurnLoop:
                         "type": "final_answer",
                         "tool_name": None,
                         "tool_input": {},
-                        "final_answer": parsed.get("answer"),
+                        "final_answer": None,
                         "reason": parsed.get("reason"),
                     }
+                    normalized["action"] = "final_answer"
+                    normalized["answer"] = None
             return normalized
 
         parsed["_raw_output"] = raw_output
@@ -1483,15 +1368,18 @@ class AgentTurnLoop:
             for tool in self.tool_executor.registry.list_tools(package=package_name)
         ]
 
-    def _cached_mail_messages_from_session(
+    def _cached_tool_observations_from_session(
         self,
         *,
         session_id: str,
         limit: int = 8,
     ) -> list[dict[str, Any]]:
+        cacheable_tool_names = self._cacheable_tool_names()
+        if not cacheable_tool_names:
+            return []
         detail = self.session_service.get_session(session_id=session_id)
-        cached_messages: list[dict[str, Any]] = []
-        seen_message_ids: set[str] = set()
+        cached_observations: list[dict[str, Any]] = []
+        seen_fingerprints: set[str] = set()
         for session_message in reversed(detail.messages):
             tool_events = session_message.payload.get("tool_events")
             if not isinstance(tool_events, list):
@@ -1499,80 +1387,87 @@ class AgentTurnLoop:
             for tool_event in reversed(tool_events):
                 if not isinstance(tool_event, dict):
                     continue
-                if tool_event.get("tool_name") != "mail.load_messages":
+                tool_name = tool_event.get("tool_name")
+                if not isinstance(tool_name, str) or tool_name not in cacheable_tool_names:
                     continue
                 result = tool_event.get("result")
                 if not isinstance(result, dict):
                     continue
-                output = result.get("output")
-                if not isinstance(output, dict):
+                fingerprint = json.dumps(
+                    {
+                        "tool_name": tool_name,
+                        "input": tool_event.get("input"),
+                        "result": result,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                if fingerprint in seen_fingerprints:
                     continue
-                messages = output.get("messages")
-                if not isinstance(messages, list):
-                    continue
-                for message in reversed(messages):
-                    if not isinstance(message, dict):
-                        continue
-                    message_id = str(message.get("message_id") or "")
-                    if not message_id or message_id in seen_message_ids:
-                        continue
-                    cached_message = dict(message)
-                    cached_message["_cache"] = {
-                        "source": "session_tool_result",
-                        "trace_id": session_message.payload.get("trace_id"),
-                        "log_path": session_message.payload.get("log_path"),
+                seen_fingerprints.add(fingerprint)
+                cached_observations.append(
+                    {
+                        "tool_name": tool_name,
+                        "input": tool_event.get("input")
+                        if isinstance(tool_event.get("input"), dict)
+                        else {},
+                        "result": result,
+                        "feedback": tool_event.get("feedback")
+                        if isinstance(tool_event.get("feedback"), dict)
+                        else {},
+                        "_cache": {
+                            "source": "session_tool_result",
+                            "trace_id": session_message.payload.get("trace_id"),
+                            "log_path": session_message.payload.get("log_path"),
+                        },
                     }
-                    cached_messages.append(cached_message)
-                    seen_message_ids.add(message_id)
-                    if len(cached_messages) >= limit:
-                        return list(reversed(cached_messages))
-        return list(reversed(cached_messages))
+                )
+                if len(cached_observations) >= limit:
+                    return list(reversed(cached_observations))
+        return list(reversed(cached_observations))
 
-    def _cached_mail_observation_from_context_window(
+    def _cacheable_tool_names(self) -> set[str]:
+        cacheable: set[str] = set()
+        for package in self.tool_executor.registry.list_packages():
+            tool_names = package.observation_cache.get("tool_names")
+            if not isinstance(tool_names, list):
+                continue
+            cacheable.update(tool_name for tool_name in tool_names if isinstance(tool_name, str))
+        return cacheable
+
+    def _cached_tool_observations_from_context_window(
         self,
         context_window: dict[str, Any],
-    ) -> dict[str, Any] | None:
-        cached_messages = context_window.get("cached_mail_messages")
-        if not isinstance(cached_messages, list) or not cached_messages:
-            return None
-        message_ids = [
-            str(message.get("message_id"))
-            for message in cached_messages
-            if isinstance(message, dict) and message.get("message_id")
-        ]
-        return {
-            "tool_name": "mail.load_messages",
-            "input": {
-                "message_ids": message_ids,
-                "source": "session_cache",
-            },
-            "result": {
-                "invocation_id": "session_cache",
-                "tool_name": "mail.load_messages",
-                "status": "completed",
-                "output": {"messages": cached_messages},
-                "error": None,
-            },
-        }
-
-    def _loaded_messages_from_observations(
-        self,
-        observations: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        for observation in reversed(observations):
-            if observation.get("tool_name") != "mail.load_messages":
+        cached_observations = context_window.get("cached_tool_observations")
+        if not isinstance(cached_observations, list):
+            return []
+        observations: list[dict[str, Any]] = []
+        for observation in cached_observations:
+            if not isinstance(observation, dict):
                 continue
+            tool_name = observation.get("tool_name")
             result = observation.get("result")
-            if not isinstance(result, dict):
+            if not isinstance(tool_name, str) or not isinstance(result, dict):
                 continue
-            output = result.get("output")
-            if not isinstance(output, dict):
-                continue
-            messages = output.get("messages")
-            if not isinstance(messages, list):
-                continue
-            return [message for message in messages if isinstance(message, dict)]
-        return []
+            observation_payload = {
+                "tool_name": tool_name,
+                "input": observation.get("input")
+                if isinstance(observation.get("input"), dict)
+                else {},
+                "result": result,
+            }
+            feedback = observation.get("feedback")
+            if isinstance(feedback, dict):
+                observation_payload["feedback"] = feedback
+            cache_info = observation.get("_cache")
+            if isinstance(cache_info, dict):
+                observation_payload["_cache"] = {
+                    "source": "session_tool_result",
+                    **cache_info,
+                }
+            observations.append(observation_payload)
+        return observations
 
     def _execute_tool(
         self,
@@ -1664,26 +1559,18 @@ class AgentTurnLoop:
         if result.status != "completed":
             return f"`{tool_name}` failed: {result.error or 'unknown error'}"
         output = result.output
-        if tool_name == "mail.search":
-            messages = output.get("messages")
-            count = len(messages) if isinstance(messages, list) else 0
-            return f"`{tool_name}` completed with {count} matched messages."
-        if tool_name == "mail.load_messages":
-            messages = output.get("messages")
-            count = len(messages) if isinstance(messages, list) else 0
-            return f"`{tool_name}` completed with {count} loaded messages."
-        if tool_name == "matter.create_many":
-            count = output.get("matters_created")
-            return f"`{tool_name}` completed with {count or 0} created matters."
-        if tool_name == "matter.create":
-            matter = output.get("matter")
-            title = matter.get("title") if isinstance(matter, dict) else None
-            return (
-                f"`{tool_name}` completed for `{title}`."
-                if title
-                else f"`{tool_name}` completed."
-            )
+        count_summary = self._generic_output_count_summary(output)
+        if count_summary:
+            return f"`{tool_name}` completed with {count_summary}."
         return f"`{tool_name}` completed."
+
+    def _generic_output_count_summary(self, output: dict[str, Any]) -> str:
+        for key, value in output.items():
+            if isinstance(value, list):
+                return f"{len(value)} `{key}` items"
+            if isinstance(value, int) and key.endswith("_count"):
+                return f"{value} `{key}`"
+        return ""
 
     def _short_text(self, value: str, *, limit: int = 500) -> str:
         compact = " ".join(value.strip().split())
@@ -1703,42 +1590,7 @@ class AgentTurnLoop:
             if event.result.get("status") == "completed"
         }
         warnings: list[AgentTurnVerificationWarning] = []
-        lower_answer = answer.lower()
-        if ("日历" in answer or "calendar" in lower_answer) and not any(
-            tool_name.startswith("calendar.") for tool_name in successful_tools
-        ):
-            warnings.append(
-                AgentTurnVerificationWarning(
-                    code="unsupported_calendar_claim",
-                    message=(
-                        "Final answer mentions a calendar action, but no calendar tool "
-                        "was executed in this turn."
-                    ),
-                    evidence={"successful_tools": sorted(successful_tools)},
-                )
-            )
-
-        matter_claim_markers = [
-            "已创建",
-            "已写入",
-            "加入本地事务",
-            "写入本地事务",
-            "创建事务",
-        ]
-        matter_write_tools = {"matter.create", "matter.create_many", "mail.persist_matters"}
-        if any(marker in answer for marker in matter_claim_markers) and not (
-            successful_tools & matter_write_tools
-        ):
-            warnings.append(
-                AgentTurnVerificationWarning(
-                    code="unsupported_matter_write_claim",
-                    message=(
-                        "Final answer claims a local matter was written, but no matter "
-                        "write tool completed in this turn."
-                    ),
-                    evidence={"successful_tools": sorted(successful_tools)},
-                )
-            )
+        _ = (answer, successful_tools)
         return warnings
 
     def _local_tool_feedback(
@@ -1773,47 +1625,8 @@ class AgentTurnLoop:
         tool_name: str,
         result: ToolResult,
     ) -> dict[str, Any]:
-        if not tool_name.startswith("matter."):
-            return {}
-        output = result.output
-        matters = self._extract_matter_records_from_tool_output(output)
-        if not matters:
-            summary: dict[str, Any] = {"tool_family": "matter", "matter_count": 0}
-            if result.status == "rejected" and output.get("validation_errors"):
-                summary["validation_errors"] = output["validation_errors"]
-            return summary
-        status_counts: dict[str, int] = {}
-        priority_counts: dict[str, int] = {}
-        due_count = 0
-        for matter in matters:
-            status = str(matter.get("status") or "unknown")
-            priority = str(matter.get("priority") or "unknown")
-            status_counts[status] = status_counts.get(status, 0) + 1
-            priority_counts[priority] = priority_counts.get(priority, 0) + 1
-            if matter.get("due_at"):
-                due_count += 1
-        return {
-            "tool_family": "matter",
-            "matter_count": len(matters),
-            "matter_status_counts": status_counts,
-            "matter_priority_counts": priority_counts,
-            "open_count": status_counts.get("open", 0),
-            "in_progress_count": status_counts.get("in_progress", 0),
-            "done_count": status_counts.get("done", 0),
-            "due_count": due_count,
-        }
-
-    def _extract_matter_records_from_tool_output(
-        self,
-        output: dict[str, Any],
-    ) -> list[dict[str, Any]]:
-        matter = output.get("matter")
-        if isinstance(matter, dict):
-            return [matter]
-        matters = output.get("matters")
-        if isinstance(matters, list):
-            return [item for item in matters if isinstance(item, dict)]
-        return []
+        _ = (tool_name, result)
+        return {}
 
     def _check_tool_result_with_llm(
         self,
@@ -1837,7 +1650,7 @@ class AgentTurnLoop:
             "decision. Do not make a final user answer. Do not claim success when "
             "ToolResult.status is failed. Distinguish tool execution status from domain "
             "record status: ToolResult.status=completed means the tool ran, not that a "
-            "matter/task is done. If tool_feedback.domain_summary is present, use it as "
+            "business object is done. If tool_feedback.domain_summary is present, use it as "
             "the authoritative structured summary for business records. Return only strict JSON: {\"status\":"
             "\"accepted|needs_retry|failed\",\"message\":\"...\",\"remaining_work\":\"...\"}."
         )
@@ -1902,47 +1715,61 @@ class AgentTurnLoop:
         self,
         *,
         user_input: str,
-        loaded_messages: list[dict[str, Any]],
+        route: dict[str, Any],
+        context_window: dict[str, Any],
+        observations: list[dict[str, Any]],
+        final_decision: dict[str, Any] | None,
         llm_events: list[AgentTurnLLMEvent],
     ) -> str | None:
         if self.llm_client is None:
             return None
+        answer_decision = self._decision_context_for_answer_stage(final_decision)
         system_prompt = (
-            "You are the Main Agent Brain for Local Knowledge Agent OS. Use the loaded "
-            "local mail messages as observations. Answer the user directly in Chinese. "
-            "Mention uncertainty when the mail evidence is incomplete."
+            "You are the Final Answer Writer for Local Knowledge Agent OS. Use the provided "
+            "session context window, tool observations, and decision reason to answer the "
+            "user directly in Chinese. The decision stage is only a structured control step; "
+            "do not treat any decision-stage final_answer text as authoritative final prose. "
+            "Base the answer on evidence from observations and session context. Mention "
+            "uncertainty when evidence is incomplete. Do not wrap the answer in JSON."
         )
         user_prompt = json.dumps(
             {
                 "user_input": user_input,
-                "loaded_mail_messages": loaded_messages,
+                "route": route,
+                "session_context_window": context_window,
+                "observations": observations,
+                "answer_stage_decision": answer_decision,
             },
             ensure_ascii=False,
             indent=2,
         )
-        if self._should_stream_answer():
-            streamed_answer = self._stream_text_with_retry(
-                stage="answer",
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                prompt_summary=f"agent_turn_answer messages={len(loaded_messages)}",
-                max_output_tokens=None,
-                llm_events=llm_events,
-                content_role="final_answer",
-            )
-            if streamed_answer is not None:
-                return streamed_answer
         response = self._complete_text_with_retry(
             stage="answer",
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            prompt_summary=f"agent_turn_answer messages={len(loaded_messages)}",
+            prompt_summary=f"agent_turn_answer observations={len(observations)}",
             max_output_tokens=None,
             llm_events=llm_events,
         )
         if response is None:
             return None
         return response.content
+
+    def _decision_context_for_answer_stage(
+        self,
+        decision: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        if not isinstance(decision, dict):
+            return {}
+        operation = decision.get("operation") if isinstance(decision.get("operation"), dict) else {}
+        operation_for_answer = dict(operation)
+        operation_for_answer.pop("final_answer", None)
+        return {
+            "action": decision.get("action"),
+            "reason": decision.get("reason"),
+            "assistant_message": decision.get("assistant_message"),
+            "operation": operation_for_answer,
+        }
 
     def _answer_from_context_with_llm(
         self,
@@ -1954,40 +1781,12 @@ class AgentTurnLoop:
     ) -> str | None:
         if self.llm_client is None:
             return None
-        if self._should_stream_answer():
-            system_prompt = (
-                "You are the Main Agent Brain for Local Knowledge Agent OS. Answer the "
-                "current user turn directly in Chinese using only the provided session "
-                "context window when it is sufficient. Do not invent unavailable local "
-                "facts. If the context is insufficient and no tool package was selected, "
-                "explain what information is missing. Do not wrap the answer in JSON."
-            )
-            user_prompt = json.dumps(
-                {
-                    "user_input": user_input,
-                    "route": route,
-                    "session_context_window": context_window,
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
-            streamed_answer = self._stream_text_with_retry(
-                stage="context_answer",
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                prompt_summary=f"agent_turn_context_answer user_input={user_input[:80]}",
-                max_output_tokens=self.llm_generation_token_budget,
-                llm_events=llm_events,
-                content_role="context_answer",
-            )
-            if streamed_answer is not None:
-                return streamed_answer
         system_prompt = (
             "You are the Main Agent Brain for Local Knowledge Agent OS. Answer the "
-            "current user turn using only the provided session context window when it "
-            "is sufficient. Do not invent unavailable local facts. If the context is "
-            "insufficient and no tool package was selected, explain what information is "
-            "missing. Return only strict JSON: {\"answer\":\"...\"}"
+            "current user turn directly in Chinese using only the provided session "
+            "context window when it is sufficient. Do not invent unavailable local "
+            "facts. If the context is insufficient and no tool package was selected, "
+            "explain what information is missing. Do not wrap the answer in JSON."
         )
         user_prompt = json.dumps(
             {
@@ -2008,168 +1807,33 @@ class AgentTurnLoop:
         )
         if response is None:
             return None
-        parsed = self._parse_json_object(response.content)
-        if isinstance(parsed, dict) and isinstance(parsed.get("answer"), str):
-            return parsed["answer"].strip() or None
         return response.content.strip() or None
 
-    def _should_stream_answer(self) -> bool:
+    def _should_stream_llm_call(self) -> bool:
         return (
             _turn_llm_response_mode.get() == LLMResponseMode.STREAM
             and self.llm_client is not None
             and hasattr(self.llm_client, "stream")
         )
 
-    def _stream_text_with_retry(
-        self,
-        *,
-        stage: str,
-        system_prompt: str,
-        user_prompt: str,
-        prompt_summary: str,
-        max_output_tokens: int | None,
-        llm_events: list[AgentTurnLLMEvent],
-        content_role: str,
-    ) -> str | None:
-        if self.llm_client is None or not hasattr(self.llm_client, "stream"):
-            return None
+    def _llm_content_role_for_stage(self, stage: str) -> str:
+        return {
+            "route": "route_decision",
+            "decision": "agent_decision",
+            "decision_repair": "decision_repair",
+            "tool_result_check": "tool_result_check",
+            "context_summarize": "context_summary",
+            "context_answer": "context_answer",
+            "answer": "final_answer",
+        }.get(stage, "llm_output")
 
-        provider = type(self.llm_client).__name__
-        for attempt in range(1, self.llm_max_attempts + 1):
-            started_at = llm_audit_now_iso()
-            perf_start = time.perf_counter()
-            llm_call_id = stable_llm_call_id(
-                _turn_run_id.get(),
-                stage,
-                "stream",
-                str(attempt),
-                started_at,
-            )
-            self._append_run_event(
-                type="llm_started",
-                message=f"LLM stream started for `{stage}`.",
-                stage=stage,
-                payload={
-                    "stream_part": "llm_audit",
-                    "content_role": content_role,
-                    "llm_call_id": llm_call_id,
-                    "provider": provider,
-                    "attempt": attempt,
-                    "response_mode": LLMResponseMode.STREAM.value,
-                },
-            )
-            try:
-                content = self._stream_text_once(
-                    stage=stage,
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
-                    prompt_summary=prompt_summary,
-                    max_output_tokens=max_output_tokens,
-                    llm_call_id=llm_call_id,
-                    content_role=content_role,
-                )
-            except LLMRateLimitError as exc:
-                duration_ms = self._duration_ms(perf_start)
-                llm_event = self._llm_error_event(
-                    stage=stage,
-                    provider=provider,
-                    attempt=attempt,
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
-                    prompt_summary=prompt_summary,
-                    started_at=started_at,
-                    duration_ms=duration_ms,
-                    llm_call_id=llm_call_id,
-                    exc=exc,
-                )
-                self._append_run_event(
-                    type="llm_failed",
-                    message=f"LLM stream rate limited for `{stage}`.",
-                    stage=stage,
-                    payload={
-                        "stream_part": "llm_audit",
-                        "content_role": content_role,
-                        "llm_call_id": llm_call_id,
-                        "status": "rate_limited",
-                        "status_code": exc.status_code,
-                        "retry_after": exc.retry_after,
-                        "audit_record": llm_event.audit_record,
-                    },
-                )
-                llm_events.append(llm_event)
-                if attempt >= self.llm_max_attempts:
-                    return None
-                time.sleep(self._retry_after_seconds(exc.retry_after))
-                continue
-            except LLMClientError as exc:
-                duration_ms = self._duration_ms(perf_start)
-                llm_event = self._llm_error_event(
-                    stage=stage,
-                    provider=provider,
-                    attempt=attempt,
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
-                    prompt_summary=prompt_summary,
-                    started_at=started_at,
-                    duration_ms=duration_ms,
-                    llm_call_id=llm_call_id,
-                    exc=exc,
-                )
-                self._append_run_event(
-                    type="llm_failed",
-                    message=f"LLM stream failed for `{stage}`.",
-                    stage=stage,
-                    payload={
-                        "stream_part": "llm_audit",
-                        "content_role": content_role,
-                        "llm_call_id": llm_call_id,
-                        "status": self._llm_error_status(exc),
-                        "error_type": type(exc).__name__,
-                        "audit_record": llm_event.audit_record,
-                    },
-                )
-                llm_events.append(llm_event)
-                return None
+    def _llm_display_target_for_stage(self, stage: str) -> str:
+        if stage in {"answer", "context_answer"}:
+            return "assistant_answer"
+        return "agent_process"
 
-            duration_ms = self._duration_ms(perf_start)
-            response = LLMResponse(
-                provider=provider,
-                client_name=_turn_llm_client_name.get() or "default",
-                model=_turn_llm_model.get() or "default",
-                status="completed",
-                content=content,
-                prompt_summary=prompt_summary,
-                response_mode=LLMResponseMode.STREAM,
-                finish_reason="stream_completed",
-            )
-            llm_event = self._llm_completed_event(
-                stage=stage,
-                attempt=attempt,
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                prompt_summary=prompt_summary,
-                started_at=started_at,
-                duration_ms=duration_ms,
-                llm_call_id=llm_call_id,
-                response=response,
-            )
-            llm_events.append(llm_event)
-            self._append_run_event(
-                type="llm_completed",
-                message=f"LLM stream completed for `{stage}`.",
-                stage=stage,
-                payload={
-                    "stream_part": "llm_audit",
-                    "content_role": content_role,
-                    "llm_call_id": llm_call_id,
-                    "status": "completed",
-                    "content_length": len(content),
-                    "finish_reason": "stream_completed",
-                    "audit_record": llm_event.audit_record,
-                },
-            )
-            return content
-        return None
+    def _llm_stage_requires_json(self, stage: str) -> bool:
+        return stage not in {"answer", "context_answer"}
 
     def _stream_text_once(
         self,
@@ -2180,9 +1844,13 @@ class AgentTurnLoop:
         prompt_summary: str,
         max_output_tokens: int | None,
         llm_call_id: str,
-        content_role: str,
-    ) -> str:
-        async def collect() -> str:
+    ) -> LLMResponse:
+        if self.llm_client is None:
+            raise LLMClientError("No LLM client is configured.")
+        content_role = self._llm_content_role_for_stage(stage)
+        display_target = self._llm_display_target_for_stage(stage)
+
+        async def collect() -> tuple[str, dict[str, Any]]:
             request = LLMRequest(
                 client_name=_turn_llm_client_name.get(),
                 model=_turn_llm_model.get(),
@@ -2194,11 +1862,27 @@ class AgentTurnLoop:
                 prompt_summary=prompt_summary,
                 temperature=0.0,
                 max_output_tokens=max_output_tokens,
-                require_json=False,
+                require_json=self._llm_stage_requires_json(stage),
                 metadata={"stage": stage},
             )
             snapshot = ""
+            stream_metadata: dict[str, Any] = {}
             async for event in self.llm_client.stream(request):  # type: ignore[union-attr]
+                stream_metadata.update(
+                    {
+                        "client_name": event.client_name,
+                        "provider": event.provider,
+                        "model": event.model,
+                    }
+                )
+                if event.event_type == "llm_failed":
+                    raise LLMClientError(event.error or "LLM stream failed.")
+                if event.event_type == "llm_completed":
+                    if event.content_snapshot:
+                        snapshot = event.content_snapshot
+                    if event.metadata:
+                        stream_metadata.update(event.metadata)
+                    continue
                 if event.event_type != "llm_delta" or not event.delta:
                     continue
                 snapshot = event.content_snapshot or snapshot + event.delta
@@ -2209,7 +1893,7 @@ class AgentTurnLoop:
                     payload={
                         "stream_part": "llm_delta",
                         "content_role": content_role,
-                        "display_target": "assistant_answer",
+                        "display_target": display_target,
                         "llm_call_id": llm_call_id,
                         "client_name": event.client_name,
                         "provider": event.provider,
@@ -2218,9 +1902,24 @@ class AgentTurnLoop:
                         "content_snapshot": snapshot,
                     },
                 )
-            return snapshot
+            return snapshot, stream_metadata
 
-        return asyncio.run(collect())
+        content, stream_metadata = asyncio.run(collect())
+        return LLMResponse(
+            provider=stream_metadata.get("provider") or type(self.llm_client).__name__,
+            client_name=stream_metadata.get("client_name")
+            or _turn_llm_client_name.get()
+            or "default",
+            model=stream_metadata.get("model") or _turn_llm_model.get() or "default",
+            status="completed",
+            content=content,
+            prompt_summary=prompt_summary,
+            response_mode=LLMResponseMode.STREAM,
+            finish_reason=stream_metadata.get("finish_reason") or "stream_completed",
+            provider_request_id=stream_metadata.get("provider_request_id"),
+            usage=stream_metadata.get("usage") or {},
+            metadata={"streamed": True, "content_role": content_role},
+        )
 
     def _summarize_context_window(
         self,
@@ -2283,33 +1982,54 @@ class AgentTurnLoop:
             return None
 
         provider = type(self.llm_client).__name__
+        use_stream = self._should_stream_llm_call()
+        response_mode = LLMResponseMode.STREAM if use_stream else _turn_llm_response_mode.get()
+        content_role = self._llm_content_role_for_stage(stage)
         for attempt in range(1, self.llm_max_attempts + 1):
             started_at = llm_audit_now_iso()
             perf_start = time.perf_counter()
             llm_call_id = stable_llm_call_id(
                 _turn_run_id.get(),
                 stage,
+                response_mode.value,
                 str(attempt),
                 started_at,
             )
             self._append_run_event(
                 type="llm_started",
-                message=f"LLM call started for `{stage}`.",
+                message=(
+                    f"LLM stream started for `{stage}`."
+                    if use_stream
+                    else f"LLM call started for `{stage}`."
+                ),
                 stage=stage,
                 payload={
+                    "stream_part": "llm_audit",
+                    "content_role": content_role,
                     "llm_call_id": llm_call_id,
                     "provider": provider,
                     "attempt": attempt,
+                    "response_mode": response_mode.value,
                 },
             )
             try:
-                response = self._complete_text_once(
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
-                    prompt_summary=prompt_summary,
-                    max_output_tokens=max_output_tokens,
-                    stage=stage,
-                )
+                if use_stream:
+                    response = self._stream_text_once(
+                        system_prompt=system_prompt,
+                        user_prompt=user_prompt,
+                        prompt_summary=prompt_summary,
+                        max_output_tokens=max_output_tokens,
+                        stage=stage,
+                        llm_call_id=llm_call_id,
+                    )
+                else:
+                    response = self._complete_text_once(
+                        system_prompt=system_prompt,
+                        user_prompt=user_prompt,
+                        prompt_summary=prompt_summary,
+                        max_output_tokens=max_output_tokens,
+                        stage=stage,
+                    )
             except LLMRateLimitError as exc:
                 duration_ms = self._duration_ms(perf_start)
                 llm_event = self._llm_error_event(
@@ -2326,12 +2046,19 @@ class AgentTurnLoop:
                 )
                 self._append_run_event(
                     type="llm_failed",
-                    message=f"LLM call rate limited for `{stage}`.",
+                    message=(
+                        f"LLM stream rate limited for `{stage}`."
+                        if use_stream
+                        else f"LLM call rate limited for `{stage}`."
+                    ),
                     stage=stage,
                     payload={
+                        "stream_part": "llm_audit",
+                        "content_role": content_role,
                         "llm_call_id": llm_call_id,
                         "provider": provider,
                         "attempt": attempt,
+                        "response_mode": response_mode.value,
                         "status": "rate_limited",
                         "status_code": exc.status_code,
                         "retry_after": exc.retry_after,
@@ -2361,12 +2088,19 @@ class AgentTurnLoop:
                 )
                 self._append_run_event(
                     type="llm_failed",
-                    message=f"LLM call failed for `{stage}`.",
+                    message=(
+                        f"LLM stream failed for `{stage}`."
+                        if use_stream
+                        else f"LLM call failed for `{stage}`."
+                    ),
                     stage=stage,
                     payload={
+                        "stream_part": "llm_audit",
+                        "content_role": content_role,
                         "llm_call_id": llm_call_id,
                         "provider": provider,
                         "attempt": attempt,
+                        "response_mode": response_mode.value,
                         "status": self._llm_error_status(exc),
                         "error_type": type(exc).__name__,
                         "error_category": llm_event.error_category,
@@ -2392,12 +2126,19 @@ class AgentTurnLoop:
             llm_events.append(llm_event)
             self._append_run_event(
                 type="llm_completed",
-                message=f"LLM call completed for `{stage}`.",
+                message=(
+                    f"LLM stream completed for `{stage}`."
+                    if use_stream
+                    else f"LLM call completed for `{stage}`."
+                ),
                 stage=stage,
                 payload={
+                    "stream_part": "llm_audit",
+                    "content_role": content_role,
                     "llm_call_id": llm_call_id,
                     "provider": response.provider,
                     "attempt": attempt,
+                    "response_mode": response.response_mode.value,
                     "status": response.status,
                     "content_length": len(response.content),
                     "provider_request_id": response.provider_request_id,
@@ -2429,7 +2170,7 @@ class AgentTurnLoop:
                 client_name=_turn_llm_client_name.get(),
                 model=_turn_llm_model.get(),
                 response_mode=_turn_llm_response_mode.get(),
-                require_json=stage not in {"answer"},
+                require_json=self._llm_stage_requires_json(stage),
                 metadata={"stage": stage},
             )
         except TypeError:
@@ -2810,25 +2551,6 @@ class AgentTurnLoop:
         if run_manager.is_cancel_requested(run_id):
             reason = run_manager.cancel_reason(run_id) or "Run cancelled."
             raise AgentRunCancelled(reason)
-
-    def _answer_locally(self, *, user_input: str, loaded_messages: list[dict[str, Any]]) -> str:
-        lines = [
-            "我已调用本地 mail tools 检索并加载相关邮件。当前未配置可用 LLM，下面是本地摘要：",
-            f"用户问题：{user_input}",
-        ]
-        for index, message in enumerate(loaded_messages, start=1):
-            body = str(message.get("body_text") or "").strip().replace("\r", "")
-            snippet = body[:300] + ("..." if len(body) > 300 else "")
-            lines.extend(
-                [
-                    "",
-                    f"{index}. {message.get('subject') or '(no subject)'}",
-                    f"   from: {message.get('sender') or ''}",
-                    f"   received_at: {message.get('received_at') or ''}",
-                    f"   snippet: {snippet}",
-                ]
-            )
-        return "\n".join(lines)
 
     def _write_log(self, *, result: AgentTurnResult, user_input: str) -> Path:
         self.log_dir.mkdir(parents=True, exist_ok=True)
