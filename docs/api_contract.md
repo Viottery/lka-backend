@@ -213,6 +213,10 @@ POST /agent/turn
 `llm` 是可选字段；不传时使用会话 / 配置默认值。`model` 是运行时可切换选项，不应由
 后端代码写死。当前 `/agent/turn` 仍返回完整非流式结果；`response_mode=stream` 先作为
 LLM service 层能力预留，用户可见 stream endpoint 后续单独提供。
+每次 LLM 调用都会在响应的 `llm_events` 中带上 `llm_call_id`、provider / model、
+response mode、耗时、usage、finish reason、provider request id、rate-limit headers、
+错误分类和 retry 判断等审计字段。完整 prompt / output 仍只写入本地 markdown run log；
+第一版暂不新增 SQLite `llm_calls` 表。
 
 响应：
 

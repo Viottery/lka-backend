@@ -20,6 +20,7 @@ from app.core.llm.models import (
     LLMResponseMode,
     LLMStreamEvent,
 )
+from app.core.llm.audit import LLMCallRecord
 from app.core.llm.registry import LLMClientRegistry, build_llm_registry
 from app.core.llm.service import LLMService
 from app.core.local_config import LLMProviderConfig
@@ -48,6 +49,7 @@ __all__ = [
     "LLMClient",
     "LLMClientError",
     "LLMClientRegistry",
+    "LLMCallRecord",
     "LLMMessage",
     "LLMNetworkError",
     "LLMProviderHTTPError",

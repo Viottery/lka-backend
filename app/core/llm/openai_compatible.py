@@ -19,6 +19,13 @@ from app.core.llm.errors import (
     LLMResponseParseError,
     LLMTimeoutError,
 )
+from app.core.llm.audit import (
+    audit_headers,
+    classify_provider_error,
+    parse_error_body,
+    provider_request_id_from_headers,
+    retry_after_from_headers,
+)
 from app.core.llm.models import LLMRequest, LLMResponse, LLMResponseMode, LLMStreamEvent
 
 
@@ -51,12 +58,13 @@ class OpenAICompatibleLLMClient:
         self.supports_json_mode = supports_json_mode
 
     async def complete(self, request: LLMRequest) -> LLMResponse:
-        response_payload = await asyncio.to_thread(
+        response_payload, response_headers = await asyncio.to_thread(
             self._post_chat_completion,
             request,
             False,
         )
-        content, usage = self._message_content(response_payload)
+        content, usage, finish_reason = self._message_content(response_payload)
+        headers = audit_headers(response_headers)
         return LLMResponse(
             provider=self.provider_name,
             client_name=self.name,
@@ -66,6 +74,9 @@ class OpenAICompatibleLLMClient:
             prompt_summary=request.prompt_summary,
             response_mode=request.response_mode,
             usage=usage,
+            finish_reason=finish_reason,
+            provider_request_id=provider_request_id_from_headers(headers),
+            metadata={"headers": headers},
         )
 
     async def stream(self, request: LLMRequest) -> AsyncIterator[LLMStreamEvent]:
@@ -100,14 +111,19 @@ class OpenAICompatibleLLMClient:
 
         yield self._stream_event("llm_completed", request, snapshot)
 
-    def _post_chat_completion(self, request: LLMRequest, stream: bool) -> dict[str, Any]:
+    def _post_chat_completion(
+        self,
+        request: LLMRequest,
+        stream: bool,
+    ) -> tuple[dict[str, Any], dict[str, str]]:
         http_request = self._build_request(request, stream=stream)
         try:
             with urllib.request.urlopen(
                 http_request,
                 timeout=self.timeout_seconds,
             ) as response:
-                return json.loads(response.read().decode("utf-8"))
+                headers = {str(key).lower(): str(value) for key, value in response.headers.items()}
+                return json.loads(response.read().decode("utf-8")), headers
         except urllib.error.HTTPError as exc:
             self._raise_http_error(exc)
         except (TimeoutError, socket.timeout) as exc:
@@ -155,16 +171,21 @@ class OpenAICompatibleLLMClient:
     def _model_for(self, request: LLMRequest) -> str:
         return request.model or self.default_model
 
-    def _message_content(self, payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    def _message_content(
+        self,
+        payload: dict[str, Any],
+    ) -> tuple[str, dict[str, Any], str | None]:
         try:
-            message = payload["choices"][0]["message"]
+            choice = payload["choices"][0]
+            message = choice["message"]
             content = message.get("content") or ""
         except (KeyError, IndexError, TypeError) as exc:
             raise LLMResponseParseError(
                 "LLM provider response did not include message content."
             ) from exc
         usage = payload.get("usage")
-        return content, usage if isinstance(usage, dict) else {}
+        finish_reason = choice.get("finish_reason") if isinstance(choice, dict) else None
+        return content, usage if isinstance(usage, dict) else {}, finish_reason
 
     def _stream_delta(self, data: str) -> str:
         try:
@@ -196,21 +217,45 @@ class OpenAICompatibleLLMClient:
     def _raise_http_error(self, exc: urllib.error.HTTPError) -> None:
         error_body = exc.read().decode("utf-8", errors="replace")
         message = f"LLM provider returned HTTP {exc.code}: {error_body}"
-        retry_after = exc.headers.get("Retry-After")
+        headers = audit_headers(exc.headers)
+        retry_after = retry_after_from_headers(headers)
+        error_info = parse_error_body(error_body)
+        category, retriable = classify_provider_error(
+            http_status=exc.code,
+            provider_error_type=error_info.get("type")
+            if isinstance(error_info.get("type"), str)
+            else None,
+            provider_error_code=error_info.get("code")
+            if isinstance(error_info.get("code"), str)
+            else None,
+        )
+        common_kwargs = {
+            "status_code": exc.code,
+            "message": message,
+            "retry_after": retry_after,
+            "headers": headers,
+            "error_body": error_body,
+            "provider_error_type": error_info.get("type")
+            if isinstance(error_info.get("type"), str)
+            else None,
+            "provider_error_code": error_info.get("code")
+            if isinstance(error_info.get("code"), str)
+            else None,
+            "provider_error_param": error_info.get("param")
+            if isinstance(error_info.get("param"), str)
+            else None,
+            "provider_error_event_id": error_info.get("event_id")
+            if isinstance(error_info.get("event_id"), str)
+            else None,
+            "error_category": category,
+            "is_retriable": retriable,
+        }
         if exc.code == 429:
             raise LLMRateLimitError(
-                status_code=exc.code,
-                message=message,
-                retry_after=retry_after,
+                **common_kwargs,
             ) from exc
         if exc.code in {401, 403}:
             raise LLMAuthenticationError(
-                status_code=exc.code,
-                message=message,
-                retry_after=retry_after,
+                **common_kwargs,
             ) from exc
-        raise LLMProviderHTTPError(
-            status_code=exc.code,
-            message=message,
-            retry_after=retry_after,
-        ) from exc
+        raise LLMProviderHTTPError(**common_kwargs) from exc

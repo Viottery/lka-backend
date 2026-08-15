@@ -40,6 +40,9 @@ class LLMResponse(BaseModel):
     model: str | None = None
     response_mode: LLMResponseMode = LLMResponseMode.TEXT
     usage: dict[str, Any] = Field(default_factory=dict)
+    finish_reason: str | None = None
+    provider_request_id: str | None = None
+    partial: bool = False
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 

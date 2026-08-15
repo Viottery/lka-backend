@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 
 class LLMClientError(RuntimeError):
     """Raised when a configured LLM provider cannot complete a request."""
@@ -14,10 +16,26 @@ class LLMProviderHTTPError(LLMClientError):
         status_code: int,
         message: str,
         retry_after: str | None = None,
+        headers: dict[str, str] | None = None,
+        error_body: str | dict[str, Any] | None = None,
+        provider_error_type: str | None = None,
+        provider_error_code: str | None = None,
+        provider_error_param: str | None = None,
+        provider_error_event_id: str | None = None,
+        error_category: str | None = None,
+        is_retriable: bool | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.retry_after = retry_after
+        self.headers = headers or {}
+        self.error_body = error_body
+        self.provider_error_type = provider_error_type
+        self.provider_error_code = provider_error_code
+        self.provider_error_param = provider_error_param
+        self.provider_error_event_id = provider_error_event_id
+        self.error_category = error_category
+        self.is_retriable = is_retriable
 
 
 class LLMRateLimitError(LLMProviderHTTPError):

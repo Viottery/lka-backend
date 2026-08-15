@@ -179,6 +179,12 @@ def test_agent_turn_retries_rate_limited_llm_and_logs_failure(tmp_path, monkeypa
     ]
     assert response.llm_events[0].status_code == 429
     assert response.llm_events[0].retry_after == "0"
+    assert response.llm_events[0].llm_call_id is not None
+    assert response.llm_events[0].error_category == "rate_limited"
+    assert response.llm_events[0].is_retriable is True
+    assert response.llm_events[0].audit_record["stage"] == "route"
+    assert response.llm_events[1].audit_record["status"] == "completed"
+    assert response.llm_events[1].content_length is not None
     assert [event.action for event in response.decision_events] == [
         "select_package",
         "call_tool",

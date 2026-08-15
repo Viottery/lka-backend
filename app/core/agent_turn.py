@@ -19,6 +19,15 @@ from app.core.agent_runs import (
     AgentRunCancelled,
     InMemoryAgentRunManager,
 )
+from app.core.llm.audit import (
+    LLMCallRecord,
+    classify_openai_sdk_exception,
+    classify_provider_error,
+    now_iso as llm_audit_now_iso,
+    prompt_metadata,
+    stable_llm_call_id,
+    usage_token_counts,
+)
 from app.core.llm import (
     LLMAuthenticationError,
     LLMClientError,
@@ -75,13 +84,41 @@ class AgentTurnToolEvent(BaseModel):
 
 
 class AgentTurnLLMEvent(BaseModel):
+    llm_call_id: str | None = None
+    run_id: str | None = None
+    trace_id: str | None = None
+    session_id: str | None = None
     stage: str
+    client_name: str | None = None
     provider: str
+    model: str | None = None
+    response_mode: str | None = None
     status: str
+    started_at: str | None = None
+    completed_at: str | None = None
+    failed_at: str | None = None
+    duration_ms: int | None = None
     system_prompt: str
     user_prompt: str
     output: str
     attempt: int = 1
+    http_status: int | None = None
+    provider_request_id: str | None = None
+    provider_error_type: str | None = None
+    provider_error_code: str | None = None
+    provider_error_param: str | None = None
+    error_category: str | None = None
+    error_message: str | None = None
+    is_retriable: bool | None = None
+    finish_reason: str | None = None
+    input_token_count: int | None = None
+    output_token_count: int | None = None
+    total_token_count: int | None = None
+    content_length: int | None = None
+    prompt_summary: str | None = None
+    partial: bool = False
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    audit_record: dict[str, Any] = Field(default_factory=dict)
     error_type: str | None = None
     status_code: int | None = None
     retry_after: str | None = None
@@ -1926,11 +1963,23 @@ class AgentTurnLoop:
 
         provider = type(self.llm_client).__name__
         for attempt in range(1, self.llm_max_attempts + 1):
+            started_at = llm_audit_now_iso()
+            perf_start = time.perf_counter()
+            llm_call_id = stable_llm_call_id(
+                _turn_run_id.get(),
+                stage,
+                str(attempt),
+                started_at,
+            )
             self._append_run_event(
                 type="llm_started",
                 message=f"LLM call started for `{stage}`.",
                 stage=stage,
-                payload={"provider": provider, "attempt": attempt},
+                payload={
+                    "llm_call_id": llm_call_id,
+                    "provider": provider,
+                    "attempt": attempt,
+                },
             )
             try:
                 response = self._complete_text_once(
@@ -1941,76 +1990,98 @@ class AgentTurnLoop:
                     stage=stage,
                 )
             except LLMRateLimitError as exc:
+                duration_ms = self._duration_ms(perf_start)
+                llm_event = self._llm_error_event(
+                    stage=stage,
+                    provider=provider,
+                    attempt=attempt,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    prompt_summary=prompt_summary,
+                    started_at=started_at,
+                    duration_ms=duration_ms,
+                    llm_call_id=llm_call_id,
+                    exc=exc,
+                )
                 self._append_run_event(
                     type="llm_failed",
                     message=f"LLM call rate limited for `{stage}`.",
                     stage=stage,
                     payload={
+                        "llm_call_id": llm_call_id,
                         "provider": provider,
                         "attempt": attempt,
                         "status": "rate_limited",
                         "status_code": exc.status_code,
                         "retry_after": exc.retry_after,
+                        "error_category": llm_event.error_category,
+                        "is_retriable": llm_event.is_retriable,
+                        "audit_record": llm_event.audit_record,
                     },
                 )
-                llm_events.append(
-                    self._llm_error_event(
-                        stage=stage,
-                        provider=provider,
-                        attempt=attempt,
-                        system_prompt=system_prompt,
-                        user_prompt=user_prompt,
-                        exc=exc,
-                    )
-                )
+                llm_events.append(llm_event)
                 if attempt >= self.llm_max_attempts:
                     return None
                 time.sleep(self._retry_after_seconds(exc.retry_after))
                 continue
             except LLMClientError as exc:
+                duration_ms = self._duration_ms(perf_start)
+                llm_event = self._llm_error_event(
+                    stage=stage,
+                    provider=provider,
+                    attempt=attempt,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    prompt_summary=prompt_summary,
+                    started_at=started_at,
+                    duration_ms=duration_ms,
+                    llm_call_id=llm_call_id,
+                    exc=exc,
+                )
                 self._append_run_event(
                     type="llm_failed",
                     message=f"LLM call failed for `{stage}`.",
                     stage=stage,
                     payload={
+                        "llm_call_id": llm_call_id,
                         "provider": provider,
                         "attempt": attempt,
                         "status": self._llm_error_status(exc),
                         "error_type": type(exc).__name__,
+                        "error_category": llm_event.error_category,
+                        "is_retriable": llm_event.is_retriable,
+                        "audit_record": llm_event.audit_record,
                     },
                 )
-                llm_events.append(
-                    self._llm_error_event(
-                        stage=stage,
-                        provider=provider,
-                        attempt=attempt,
-                        system_prompt=system_prompt,
-                        user_prompt=user_prompt,
-                        exc=exc,
-                    )
-                )
+                llm_events.append(llm_event)
                 return None
 
-            llm_events.append(
-                AgentTurnLLMEvent(
-                    stage=stage,
-                    provider=response.provider,
-                    status=response.status,
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
-                    output=response.content,
-                    attempt=attempt,
-                )
+            duration_ms = self._duration_ms(perf_start)
+            llm_event = self._llm_completed_event(
+                stage=stage,
+                attempt=attempt,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                prompt_summary=prompt_summary,
+                started_at=started_at,
+                duration_ms=duration_ms,
+                llm_call_id=llm_call_id,
+                response=response,
             )
+            llm_events.append(llm_event)
             self._append_run_event(
                 type="llm_completed",
                 message=f"LLM call completed for `{stage}`.",
                 stage=stage,
                 payload={
+                    "llm_call_id": llm_call_id,
                     "provider": response.provider,
                     "attempt": attempt,
                     "status": response.status,
                     "content_length": len(response.content),
+                    "provider_request_id": response.provider_request_id,
+                    "finish_reason": response.finish_reason,
+                    "audit_record": llm_event.audit_record,
                 },
             )
             return response
@@ -2060,11 +2131,61 @@ class AgentTurnLoop:
         attempt: int,
         system_prompt: str,
         user_prompt: str,
+        prompt_summary: str,
+        started_at: str,
+        duration_ms: int,
+        llm_call_id: str,
         exc: LLMClientError,
     ) -> AgentTurnLLMEvent:
         status_code = exc.status_code if isinstance(exc, LLMProviderHTTPError) else None
         retry_after = exc.retry_after if isinstance(exc, LLMProviderHTTPError) else None
+        provider_error_type = (
+            exc.provider_error_type if isinstance(exc, LLMProviderHTTPError) else None
+        )
+        provider_error_code = (
+            exc.provider_error_code if isinstance(exc, LLMProviderHTTPError) else None
+        )
+        provider_error_param = (
+            exc.provider_error_param if isinstance(exc, LLMProviderHTTPError) else None
+        )
+        if isinstance(exc, LLMProviderHTTPError):
+            category, retriable = classify_provider_error(
+                http_status=exc.status_code,
+                provider_error_type=provider_error_type,
+                provider_error_code=provider_error_code,
+            )
+            category = exc.error_category or category
+            retriable = exc.is_retriable if exc.is_retriable is not None else retriable
+            headers = exc.headers
+        else:
+            category, retriable = classify_openai_sdk_exception(exc)
+            headers = {}
+        call_record = self._llm_call_record(
+            llm_call_id=llm_call_id,
+            stage=stage,
+            client_name=_turn_llm_client_name.get() or "default",
+            provider=provider,
+            model=_turn_llm_model.get() or "default",
+            response_mode=_turn_llm_response_mode.get().value,
+            status=self._llm_error_status(exc),
+            started_at=started_at,
+            failed_at=llm_audit_now_iso(),
+            duration_ms=duration_ms,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            prompt_summary=prompt_summary,
+            http_status=status_code,
+            retry_after=retry_after,
+            provider_error_type=provider_error_type,
+            provider_error_code=provider_error_code,
+            provider_error_param=provider_error_param,
+            error_category=category,
+            error_message=str(exc),
+            is_retriable=retriable,
+            metadata={"headers": headers},
+        )
         return AgentTurnLLMEvent(
+            **self._event_fields_from_call_record(call_record),
             stage=stage,
             provider=provider,
             status=self._llm_error_status(exc),
@@ -2077,6 +2198,180 @@ class AgentTurnLoop:
             retry_after=retry_after,
             error=str(exc),
         )
+
+    def _llm_completed_event(
+        self,
+        *,
+        stage: str,
+        attempt: int,
+        system_prompt: str,
+        user_prompt: str,
+        prompt_summary: str,
+        started_at: str,
+        duration_ms: int,
+        llm_call_id: str,
+        response: LLMResponse,
+    ) -> AgentTurnLLMEvent:
+        input_tokens, output_tokens, total_tokens = usage_token_counts(response.usage)
+        call_record = self._llm_call_record(
+            llm_call_id=llm_call_id,
+            stage=stage,
+            client_name=response.client_name or _turn_llm_client_name.get() or "default",
+            provider=response.provider,
+            model=response.model or _turn_llm_model.get() or "default",
+            response_mode=response.response_mode.value,
+            status=response.status,
+            started_at=started_at,
+            completed_at=llm_audit_now_iso(),
+            duration_ms=duration_ms,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            prompt_summary=prompt_summary,
+            provider_request_id=response.provider_request_id,
+            finish_reason=response.finish_reason,
+            input_token_count=input_tokens,
+            output_token_count=output_tokens,
+            total_token_count=total_tokens,
+            content_length=len(response.content),
+            partial=response.partial,
+            metadata=response.metadata,
+        )
+        return AgentTurnLLMEvent(
+            **self._event_fields_from_call_record(call_record),
+            stage=stage,
+            provider=response.provider,
+            status=response.status,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            output=response.content,
+            attempt=attempt,
+        )
+
+    def _llm_call_record(
+        self,
+        *,
+        llm_call_id: str,
+        stage: str,
+        client_name: str,
+        provider: str,
+        model: str,
+        response_mode: str,
+        status: str,
+        started_at: str,
+        system_prompt: str,
+        user_prompt: str,
+        prompt_summary: str,
+        completed_at: str | None = None,
+        failed_at: str | None = None,
+        duration_ms: int | None = None,
+        http_status: int | None = None,
+        provider_request_id: str | None = None,
+        retry_after: str | None = None,
+        provider_error_type: str | None = None,
+        provider_error_code: str | None = None,
+        provider_error_param: str | None = None,
+        error_category: str | None = None,
+        error_message: str | None = None,
+        is_retriable: bool | None = None,
+        finish_reason: str | None = None,
+        input_token_count: int | None = None,
+        output_token_count: int | None = None,
+        total_token_count: int | None = None,
+        content_length: int | None = None,
+        partial: bool = False,
+        metadata: dict[str, Any] | None = None,
+    ) -> LLMCallRecord:
+        record_metadata = {}
+        record_metadata.update(prompt_metadata(system_prompt=system_prompt, user_prompt=user_prompt))
+        if metadata:
+            record_metadata.update(metadata)
+        run_context = self._current_run_context()
+        return LLMCallRecord(
+            llm_call_id=llm_call_id,
+            run_id=run_context.get("run_id"),
+            trace_id=run_context.get("trace_id"),
+            session_id=run_context.get("session_id"),
+            stage=stage,
+            client_name=client_name,
+            provider=provider,
+            model=model,
+            response_mode=response_mode,
+            status=status,
+            started_at=started_at,
+            completed_at=completed_at,
+            failed_at=failed_at,
+            duration_ms=duration_ms,
+            http_status=http_status,
+            provider_request_id=provider_request_id,
+            retry_after=retry_after,
+            provider_error_type=provider_error_type,
+            provider_error_code=provider_error_code,
+            provider_error_param=provider_error_param,
+            error_category=error_category,
+            error_message=error_message,
+            is_retriable=is_retriable,
+            finish_reason=finish_reason,
+            input_token_count=input_token_count,
+            output_token_count=output_token_count,
+            total_token_count=total_token_count,
+            content_length=content_length,
+            prompt_summary=prompt_summary,
+            partial=partial,
+            metadata=record_metadata,
+        )
+
+    def _event_fields_from_call_record(
+        self,
+        record: LLMCallRecord,
+    ) -> dict[str, Any]:
+        payload = record.model_dump(mode="json")
+        return {
+            "llm_call_id": record.llm_call_id,
+            "run_id": record.run_id,
+            "trace_id": record.trace_id,
+            "session_id": record.session_id,
+            "client_name": record.client_name,
+            "model": record.model,
+            "response_mode": record.response_mode,
+            "started_at": record.started_at,
+            "completed_at": record.completed_at,
+            "failed_at": record.failed_at,
+            "duration_ms": record.duration_ms,
+            "http_status": record.http_status,
+            "provider_request_id": record.provider_request_id,
+            "provider_error_type": record.provider_error_type,
+            "provider_error_code": record.provider_error_code,
+            "provider_error_param": record.provider_error_param,
+            "error_category": record.error_category,
+            "error_message": record.error_message,
+            "is_retriable": record.is_retriable,
+            "finish_reason": record.finish_reason,
+            "input_token_count": record.input_token_count,
+            "output_token_count": record.output_token_count,
+            "total_token_count": record.total_token_count,
+            "content_length": record.content_length,
+            "prompt_summary": record.prompt_summary,
+            "partial": record.partial,
+            "metadata": record.metadata,
+            "audit_record": payload,
+        }
+
+    def _current_run_context(self) -> dict[str, str | None]:
+        run_id = _turn_run_id.get()
+        run_manager = _turn_run_manager.get()
+        if run_id is None or run_manager is None:
+            return {"run_id": run_id, "trace_id": None, "session_id": None}
+        run = run_manager.get_run(run_id)
+        if run is None:
+            return {"run_id": run_id, "trace_id": None, "session_id": None}
+        return {
+            "run_id": run.run_id,
+            "trace_id": run.trace_id,
+            "session_id": run.session_id,
+        }
+
+    def _duration_ms(self, started_at: float) -> int:
+        return max(int((time.perf_counter() - started_at) * 1000), 0)
 
     def _llm_error_status(self, exc: LLMClientError) -> str:
         if isinstance(exc, LLMRateLimitError):

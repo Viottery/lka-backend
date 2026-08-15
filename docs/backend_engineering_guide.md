@@ -156,6 +156,13 @@ LLM provider 的失败必须进入 run log。HTTP `429` 限流应被单独识别
 Agent Loop 按 `Retry-After` 或本地默认等待时间重试；重试耗尽后再降级到本地 heuristic
 或其他后备策略，而不是直接退出或让领域服务自行处理。认证失败、网络失败、超时、非
 429 HTTP 错误和 provider 响应解析失败也必须拆分记录，便于后续调试和策略调整。
+每次 LLM 调用还会生成结构化审计记录，当前落点是 `AgentTurnResult.llm_events`、
+Agent Run event payload 和 markdown run log。审计字段包括 `llm_call_id`、`run_id`、
+`trace_id`、`session_id`、stage、client、provider、model、response mode、状态、耗时、
+HTTP status、provider request id、`Retry-After`、OpenAI / OpenAI-compatible error body
+字段、canonical `error_category`、`is_retriable`、finish reason、token usage、
+content length、prompt summary 和隐私受控 metadata。完整 prompt / output 保留在本地
+run log 中，SQLite `llm_calls` 表留到第二版再落地。
 
 ---
 
