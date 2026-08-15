@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import asyncio
 import inspect
+import queue
+import threading
 import time
 from contextvars import ContextVar
 from email.utils import parsedate_to_datetime
@@ -17,6 +19,7 @@ from pydantic import BaseModel, Field
 
 from app.core.agent_runs import (
     AgentRunCancelled,
+    AgentRunRecord,
     InMemoryAgentRunManager,
 )
 from app.core.llm.audit import (
@@ -207,6 +210,7 @@ class AgentTurnLoop:
         llm_client_name: str | None = None,
         llm_model: str | None = None,
         llm_response_mode: LLMResponseMode = LLMResponseMode.TEXT,
+        existing_run_id: str | None = None,
     ) -> AgentTurnResult:
         client_token = _turn_llm_client_name.set(llm_client_name)
         model_token = _turn_llm_model.set(llm_model)
@@ -214,20 +218,21 @@ class AgentTurnLoop:
         run_manager_token = None
         run_id_token = None
         try:
-            session = self.session_service.ensure_session(
-                session_id=session_id,
-                title=user_input.strip()[:60] or "Agent Session",
-                metadata={"entrypoint": "agent.turn"},
-            )
-            trace_id = _stable_id("agent_turn", session.session_id, user_input, _now_iso())
-            run_id = trace_id
             if self.run_manager is not None:
-                run = self.run_manager.create_run(
-                    session_id=session.session_id,
-                    user_input=user_input,
-                    trace_id=trace_id,
+                run = (
+                    self._get_existing_run(existing_run_id)
+                    if existing_run_id
+                    else self.create_run_for_turn(
+                        session_id=session_id,
+                        user_input=user_input,
+                    )
+                )
+                session = self.session_service.ensure_session(
+                    session_id=run.session_id,
+                    title=user_input.strip()[:60] or "Agent Session",
                     metadata={"entrypoint": "agent.turn"},
                 )
+                trace_id = run.trace_id
                 run_id = run.run_id
                 run_manager_token = _turn_run_manager.set(self.run_manager)
                 run_id_token = _turn_run_id.set(run_id)
@@ -239,6 +244,14 @@ class AgentTurnLoop:
                     stage="run",
                     payload={"session_id": session.session_id, "trace_id": trace_id},
                 )
+            else:
+                session = self.session_service.ensure_session(
+                    session_id=session_id,
+                    title=user_input.strip()[:60] or "Agent Session",
+                    metadata={"entrypoint": "agent.turn"},
+                )
+                trace_id = _stable_id("agent_turn", session.session_id, user_input, _now_iso())
+                run_id = trace_id
             return self._run(
                 session=session,
                 trace_id=trace_id,
@@ -268,15 +281,72 @@ class AgentTurnLoop:
         llm_client_name: str | None = None,
         llm_model: str | None = None,
         llm_response_mode: LLMResponseMode = LLMResponseMode.TEXT,
+        existing_run_id: str | None = None,
     ) -> AgentTurnResult:
-        return await asyncio.to_thread(
-            self.run,
-            session_id=session_id,
-            user_input=user_input,
-            llm_client_name=llm_client_name,
-            llm_model=llm_model,
-            llm_response_mode=llm_response_mode,
+        result_queue: queue.Queue[tuple[bool, AgentTurnResult | BaseException]] = queue.Queue(
+            maxsize=1
         )
+
+        def target() -> None:
+            try:
+                result_queue.put(
+                    (
+                        True,
+                        self.run(
+                            session_id=session_id,
+                            user_input=user_input,
+                            llm_client_name=llm_client_name,
+                            llm_model=llm_model,
+                            llm_response_mode=llm_response_mode,
+                            existing_run_id=existing_run_id,
+                        ),
+                    )
+                )
+            except BaseException as exc:
+                result_queue.put((False, exc))
+
+        thread = threading.Thread(target=target, name="lka-agent-turn", daemon=True)
+        thread.start()
+        while True:
+            try:
+                ok, value = result_queue.get_nowait()
+            except queue.Empty:
+                await asyncio.sleep(0.01)
+                continue
+            if ok:
+                return value  # type: ignore[return-value]
+            raise value
+
+    def create_run_for_turn(
+        self,
+        *,
+        session_id: str | None,
+        user_input: str,
+        parent_run_id: str | None = None,
+    ) -> AgentRunRecord:
+        if self.run_manager is None:
+            raise RuntimeError("Agent run manager is not configured.")
+        session = self.session_service.ensure_session(
+            session_id=session_id,
+            title=user_input.strip()[:60] or "Agent Session",
+            metadata={"entrypoint": "agent.turn"},
+        )
+        trace_id = _stable_id("agent_turn", session.session_id, user_input, _now_iso())
+        return self.run_manager.create_run(
+            session_id=session.session_id,
+            user_input=user_input,
+            trace_id=trace_id,
+            parent_run_id=parent_run_id,
+            metadata={"entrypoint": "agent.turn"},
+        )
+
+    def _get_existing_run(self, run_id: str) -> AgentRunRecord:
+        if self.run_manager is None:
+            raise RuntimeError("Agent run manager is not configured.")
+        run = self.run_manager.get_run(run_id)
+        if run is None:
+            raise KeyError(f"Agent run not found: {run_id}")
+        return run
 
     def _run(
         self,

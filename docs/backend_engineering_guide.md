@@ -91,6 +91,9 @@ Agent Loop 还会由本地 harness 生成 `progress_events`，用于前端展示
 package 选择、LLM 的 `assistant_message`、package 展开、工具开始 / 完成、工具反馈、最终回答
 和校验 warning 都会进入该事件流。`progress_events` 不参与后续上下文窗口压缩，也不由 LLM
 生成，避免把运行流水混入对话记忆。
+HTTP stream endpoint 使用 SSE 输出统一的 Agent Run event，不维护另一套事件模型。第一版
+stream 是事件级流式输出，覆盖 run、package、tool、LLM audit、final answer 和 terminal
+事件；provider token delta 可在后续接入 `LLMService.stream()` 时补充。
 最终回答会经过一层本地轻量校验，结果写入 `verification_warnings`。当前校验只记录 warning，
 不自动改写答案；例如模型声称已经写入日历但本轮没有 calendar tool 完成时，会标记
 `unsupported_calendar_claim`，供前端和后续 verifier 使用。

@@ -301,9 +301,44 @@ response mode、耗时、usage、finish reason、provider request id、rate-limi
 
 ---
 
-## 6. Sessions
+## 6. Agent Turn Stream
 
-### 6.1 Create Session
+```http
+POST /agent/turn/stream
+Accept: text/event-stream
+```
+
+请求体与 `/agent/turn` 相同。第一版 stream endpoint 复用 Agent Run event，不单独发明事件模型。
+LLM client / model 解析仍使用当前规则：请求级 `llm` override 优先，否则使用配置默认值；
+暂不读取 session metadata 中的 LLM preference。
+
+响应：
+
+```text
+Content-Type: text/event-stream
+Cache-Control: no-cache
+Connection: keep-alive
+```
+
+每个 SSE frame：
+
+```text
+event: <event_type>
+id: <run_id>:<sequence>
+data: <AgentRunEvent JSON>
+
+```
+
+第一版会输出 run/progress/tool/LLM/final answer 事件，例如 `run_started`、
+`package_selected`、`tool_started`、`tool_completed`、`llm_started`、`llm_completed`、
+`llm_failed`、`final_answer`、`run_completed`、`run_failed`。当前 endpoint 先提供事件级
+stream；final answer 的 provider token delta 后续再接入。
+
+---
+
+## 7. Sessions
+
+### 7.1 Create Session
 
 ```http
 POST /sessions
@@ -350,7 +385,7 @@ POST /sessions
 }
 ```
 
-### 6.2 List Sessions
+### 7.2 List Sessions
 
 ```http
 GET /sessions?limit=50
@@ -373,7 +408,7 @@ GET /sessions?limit=50
 }
 ```
 
-### 6.3 Get Session
+### 7.3 Get Session
 
 ```http
 GET /sessions/session_xxx
@@ -388,7 +423,7 @@ GET /sessions/session_xxx
 }
 ```
 
-### 6.4 Append Session Message
+### 7.4 Append Session Message
 
 ```http
 POST /sessions/session_xxx/messages
@@ -416,7 +451,7 @@ POST /sessions/session_xxx/messages
 
 ---
 
-## 7. Mail Import
+## 8. Mail Import
 
 ```http
 POST /mail/import
@@ -466,7 +501,7 @@ POST /mail/import
 
 ---
 
-## 8. Mail Search
+## 9. Mail Search
 
 ```http
 GET /mail/search?q=document&limit=10
@@ -502,7 +537,7 @@ GET /mail/search?q=document&limit=10
 
 ---
 
-## 9. List Mail Matters
+## 10. List Mail Matters
 
 ```http
 GET /mail/matters
@@ -526,12 +561,12 @@ GET /mail/matters
 
 ---
 
-## 10. Matters
+## 11. Matters
 
 独立事务系统用于保存任务、事件、待办和提醒候选项，不从属于邮件。邮件、Agent trace、
 本地文件或后续日历对象都可以作为 `source_links` 关联到同一个 matter。
 
-### 10.1 Create Matter
+### 11.1 Create Matter
 
 ```http
 POST /matters
@@ -560,7 +595,7 @@ POST /matters
 
 响应：返回完整 `matter` 记录。
 
-### 10.2 List / Search / Update
+### 11.2 List / Search / Update
 
 ```http
 GET /matters?limit=50&status=open
@@ -578,7 +613,7 @@ POST /matters/{matter_id}/source-links
 
 ---
 
-## 11. Outlook Auth Start
+## 12. Outlook Auth Start
 
 ```http
 POST /mail/outlook/auth/start
@@ -606,7 +641,7 @@ POST /mail/outlook/auth/start
 
 ---
 
-## 12. Outlook Auth Complete
+## 13. Outlook Auth Complete
 
 ```http
 POST /mail/outlook/auth/complete
@@ -635,7 +670,7 @@ POST /mail/outlook/auth/complete
 
 ---
 
-## 13. Outlook Sync
+## 14. Outlook Sync
 
 ```http
 POST /mail/outlook/sync
@@ -678,7 +713,7 @@ POST /mail/outlook/sync
 
 ---
 
-## 14. Compatibility Notes
+## 15. Compatibility Notes
 
 - 当前后端实现是轻量骨架，因此部分返回值是规则化输出而非真实 agent 结果。
 - 这份契约保留了未来完整系统需要的字段，便于逐步替换实现。

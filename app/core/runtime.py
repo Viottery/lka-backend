@@ -11,7 +11,7 @@ from app.api.schemas import (
     CapabilityItem,
     WorkspaceIndexResponse,
 )
-from app.core.agent_runs import InMemoryAgentRunManager
+from app.core.agent_runs import AgentRunRecord, InMemoryAgentRunManager
 from app.core.agent_turn import AgentTurnLoop, AgentTurnResult
 from app.core.config import Settings
 from app.core.context import ContextAssembler
@@ -341,6 +341,7 @@ class LocalKnowledgeAgentRuntime:
         llm_client_name: str | None = None,
         llm_model: str | None = None,
         llm_response_mode: LLMResponseMode = LLMResponseMode.TEXT,
+        existing_run_id: str | None = None,
     ) -> AgentTurnResult:
         """Run the minimal general agent turn loop."""
 
@@ -350,6 +351,7 @@ class LocalKnowledgeAgentRuntime:
             llm_client_name=llm_client_name,
             llm_model=llm_model,
             llm_response_mode=llm_response_mode,
+            existing_run_id=existing_run_id,
         )
 
     async def run_agent_turn_async(
@@ -360,6 +362,7 @@ class LocalKnowledgeAgentRuntime:
         llm_client_name: str | None = None,
         llm_model: str | None = None,
         llm_response_mode: LLMResponseMode = LLMResponseMode.TEXT,
+        existing_run_id: str | None = None,
     ) -> AgentTurnResult:
         """Run one agent turn without blocking the event loop."""
 
@@ -369,6 +372,22 @@ class LocalKnowledgeAgentRuntime:
             llm_client_name=llm_client_name,
             llm_model=llm_model,
             llm_response_mode=llm_response_mode,
+            existing_run_id=existing_run_id,
+        )
+
+    def create_agent_run(
+        self,
+        *,
+        session_id: str | None,
+        user_input: str,
+        parent_run_id: str | None = None,
+    ) -> AgentRunRecord:
+        """Create a queued run before an HTTP stream starts consuming events."""
+
+        return self.agent_turn_loop.create_run_for_turn(
+            session_id=session_id,
+            user_input=user_input,
+            parent_run_id=parent_run_id,
         )
 
     def import_mail(
