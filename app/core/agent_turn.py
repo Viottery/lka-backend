@@ -34,8 +34,10 @@ from app.core.llm.audit import (
 from app.core.llm import (
     LLMAuthenticationError,
     LLMClientError,
+    LLMMessage,
     LLMNetworkError,
     LLMProviderHTTPError,
+    LLMRequest,
     LLMRateLimitError,
     LLMResponse,
     LLMResponseParseError,
@@ -1918,6 +1920,18 @@ class AgentTurnLoop:
             ensure_ascii=False,
             indent=2,
         )
+        if self._should_stream_answer():
+            streamed_answer = self._stream_text_with_retry(
+                stage="answer",
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                prompt_summary=f"agent_turn_answer messages={len(loaded_messages)}",
+                max_output_tokens=None,
+                llm_events=llm_events,
+                content_role="final_answer",
+            )
+            if streamed_answer is not None:
+                return streamed_answer
         response = self._complete_text_with_retry(
             stage="answer",
             system_prompt=system_prompt,
@@ -1940,6 +1954,34 @@ class AgentTurnLoop:
     ) -> str | None:
         if self.llm_client is None:
             return None
+        if self._should_stream_answer():
+            system_prompt = (
+                "You are the Main Agent Brain for Local Knowledge Agent OS. Answer the "
+                "current user turn directly in Chinese using only the provided session "
+                "context window when it is sufficient. Do not invent unavailable local "
+                "facts. If the context is insufficient and no tool package was selected, "
+                "explain what information is missing. Do not wrap the answer in JSON."
+            )
+            user_prompt = json.dumps(
+                {
+                    "user_input": user_input,
+                    "route": route,
+                    "session_context_window": context_window,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            streamed_answer = self._stream_text_with_retry(
+                stage="context_answer",
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                prompt_summary=f"agent_turn_context_answer user_input={user_input[:80]}",
+                max_output_tokens=self.llm_generation_token_budget,
+                llm_events=llm_events,
+                content_role="context_answer",
+            )
+            if streamed_answer is not None:
+                return streamed_answer
         system_prompt = (
             "You are the Main Agent Brain for Local Knowledge Agent OS. Answer the "
             "current user turn using only the provided session context window when it "
@@ -1970,6 +2012,215 @@ class AgentTurnLoop:
         if isinstance(parsed, dict) and isinstance(parsed.get("answer"), str):
             return parsed["answer"].strip() or None
         return response.content.strip() or None
+
+    def _should_stream_answer(self) -> bool:
+        return (
+            _turn_llm_response_mode.get() == LLMResponseMode.STREAM
+            and self.llm_client is not None
+            and hasattr(self.llm_client, "stream")
+        )
+
+    def _stream_text_with_retry(
+        self,
+        *,
+        stage: str,
+        system_prompt: str,
+        user_prompt: str,
+        prompt_summary: str,
+        max_output_tokens: int | None,
+        llm_events: list[AgentTurnLLMEvent],
+        content_role: str,
+    ) -> str | None:
+        if self.llm_client is None or not hasattr(self.llm_client, "stream"):
+            return None
+
+        provider = type(self.llm_client).__name__
+        for attempt in range(1, self.llm_max_attempts + 1):
+            started_at = llm_audit_now_iso()
+            perf_start = time.perf_counter()
+            llm_call_id = stable_llm_call_id(
+                _turn_run_id.get(),
+                stage,
+                "stream",
+                str(attempt),
+                started_at,
+            )
+            self._append_run_event(
+                type="llm_started",
+                message=f"LLM stream started for `{stage}`.",
+                stage=stage,
+                payload={
+                    "stream_part": "llm_audit",
+                    "content_role": content_role,
+                    "llm_call_id": llm_call_id,
+                    "provider": provider,
+                    "attempt": attempt,
+                    "response_mode": LLMResponseMode.STREAM.value,
+                },
+            )
+            try:
+                content = self._stream_text_once(
+                    stage=stage,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    prompt_summary=prompt_summary,
+                    max_output_tokens=max_output_tokens,
+                    llm_call_id=llm_call_id,
+                    content_role=content_role,
+                )
+            except LLMRateLimitError as exc:
+                duration_ms = self._duration_ms(perf_start)
+                llm_event = self._llm_error_event(
+                    stage=stage,
+                    provider=provider,
+                    attempt=attempt,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    prompt_summary=prompt_summary,
+                    started_at=started_at,
+                    duration_ms=duration_ms,
+                    llm_call_id=llm_call_id,
+                    exc=exc,
+                )
+                self._append_run_event(
+                    type="llm_failed",
+                    message=f"LLM stream rate limited for `{stage}`.",
+                    stage=stage,
+                    payload={
+                        "stream_part": "llm_audit",
+                        "content_role": content_role,
+                        "llm_call_id": llm_call_id,
+                        "status": "rate_limited",
+                        "status_code": exc.status_code,
+                        "retry_after": exc.retry_after,
+                        "audit_record": llm_event.audit_record,
+                    },
+                )
+                llm_events.append(llm_event)
+                if attempt >= self.llm_max_attempts:
+                    return None
+                time.sleep(self._retry_after_seconds(exc.retry_after))
+                continue
+            except LLMClientError as exc:
+                duration_ms = self._duration_ms(perf_start)
+                llm_event = self._llm_error_event(
+                    stage=stage,
+                    provider=provider,
+                    attempt=attempt,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    prompt_summary=prompt_summary,
+                    started_at=started_at,
+                    duration_ms=duration_ms,
+                    llm_call_id=llm_call_id,
+                    exc=exc,
+                )
+                self._append_run_event(
+                    type="llm_failed",
+                    message=f"LLM stream failed for `{stage}`.",
+                    stage=stage,
+                    payload={
+                        "stream_part": "llm_audit",
+                        "content_role": content_role,
+                        "llm_call_id": llm_call_id,
+                        "status": self._llm_error_status(exc),
+                        "error_type": type(exc).__name__,
+                        "audit_record": llm_event.audit_record,
+                    },
+                )
+                llm_events.append(llm_event)
+                return None
+
+            duration_ms = self._duration_ms(perf_start)
+            response = LLMResponse(
+                provider=provider,
+                client_name=_turn_llm_client_name.get() or "default",
+                model=_turn_llm_model.get() or "default",
+                status="completed",
+                content=content,
+                prompt_summary=prompt_summary,
+                response_mode=LLMResponseMode.STREAM,
+                finish_reason="stream_completed",
+            )
+            llm_event = self._llm_completed_event(
+                stage=stage,
+                attempt=attempt,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                prompt_summary=prompt_summary,
+                started_at=started_at,
+                duration_ms=duration_ms,
+                llm_call_id=llm_call_id,
+                response=response,
+            )
+            llm_events.append(llm_event)
+            self._append_run_event(
+                type="llm_completed",
+                message=f"LLM stream completed for `{stage}`.",
+                stage=stage,
+                payload={
+                    "stream_part": "llm_audit",
+                    "content_role": content_role,
+                    "llm_call_id": llm_call_id,
+                    "status": "completed",
+                    "content_length": len(content),
+                    "finish_reason": "stream_completed",
+                    "audit_record": llm_event.audit_record,
+                },
+            )
+            return content
+        return None
+
+    def _stream_text_once(
+        self,
+        *,
+        stage: str,
+        system_prompt: str,
+        user_prompt: str,
+        prompt_summary: str,
+        max_output_tokens: int | None,
+        llm_call_id: str,
+        content_role: str,
+    ) -> str:
+        async def collect() -> str:
+            request = LLMRequest(
+                client_name=_turn_llm_client_name.get(),
+                model=_turn_llm_model.get(),
+                response_mode=LLMResponseMode.STREAM,
+                messages=[
+                    LLMMessage(role="system", content=system_prompt),
+                    LLMMessage(role="user", content=user_prompt),
+                ],
+                prompt_summary=prompt_summary,
+                temperature=0.0,
+                max_output_tokens=max_output_tokens,
+                require_json=False,
+                metadata={"stage": stage},
+            )
+            snapshot = ""
+            async for event in self.llm_client.stream(request):  # type: ignore[union-attr]
+                if event.event_type != "llm_delta" or not event.delta:
+                    continue
+                snapshot = event.content_snapshot or snapshot + event.delta
+                self._append_run_event(
+                    type="llm_delta",
+                    message=event.delta,
+                    stage=stage,
+                    payload={
+                        "stream_part": "llm_delta",
+                        "content_role": content_role,
+                        "display_target": "assistant_answer",
+                        "llm_call_id": llm_call_id,
+                        "client_name": event.client_name,
+                        "provider": event.provider,
+                        "model": event.model,
+                        "delta": event.delta,
+                        "content_snapshot": snapshot,
+                    },
+                )
+            return snapshot
+
+        return asyncio.run(collect())
 
     def _summarize_context_window(
         self,

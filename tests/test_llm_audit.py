@@ -4,6 +4,7 @@ from email.message import Message
 from io import BytesIO
 from urllib.error import HTTPError
 
+import asyncio
 import json
 
 import pytest
@@ -270,6 +271,53 @@ def test_openai_compatible_generic_http_error_maps_unprocessable_entity():
     assert raised.value.headers["x-request-id"] == "req_422"
 
 
+def test_openai_compatible_stream_parses_chat_completion_delta_chunks(monkeypatch):
+    def fake_urlopen(request, timeout):
+        assert json.loads(request.data.decode("utf-8"))["stream"] is True
+        return _fake_stream_response(
+            [
+                'data: {"choices":[{"delta":{"content":"Hello "}}]}\n\n',
+                'data: {"choices":[{"delta":{"content":"world"}}]}\n\n',
+                "data: [DONE]\n\n",
+            ]
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    client = OpenAICompatibleLLMClient(
+        name="test-client",
+        provider_name="openai-compatible",
+        base_url="https://example.invalid/v1",
+        api_key="test-key",
+        default_model="test-model",
+    )
+
+    async def collect():
+        events = []
+        async for event in client.stream(
+            LLMRequest(
+                messages=[LLMMessage(role="user", content="hello")],
+                prompt_summary="stream-test",
+                metadata={"stage": "answer"},
+            )
+        ):
+            events.append(event)
+        return events
+
+    events = asyncio.run(collect())
+
+    assert [event.event_type for event in events] == [
+        "llm_started",
+        "llm_delta",
+        "llm_delta",
+        "llm_completed",
+    ]
+    assert [event.delta for event in events if event.event_type == "llm_delta"] == [
+        "Hello ",
+        "world",
+    ]
+    assert events[-1].content_snapshot == "Hello world"
+
+
 def test_stream_error_call_record_preserves_partial_content_and_event_fields():
     record = build_stream_error_call_record(
         llm_call_id="llm_call_stream",
@@ -338,3 +386,23 @@ def _fake_http_response(payload: dict, *, headers: dict[str, str]):
             return json.dumps(payload).encode("utf-8")
 
     return FakeHTTPResponse()
+
+
+def _fake_stream_response(lines: list[str]):
+    class FakeStreamResponse:
+        def __init__(self):
+            self.lines = [line.encode("utf-8") for line in lines]
+            self.index = 0
+            self.closed = False
+
+        def readline(self):
+            if self.index >= len(self.lines):
+                return b""
+            line = self.lines[self.index]
+            self.index += 1
+            return line
+
+        def close(self):
+            self.closed = True
+
+    return FakeStreamResponse()

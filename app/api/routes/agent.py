@@ -122,8 +122,24 @@ async def _agent_turn_event_stream(
 
 
 def _sse_event_frame(event: AgentRunEvent) -> str:
-    data = json.dumps(event.model_dump(mode="json"), ensure_ascii=False)
+    payload = event.model_dump(mode="json")
+    payload["stream_part"] = _stream_part_for_event(event)
+    data = json.dumps(payload, ensure_ascii=False)
     return f"id: {event.run_id}:{event.sequence}\nevent: {event.type}\ndata: {data}\n\n"
+
+
+def _stream_part_for_event(event: AgentRunEvent) -> str:
+    if event.type in {"run_started", "run_completed", "run_failed", "run_cancelled"}:
+        return "lifecycle"
+    if event.type in {"tool_started", "tool_completed", "tool_failed"}:
+        return "tool_result"
+    if event.type == "llm_delta":
+        return "llm_delta"
+    if event.type in {"llm_started", "llm_completed", "llm_failed"}:
+        return "llm_audit"
+    if event.type == "final_answer":
+        return "final_answer"
+    return "progress"
 
 
 def _heartbeat_frame(*, run_id: str, sequence: int) -> str:

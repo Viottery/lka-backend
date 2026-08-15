@@ -325,14 +325,37 @@ Connection: keep-alive
 ```text
 event: <event_type>
 id: <run_id>:<sequence>
-data: <AgentRunEvent JSON>
+data: <AgentRunEvent JSON plus stream_part>
 
 ```
 
 第一版会输出 run/progress/tool/LLM/final answer 事件，例如 `run_started`、
 `package_selected`、`tool_started`、`tool_completed`、`llm_started`、`llm_completed`、
-`llm_failed`、`final_answer`、`run_completed`、`run_failed`。当前 endpoint 先提供事件级
-stream；final answer 的 provider token delta 后续再接入。
+`llm_failed`、`llm_delta`、`final_answer`、`run_completed`、`run_failed`。
+每个 SSE `data` 都会带 `stream_part`，用于前端区分结构：
+
+```text
+lifecycle
+progress
+tool_result
+llm_audit
+llm_delta
+final_answer
+```
+
+`llm_delta` 只在自然语言输出阶段发送，目前包括 `answer` 和 `context_answer`。route、
+decision、decision_repair 和 tool_result_check 仍使用完整 non-stream JSON，避免 JSON
+未完整时提前执行工具。`llm_delta.payload` 至少包含：
+
+```json
+{
+  "stream_part": "llm_delta",
+  "content_role": "final_answer",
+  "display_target": "assistant_answer",
+  "delta": "增量文本",
+  "content_snapshot": "截至当前的完整文本"
+}
+```
 
 ---
 

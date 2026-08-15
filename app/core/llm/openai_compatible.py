@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import queue
 import socket
+import threading
 import urllib.error
 import urllib.request
 from collections.abc import AsyncIterator
@@ -58,7 +60,7 @@ class OpenAICompatibleLLMClient:
         self.supports_json_mode = supports_json_mode
 
     async def complete(self, request: LLMRequest) -> LLMResponse:
-        response_payload, response_headers = await asyncio.to_thread(
+        response_payload, response_headers = await _run_blocking(
             self._post_chat_completion,
             request,
             False,
@@ -87,12 +89,12 @@ class OpenAICompatibleLLMClient:
             yield self._stream_event("llm_completed", request, response.content)
             return
 
-        response = await asyncio.to_thread(self._open_stream, request)
+        response = await _run_blocking(self._open_stream, request)
         snapshot = ""
         yield self._stream_event("llm_started", request, snapshot)
         try:
             while True:
-                line = await asyncio.to_thread(response.readline)
+                line = await _run_blocking(response.readline)
                 if not line:
                     break
                 text = line.decode("utf-8", errors="replace").strip()
@@ -259,3 +261,24 @@ class OpenAICompatibleLLMClient:
                 **common_kwargs,
             ) from exc
         raise LLMProviderHTTPError(**common_kwargs) from exc
+
+
+async def _run_blocking(func, *args):
+    result_queue: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+
+    def target() -> None:
+        try:
+            result_queue.put((True, func(*args)))
+        except BaseException as exc:
+            result_queue.put((False, exc))
+
+    threading.Thread(target=target, name="lka-llm-http", daemon=True).start()
+    while True:
+        try:
+            ok, value = result_queue.get_nowait()
+        except queue.Empty:
+            await asyncio.sleep(0.01)
+            continue
+        if ok:
+            return value
+        raise value
