@@ -58,6 +58,7 @@ def test_agent_turn_expands_mail_package_and_records_log(tmp_path, monkeypatch):
     )
 
     assert response.session_id == "session_agent_turn_ntuso"
+    assert response.run_id.startswith("agent_run_")
     assert response.selected_package == "mail"
     assert [event.tool_name for event in response.tool_events] == [
         "mail.search",
@@ -86,6 +87,20 @@ def test_agent_turn_expands_mail_package_and_records_log(tmp_path, monkeypatch):
     assert response.verification_warnings == []
     assert full_body_sentinel in response.answer
     assert response.log_path is not None
+    run = app.state.runtime.agent_run_manager.get_run(response.run_id)
+    assert run is not None
+    assert run.status == "completed"
+    assert run.session_id == response.session_id
+    assert run.trace_id == response.trace_id
+    assert run.log_path == response.log_path
+    assert run.result_snapshot["selected_package"] == "mail"
+    run_events = app.state.runtime.agent_run_manager.list_events(response.run_id)
+    assert [event.sequence for event in run_events] == list(range(1, len(run_events) + 1))
+    assert run_events[0].type == "run_started"
+    assert "package_selected" in [event.type for event in run_events]
+    assert "tool_started" in [event.type for event in run_events]
+    assert "tool_completed" in [event.type for event in run_events]
+    assert run_events[-1].type == "run_completed"
 
     log_text = Path(response.log_path).read_text(encoding="utf-8")
     assert "## Package Catalog" in log_text

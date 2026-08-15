@@ -11,6 +11,7 @@ from app.api.schemas import (
     CapabilityItem,
     WorkspaceIndexResponse,
 )
+from app.core.agent_runs import InMemoryAgentRunManager
 from app.core.agent_turn import AgentTurnLoop, AgentTurnResult
 from app.core.config import Settings
 from app.core.context import ContextAssembler
@@ -116,12 +117,14 @@ class LocalKnowledgeAgentRuntime:
         self.tool_registry.register_tool(LinkMatterSourceTool(self.matter_service))
         self.tool_registry.register_tool(RuntimeNowTool())
         self.tool_executor = ToolExecutor(self.tool_registry)
+        self.agent_run_manager = InMemoryAgentRunManager()
         self.agent_llm_client = build_text_llm_client(self.local_app_config.llm)
         self.agent_turn_loop = AgentTurnLoop(
             session_service=self.session_service,
             tool_executor=self.tool_executor,
             llm_client=self.agent_llm_client,
             log_dir=self.settings.data_dir / "agent_logs",
+            run_manager=self.agent_run_manager,
         )
         self.debug_loop = RuntimeLoop(
             context_assembler=ContextAssembler(),

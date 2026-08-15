@@ -15,6 +15,10 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from app.core.agent_runs import (
+    AgentRunCancelled,
+    InMemoryAgentRunManager,
+)
 from app.core.llm import (
     LLMAuthenticationError,
     LLMClientError,
@@ -30,6 +34,7 @@ from app.core.llm import (
 )
 from app.core.runtime_context import current_time_payload
 from app.core.sessions import SessionService
+from app.core.sessions import AgentSession
 from app.core.sessions import SessionRecentMessage
 from app.core.tools import ToolContext, ToolExecutor, ToolResult
 
@@ -53,6 +58,11 @@ _turn_llm_response_mode: ContextVar[LLMResponseMode] = ContextVar(
     "turn_llm_response_mode",
     default=LLMResponseMode.TEXT,
 )
+_turn_run_manager: ContextVar[InMemoryAgentRunManager | None] = ContextVar(
+    "turn_run_manager",
+    default=None,
+)
+_turn_run_id: ContextVar[str | None] = ContextVar("turn_run_id", default=None)
 
 
 class AgentTurnToolEvent(BaseModel):
@@ -113,6 +123,7 @@ class AgentTurnVerificationWarning(BaseModel):
 
 
 class AgentTurnResult(BaseModel):
+    run_id: str
     session_id: str
     trace_id: str
     answer: str
@@ -138,11 +149,13 @@ class AgentTurnLoop:
         tool_executor: ToolExecutor,
         llm_client: TextLLMClient | LLMService | None,
         log_dir: Path,
+        run_manager: InMemoryAgentRunManager | None = None,
     ) -> None:
         self.session_service = session_service
         self.tool_executor = tool_executor
         self.llm_client = llm_client
         self.log_dir = log_dir
+        self.run_manager = run_manager
         self.llm_max_attempts = 2
         self.default_rate_limit_wait_seconds = 1.0
         self.max_decision_steps = 6
@@ -161,12 +174,51 @@ class AgentTurnLoop:
         client_token = _turn_llm_client_name.set(llm_client_name)
         model_token = _turn_llm_model.set(llm_model)
         mode_token = _turn_llm_response_mode.set(llm_response_mode)
+        run_manager_token = None
+        run_id_token = None
         try:
-            return self._run(
+            session = self.session_service.ensure_session(
                 session_id=session_id,
+                title=user_input.strip()[:60] or "Agent Session",
+                metadata={"entrypoint": "agent.turn"},
+            )
+            trace_id = _stable_id("agent_turn", session.session_id, user_input, _now_iso())
+            run_id = trace_id
+            if self.run_manager is not None:
+                run = self.run_manager.create_run(
+                    session_id=session.session_id,
+                    user_input=user_input,
+                    trace_id=trace_id,
+                    metadata={"entrypoint": "agent.turn"},
+                )
+                run_id = run.run_id
+                run_manager_token = _turn_run_manager.set(self.run_manager)
+                run_id_token = _turn_run_id.set(run_id)
+                self.run_manager.mark_running(run_id)
+                self.run_manager.append_event(
+                    run_id,
+                    "run_started",
+                    "Agent run started.",
+                    stage="run",
+                    payload={"session_id": session.session_id, "trace_id": trace_id},
+                )
+            return self._run(
+                session=session,
+                trace_id=trace_id,
+                run_id=run_id,
                 user_input=user_input,
             )
+        except AgentRunCancelled as exc:
+            self._mark_current_run_cancelled(str(exc) or "Run cancelled.")
+            raise
+        except Exception as exc:
+            self._mark_current_run_failed(type(exc).__name__, str(exc))
+            raise
         finally:
+            if run_id_token is not None:
+                _turn_run_id.reset(run_id_token)
+            if run_manager_token is not None:
+                _turn_run_manager.reset(run_manager_token)
             _turn_llm_client_name.reset(client_token)
             _turn_llm_model.reset(model_token)
             _turn_llm_response_mode.reset(mode_token)
@@ -192,15 +244,11 @@ class AgentTurnLoop:
     def _run(
         self,
         *,
-        session_id: str | None,
+        session: AgentSession,
+        trace_id: str,
+        run_id: str,
         user_input: str,
     ) -> AgentTurnResult:
-        session = self.session_service.ensure_session(
-            session_id=session_id,
-            title=user_input.strip()[:60] or "Agent Session",
-            metadata={"entrypoint": "agent.turn"},
-        )
-        trace_id = _stable_id("agent_turn", session.session_id, user_input, _now_iso())
         context = ToolContext(
             session_id=session.session_id,
             trace_id=trace_id,
@@ -339,6 +387,7 @@ class AgentTurnLoop:
             ),
         )
         result = AgentTurnResult(
+            run_id=run_id,
             session_id=session.session_id,
             trace_id=trace_id,
             answer=answer,
@@ -359,6 +408,7 @@ class AgentTurnLoop:
             role="agent",
             content=answer,
             payload={
+                "run_id": result.run_id,
                 "trace_id": trace_id,
                 "selected_package": result.selected_package,
                 "log_path": result.log_path,
@@ -380,6 +430,7 @@ class AgentTurnLoop:
                 ],
             },
         )
+        self._complete_current_run(result)
         return result
 
     def _route(
@@ -1434,6 +1485,7 @@ class AgentTurnLoop:
                 message=f"Calling `{tool_name}`.",
                 metadata={"input": tool_input},
             )
+        self._raise_if_cancel_requested()
         result = self.tool_executor.execute(
             invocation_id=_stable_id("tool_invocation", context.trace_id, tool_name, selected_at),
             tool_name=tool_name,
@@ -1486,6 +1538,17 @@ class AgentTurnLoop:
                 status=status,
                 metadata=metadata or {},
             )
+        )
+        self._append_run_event(
+            type=type,
+            message=message,
+            stage=stage,
+            payload={
+                "tool_name": tool_name,
+                "package_name": package_name,
+                "status": status,
+                "metadata": metadata or {},
+            },
         )
 
     def _tool_progress_message(self, *, tool_name: str, result: ToolResult) -> str:
@@ -1863,6 +1926,12 @@ class AgentTurnLoop:
 
         provider = type(self.llm_client).__name__
         for attempt in range(1, self.llm_max_attempts + 1):
+            self._append_run_event(
+                type="llm_started",
+                message=f"LLM call started for `{stage}`.",
+                stage=stage,
+                payload={"provider": provider, "attempt": attempt},
+            )
             try:
                 response = self._complete_text_once(
                     system_prompt=system_prompt,
@@ -1872,6 +1941,18 @@ class AgentTurnLoop:
                     stage=stage,
                 )
             except LLMRateLimitError as exc:
+                self._append_run_event(
+                    type="llm_failed",
+                    message=f"LLM call rate limited for `{stage}`.",
+                    stage=stage,
+                    payload={
+                        "provider": provider,
+                        "attempt": attempt,
+                        "status": "rate_limited",
+                        "status_code": exc.status_code,
+                        "retry_after": exc.retry_after,
+                    },
+                )
                 llm_events.append(
                     self._llm_error_event(
                         stage=stage,
@@ -1887,6 +1968,17 @@ class AgentTurnLoop:
                 time.sleep(self._retry_after_seconds(exc.retry_after))
                 continue
             except LLMClientError as exc:
+                self._append_run_event(
+                    type="llm_failed",
+                    message=f"LLM call failed for `{stage}`.",
+                    stage=stage,
+                    payload={
+                        "provider": provider,
+                        "attempt": attempt,
+                        "status": self._llm_error_status(exc),
+                        "error_type": type(exc).__name__,
+                    },
+                )
                 llm_events.append(
                     self._llm_error_event(
                         stage=stage,
@@ -1909,6 +2001,17 @@ class AgentTurnLoop:
                     output=response.content,
                     attempt=attempt,
                 )
+            )
+            self._append_run_event(
+                type="llm_completed",
+                message=f"LLM call completed for `{stage}`.",
+                stage=stage,
+                payload={
+                    "provider": response.provider,
+                    "attempt": attempt,
+                    "status": response.status,
+                    "content_length": len(response.content),
+                },
             )
             return response
         return None
@@ -2006,6 +2109,92 @@ class AgentTurnLoop:
         except (TypeError, ValueError):
             return self.default_rate_limit_wait_seconds
 
+    def _append_run_event(
+        self,
+        *,
+        type: str,
+        message: str,
+        stage: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        run_manager = _turn_run_manager.get()
+        run_id = _turn_run_id.get()
+        if run_manager is None or run_id is None:
+            return
+        run_manager.append_event(
+            run_id,
+            type,
+            message,
+            stage=stage,
+            payload=payload or {},
+        )
+
+    def _complete_current_run(self, result: AgentTurnResult) -> None:
+        run_manager = _turn_run_manager.get()
+        run_id = _turn_run_id.get()
+        if run_manager is None or run_id is None:
+            return
+        run_manager.append_event(
+            run_id,
+            "run_completed",
+            "Agent run completed.",
+            stage="run",
+            payload={
+                "answer_length": len(result.answer),
+                "selected_package": result.selected_package,
+                "tool_event_count": len(result.tool_events),
+                "llm_event_count": len(result.llm_events),
+                "log_path": result.log_path,
+            },
+        )
+        run_manager.complete_run(
+            run_id,
+            result_snapshot={
+                "session_id": result.session_id,
+                "trace_id": result.trace_id,
+                "answer": result.answer,
+                "selected_package": result.selected_package,
+            },
+            log_path=result.log_path,
+        )
+
+    def _mark_current_run_failed(self, error_type: str, error: str) -> None:
+        run_manager = _turn_run_manager.get()
+        run_id = _turn_run_id.get()
+        if run_manager is None or run_id is None:
+            return
+        run_manager.append_event(
+            run_id,
+            "run_failed",
+            error or "Agent run failed.",
+            stage="run",
+            payload={"error_type": error_type},
+        )
+        run_manager.fail_run(run_id, error_type=error_type, error=error)
+
+    def _mark_current_run_cancelled(self, reason: str) -> None:
+        run_manager = _turn_run_manager.get()
+        run_id = _turn_run_id.get()
+        if run_manager is None or run_id is None:
+            return
+        run_manager.append_event(
+            run_id,
+            "run_cancelled",
+            reason or "Agent run cancelled.",
+            stage="run",
+            payload={"reason": reason},
+        )
+        run_manager.mark_cancelled(run_id, reason=reason)
+
+    def _raise_if_cancel_requested(self) -> None:
+        run_manager = _turn_run_manager.get()
+        run_id = _turn_run_id.get()
+        if run_manager is None or run_id is None:
+            return
+        if run_manager.is_cancel_requested(run_id):
+            reason = run_manager.cancel_reason(run_id) or "Run cancelled."
+            raise AgentRunCancelled(reason)
+
     def _answer_locally(self, *, user_input: str, loaded_messages: list[dict[str, Any]]) -> str:
         lines = [
             "我已调用本地 mail tools 检索并加载相关邮件。当前未配置可用 LLM，下面是本地摘要：",
@@ -2033,6 +2222,7 @@ class AgentTurnLoop:
             "",
             f"- generated_at: `{_now_iso()}`",
             f"- session_id: `{result.session_id}`",
+            f"- run_id: `{result.run_id}`",
             f"- trace_id: `{result.trace_id}`",
             f"- selected_package: `{result.selected_package}`",
             "",

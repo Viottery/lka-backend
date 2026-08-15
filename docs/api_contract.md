@@ -219,6 +219,7 @@ LLM service 层能力预留，用户可见 stream endpoint 后续单独提供。
 ```json
 {
   "session_id": "session_001",
+  "run_id": "agent_run_xxx",
   "trace_id": "agent_turn_xxx",
   "answer": "我已调用本地 mail tools...",
   "selected_package": "mail",
@@ -236,6 +237,7 @@ LLM service 层能力预留，用户可见 stream endpoint 后续单独提供。
 ### 设计说明
 
 - 这是第一版通用 Agent turn 入口，不是邮件专属 agent endpoint。
+- 每次调用都会创建独立 Agent Run；`run_id` 用于后续 stream、取消、确认、重试和事件查询。
 - Agent 第一层只读取 Tool Package catalog；当前已实现的可展开 package 包括 `mail`、
   `matter` 和 `runtime`。
 - 当 turn 判断用户目标需要本地邮件上下文时，才展开 `mail.search`、
