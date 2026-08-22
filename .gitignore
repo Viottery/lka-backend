@@ -17,3 +17,4 @@ config/local.toml
 config/secrets*.toml
 config/tokens*.json
 config/cache/
+scratch/
