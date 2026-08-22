@@ -1,0 +1,149 @@
+{
+  "suite_id": "hard_mail_tasks",
+  "description": "Difficult but feasible mail and cross-package cases: dense distractors, conflicting updates, multi-evidence aggregation, and source-linked matter creation.",
+  "cases": [
+    {
+      "case_id": "multi_deadline_digest_with_distractors",
+      "name": "Aggregate several real deadlines while ignoring unrelated urgent/scam/travel noise.",
+      "workflow": "mail_qa",
+      "setup": {"mail_fixtures": ["core_mailbox", "expanded_mailbox", "hard_mailbox"]},
+      "request": {"user_input": "把接下来需要处理的学生事务 deadline 汇总一下，排除广告、诈骗和旅行信息。"},
+      "search_query": "deadline overdue formalities registration scholarship library",
+      "scripted_answer": "需要处理的 deadline：ICA Student Pass formalities 在 2026-08-20；Course registration 在 2026-08-18 17:00；Scholarship application 在 2026-08-25 23:59 SGT；Library overdue book 需要 2026-08-19 前归还。",
+      "expect": {
+        "selected_package": "mail",
+        "tool_sequence": ["mail.search", "mail.load_messages"],
+        "answer_contains_all": ["2026-08-20", "2026-08-18", "2026-08-25", "2026-08-19", "Library overdue"],
+        "answer_excludes_all": ["phishing", "refundable deposit", "flight departs"],
+        "evidence_external_ids": [
+          "eval_ica_student_pass_checklist",
+          "eval_course_deadline_reminder",
+          "eval_scholarship_deadline",
+          "eval_library_overdue_warning"
+        ],
+        "forbidden_evidence_external_ids": [
+          "eval_phishing_urgent_bank",
+          "eval_travel_itinerary_noise",
+          "eval_noise_newsletter_weekly"
+        ],
+        "max_llm_calls": 8,
+        "max_wall_time_ms": 7000
+      }
+    },
+    {
+      "case_id": "conflicting_thesis_defense_updates",
+      "name": "Resolve a three-message update chain and avoid obsolete time/location.",
+      "workflow": "mail_qa",
+      "setup": {"mail_fixtures": ["hard_mailbox"]},
+      "request": {"user_input": "Thesis defense 最终是什么时间地点？旧信息不要混进来。"},
+      "search_query": "thesis defense",
+      "scripted_answer": "最终 thesis defense 是 2026-08-24 10:30，在 Room C；slides 需要在 2026-08-23 10:30 前上传。旧的 09:00 和 Room A 不应再使用。",
+      "expect": {
+        "selected_package": "mail",
+        "tool_sequence": ["mail.search", "mail.load_messages"],
+        "answer_contains_all": ["2026-08-24", "10:30", "Room C", "2026-08-23 10:30"],
+        "answer_excludes_all": ["Room A is the final room"],
+        "evidence_external_ids": [
+          "eval_thesis_defense_original",
+          "eval_thesis_defense_room_change",
+          "eval_thesis_defense_final_update"
+        ],
+        "max_llm_calls": 8,
+        "max_wall_time_ms": 7000
+      }
+    },
+    {
+      "case_id": "finance_reimbursement_scam_filter",
+      "name": "Select legitimate finance instructions while rejecting near-duplicate scam.",
+      "workflow": "mail_qa",
+      "setup": {"mail_fixtures": ["hard_mailbox"]},
+      "request": {"user_input": "Finance workshop reimbursement 要交什么？注意不要采信可疑邮件。"},
+      "search_query": "Finance workshop reimbursement instructions",
+      "scripted_answer": "Finance workshop reimbursement 需要 original receipt、bank account proof 和 claim form，提交截止 2026-08-26 17:00；不要提供 bank password 或 one-time code。",
+      "expect": {
+        "selected_package": "mail",
+        "tool_sequence": ["mail.search", "mail.load_messages"],
+        "answer_contains_all": ["original receipt", "bank account proof", "claim form", "2026-08-26 17:00"],
+        "answer_excludes_all": ["send your bank password", "one-time code"],
+        "evidence_external_ids": ["eval_finance_workshop_actual"],
+        "forbidden_evidence_external_ids": ["eval_finance_workshop_scam"],
+        "max_llm_calls": 8,
+        "max_wall_time_ms": 7000
+      }
+    },
+    {
+      "case_id": "old_vs_current_visa_photo_requirement",
+      "name": "Use the current exact requirement rather than archived obsolete guidance.",
+      "workflow": "mail_qa",
+      "setup": {"mail_fixtures": ["hard_mailbox"]},
+      "request": {"user_input": "Visa photo 重新提交的当前要求是什么？"},
+      "search_query": "white background 35x45 glasses upload",
+      "scripted_answer": "当前 Visa photo resubmission 要求是 white background、35x45 mm、no glasses，并在 2026-08-21 12:00 前上传；旧的 blue background guidance 已过时。",
+      "expect": {
+        "selected_package": "mail",
+        "tool_sequence": ["mail.search", "mail.load_messages"],
+        "answer_contains_all": ["white background", "35x45 mm", "no glasses", "2026-08-21 12:00"],
+        "answer_excludes_all": ["blue background was accepted"],
+        "evidence_external_ids": ["eval_visa_photo_exact"],
+        "forbidden_evidence_external_ids": ["eval_visa_photo_old"],
+        "max_llm_calls": 8,
+        "max_wall_time_ms": 7000
+      }
+    },
+    {
+      "case_id": "capstone_multisource_to_matter",
+      "name": "Create one matter from two related capstone evidence messages while excluding promotion.",
+      "workflow": "mail_to_matter",
+      "setup": {"mail_fixtures": ["hard_mailbox"]},
+      "request": {"user_input": "把 Capstone pitch 相关事项整理成一个本地事务，证据要关联邮件。"},
+      "search_query": "Capstone pitch preparation rehearsal",
+      "matter": {
+        "title": "Prepare capstone pitch package",
+        "summary": "Create 5-minute demo video, submit project abstract, attend rehearsal on 2026-08-22 16:00, and bring two printed rubrics.",
+        "status": "open",
+        "priority": "high",
+        "due_at": "2026-08-22T16:00:00+08:00",
+        "tags": ["capstone", "pitch", "eval_hard"],
+        "source_links": [],
+        "metadata": {"created_from": "hard_mail_tasks"}
+      },
+      "scripted_answer": "已创建事务 Prepare capstone pitch package，并关联 preparation 与 rehearsal 两封邮件证据。",
+      "expect": {
+        "selected_package": "mail",
+        "tool_sequence": ["mail.search", "mail.load_messages", "matter.create"],
+        "answer_contains_all": ["Prepare capstone pitch package", "关联"],
+        "evidence_external_ids": [
+          "eval_capstone_pitch_initial",
+          "eval_capstone_pitch_rehearsal"
+        ],
+        "forbidden_evidence_external_ids": ["eval_capstone_noise_marketing"],
+        "created_matter_contains": ["Prepare capstone pitch package", "2026-08-22", "high", "printed rubrics"],
+        "matter_source_external_ids": [
+          "eval_capstone_pitch_initial",
+          "eval_capstone_pitch_rehearsal"
+        ],
+        "max_llm_calls": 10,
+        "max_wall_time_ms": 7000
+      }
+    },
+    {
+      "case_id": "lab_incident_specific_vs_general_training",
+      "name": "Find the specific incident report requirement, not general training reminder.",
+      "workflow": "mail_qa",
+      "setup": {"mail_fixtures": ["hard_mailbox"]},
+      "request": {"user_input": "Lab incident report 要交哪些内容？不要回答普通培训提醒。"},
+      "search_query": "Lab incident report required",
+      "scripted_answer": "Lab incident report LIR-2026-08 需要在 2026-08-20 18:00 前提交，包含 witness name、equipment ID 和 corrective action。",
+      "expect": {
+        "selected_package": "mail",
+        "tool_sequence": ["mail.search", "mail.load_messages"],
+        "answer_contains_all": ["LIR-2026-08", "2026-08-20 18:00", "witness name", "equipment ID", "corrective action"],
+        "answer_excludes_all": ["General lab safety training"],
+        "evidence_external_ids": ["eval_lab_incident_report"],
+        "forbidden_evidence_external_ids": ["eval_lab_general_training"],
+        "max_llm_calls": 8,
+        "max_wall_time_ms": 7000
+      }
+    }
+  ]
+}

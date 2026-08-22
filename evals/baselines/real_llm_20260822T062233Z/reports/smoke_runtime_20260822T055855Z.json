@@ -1,0 +1,1485 @@
+{
+  "cases": [
+    {
+      "case_id": "mail_basic_ntuso",
+      "error": null,
+      "fixture_index": {
+        "mail": {
+          "account_ids": [
+            "mail_account_8739674aaf47"
+          ],
+          "messages_by_external_id": {
+            "eval_course_deadline_reminder": {
+              "message_id": "mail_msg_b55458eeaadc",
+              "received_at": "2026-08-10T01:00:00Z",
+              "subject": "Course registration deadline reminder"
+            },
+            "eval_ica_student_pass_checklist": {
+              "message_id": "mail_msg_a8143b23db5c",
+              "received_at": "2026-08-07T03:15:00Z",
+              "subject": "ICA Student Pass completion checklist"
+            },
+            "eval_lab_attachment_metadata": {
+              "message_id": "mail_msg_b6649df353b4",
+              "received_at": "2026-08-11T06:00:00Z",
+              "subject": "Lab onboarding documents"
+            },
+            "eval_ntuso_audition_20260805": {
+              "message_id": "mail_msg_1e836c3e6c9e",
+              "received_at": "2026-08-05T09:30:00Z",
+              "subject": "NTUSO Audition requirements 2026"
+            },
+            "eval_ntuso_audition_update_20260812": {
+              "message_id": "mail_msg_df04b623c7e8",
+              "received_at": "2026-08-12T10:00:00Z",
+              "subject": "Updated NTUSO Audition schedule"
+            }
+          }
+        },
+        "matters": {
+          "matter_ids": []
+        },
+        "workspaces": []
+      },
+      "log": {
+        "exists": true,
+        "json_parse_errors": [],
+        "missing_sections": [],
+        "path": "/tmp/lka_eval_smoke_mail_basic_ntuso_lxfntjzo/data/agent_logs/agent_turn_8400faa474ec.md"
+      },
+      "metrics": [
+        {
+          "details": {
+            "error": null
+          },
+          "name": "no_runtime_error",
+          "passed": true,
+          "score": 1.0,
+          "weight": 2.0
+        },
+        {
+          "details": {
+            "actual": "mail",
+            "expected": "mail"
+          },
+          "name": "selected_package_match",
+          "passed": true,
+          "score": 1.0,
+          "weight": 1.0
+        },
+        {
+          "details": {
+            "actual": [
+              "mail.search",
+              "mail.load_messages"
+            ],
+            "expected": [
+              "mail.search",
+              "mail.load_messages"
+            ]
+          },
+          "name": "tool_sequence_exact_match",
+          "passed": true,
+          "score": 1.0,
+          "weight": 2.0
+        },
+        {
+          "details": {
+            "actual": [
+              "mail.search",
+              "mail.load_messages"
+            ],
+            "expected": [
+              "mail.search",
+              "mail.load_messages"
+            ]
+          },
+          "name": "tool_sequence_f1",
+          "passed": true,
+          "score": 1.0,
+          "weight": 1.0
+        },
+        {
+          "details": {
+            "actual": [
+              "mail.load_messages",
+              "mail.search"
+            ],
+            "missing": []
+          },
+          "name": "required_tool_called",
+          "passed": true,
+          "score": 1.0,
+          "weight": 1.0
+        },
+        {
+          "details": {
+            "violations": []
+          },
+          "name": "forbidden_tool_not_called",
+          "passed": true,
+          "score": 1.0,
+          "weight": 1.0
+        },
+        {
+          "details": {
+            "missing": [
+              "G major scale",
+              "one prepared piece",
+              "sight reading"
+            ]
+          },
+          "name": "answer_contains_all",
+          "passed": false,
+          "score": 0.25,
+          "weight": 2.0
+        },
+        {
+          "details": {
+            "violations": []
+          },
+          "name": "answer_excludes_all",
+          "passed": true,
+          "score": 1.0,
+          "weight": 1.0
+        },
+        {
+          "details": {
+            "expected_message_ids": [
+              "mail_msg_1e836c3e6c9e"
+            ],
+            "missing": []
+          },
+          "name": "evidence_recall_at_k",
+          "passed": true,
+          "score": 1.0,
+          "weight": 2.0
+        },
+        {
+          "details": {
+            "loaded": [
+              "mail_msg_1e836c3e6c9e",
+              "mail_msg_df04b623c7e8"
+            ],
+            "missing": []
+          },
+          "name": "loaded_required_messages",
+          "passed": true,
+          "score": 1.0,
+          "weight": 1.0
+        },
+        {
+          "details": {
+            "completed": 2,
+            "total": 2
+          },
+          "name": "tool_success_rate",
+          "passed": true,
+          "score": 1.0,
+          "weight": 1.0
+        },
+        {
+          "details": {
+            "actual": 0,
+            "maximum": 0
+          },
+          "name": "schema_rejection_count",
+          "passed": true,
+          "score": 1.0,
+          "weight": 1.0
+        },
+        {
+          "details": {
+            "actual": 7,
+            "maximum": 8
+          },
+          "name": "llm_call_count",
+          "passed": true,
+          "score": 1.0,
+          "weight": 1.0
+        },
+        {
+          "details": {
+            "actual": 17923,
+            "maximum": null
+          },
+          "name": "reported_token_total",
+          "passed": true,
+          "score": 1.0,
+          "weight": 1.0
+        },
+        {
+          "details": {
+            "actual": 48559.325,
+            "maximum": 5000
+          },
+          "name": "wall_time_ms",
+          "passed": false,
+          "score": 0.0,
+          "weight": 1.0
+        },
+        {
+          "details": {
+            "json_parse_errors": [],
+            "missing_sections": []
+          },
+          "name": "run_log_completeness_rate",
+          "passed": true,
+          "score": 1.0,
+          "weight": 1.0
+        }
+      ],
+      "name": "mail_basic_ntuso",
+      "passed": false,
+      "request": {
+        "session_id": "eval_smoke_mail_basic_ntuso",
+        "user_input": "帮我查询 NTUSO audition 的考试要求。"
+      },
+      "result": {
+        "answer": "已从你的本地邮件中找到 NTUSO（南洋理工大学交响乐团）audition 的相关通知，考试要求如下：\n\n**考试要求（来自 2026-08-05 邮件）**\n- 演奏 G 大调音阶\n- 准备一首自选曲目\n- 视奏测试\n- 需提前 15 分钟到场\n- 考场地点：Music Studio 3\n\n**日程更新（来自 2026-08-12 邮件）**\n- 小提琴考生：**2026-08-28 14:00** 参加面试\n- 需携带：学生证 + 打印的曲目清单（repertoire list）\n\n建议你提前准备好曲目单并打印，并按照要求提前到达考场。如需查看邮件原文，可以在收件箱中搜索“NTUSO”即可找到这两封邮件。",
+        "answer_preview": "已从你的本地邮件中找到 NTUSO（南洋理工大学交响乐团）audition 的相关通知，考试要求如下：\n\n**考试要求（来自 2026-08-05 邮件）**\n- 演奏 G 大调音阶\n- 准备一首自选曲目\n- 视奏测试\n- 需提前 15 分钟到场\n- 考场地点：Music Studio 3\n\n**日程更新（来自 2026-08-12 邮件）**\n- 小提琴考生：**2026-08-28 14:00** 参加面试\n- 需携带：学生证 + 打印的曲目清单（repertoire list）\n\n建议你提前准备好曲目单并打印，并按照要求提前到达考场。如需查看邮件原文，可以在收件箱中搜索“NTUSO”即可找到这两封邮件。",
+        "decision_events": [
+          {
+            "action": "select_package",
+            "answer": null,
+            "assistant_message": null,
+            "decided_at": "2026-08-22T05:58:12.067385+00:00",
+            "operation": {},
+            "raw_output": "{\"selected_package\":\"mail\",\"reason\":\"The session context window is empty and contains no NTUSO audition requirement details. Such information most plausibly lives in local or synced email (e.g., an NTUSO audition notice or confirmation), so the mail package should be searched for relevant messages before answering.\",\"search_query\":\"NTUSO audition\"}",
+            "reason": "The session context window is empty and contains no NTUSO audition requirement details. Such information most plausibly lives in local or synced email (e.g., an NTUSO audition notice or confirmation), so the mail package should be searched for relevant messages before answering.",
+            "selected_package": "mail",
+            "source": "llm",
+            "step_index": 1,
+            "tool_input": {},
+            "tool_name": null
+          },
+          {
+            "action": "call_tool",
+            "answer": null,
+            "assistant_message": "正在搜索本地邮件中的 NTUSO audition 相关信息…",
+            "decided_at": "2026-08-22T05:58:15.480965+00:00",
+            "operation": {
+              "confidence": "medium",
+              "final_answer": null,
+              "package_name": "mail",
+              "reason": "Session context is empty; search local mail for candidate messages containing NTUSO audition before loading full records.",
+              "tool_input": {
+                "limit": 20,
+                "query": "NTUSO audition"
+              },
+              "tool_name": "mail.search",
+              "type": "tool_call"
+            },
+            "raw_output": "{\"operation\":{\"type\":\"tool_call\",\"package_name\":\"mail\",\"tool_name\":\"mail.search\",\"tool_input\":{\"query\":\"NTUSO audition\",\"limit\":20},\"final_answer\":null,\"reason\":\"Session context is empty; search local mail for candidate messages containing NTUSO audition before loading full records.\",\"confidence\":\"medium\"},\"assistant_message\":\"正在搜索本地邮件中的 NTUSO audition 相关信息…\"}",
+            "reason": "Session context is empty; search local mail for candidate messages containing NTUSO audition before loading full records.",
+            "selected_package": null,
+            "source": "llm",
+            "step_index": 2,
+            "tool_input": {
+              "limit": 20,
+              "query": "NTUSO audition"
+            },
+            "tool_name": "mail.search"
+          },
+          {
+            "action": "call_tool",
+            "answer": null,
+            "assistant_message": "已找到相关邮件，正在读取完整考试要求内容。",
+            "decided_at": "2026-08-22T05:58:22.642615+00:00",
+            "operation": {
+              "confidence": "high",
+              "final_answer": null,
+              "package_name": "mail",
+              "reason": "邮件搜索已返回两封与 NTUSO audition 相关的邮件；需读取完整邮件正文以提取考试要求（以及可能的更新日程）。",
+              "tool_input": {
+                "message_ids": [
+                  "mail_msg_1e836c3e6c9e",
+                  "mail_msg_df04b623c7e8"
+                ]
+              },
+              "tool_name": "mail.load_messages",
+              "type": "tool_call"
+            },
+            "raw_output": "{\"operation\":{\"type\":\"tool_call\",\"package_name\":\"mail\",\"tool_name\":\"mail.load_messages\",\"tool_input\":{\"message_ids\":[\"mail_msg_1e836c3e6c9e\",\"mail_msg_df04b623c7e8\"]},\"final_answer\":null,\"reason\":\"邮件搜索已返回两封与 NTUSO audition 相关的邮件；需读取完整邮件正文以提取考试要求（以及可能的更新日程）。\",\"confidence\":\"high\"},\"assistant_message\":\"已找到相关邮件，正在读取完整考试要求内容。\"}",
+            "reason": "邮件搜索已返回两封与 NTUSO audition 相关的邮件；需读取完整邮件正文以提取考试要求（以及可能的更新日程）。",
+            "selected_package": null,
+            "source": "llm",
+            "step_index": 3,
+            "tool_input": {
+              "message_ids": [
+                "mail_msg_1e836c3e6c9e",
+                "mail_msg_df04b623c7e8"
+              ]
+            },
+            "tool_name": "mail.load_messages"
+          },
+          {
+            "action": "final_answer",
+            "answer": null,
+            "assistant_message": "已从本地邮件中查找到 NTUSO audition 的考试要求。",
+            "decided_at": "2026-08-22T05:58:51.996533+00:00",
+            "operation": {
+              "confidence": "high",
+              "final_answer": "根据邮箱中的 NTUSO 通知（2026-08-05《NTUSO Audition requirements 2026》），考试要求为：1) G 大调音阶；2) 自备一首曲目；3) 视奏；4) 提前 15 分钟到场；考场为 Music Studio 3。另有一封 2026-08-12 的更新通知显示：小提琴考生应于 2026-08-28 14:00 参加考试，并需携带学生证和打印好的曲目单。",
+              "package_name": null,
+              "reason": "已通过 mail.search 找到相关邮件，并用 mail.load_messages 读取了完整正文，考试要求信息充分，可以直接进入最终回答阶段。",
+              "tool_input": {},
+              "tool_name": null,
+              "type": "final_answer"
+            },
+            "raw_output": "{\n  \"operation\": {\n    \"type\": \"final_answer\",\n    \"package_name\": null,\n    \"tool_name\": null,\n    \"tool_input\": {},\n    \"final_answer\": \"根据邮箱中的 NTUSO 通知（2026-08-05《NTUSO Audition requirements 2026》），考试要求为：1) G 大调音阶；2) 自备一首曲目；3) 视奏；4) 提前 15 分钟到场；考场为 Music Studio 3。另有一封 2026-08-12 的更新通知显示：小提琴考生应于 2026-08-28 14:00 参加考试，并需携带学生证和打印好的曲目单。\",\n    \"reason\": \"已通过 mail.search 找到相关邮件，并用 mail.load_messages 读取了完整正文，考试要求信息充分，可以直接进入最终回答阶段。\",\n    \"confidence\": \"high\"\n  },\n  \"assistant_message\": \"已从本地邮件中查找到 NTUSO audition 的考试要求。\"\n}",
+            "reason": "已通过 mail.search 找到相关邮件，并用 mail.load_messages 读取了完整正文，考试要求信息充分，可以直接进入最终回答阶段。",
+            "selected_package": null,
+            "source": "llm",
+            "step_index": 4,
+            "tool_input": {},
+            "tool_name": null
+          }
+        ],
+        "expanded_tools": [
+          {
+            "description": "Search local persisted mail with SQLite FTS and return candidate message ids. Use an empty query string to match all local mail, ordered by newest first.",
+            "input_schema": {
+              "properties": {
+                "limit": {
+                  "description": "Maximum number of candidate messages to return.",
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "query": {
+                  "description": "Search text. Use an empty string to match all local mail; combine with limit to fetch the latest messages.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "query"
+              ],
+              "type": "object"
+            },
+            "name": "mail.search",
+            "output_schema": {
+              "messages": "array",
+              "query": "string"
+            },
+            "package": "mail",
+            "requires_confirmation": false,
+            "risk": "low",
+            "side_effects": [
+              "read_local_db"
+            ],
+            "type": "local_tool"
+          },
+          {
+            "description": "Load complete local mail records, including full body text and attachment metadata.",
+            "input_schema": {
+              "properties": {
+                "message_ids": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "message_ids"
+              ],
+              "type": "object"
+            },
+            "name": "mail.load_messages",
+            "output_schema": {
+              "messages": "array"
+            },
+            "package": "mail",
+            "requires_confirmation": false,
+            "risk": "low",
+            "side_effects": [
+              "read_local_db"
+            ],
+            "type": "local_tool"
+          },
+          {
+            "description": "Synchronize the configured remote mail provider and import changed messages into the local mail store.",
+            "input_schema": {
+              "properties": {
+                "folder": {
+                  "type": "string"
+                },
+                "limit": {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "max_pages": {
+                  "minimum": 1,
+                  "type": "integer"
+                }
+              },
+              "type": "object"
+            },
+            "name": "mail.sync",
+            "output_schema": {
+              "delta_link": "string|null",
+              "folder": "string",
+              "imported_attachments": "integer",
+              "imported_messages": "integer",
+              "next_link": "string|null",
+              "provider": "string",
+              "status": "string",
+              "sync_mode": "string"
+            },
+            "package": "mail",
+            "requires_confirmation": false,
+            "risk": "low_to_medium",
+            "side_effects": [
+              "read_remote_mail",
+              "write_local_db"
+            ],
+            "type": "local_tool"
+          }
+        ],
+        "llm_events": [
+          {
+            "attempt": 1,
+            "audit_record": {
+              "client_name": "packyapi",
+              "completed_at": "2026-08-22T05:58:12.066561+00:00",
+              "content_length": 350,
+              "duration_ms": 4630,
+              "error_category": null,
+              "error_message": null,
+              "failed_at": null,
+              "finish_reason": "stop",
+              "http_status": null,
+              "input_token_count": 966,
+              "is_retriable": null,
+              "llm_call_id": "llm_call_56a90edc930e1c5c",
+              "metadata": {
+                "headers": {},
+                "prompt": {
+                  "message_count": 2,
+                  "system_prompt_length": 539,
+                  "user_prompt_length": 3203
+                }
+              },
+              "model": "deepseek-v4-flash",
+              "output_token_count": 458,
+              "partial": false,
+              "prompt_summary": "agent_turn_route user_input=帮我查询 NTUSO audition 的考试要求。",
+              "provider": "packyapi",
+              "provider_error_code": null,
+              "provider_error_param": null,
+              "provider_error_type": null,
+              "provider_request_id": null,
+              "response_mode": "text",
+              "retry_after": null,
+              "run_id": "agent_run_767116e1a2fa",
+              "session_id": "eval_smoke_mail_basic_ntuso",
+              "stage": "route",
+              "started_at": "2026-08-22T05:58:07.436047+00:00",
+              "status": "completed",
+              "total_token_count": 1424,
+              "trace_id": "agent_turn_8400faa474ec"
+            },
+            "client_name": "packyapi",
+            "completed_at": "2026-08-22T05:58:12.066561+00:00",
+            "content_length": 350,
+            "duration_ms": 4630,
+            "error": null,
+            "error_category": null,
+            "error_message": null,
+            "error_type": null,
+            "failed_at": null,
+            "finish_reason": "stop",
+            "http_status": null,
+            "input_token_count": 966,
+            "is_retriable": null,
+            "llm_call_id": "llm_call_56a90edc930e1c5c",
+            "metadata": {
+              "headers": {},
+              "prompt": {
+                "message_count": 2,
+                "system_prompt_length": 539,
+                "user_prompt_length": 3203
+              }
+            },
+            "model": "deepseek-v4-flash",
+            "output": "{\"selected_package\":\"mail\",\"reason\":\"The session context window is empty and contains no NTUSO audition requirement details. Such information most plausibly lives in local or synced email (e.g., an NTUSO audition notice or confirmation), so the mail package should be searched for relevant messages before answering.\",\"search_query\":\"NTUSO audition\"}",
+            "output_token_count": 458,
+            "partial": false,
+            "prompt_summary": "agent_turn_route user_input=帮我查询 NTUSO audition 的考试要求。",
+            "provider": "packyapi",
+            "provider_error_code": null,
+            "provider_error_param": null,
+            "provider_error_type": null,
+            "provider_request_id": null,
+            "response_mode": "text",
+            "retry_after": null,
+            "run_id": "agent_run_767116e1a2fa",
+            "session_id": "eval_smoke_mail_basic_ntuso",
+            "stage": "route",
+            "started_at": "2026-08-22T05:58:07.436047+00:00",
+            "status": "completed",
+            "status_code": null,
+            "system_prompt": "You are the Main Agent Brain for Local Knowledge Agent OS. Choose at most one tool package for the current turn. Do not choose concrete tools yet. Return only null when the provided session context window, including cached local resources, is sufficient to answer without another tool call. Use only package names present in package_catalog, and use each package description and routing_hints as the source of truth. Return only strict JSON: {\"selected_package\":\"<package name or null>\",\"reason\":\"...\",\"search_query\":\"optional query hint\"}",
+            "total_token_count": 1424,
+            "trace_id": "agent_turn_8400faa474ec",
+            "user_prompt": "{\n  \"user_input\": \"帮我查询 NTUSO audition 的考试要求。\",\n  \"session_context_window\": {\n    \"session_id\": \"eval_smoke_mail_basic_ntuso\",\n    \"token_budget\": 65536,\n    \"summary\": \"\",\n    \"recent_messages\": [],\n    \"token_estimate\": 0,\n    \"updated_at\": \"2026-08-22T05:58:07.435355+00:00\",\n    \"current_time\": {\n      \"utc\": \"2026-08-22T05:58:07.435402+00:00\",\n      \"local\": \"2026-08-22T13:58:07.435402+08:00\",\n      \"timezone\": \"Asia/Shanghai\",\n      \"date\": \"2026-08-22\"\n    }\n  },\n  \"package_catalog\": [\n    {\n      \"name\": \"mail\",\n      \"description\": \"Search, load, and sync local mail knowledge. Matter persistence lives in the matter package.\",\n      \"risk\": \"low_to_medium\",\n      \"requires_expansion\": true,\n      \"tool_names\": [\n        \"mail.search\",\n        \"mail.load_messages\",\n        \"mail.sync\"\n      ],\n      \"routing_hints\": [\n        \"Use this package when the user needs evidence from local or synced email.\",\n        \"Use this package when the user asks about mailbox contents, mail notifications, or mail-derived facts.\"\n      ],\n      \"decision_hints\": [\n        \"Search candidate messages before loading full message records.\",\n        \"Load full messages for relevant message ids before writing the final answer.\",\n        \"Synchronize mail first only when the user asks to sync, asks for the latest mailbox state, or local mail may be stale.\",\n        \"This package reads and syncs mail evidence; use another registered persistence package for tasks, events, or matters.\"\n      ],\n      \"observation_cache\": {\n        \"tool_names\": [\n          \"mail.load_messages\"\n        ],\n        \"description\": \"Reuse loaded complete mail records from the same session when relevant.\"\n      }\n    },\n    {\n      \"name\": \"matter\",\n      \"description\": \"Create, search, list, update, and link independent local matters.\",\n      \"risk\": \"low_to_medium\",\n      \"requires_expansion\": true,\n      \"tool_names\": [\n        \"matter.create\",\n        \"matter.create_many\",\n        \"matter.search\",\n        \"matter.list\",\n        \"matter.update\",\n        \"matter.link_source\"\n      ],\n      \"routing_hints\": [\n        \"Use this package when the user asks to inspect, create, update, or link local tasks, events, reminders, or matters.\"\n      ],\n      \"decision_hints\": [\n        \"Inspect existing records when there is a realistic chance of duplicates before creating new records.\",\n        \"Use create for one record, create_many for a controlled batch, update to change existing records, and link_source to attach evidence.\",\n        \"Follow every tool input_schema exactly, especially required fields and allowed_values.\"\n      ],\n      \"observation_cache\": {}\n    },\n    {\n      \"name\": \"runtime\",\n      \"description\": \"Read deterministic runtime context such as the current time.\",\n      \"risk\": \"low\",\n      \"requires_expansion\": true,\n      \"tool_names\": [\n        \"runtime.now\"\n      ],\n      \"routing_hints\": [\n        \"Use this package when a direct answer requires deterministic runtime context.\"\n      ],\n      \"decision_hints\": [\n        \"Use runtime tools when the session context does not already contain sufficient deterministic runtime data.\"\n      ],\n      \"observation_cache\": {}\n    }\n  ]\n}"
+          },
+          {
+            "attempt": 1,
+            "audit_record": {
+              "client_name": "packyapi",
+              "completed_at": "2026-08-22T05:58:15.480828+00:00",
+              "content_length": 362,
+              "duration_ms": 3413,
+              "error_category": null,
+              "error_message": null,
+              "failed_at": null,
+              "finish_reason": "stop",
+              "http_status": null,
+              "input_token_count": 2020,
+              "is_retriable": null,
+              "llm_call_id": "llm_call_4ed8a912b4f40652",
+              "metadata": {
+                "headers": {},
+                "prompt": {
+                  "message_count": 2,
+                  "system_prompt_length": 2082,
+                  "user_prompt_length": 6362
+                }
+              },
+              "model": "deepseek-v4-flash",
+              "output_token_count": 342,
+              "partial": false,
+              "prompt_summary": "agent_turn_decision observations=0 format_attempt=1",
+              "provider": "packyapi",
+              "provider_error_code": null,
+              "provider_error_param": null,
+              "provider_error_type": null,
+              "provider_request_id": null,
+              "response_mode": "text",
+              "retry_after": null,
+              "run_id": "agent_run_767116e1a2fa",
+              "session_id": "eval_smoke_mail_basic_ntuso",
+              "stage": "decision",
+              "started_at": "2026-08-22T05:58:12.067604+00:00",
+              "status": "completed",
+              "total_token_count": 2362,
+              "trace_id": "agent_turn_8400faa474ec"
+            },
+            "client_name": "packyapi",
+            "completed_at": "2026-08-22T05:58:15.480828+00:00",
+            "content_length": 362,
+            "duration_ms": 3413,
+            "error": null,
+            "error_category": null,
+            "error_message": null,
+            "error_type": null,
+            "failed_at": null,
+            "finish_reason": "stop",
+            "http_status": null,
+            "input_token_count": 2020,
+            "is_retriable": null,
+            "llm_call_id": "llm_call_4ed8a912b4f40652",
+            "metadata": {
+              "headers": {},
+              "prompt": {
+                "message_count": 2,
+                "system_prompt_length": 2082,
+                "user_prompt_length": 6362
+              }
+            },
+            "model": "deepseek-v4-flash",
+            "output": "{\"operation\":{\"type\":\"tool_call\",\"package_name\":\"mail\",\"tool_name\":\"mail.search\",\"tool_input\":{\"query\":\"NTUSO audition\",\"limit\":20},\"final_answer\":null,\"reason\":\"Session context is empty; search local mail for candidate messages containing NTUSO audition before loading full records.\",\"confidence\":\"medium\"},\"assistant_message\":\"正在搜索本地邮件中的 NTUSO audition 相关信息…\"}",
+            "output_token_count": 342,
+            "partial": false,
+            "prompt_summary": "agent_turn_decision observations=0 format_attempt=1",
+            "provider": "packyapi",
+            "provider_error_code": null,
+            "provider_error_param": null,
+            "provider_error_type": null,
+            "provider_request_id": null,
+            "response_mode": "text",
+            "retry_after": null,
+            "run_id": "agent_run_767116e1a2fa",
+            "session_id": "eval_smoke_mail_basic_ntuso",
+            "stage": "decision",
+            "started_at": "2026-08-22T05:58:12.067604+00:00",
+            "status": "completed",
+            "status_code": null,
+            "system_prompt": "You are the Main Agent Brain for Local Knowledge Agent OS. Choose the next single action for this agent turn. You may call one available tool, expand a package, request confirmation, or enter the final answer stage. The initially expanded package is mail. Use package_catalog, package decision_hints, expanded_tools, tool descriptions, input_schema, side_effects, risk, observations, and session context as the source of truth. Use tools when more local evidence, deterministic context, or persistence is needed. Reuse cached observations when they are relevant. When observations and session context are sufficient to answer the user, return operation.type final_answer with a concise reason, then stop; do not write final natural language prose in this decision stage. If the currently expanded tools are insufficient, use operation.type expand_package with package_name set to one registered package; do not call tools from a package until that package appears in expanded_package_names. Follow each expanded tool input_schema exactly: include required fields, respect allowed_values/enums, and do not invent unsupported field values. Use the deterministic context supplied in session_context_window when resolving relative references. Return only strict JSON using this operation-first envelope: {\"operation\":{\"type\":\"tool_call|expand_package|final_answer|request_confirmation|no_op\",\"package_name\":null,\"tool_name\":\"<expanded tool name or null>\",\"tool_input\":{},\"final_answer\":null,\"reason\":\"...\",\"confidence\":\"low|medium|high\"},\"assistant_message\":\"short user-visible progress text\"}. The operation object is the only executable control channel and must come first. assistant_message is display-only progress text; it never selects tools and never becomes the final answer. For a final answer, set operation.type to final_answer, set operation.final_answer to null if present, and explain only why the answer stage can now run. For a tool call, put all executable details in operation and only optional progress text in assistant_message. Never return plain text outside JSON.",
+            "total_token_count": 2362,
+            "trace_id": "agent_turn_8400faa474ec",
+            "user_prompt": "{\n  \"user_input\": \"帮我查询 NTUSO audition 的考试要求。\",\n  \"session_context_window\": {\n    \"session_id\": \"eval_smoke_mail_basic_ntuso\",\n    \"token_budget\": 65536,\n    \"summary\": \"\",\n    \"recent_messages\": [],\n    \"token_estimate\": 0,\n    \"updated_at\": \"2026-08-22T05:58:07.435355+00:00\",\n    \"current_time\": {\n      \"utc\": \"2026-08-22T05:58:07.435402+00:00\",\n      \"local\": \"2026-08-22T13:58:07.435402+08:00\",\n      \"timezone\": \"Asia/Shanghai\",\n      \"date\": \"2026-08-22\"\n    }\n  },\n  \"route\": {\n    \"selected_package\": \"mail\",\n    \"reason\": \"The session context window is empty and contains no NTUSO audition requirement details. Such information most plausibly lives in local or synced email (e.g., an NTUSO audition notice or confirmation), so the mail package should be searched for relevant messages before answering.\",\n    \"search_query\": \"NTUSO audition\"\n  },\n  \"package_catalog\": [\n    {\n      \"name\": \"mail\",\n      \"description\": \"Search, load, and sync local mail knowledge. Matter persistence lives in the matter package.\",\n      \"risk\": \"low_to_medium\",\n      \"requires_expansion\": true,\n      \"tool_names\": [\n        \"mail.search\",\n        \"mail.load_messages\",\n        \"mail.sync\"\n      ],\n      \"routing_hints\": [\n        \"Use this package when the user needs evidence from local or synced email.\",\n        \"Use this package when the user asks about mailbox contents, mail notifications, or mail-derived facts.\"\n      ],\n      \"decision_hints\": [\n        \"Search candidate messages before loading full message records.\",\n        \"Load full messages for relevant message ids before writing the final answer.\",\n        \"Synchronize mail first only when the user asks to sync, asks for the latest mailbox state, or local mail may be stale.\",\n        \"This package reads and syncs mail evidence; use another registered persistence package for tasks, events, or matters.\"\n      ],\n      \"observation_cache\": {\n        \"tool_names\": [\n          \"mail.load_messages\"\n        ],\n        \"description\": \"Reuse loaded complete mail records from the same session when relevant.\"\n      }\n    },\n    {\n      \"name\": \"matter\",\n      \"description\": \"Create, search, list, update, and link independent local matters.\",\n      \"risk\": \"low_to_medium\",\n      \"requires_expansion\": true,\n      \"tool_names\": [\n        \"matter.create\",\n        \"matter.create_many\",\n        \"matter.search\",\n        \"matter.list\",\n        \"matter.update\",\n        \"matter.link_source\"\n      ],\n      \"routing_hints\": [\n        \"Use this package when the user asks to inspect, create, update, or link local tasks, events, reminders, or matters.\"\n      ],\n      \"decision_hints\": [\n        \"Inspect existing records when there is a realistic chance of duplicates before creating new records.\",\n        \"Use create for one record, create_many for a controlled batch, update to change existing records, and link_source to attach evidence.\",\n        \"Follow every tool input_schema exactly, especially required fields and allowed_values.\"\n      ],\n      \"observation_cache\": {}\n    },\n    {\n      \"name\": \"runtime\",\n      \"description\": \"Read deterministic runtime context such as the current time.\",\n      \"risk\": \"low\",\n      \"requires_expansion\": true,\n      \"tool_names\": [\n        \"runtime.now\"\n      ],\n      \"routing_hints\": [\n        \"Use this package when a direct answer requires deterministic runtime context.\"\n      ],\n      \"decision_hints\": [\n        \"Use runtime tools when the session context does not already contain sufficient deterministic runtime data.\"\n      ],\n      \"observation_cache\": {}\n    }\n  ],\n  \"expanded_package_names\": [\n    \"mail\"\n  ],\n  \"expanded_tools\": [\n    {\n      \"name\": \"mail.search\",\n      \"type\": \"local_tool\",\n      \"description\": \"Search local persisted mail with SQLite FTS and return candidate message ids. Use an empty query string to match all local mail, ordered by newest first.\",\n      \"package\": \"mail\",\n      \"risk\": \"low\",\n      \"requires_confirmation\": false,\n      \"side_effects\": [\n        \"read_local_db\"\n      ],\n      \"input_schema\": {\n        \"type\": \"object\",\n        \"required\": [\n          \"query\"\n        ],\n        \"properties\": {\n          \"query\": {\n            \"type\": \"string\",\n            \"description\": \"Search text. Use an empty string to match all local mail; combine with limit to fetch the latest messages.\"\n          },\n          \"limit\": {\n            \"type\": \"integer\",\n            \"minimum\": 1,\n            \"description\": \"Maximum number of candidate messages to return.\"\n          }\n        }\n      },\n      \"output_schema\": {\n        \"query\": \"string\",\n        \"messages\": \"array\"\n      }\n    },\n    {\n      \"name\": \"mail.load_messages\",\n      \"type\": \"local_tool\",\n      \"description\": \"Load complete local mail records, including full body text and attachment metadata.\",\n      \"package\": \"mail\",\n      \"risk\": \"low\",\n      \"requires_confirmation\": false,\n      \"side_effects\": [\n        \"read_local_db\"\n      ],\n      \"input_schema\": {\n        \"type\": \"object\",\n        \"required\": [\n          \"message_ids\"\n        ],\n        \"properties\": {\n          \"message_ids\": {\n            \"type\": \"array\",\n            \"items\": {\n              \"type\": \"string\"\n            }\n          }\n        }\n      },\n      \"output_schema\": {\n        \"messages\": \"array\"\n      }\n    },\n    {\n      \"name\": \"mail.sync\",\n      \"type\": \"local_tool\",\n      \"description\": \"Synchronize the configured remote mail provider and import changed messages into the local mail store.\",\n      \"package\": \"mail\",\n      \"risk\": \"low_to_medium\",\n      \"requires_confirmation\": false,\n      \"side_effects\": [\n        \"read_remote_mail\",\n        \"write_local_db\"\n      ],\n      \"input_schema\": {\n        \"type\": \"object\",\n        \"properties\": {\n          \"folder\": {\n            \"type\": \"string\"\n          },\n          \"limit\": {\n            \"type\": \"integer\",\n            \"minimum\": 1\n          },\n          \"max_pages\": {\n            \"type\": \"integer\",\n            \"minimum\": 1\n          }\n        }\n      },\n      \"output_schema\": {\n        \"provider\": \"string\",\n        \"folder\": \"string\",\n        \"imported_messages\": \"integer\",\n        \"imported_attachments\": \"integer\",\n        \"status\": \"string\",\n        \"sync_mode\": \"string\",\n        \"next_link\": \"string|null\",\n        \"delta_link\": \"string|null\"\n      }\n    }\n  ],\n  \"observations\": []\n}"
+          },
+          {
+            "attempt": 1,
+            "audit_record": {
+              "client_name": "packyapi",
+              "completed_at": "2026-08-22T05:58:18.654262+00:00",
+              "content_length": 438,
+              "duration_ms": 3172,
+              "error_category": null,
+              "error_message": null,
+              "failed_at": null,
+              "finish_reason": "stop",
+              "http_status": null,
+              "input_token_count": 865,
+              "is_retriable": null,
+              "llm_call_id": "llm_call_0d1aefc2c9fda0bf",
+              "metadata": {
+                "headers": {},
+                "prompt": {
+                  "message_count": 2,
+                  "system_prompt_length": 614,
+                  "user_prompt_length": 2328
+                }
+              },
+              "model": "deepseek-v4-flash",
+              "output_token_count": 266,
+              "partial": false,
+              "prompt_summary": "tool_result_check tool=mail.search",
+              "provider": "packyapi",
+              "provider_error_code": null,
+              "provider_error_param": null,
+              "provider_error_type": null,
+              "provider_request_id": null,
+              "response_mode": "text",
+              "retry_after": null,
+              "run_id": "agent_run_767116e1a2fa",
+              "session_id": "eval_smoke_mail_basic_ntuso",
+              "stage": "tool_result_check",
+              "started_at": "2026-08-22T05:58:15.481786+00:00",
+              "status": "completed",
+              "total_token_count": 1131,
+              "trace_id": "agent_turn_8400faa474ec"
+            },
+            "client_name": "packyapi",
+            "completed_at": "2026-08-22T05:58:18.654262+00:00",
+            "content_length": 438,
+            "duration_ms": 3172,
+            "error": null,
+            "error_category": null,
+            "error_message": null,
+            "error_type": null,
+            "failed_at": null,
+            "finish_reason": "stop",
+            "http_status": null,
+            "input_token_count": 865,
+            "is_retriable": null,
+            "llm_call_id": "llm_call_0d1aefc2c9fda0bf",
+            "metadata": {
+              "headers": {},
+              "prompt": {
+                "message_count": 2,
+                "system_prompt_length": 614,
+                "user_prompt_length": 2328
+              }
+            },
+            "model": "deepseek-v4-flash",
+            "output": "{\"status\":\"accepted\",\"message\":\"mail.search executed successfully and returned two relevant messages about NTUSO audition (requirements 2026 and updated schedule). This is a valid observation for the search call; full requirement details are not yet available from snippets.\",\"remaining_work\":\"Load full content of mail_msg_1e836c3e6c9e (and mail_msg_df04b623c7e8 if needed) to extract complete NTUSO audition requirements for the user.\"}",
+            "output_token_count": 266,
+            "partial": false,
+            "prompt_summary": "tool_result_check tool=mail.search",
+            "provider": "packyapi",
+            "provider_error_code": null,
+            "provider_error_param": null,
+            "provider_error_type": null,
+            "provider_request_id": null,
+            "response_mode": "text",
+            "retry_after": null,
+            "run_id": "agent_run_767116e1a2fa",
+            "session_id": "eval_smoke_mail_basic_ntuso",
+            "stage": "tool_result_check",
+            "started_at": "2026-08-22T05:58:15.481786+00:00",
+            "status": "completed",
+            "status_code": null,
+            "system_prompt": "You are the Tool Result Checker for Local Knowledge Agent OS. Check whether the just-executed tool result is a valid observation for the prior tool-call decision. Do not make a final user answer. Do not claim success when ToolResult.status is failed. Distinguish tool execution status from domain record status: ToolResult.status=completed means the tool ran, not that a business object is done. If tool_feedback.domain_summary is present, use it as the authoritative structured summary for business records. Return only strict JSON: {\"status\":\"accepted|needs_retry|failed\",\"message\":\"...\",\"remaining_work\":\"...\"}.",
+            "total_token_count": 1131,
+            "trace_id": "agent_turn_8400faa474ec",
+            "user_prompt": "{\n  \"user_input\": \"帮我查询 NTUSO audition 的考试要求。\",\n  \"selected_package\": \"mail\",\n  \"decision\": {\n    \"action\": \"call_tool\",\n    \"tool_name\": \"mail.search\",\n    \"tool_input\": {\n      \"query\": \"NTUSO audition\",\n      \"limit\": 20\n    },\n    \"assistant_message\": \"正在搜索本地邮件中的 NTUSO audition 相关信息…\",\n    \"operation\": {\n      \"type\": \"tool_call\",\n      \"package_name\": \"mail\",\n      \"tool_name\": \"mail.search\",\n      \"tool_input\": {\n        \"query\": \"NTUSO audition\",\n        \"limit\": 20\n      },\n      \"final_answer\": null,\n      \"reason\": \"Session context is empty; search local mail for candidate messages containing NTUSO audition before loading full records.\",\n      \"confidence\": \"medium\"\n    },\n    \"reason\": \"Session context is empty; search local mail for candidate messages containing NTUSO audition before loading full records.\",\n    \"_raw_output\": \"{\\\"operation\\\":{\\\"type\\\":\\\"tool_call\\\",\\\"package_name\\\":\\\"mail\\\",\\\"tool_name\\\":\\\"mail.search\\\",\\\"tool_input\\\":{\\\"query\\\":\\\"NTUSO audition\\\",\\\"limit\\\":20},\\\"final_answer\\\":null,\\\"reason\\\":\\\"Session context is empty; search local mail for candidate messages containing NTUSO audition before loading full records.\\\",\\\"confidence\\\":\\\"medium\\\"},\\\"assistant_message\\\":\\\"正在搜索本地邮件中的 NTUSO audition 相关信息…\\\"}\"\n  },\n  \"tool_result\": {\n    \"invocation_id\": \"tool_invocation_cc21f7e4100a\",\n    \"tool_name\": \"mail.search\",\n    \"status\": \"completed\",\n    \"output\": {\n      \"query\": \"NTUSO audition\",\n      \"messages\": [\n        {\n          \"message_id\": \"mail_msg_1e836c3e6c9e\",\n          \"subject\": \"NTUSO Audition requirements 2026\",\n          \"sender\": \"ntuso@example.edu\",\n          \"folder\": \"Inbox\",\n          \"received_at\": \"2026-08-05T09:30:00Z\",\n          \"snippet\": \"[NTUSO] [audition] requires G major scale, one prepared piece, sight reading, and...\"\n        },\n        {\n          \"message_id\": \"mail_msg_df04b623c7e8\",\n          \"subject\": \"Updated NTUSO Audition schedule\",\n          \"sender\": \"ntuso@example.edu\",\n          \"folder\": \"Inbox\",\n          \"received_at\": \"2026-08-12T10:00:00Z\",\n          \"snippet\": \"Updated [NTUSO] [audition] schedule: violin candidates should attend on 2026-08-28...\"\n        }\n      ]\n    },\n    \"error\": null\n  },\n  \"tool_feedback\": {\n    \"source\": \"local\",\n    \"status\": \"accepted\",\n    \"message\": \"mail.search executed successfully.\"\n  }\n}"
+          },
+          {
+            "attempt": 1,
+            "audit_record": {
+              "client_name": "packyapi",
+              "completed_at": "2026-08-22T05:58:22.642498+00:00",
+              "content_length": 324,
+              "duration_ms": 3987,
+              "error_category": null,
+              "error_message": null,
+              "failed_at": null,
+              "finish_reason": "stop",
+              "http_status": null,
+              "input_token_count": 2589,
+              "is_retriable": null,
+              "llm_call_id": "llm_call_e15d46f2d50014f7",
+              "metadata": {
+                "headers": {},
+                "prompt": {
+                  "message_count": 2,
+                  "system_prompt_length": 2082,
+                  "user_prompt_length": 8571
+                }
+              },
+              "model": "deepseek-v4-flash",
+              "output_token_count": 476,
+              "partial": false,
+              "prompt_summary": "agent_turn_decision observations=1 format_attempt=1",
+              "provider": "packyapi",
+              "provider_error_code": null,
+              "provider_error_param": null,
+              "provider_error_type": null,
+              "provider_request_id": null,
+              "response_mode": "text",
+              "retry_after": null,
+              "run_id": "agent_run_767116e1a2fa",
+              "session_id": "eval_smoke_mail_basic_ntuso",
+              "stage": "decision",
+              "started_at": "2026-08-22T05:58:18.654604+00:00",
+              "status": "completed",
+              "total_token_count": 3065,
+              "trace_id": "agent_turn_8400faa474ec"
+            },
+            "client_name": "packyapi",
+            "completed_at": "2026-08-22T05:58:22.642498+00:00",
+            "content_length": 324,
+            "duration_ms": 3987,
+            "error": null,
+            "error_category": null,
+            "error_message": null,
+            "error_type": null,
+            "failed_at": null,
+            "finish_reason": "stop",
+            "http_status": null,
+            "input_token_count": 2589,
+            "is_retriable": null,
+            "llm_call_id": "llm_call_e15d46f2d50014f7",
+            "metadata": {
+              "headers": {},
+              "prompt": {
+                "message_count": 2,
+                "system_prompt_length": 2082,
+                "user_prompt_length": 8571
+              }
+            },
+            "model": "deepseek-v4-flash",
+            "output": "{\"operation\":{\"type\":\"tool_call\",\"package_name\":\"mail\",\"tool_name\":\"mail.load_messages\",\"tool_input\":{\"message_ids\":[\"mail_msg_1e836c3e6c9e\",\"mail_msg_df04b623c7e8\"]},\"final_answer\":null,\"reason\":\"邮件搜索已返回两封与 NTUSO audition 相关的邮件；需读取完整邮件正文以提取考试要求（以及可能的更新日程）。\",\"confidence\":\"high\"},\"assistant_message\":\"已找到相关邮件，正在读取完整考试要求内容。\"}",
+            "output_token_count": 476,
+            "partial": false,
+            "prompt_summary": "agent_turn_decision observations=1 format_attempt=1",
+            "provider": "packyapi",
+            "provider_error_code": null,
+            "provider_error_param": null,
+            "provider_error_type": null,
+            "provider_request_id": null,
+            "response_mode": "text",
+            "retry_after": null,
+            "run_id": "agent_run_767116e1a2fa",
+            "session_id": "eval_smoke_mail_basic_ntuso",
+            "stage": "decision",
+            "started_at": "2026-08-22T05:58:18.654604+00:00",
+            "status": "completed",
+            "status_code": null,
+            "system_prompt": "You are the Main Agent Brain for Local Knowledge Agent OS. Choose the next single action for this agent turn. You may call one available tool, expand a package, request confirmation, or enter the final answer stage. The initially expanded package is mail. Use package_catalog, package decision_hints, expanded_tools, tool descriptions, input_schema, side_effects, risk, observations, and session context as the source of truth. Use tools when more local evidence, deterministic context, or persistence is needed. Reuse cached observations when they are relevant. When observations and session context are sufficient to answer the user, return operation.type final_answer with a concise reason, then stop; do not write final natural language prose in this decision stage. If the currently expanded tools are insufficient, use operation.type expand_package with package_name set to one registered package; do not call tools from a package until that package appears in expanded_package_names. Follow each expanded tool input_schema exactly: include required fields, respect allowed_values/enums, and do not invent unsupported field values. Use the deterministic context supplied in session_context_window when resolving relative references. Return only strict JSON using this operation-first envelope: {\"operation\":{\"type\":\"tool_call|expand_package|final_answer|request_confirmation|no_op\",\"package_name\":null,\"tool_name\":\"<expanded tool name or null>\",\"tool_input\":{},\"final_answer\":null,\"reason\":\"...\",\"confidence\":\"low|medium|high\"},\"assistant_message\":\"short user-visible progress text\"}. The operation object is the only executable control channel and must come first. assistant_message is display-only progress text; it never selects tools and never becomes the final answer. For a final answer, set operation.type to final_answer, set operation.final_answer to null if present, and explain only why the answer stage can now run. For a tool call, put all executable details in operation and only optional progress text in assistant_message. Never return plain text outside JSON.",
+            "total_token_count": 3065,
+            "trace_id": "agent_turn_8400faa474ec",
+            "user_prompt": "{\n  \"user_input\": \"帮我查询 NTUSO audition 的考试要求。\",\n  \"session_context_window\": {\n    \"session_id\": \"eval_smoke_mail_basic_ntuso\",\n    \"token_budget\": 65536,\n    \"summary\": \"\",\n    \"recent_messages\": [],\n    \"token_estimate\": 0,\n    \"updated_at\": \"2026-08-22T05:58:07.435355+00:00\",\n    \"current_time\": {\n      \"utc\": \"2026-08-22T05:58:07.435402+00:00\",\n      \"local\": \"2026-08-22T13:58:07.435402+08:00\",\n      \"timezone\": \"Asia/Shanghai\",\n      \"date\": \"2026-08-22\"\n    }\n  },\n  \"route\": {\n    \"selected_package\": \"mail\",\n    \"reason\": \"The session context window is empty and contains no NTUSO audition requirement details. Such information most plausibly lives in local or synced email (e.g., an NTUSO audition notice or confirmation), so the mail package should be searched for relevant messages before answering.\",\n    \"search_query\": \"NTUSO audition\"\n  },\n  \"package_catalog\": [\n    {\n      \"name\": \"mail\",\n      \"description\": \"Search, load, and sync local mail knowledge. Matter persistence lives in the matter package.\",\n      \"risk\": \"low_to_medium\",\n      \"requires_expansion\": true,\n      \"tool_names\": [\n        \"mail.search\",\n        \"mail.load_messages\",\n        \"mail.sync\"\n      ],\n      \"routing_hints\": [\n        \"Use this package when the user needs evidence from local or synced email.\",\n        \"Use this package when the user asks about mailbox contents, mail notifications, or mail-derived facts.\"\n      ],\n      \"decision_hints\": [\n        \"Search candidate messages before loading full message records.\",\n        \"Load full messages for relevant message ids before writing the final answer.\",\n        \"Synchronize mail first only when the user asks to sync, asks for the latest mailbox state, or local mail may be stale.\",\n        \"This package reads and syncs mail evidence; use another registered persistence package for tasks, events, or matters.\"\n      ],\n      \"observation_cache\": {\n        \"tool_names\": [\n          \"mail.load_messages\"\n        ],\n        \"description\": \"Reuse loaded complete mail records from the same session when relevant.\"\n      }\n    },\n    {\n      \"name\": \"matter\",\n      \"description\": \"Create, search, list, update, and link independent local matters.\",\n      \"risk\": \"low_to_medium\",\n      \"requires_expansion\": true,\n      \"tool_names\": [\n        \"matter.create\",\n        \"matter.create_many\",\n        \"matter.search\",\n        \"matter.list\",\n        \"matter.update\",\n        \"matter.link_source\"\n      ],\n      \"routing_hints\": [\n        \"Use this package when the user asks to inspect, create, update, or link local tasks, events, reminders, or matters.\"\n      ],\n      \"decision_hints\": [\n        \"Inspect existing records when there is a realistic chance of duplicates before creating new records.\",\n        \"Use create for one record, create_many for a controlled batch, update to change existing records, and link_source to attach evidence.\",\n        \"Follow every tool input_schema exactly, especially required fields and allowed_values.\"\n      ],\n      \"observation_cache\": {}\n    },\n    {\n      \"name\": \"runtime\",\n      \"description\": \"Read deterministic runtime context such as the current time.\",\n      \"risk\": \"low\",\n      \"requires_expansion\": true,\n      \"tool_names\": [\n        \"runtime.now\"\n      ],\n      \"routing_hints\": [\n        \"Use this package when a direct answer requires deterministic runtime context.\"\n      ],\n      \"decision_hints\": [\n        \"Use runtime tools when the session context does not already contain sufficient deterministic runtime data.\"\n      ],\n      \"observation_cache\": {}\n    }\n  ],\n  \"expanded_package_names\": [\n    \"mail\"\n  ],\n  \"expanded_tools\": [\n    {\n      \"name\": \"mail.search\",\n      \"type\": \"local_tool\",\n      \"description\": \"Search local persisted mail with SQLite FTS and return candidate message ids. Use an empty query string to match all local mail, ordered by newest first.\",\n      \"package\": \"mail\",\n      \"risk\": \"low\",\n      \"requires_confirmation\": false,\n      \"side_effects\": [\n        \"read_local_db\"\n      ],\n      \"input_schema\": {\n        \"type\": \"object\",\n        \"required\": [\n          \"query\"\n        ],\n        \"properties\": {\n          \"query\": {\n            \"type\": \"string\",\n            \"description\": \"Search text. Use an empty string to match all local mail; combine with limit to fetch the latest messages.\"\n          },\n          \"limit\": {\n            \"type\": \"integer\",\n            \"minimum\": 1,\n            \"description\": \"Maximum number of candidate messages to return.\"\n          }\n        }\n      },\n      \"output_schema\": {\n        \"query\": \"string\",\n        \"messages\": \"array\"\n      }\n    },\n    {\n      \"name\": \"mail.load_messages\",\n      \"type\": \"local_tool\",\n      \"description\": \"Load complete local mail records, including full body text and attachment metadata.\",\n      \"package\": \"mail\",\n      \"risk\": \"low\",\n      \"requires_confirmation\": false,\n      \"side_effects\": [\n        \"read_local_db\"\n      ],\n      \"input_schema\": {\n        \"type\": \"object\",\n        \"required\": [\n          \"message_ids\"\n        ],\n        \"properties\": {\n          \"message_ids\": {\n            \"type\": \"array\",\n            \"items\": {\n              \"type\": \"string\"\n            }\n          }\n        }\n      },\n      \"output_schema\": {\n        \"messages\": \"array\"\n      }\n    },\n    {\n      \"name\": \"mail.sync\",\n      \"type\": \"local_tool\",\n      \"description\": \"Synchronize the configured remote mail provider and import changed messages into the local mail store.\",\n      \"package\": \"mail\",\n      \"risk\": \"low_to_medium\",\n      \"requires_confirmation\": false,\n      \"side_effects\": [\n        \"read_remote_mail\",\n        \"write_local_db\"\n      ],\n      \"input_schema\": {\n        \"type\": \"object\",\n        \"properties\": {\n          \"folder\": {\n            \"type\": \"string\"\n          },\n          \"limit\": {\n            \"type\": \"integer\",\n            \"minimum\": 1\n          },\n          \"max_pages\": {\n            \"type\": \"integer\",\n            \"minimum\": 1\n          }\n        }\n      },\n      \"output_schema\": {\n        \"provider\": \"string\",\n        \"folder\": \"string\",\n        \"imported_messages\": \"integer\",\n        \"imported_attachments\": \"integer\",\n        \"status\": \"string\",\n        \"sync_mode\": \"string\",\n        \"next_link\": \"string|null\",\n        \"delta_link\": \"string|null\"\n      }\n    }\n  ],\n  \"observations\": [\n    {\n      \"tool_name\": \"mail.search\",\n      \"input\": {\n        \"query\": \"NTUSO audition\",\n        \"limit\": 20\n      },\n      \"result\": {\n        \"invocation_id\": \"tool_invocation_cc21f7e4100a\",\n        \"tool_name\": \"mail.search\",\n        \"status\": \"completed\",\n        \"output\": {\n          \"query\": \"NTUSO audition\",\n          \"messages\": [\n            {\n              \"message_id\": \"mail_msg_1e836c3e6c9e\",\n              \"subject\": \"NTUSO Audition requirements 2026\",\n              \"sender\": \"ntuso@example.edu\",\n              \"folder\": \"Inbox\",\n              \"received_at\": \"2026-08-05T09:30:00Z\",\n              \"snippet\": \"[NTUSO] [audition] requires G major scale, one prepared piece, sight reading, and...\"\n            },\n            {\n              \"message_id\": \"mail_msg_df04b623c7e8\",\n              \"subject\": \"Updated NTUSO Audition schedule\",\n              \"sender\": \"ntuso@example.edu\",\n              \"folder\": \"Inbox\",\n              \"received_at\": \"2026-08-12T10:00:00Z\",\n              \"snippet\": \"Updated [NTUSO] [audition] schedule: violin candidates should attend on 2026-08-28...\"\n            }\n          ]\n        },\n        \"error\": null\n      },\n      \"feedback\": {\n        \"source\": \"llm\",\n        \"status\": \"accepted\",\n        \"message\": \"mail.search executed successfully and returned two relevant messages about NTUSO audition (requirements 2026 and updated schedule). This is a valid observation for the search call; full requirement details are not yet available from snippets.\",\n        \"remaining_work\": \"Load full content of mail_msg_1e836c3e6c9e (and mail_msg_df04b623c7e8 if needed) to extract complete NTUSO audition requirements for the user.\",\n        \"local_status\": \"accepted\",\n        \"llm_output\": \"{\\\"status\\\":\\\"accepted\\\",\\\"message\\\":\\\"mail.search executed successfully and returned two relevant messages about NTUSO audition (requirements 2026 and updated schedule). This is a valid observation for the search call; full requirement details are not yet available from snippets.\\\",\\\"remaining_work\\\":\\\"Load full content of mail_msg_1e836c3e6c9e (and mail_msg_df04b623c7e8 if needed) to extract complete NTUSO audition requirements for the user.\\\"}\"\n      }\n    }\n  ]\n}"
+          },
+          {
+            "attempt": 1,
+            "audit_record": {
+              "client_name": "packyapi",
+              "completed_at": "2026-08-22T05:58:26.547496+00:00",
+              "content_length": 195,
+              "duration_ms": 3904,
+              "error_category": null,
+              "error_message": null,
+              "failed_at": null,
+              "finish_reason": "stop",
+              "http_status": null,
+              "input_token_count": 1027,
+              "is_retriable": null,
+              "llm_call_id": "llm_call_7c8f2aac738e7c23",
+              "metadata": {
+                "headers": {},
+                "prompt": {
+                  "message_count": 2,
+                  "system_prompt_length": 614,
+                  "user_prompt_length": 2604
+                }
+              },
+              "model": "deepseek-v4-flash",
+              "output_token_count": 312,
+              "partial": false,
+              "prompt_summary": "tool_result_check tool=mail.load_messages",
+              "provider": "packyapi",
+              "provider_error_code": null,
+              "provider_error_param": null,
+              "provider_error_type": null,
+              "provider_request_id": null,
+              "response_mode": "text",
+              "retry_after": null,
+              "run_id": "agent_run_767116e1a2fa",
+              "session_id": "eval_smoke_mail_basic_ntuso",
+              "stage": "tool_result_check",
+              "started_at": "2026-08-22T05:58:22.643288+00:00",
+              "status": "completed",
+              "total_token_count": 1339,
+              "trace_id": "agent_turn_8400faa474ec"
+            },
+            "client_name": "packyapi",
+            "completed_at": "2026-08-22T05:58:26.547496+00:00",
+            "content_length": 195,
+            "duration_ms": 3904,
+            "error": null,
+            "error_category": null,
+            "error_message": null,
+            "error_type": null,
+            "failed_at": null,
+            "finish_reason": "stop",
+            "http_status": null,
+            "input_token_count": 1027,
+            "is_retriable": null,
+            "llm_call_id": "llm_call_7c8f2aac738e7c23",
+            "metadata": {
+              "headers": {},
+              "prompt": {
+                "message_count": 2,
+                "system_prompt_length": 614,
+                "user_prompt_length": 2604
+              }
+            },
+            "model": "deepseek-v4-flash",
+            "output": "{\"status\":\"accepted\",\"message\":\"邮件已成功读取，包含 NTUSO audition 考试要求及更新日程。\",\"remaining_work\":\"提取并整理考试要求（G 大调音阶、自备曲目、视奏、提前15分钟到场、考场 Music Studio 3）及更新安排（小提琴考生 2026-08-28 14:00，需携带学生证和打印曲目单），向用户呈现完整答案。\"}",
+            "output_token_count": 312,
+            "partial": false,
+            "prompt_summary": "tool_result_check tool=mail.load_messages",
+            "provider": "packyapi",
+            "provider_error_code": null,
+            "provider_error_param": null,
+            "provider_error_type": null,
+            "provider_request_id": null,
+            "response_mode": "text",
+            "retry_after": null,
+            "run_id": "agent_run_767116e1a2fa",
+            "session_id": "eval_smoke_mail_basic_ntuso",
+            "stage": "tool_result_check",
+            "started_at": "2026-08-22T05:58:22.643288+00:00",
+            "status": "completed",
+            "status_code": null,
+            "system_prompt": "You are the Tool Result Checker for Local Knowledge Agent OS. Check whether the just-executed tool result is a valid observation for the prior tool-call decision. Do not make a final user answer. Do not claim success when ToolResult.status is failed. Distinguish tool execution status from domain record status: ToolResult.status=completed means the tool ran, not that a business object is done. If tool_feedback.domain_summary is present, use it as the authoritative structured summary for business records. Return only strict JSON: {\"status\":\"accepted|needs_retry|failed\",\"message\":\"...\",\"remaining_work\":\"...\"}.",
+            "total_token_count": 1339,
+            "trace_id": "agent_turn_8400faa474ec",
+            "user_prompt": "{\n  \"user_input\": \"帮我查询 NTUSO audition 的考试要求。\",\n  \"selected_package\": \"mail\",\n  \"decision\": {\n    \"action\": \"call_tool\",\n    \"tool_name\": \"mail.load_messages\",\n    \"tool_input\": {\n      \"message_ids\": [\n        \"mail_msg_1e836c3e6c9e\",\n        \"mail_msg_df04b623c7e8\"\n      ]\n    },\n    \"assistant_message\": \"已找到相关邮件，正在读取完整考试要求内容。\",\n    \"operation\": {\n      \"type\": \"tool_call\",\n      \"package_name\": \"mail\",\n      \"tool_name\": \"mail.load_messages\",\n      \"tool_input\": {\n        \"message_ids\": [\n          \"mail_msg_1e836c3e6c9e\",\n          \"mail_msg_df04b623c7e8\"\n        ]\n      },\n      \"final_answer\": null,\n      \"reason\": \"邮件搜索已返回两封与 NTUSO audition 相关的邮件；需读取完整邮件正文以提取考试要求（以及可能的更新日程）。\",\n      \"confidence\": \"high\"\n    },\n    \"reason\": \"邮件搜索已返回两封与 NTUSO audition 相关的邮件；需读取完整邮件正文以提取考试要求（以及可能的更新日程）。\",\n    \"_raw_output\": \"{\\\"operation\\\":{\\\"type\\\":\\\"tool_call\\\",\\\"package_name\\\":\\\"mail\\\",\\\"tool_name\\\":\\\"mail.load_messages\\\",\\\"tool_input\\\":{\\\"message_ids\\\":[\\\"mail_msg_1e836c3e6c9e\\\",\\\"mail_msg_df04b623c7e8\\\"]},\\\"final_answer\\\":null,\\\"reason\\\":\\\"邮件搜索已返回两封与 NTUSO audition 相关的邮件；需读取完整邮件正文以提取考试要求（以及可能的更新日程）。\\\",\\\"confidence\\\":\\\"high\\\"},\\\"assistant_message\\\":\\\"已找到相关邮件，正在读取完整考试要求内容。\\\"}\"\n  },\n  \"tool_result\": {\n    \"invocation_id\": \"tool_invocation_0e137e6fda1a\",\n    \"tool_name\": \"mail.load_messages\",\n    \"status\": \"completed\",\n    \"output\": {\n      \"messages\": [\n        {\n          \"message_id\": \"mail_msg_1e836c3e6c9e\",\n          \"subject\": \"NTUSO Audition requirements 2026\",\n          \"sender\": \"ntuso@example.edu\",\n          \"folder\": \"Inbox\",\n          \"recipients\": [\n            \"eval-user@example.com\"\n          ],\n          \"cc\": [],\n          \"received_at\": \"2026-08-05T09:30:00Z\",\n          \"body_text\": \"NTUSO audition requires G major scale, one prepared piece, sight reading, and arrival 15 minutes early. The audition room is Music Studio 3.\",\n          \"attachments\": []\n        },\n        {\n          \"message_id\": \"mail_msg_df04b623c7e8\",\n          \"subject\": \"Updated NTUSO Audition schedule\",\n          \"sender\": \"ntuso@example.edu\",\n          \"folder\": \"Inbox\",\n          \"recipients\": [\n            \"eval-user@example.com\"\n          ],\n          \"cc\": [],\n          \"received_at\": \"2026-08-12T10:00:00Z\",\n          \"body_text\": \"Updated NTUSO audition schedule: violin candidates should attend on 2026-08-28 at 14:00. Bring student card and printed repertoire list.\",\n          \"attachments\": []\n        }\n      ]\n    },\n    \"error\": null\n  },\n  \"tool_feedback\": {\n    \"source\": \"local\",\n    \"status\": \"accepted\",\n    \"message\": \"mail.load_messages executed successfully.\"\n  }\n}"
+          },
+          {
+            "attempt": 1,
+            "audit_record": {
+              "client_name": "packyapi",
+              "completed_at": "2026-08-22T05:58:51.996409+00:00",
+              "content_length": 521,
+              "duration_ms": 25448,
+              "error_category": null,
+              "error_message": null,
+              "failed_at": null,
+              "finish_reason": "stop",
+              "http_status": null,
+              "input_token_count": 3237,
+              "is_retriable": null,
+              "llm_call_id": "llm_call_09cc831b0de228b0",
+              "metadata": {
+                "headers": {},
+                "prompt": {
+                  "message_count": 2,
+                  "system_prompt_length": 2082,
+                  "user_prompt_length": 10717
+                }
+              },
+              "model": "deepseek-v4-flash",
+              "output_token_count": 3229,
+              "partial": false,
+              "prompt_summary": "agent_turn_decision observations=2 format_attempt=1",
+              "provider": "packyapi",
+              "provider_error_code": null,
+              "provider_error_param": null,
+              "provider_error_type": null,
+              "provider_request_id": null,
+              "response_mode": "text",
+              "retry_after": null,
+              "run_id": "agent_run_767116e1a2fa",
+              "session_id": "eval_smoke_mail_basic_ntuso",
+              "stage": "decision",
+              "started_at": "2026-08-22T05:58:26.547859+00:00",
+              "status": "completed",
+              "total_token_count": 6466,
+              "trace_id": "agent_turn_8400faa474ec"
+            },
+            "client_name": "packyapi",
+            "completed_at": "2026-08-22T05:58:51.996409+00:00",
+            "content_length": 521,
+            "duration_ms": 25448,
+            "error": null,
+            "error_category": null,
+            "error_message": null,
+            "error_type": null,
+            "failed_at": null,
+            "finish_reason": "stop",
+            "http_status": null,
+            "input_token_count": 3237,
+            "is_retriable": null,
+            "llm_call_id": "llm_call_09cc831b0de228b0",
+            "metadata": {
+              "headers": {},
+              "prompt": {
+                "message_count": 2,
+                "system_prompt_length": 2082,
+                "user_prompt_length": 10717
+              }
+            },
+            "model": "deepseek-v4-flash",
+            "output": "{\n  \"operation\": {\n    \"type\": \"final_answer\",\n    \"package_name\": null,\n    \"tool_name\": null,\n    \"tool_input\": {},\n    \"final_answer\": \"根据邮箱中的 NTUSO 通知（2026-08-05《NTUSO Audition requirements 2026》），考试要求为：1) G 大调音阶；2) 自备一首曲目；3) 视奏；4) 提前 15 分钟到场；考场为 Music Studio 3。另有一封 2026-08-12 的更新通知显示：小提琴考生应于 2026-08-28 14:00 参加考试，并需携带学生证和打印好的曲目单。\",\n    \"reason\": \"已通过 mail.search 找到相关邮件，并用 mail.load_messages 读取了完整正文，考试要求信息充分，可以直接进入最终回答阶段。\",\n    \"confidence\": \"high\"\n  },\n  \"assistant_message\": \"已从本地邮件中查找到 NTUSO audition 的考试要求。\"\n}",
+            "output_token_count": 3229,
+            "partial": false,
+            "prompt_summary": "agent_turn_decision observations=2 format_attempt=1",
+            "provider": "packyapi",
+            "provider_error_code": null,
+            "provider_error_param": null,
+            "provider_error_type": null,
+            "provider_request_id": null,
+            "response_mode": "text",
+            "retry_after": null,
+            "run_id": "agent_run_767116e1a2fa",
+            "session_id": "eval_smoke_mail_basic_ntuso",
+            "stage": "decision",
+            "started_at": "2026-08-22T05:58:26.547859+00:00",
+            "status": "completed",
+            "status_code": null,
+            "system_prompt": "You are the Main Agent Brain for Local Knowledge Agent OS. Choose the next single action for this agent turn. You may call one available tool, expand a package, request confirmation, or enter the final answer stage. The initially expanded package is mail. Use package_catalog, package decision_hints, expanded_tools, tool descriptions, input_schema, side_effects, risk, observations, and session context as the source of truth. Use tools when more local evidence, deterministic context, or persistence is needed. Reuse cached observations when they are relevant. When observations and session context are sufficient to answer the user, return operation.type final_answer with a concise reason, then stop; do not write final natural language prose in this decision stage. If the currently expanded tools are insufficient, use operation.type expand_package with package_name set to one registered package; do not call tools from a package until that package appears in expanded_package_names. Follow each expanded tool input_schema exactly: include required fields, respect allowed_values/enums, and do not invent unsupported field values. Use the deterministic context supplied in session_context_window when resolving relative references. Return only strict JSON using this operation-first envelope: {\"operation\":{\"type\":\"tool_call|expand_package|final_answer|request_confirmation|no_op\",\"package_name\":null,\"tool_name\":\"<expanded tool name or null>\",\"tool_input\":{},\"final_answer\":null,\"reason\":\"...\",\"confidence\":\"low|medium|high\"},\"assistant_message\":\"short user-visible progress text\"}. The operation object is the only executable control channel and must come first. assistant_message is display-only progress text; it never selects tools and never becomes the final answer. For a final answer, set operation.type to final_answer, set operation.final_answer to null if present, and explain only why the answer stage can now run. For a tool call, put all executable details in operation and only optional progress text in assistant_message. Never return plain text outside JSON.",
+            "total_token_count": 6466,
+            "trace_id": "agent_turn_8400faa474ec",
+            "user_prompt": "{\n  \"user_input\": \"帮我查询 NTUSO audition 的考试要求。\",\n  \"session_context_window\": {\n    \"session_id\": \"eval_smoke_mail_basic_ntuso\",\n    \"token_budget\": 65536,\n    \"summary\": \"\",\n    \"recent_messages\": [],\n    \"token_estimate\": 0,\n    \"updated_at\": \"2026-08-22T05:58:07.435355+00:00\",\n    \"current_time\": {\n      \"utc\": \"2026-08-22T05:58:07.435402+00:00\",\n      \"local\": \"2026-08-22T13:58:07.435402+08:00\",\n      \"timezone\": \"Asia/Shanghai\",\n      \"date\": \"2026-08-22\"\n    }\n  },\n  \"route\": {\n    \"selected_package\": \"mail\",\n    \"reason\": \"The session context window is empty and contains no NTUSO audition requirement details. Such information most plausibly lives in local or synced email (e.g., an NTUSO audition notice or confirmation), so the mail package should be searched for relevant messages before answering.\",\n    \"search_query\": \"NTUSO audition\"\n  },\n  \"package_catalog\": [\n    {\n      \"name\": \"mail\",\n      \"description\": \"Search, load, and sync local mail knowledge. Matter persistence lives in the matter package.\",\n      \"risk\": \"low_to_medium\",\n      \"requires_expansion\": true,\n      \"tool_names\": [\n        \"mail.search\",\n        \"mail.load_messages\",\n        \"mail.sync\"\n      ],\n      \"routing_hints\": [\n        \"Use this package when the user needs evidence from local or synced email.\",\n        \"Use this package when the user asks about mailbox contents, mail notifications, or mail-derived facts.\"\n      ],\n      \"decision_hints\": [\n        \"Search candidate messages before loading full message records.\",\n        \"Load full messages for relevant message ids before writing the final answer.\",\n        \"Synchronize mail first only when the user asks to sync, asks for the latest mailbox state, or local mail may be stale.\",\n        \"This package reads and syncs mail evidence; use another registered persistence package for tasks, events, or matters.\"\n      ],\n      \"observation_cache\": {\n        \"tool_names\": [\n          \"mail.load_messages\"\n        ],\n        \"description\": \"Reuse loaded complete mail records from the same session when relevant.\"\n      }\n    },\n    {\n      \"name\": \"matter\",\n      \"description\": \"Create, search, list, update, and link independent local matters.\",\n      \"risk\": \"low_to_medium\",\n      \"requires_expansion\": true,\n      \"tool_names\": [\n        \"matter.create\",\n        \"matter.create_many\",\n        \"matter.search\",\n        \"matter.list\",\n        \"matter.update\",\n        \"matter.link_source\"\n      ],\n      \"routing_hints\": [\n        \"Use this package when the user asks to inspect, create, update, or link local tasks, events, reminders, or matters.\"\n      ],\n      \"decision_hints\": [\n        \"Inspect existing records when there is a realistic chance of duplicates before creating new records.\",\n        \"Use create for one record, create_many for a controlled batch, update to change existing records, and link_source to attach evidence.\",\n        \"Follow every tool input_schema exactly, especially required fields and allowed_values.\"\n      ],\n      \"observation_cache\": {}\n    },\n    {\n      \"name\": \"runtime\",\n      \"description\": \"Read deterministic runtime context such as the current time.\",\n      \"risk\": \"low\",\n      \"requires_expansion\": true,\n      \"tool_names\": [\n        \"runtime.now\"\n      ],\n      \"routing_hints\": [\n        \"Use this package when a direct answer requires deterministic runtime context.\"\n      ],\n      \"decision_hints\": [\n        \"Use runtime tools when the session context does not already contain sufficient deterministic runtime data.\"\n      ],\n      \"observation_cache\": {}\n    }\n  ],\n  \"expanded_package_names\": [\n    \"mail\"\n  ],\n  \"expanded_tools\": [\n    {\n      \"name\": \"mail.search\",\n      \"type\": \"local_tool\",\n      \"description\": \"Search local persisted mail with SQLite FTS and return candidate message ids. Use an empty query string to match all local mail, ordered by newest first.\",\n      \"package\": \"mail\",\n      \"risk\": \"low\",\n      \"requires_confirmation\": false,\n      \"side_effects\": [\n        \"read_local_db\"\n      ],\n      \"input_schema\": {\n        \"type\": \"object\",\n        \"required\": [\n          \"query\"\n        ],\n        \"properties\": {\n          \"query\": {\n            \"type\": \"string\",\n            \"description\": \"Search text. Use an empty string to match all local mail; combine with limit to fetch the latest messages.\"\n          },\n          \"limit\": {\n            \"type\": \"integer\",\n            \"minimum\": 1,\n            \"description\": \"Maximum number of candidate messages to return.\"\n          }\n        }\n      },\n      \"output_schema\": {\n        \"query\": \"string\",\n        \"messages\": \"array\"\n      }\n    },\n    {\n      \"name\": \"mail.load_messages\",\n      \"type\": \"local_tool\",\n      \"description\": \"Load complete local mail records, including full body text and attachment metadata.\",\n      \"package\": \"mail\",\n      \"risk\": \"low\",\n      \"requires_confirmation\": false,\n      \"side_effects\": [\n        \"read_local_db\"\n      ],\n      \"input_schema\": {\n        \"type\": \"object\",\n        \"required\": [\n          \"message_ids\"\n        ],\n        \"properties\": {\n          \"message_ids\": {\n            \"type\": \"array\",\n            \"items\": {\n              \"type\": \"string\"\n            }\n          }\n        }\n      },\n      \"output_schema\": {\n        \"messages\": \"array\"\n      }\n    },\n    {\n      \"name\": \"mail.sync\",\n      \"type\": \"local_tool\",\n      \"description\": \"Synchronize the configured remote mail provider and import changed messages into the local mail store.\",\n      \"package\": \"mail\",\n      \"risk\": \"low_to_medium\",\n      \"requires_confirmation\": false,\n      \"side_effects\": [\n        \"read_remote_mail\",\n        \"write_local_db\"\n      ],\n      \"input_schema\": {\n        \"type\": \"object\",\n        \"properties\": {\n          \"folder\": {\n            \"type\": \"string\"\n          },\n          \"limit\": {\n            \"type\": \"integer\",\n            \"minimum\": 1\n          },\n          \"max_pages\": {\n            \"type\": \"integer\",\n            \"minimum\": 1\n          }\n        }\n      },\n      \"output_schema\": {\n        \"provider\": \"string\",\n        \"folder\": \"string\",\n        \"imported_messages\": \"integer\",\n        \"imported_attachments\": \"integer\",\n        \"status\": \"string\",\n        \"sync_mode\": \"string\",\n        \"next_link\": \"string|null\",\n        \"delta_link\": \"string|null\"\n      }\n    }\n  ],\n  \"observations\": [\n    {\n      \"tool_name\": \"mail.search\",\n      \"input\": {\n        \"query\": \"NTUSO audition\",\n        \"limit\": 20\n      },\n      \"result\": {\n        \"invocation_id\": \"tool_invocation_cc21f7e4100a\",\n        \"tool_name\": \"mail.search\",\n        \"status\": \"completed\",\n        \"output\": {\n          \"query\": \"NTUSO audition\",\n          \"messages\": [\n            {\n              \"message_id\": \"mail_msg_1e836c3e6c9e\",\n              \"subject\": \"NTUSO Audition requirements 2026\",\n              \"sender\": \"ntuso@example.edu\",\n              \"folder\": \"Inbox\",\n              \"received_at\": \"2026-08-05T09:30:00Z\",\n              \"snippet\": \"[NTUSO] [audition] requires G major scale, one prepared piece, sight reading, and...\"\n            },\n            {\n              \"message_id\": \"mail_msg_df04b623c7e8\",\n              \"subject\": \"Updated NTUSO Audition schedule\",\n              \"sender\": \"ntuso@example.edu\",\n              \"folder\": \"Inbox\",\n              \"received_at\": \"2026-08-12T10:00:00Z\",\n              \"snippet\": \"Updated [NTUSO] [audition] schedule: violin candidates should attend on 2026-08-28...\"\n            }\n          ]\n        },\n        \"error\": null\n      },\n      \"feedback\": {\n        \"source\": \"llm\",\n        \"status\": \"accepted\",\n        \"message\": \"mail.search executed successfully and returned two relevant messages about NTUSO audition (requirements 2026 and updated schedule). This is a valid observation for the search call; full requirement details are not yet available from snippets.\",\n        \"remaining_work\": \"Load full content of mail_msg_1e836c3e6c9e (and mail_msg_df04b623c7e8 if needed) to extract complete NTUSO audition requirements for the user.\",\n        \"local_status\": \"accepted\",\n        \"llm_output\": \"{\\\"status\\\":\\\"accepted\\\",\\\"message\\\":\\\"mail.search executed successfully and returned two relevant messages about NTUSO audition (requirements 2026 and updated schedule). This is a valid observation for the search call; full requirement details are not yet available from snippets.\\\",\\\"remaining_work\\\":\\\"Load full content of mail_msg_1e836c3e6c9e (and mail_msg_df04b623c7e8 if needed) to extract complete NTUSO audition requirements for the user.\\\"}\"\n      }\n    },\n    {\n      \"tool_name\": \"mail.load_messages\",\n      \"input\": {\n        \"message_ids\": [\n          \"mail_msg_1e836c3e6c9e\",\n          \"mail_msg_df04b623c7e8\"\n        ]\n      },\n      \"result\": {\n        \"invocation_id\": \"tool_invocation_0e137e6fda1a\",\n        \"tool_name\": \"mail.load_messages\",\n        \"status\": \"completed\",\n        \"output\": {\n          \"messages\": [\n            {\n              \"message_id\": \"mail_msg_1e836c3e6c9e\",\n              \"subject\": \"NTUSO Audition requirements 2026\",\n              \"sender\": \"ntuso@example.edu\",\n              \"folder\": \"Inbox\",\n              \"recipients\": [\n                \"eval-user@example.com\"\n              ],\n              \"cc\": [],\n              \"received_at\": \"2026-08-05T09:30:00Z\",\n              \"body_text\": \"NTUSO audition requires G major scale, one prepared piece, sight reading, and arrival 15 minutes early. The audition room is Music Studio 3.\",\n              \"attachments\": []\n            },\n            {\n              \"message_id\": \"mail_msg_df04b623c7e8\",\n              \"subject\": \"Updated NTUSO Audition schedule\",\n              \"sender\": \"ntuso@example.edu\",\n              \"folder\": \"Inbox\",\n              \"recipients\": [\n                \"eval-user@example.com\"\n              ],\n              \"cc\": [],\n              \"received_at\": \"2026-08-12T10:00:00Z\",\n              \"body_text\": \"Updated NTUSO audition schedule: violin candidates should attend on 2026-08-28 at 14:00. Bring student card and printed repertoire list.\",\n              \"attachments\": []\n            }\n          ]\n        },\n        \"error\": null\n      },\n      \"feedback\": {\n        \"source\": \"llm\",\n        \"status\": \"accepted\",\n        \"message\": \"邮件已成功读取，包含 NTUSO audition 考试要求及更新日程。\",\n        \"remaining_work\": \"提取并整理考试要求（G 大调音阶、自备曲目、视奏、提前15分钟到场、考场 Music Studio 3）及更新安排（小提琴考生 2026-08-28 14:00，需携带学生证和打印曲目单），向用户呈现完整答案。\",\n        \"local_status\": \"accepted\",\n        \"llm_output\": \"{\\\"status\\\":\\\"accepted\\\",\\\"message\\\":\\\"邮件已成功读取，包含 NTUSO audition 考试要求及更新日程。\\\",\\\"remaining_work\\\":\\\"提取并整理考试要求（G 大调音阶、自备曲目、视奏、提前15分钟到场、考场 Music Studio 3）及更新安排（小提琴考生 2026-08-28 14:00，需携带学生证和打印曲目单），向用户呈现完整答案。\\\"}\"\n      }\n    }\n  ]\n}"
+          },
+          {
+            "attempt": 1,
+            "audit_record": {
+              "client_name": "packyapi",
+              "completed_at": "2026-08-22T05:58:55.637208+00:00",
+              "content_length": 308,
+              "duration_ms": 3640,
+              "error_category": null,
+              "error_message": null,
+              "failed_at": null,
+              "finish_reason": "stop",
+              "http_status": null,
+              "input_token_count": 1821,
+              "is_retriable": null,
+              "llm_call_id": "llm_call_a70010b7f6e60dac",
+              "metadata": {
+                "headers": {},
+                "prompt": {
+                  "message_count": 2,
+                  "system_prompt_length": 463,
+                  "user_prompt_length": 5707
+                }
+              },
+              "model": "deepseek-v4-flash",
+              "output_token_count": 315,
+              "partial": false,
+              "prompt_summary": "agent_turn_answer observations=2",
+              "provider": "packyapi",
+              "provider_error_code": null,
+              "provider_error_param": null,
+              "provider_error_type": null,
+              "provider_request_id": null,
+              "response_mode": "text",
+              "retry_after": null,
+              "run_id": "agent_run_767116e1a2fa",
+              "session_id": "eval_smoke_mail_basic_ntuso",
+              "stage": "answer",
+              "started_at": "2026-08-22T05:58:51.996680+00:00",
+              "status": "completed",
+              "total_token_count": 2136,
+              "trace_id": "agent_turn_8400faa474ec"
+            },
+            "client_name": "packyapi",
+            "completed_at": "2026-08-22T05:58:55.637208+00:00",
+            "content_length": 308,
+            "duration_ms": 3640,
+            "error": null,
+            "error_category": null,
+            "error_message": null,
+            "error_type": null,
+            "failed_at": null,
+            "finish_reason": "stop",
+            "http_status": null,
+            "input_token_count": 1821,
+            "is_retriable": null,
+            "llm_call_id": "llm_call_a70010b7f6e60dac",
+            "metadata": {
+              "headers": {},
+              "prompt": {
+                "message_count": 2,
+                "system_prompt_length": 463,
+                "user_prompt_length": 5707
+              }
+            },
+            "model": "deepseek-v4-flash",
+            "output": "已从你的本地邮件中找到 NTUSO（南洋理工大学交响乐团）audition 的相关通知，考试要求如下：\n\n**考试要求（来自 2026-08-05 邮件）**\n- 演奏 G 大调音阶\n- 准备一首自选曲目\n- 视奏测试\n- 需提前 15 分钟到场\n- 考场地点：Music Studio 3\n\n**日程更新（来自 2026-08-12 邮件）**\n- 小提琴考生：**2026-08-28 14:00** 参加面试\n- 需携带：学生证 + 打印的曲目清单（repertoire list）\n\n建议你提前准备好曲目单并打印，并按照要求提前到达考场。如需查看邮件原文，可以在收件箱中搜索“NTUSO”即可找到这两封邮件。",
+            "output_token_count": 315,
+            "partial": false,
+            "prompt_summary": "agent_turn_answer observations=2",
+            "provider": "packyapi",
+            "provider_error_code": null,
+            "provider_error_param": null,
+            "provider_error_type": null,
+            "provider_request_id": null,
+            "response_mode": "text",
+            "retry_after": null,
+            "run_id": "agent_run_767116e1a2fa",
+            "session_id": "eval_smoke_mail_basic_ntuso",
+            "stage": "answer",
+            "started_at": "2026-08-22T05:58:51.996680+00:00",
+            "status": "completed",
+            "status_code": null,
+            "system_prompt": "You are the Final Answer Writer for Local Knowledge Agent OS. Use the provided session context window, tool observations, and decision reason to answer the user directly in Chinese. The decision stage is only a structured control step; do not treat any decision-stage final_answer text as authoritative final prose. Base the answer on evidence from observations and session context. Mention uncertainty when evidence is incomplete. Do not wrap the answer in JSON.",
+            "total_token_count": 2136,
+            "trace_id": "agent_turn_8400faa474ec",
+            "user_prompt": "{\n  \"user_input\": \"帮我查询 NTUSO audition 的考试要求。\",\n  \"route\": {\n    \"selected_package\": \"mail\",\n    \"reason\": \"The session context window is empty and contains no NTUSO audition requirement details. Such information most plausibly lives in local or synced email (e.g., an NTUSO audition notice or confirmation), so the mail package should be searched for relevant messages before answering.\",\n    \"search_query\": \"NTUSO audition\"\n  },\n  \"session_context_window\": {\n    \"session_id\": \"eval_smoke_mail_basic_ntuso\",\n    \"token_budget\": 65536,\n    \"summary\": \"\",\n    \"recent_messages\": [],\n    \"token_estimate\": 0,\n    \"updated_at\": \"2026-08-22T05:58:07.435355+00:00\",\n    \"current_time\": {\n      \"utc\": \"2026-08-22T05:58:07.435402+00:00\",\n      \"local\": \"2026-08-22T13:58:07.435402+08:00\",\n      \"timezone\": \"Asia/Shanghai\",\n      \"date\": \"2026-08-22\"\n    }\n  },\n  \"observations\": [\n    {\n      \"tool_name\": \"mail.search\",\n      \"input\": {\n        \"query\": \"NTUSO audition\",\n        \"limit\": 20\n      },\n      \"result\": {\n        \"invocation_id\": \"tool_invocation_cc21f7e4100a\",\n        \"tool_name\": \"mail.search\",\n        \"status\": \"completed\",\n        \"output\": {\n          \"query\": \"NTUSO audition\",\n          \"messages\": [\n            {\n              \"message_id\": \"mail_msg_1e836c3e6c9e\",\n              \"subject\": \"NTUSO Audition requirements 2026\",\n              \"sender\": \"ntuso@example.edu\",\n              \"folder\": \"Inbox\",\n              \"received_at\": \"2026-08-05T09:30:00Z\",\n              \"snippet\": \"[NTUSO] [audition] requires G major scale, one prepared piece, sight reading, and...\"\n            },\n            {\n              \"message_id\": \"mail_msg_df04b623c7e8\",\n              \"subject\": \"Updated NTUSO Audition schedule\",\n              \"sender\": \"ntuso@example.edu\",\n              \"folder\": \"Inbox\",\n              \"received_at\": \"2026-08-12T10:00:00Z\",\n              \"snippet\": \"Updated [NTUSO] [audition] schedule: violin candidates should attend on 2026-08-28...\"\n            }\n          ]\n        },\n        \"error\": null\n      },\n      \"feedback\": {\n        \"source\": \"llm\",\n        \"status\": \"accepted\",\n        \"message\": \"mail.search executed successfully and returned two relevant messages about NTUSO audition (requirements 2026 and updated schedule). This is a valid observation for the search call; full requirement details are not yet available from snippets.\",\n        \"remaining_work\": \"Load full content of mail_msg_1e836c3e6c9e (and mail_msg_df04b623c7e8 if needed) to extract complete NTUSO audition requirements for the user.\",\n        \"local_status\": \"accepted\",\n        \"llm_output\": \"{\\\"status\\\":\\\"accepted\\\",\\\"message\\\":\\\"mail.search executed successfully and returned two relevant messages about NTUSO audition (requirements 2026 and updated schedule). This is a valid observation for the search call; full requirement details are not yet available from snippets.\\\",\\\"remaining_work\\\":\\\"Load full content of mail_msg_1e836c3e6c9e (and mail_msg_df04b623c7e8 if needed) to extract complete NTUSO audition requirements for the user.\\\"}\"\n      }\n    },\n    {\n      \"tool_name\": \"mail.load_messages\",\n      \"input\": {\n        \"message_ids\": [\n          \"mail_msg_1e836c3e6c9e\",\n          \"mail_msg_df04b623c7e8\"\n        ]\n      },\n      \"result\": {\n        \"invocation_id\": \"tool_invocation_0e137e6fda1a\",\n        \"tool_name\": \"mail.load_messages\",\n        \"status\": \"completed\",\n        \"output\": {\n          \"messages\": [\n            {\n              \"message_id\": \"mail_msg_1e836c3e6c9e\",\n              \"subject\": \"NTUSO Audition requirements 2026\",\n              \"sender\": \"ntuso@example.edu\",\n              \"folder\": \"Inbox\",\n              \"recipients\": [\n                \"eval-user@example.com\"\n              ],\n              \"cc\": [],\n              \"received_at\": \"2026-08-05T09:30:00Z\",\n              \"body_text\": \"NTUSO audition requires G major scale, one prepared piece, sight reading, and arrival 15 minutes early. The audition room is Music Studio 3.\",\n              \"attachments\": []\n            },\n            {\n              \"message_id\": \"mail_msg_df04b623c7e8\",\n              \"subject\": \"Updated NTUSO Audition schedule\",\n              \"sender\": \"ntuso@example.edu\",\n              \"folder\": \"Inbox\",\n              \"recipients\": [\n                \"eval-user@example.com\"\n              ],\n              \"cc\": [],\n              \"received_at\": \"2026-08-12T10:00:00Z\",\n              \"body_text\": \"Updated NTUSO audition schedule: violin candidates should attend on 2026-08-28 at 14:00. Bring student card and printed repertoire list.\",\n              \"attachments\": []\n            }\n          ]\n        },\n        \"error\": null\n      },\n      \"feedback\": {\n        \"source\": \"llm\",\n        \"status\": \"accepted\",\n        \"message\": \"邮件已成功读取，包含 NTUSO audition 考试要求及更新日程。\",\n        \"remaining_work\": \"提取并整理考试要求（G 大调音阶、自备曲目、视奏、提前15分钟到场、考场 Music Studio 3）及更新安排（小提琴考生 2026-08-28 14:00，需携带学生证和打印曲目单），向用户呈现完整答案。\",\n        \"local_status\": \"accepted\",\n        \"llm_output\": \"{\\\"status\\\":\\\"accepted\\\",\\\"message\\\":\\\"邮件已成功读取，包含 NTUSO audition 考试要求及更新日程。\\\",\\\"remaining_work\\\":\\\"提取并整理考试要求（G 大调音阶、自备曲目、视奏、提前15分钟到场、考场 Music Studio 3）及更新安排（小提琴考生 2026-08-28 14:00，需携带学生证和打印曲目单），向用户呈现完整答案。\\\"}\"\n      }\n    }\n  ],\n  \"answer_stage_decision\": {\n    \"action\": \"final_answer\",\n    \"reason\": \"已通过 mail.search 找到相关邮件，并用 mail.load_messages 读取了完整正文，考试要求信息充分，可以直接进入最终回答阶段。\",\n    \"assistant_message\": \"已从本地邮件中查找到 NTUSO audition 的考试要求。\",\n    \"operation\": {\n      \"type\": \"final_answer\",\n      \"package_name\": null,\n      \"tool_name\": null,\n      \"tool_input\": {},\n      \"reason\": \"已通过 mail.search 找到相关邮件，并用 mail.load_messages 读取了完整正文，考试要求信息充分，可以直接进入最终回答阶段。\",\n      \"confidence\": \"high\"\n    }\n  }\n}"
+          }
+        ],
+        "log_path": "/tmp/lka_eval_smoke_mail_basic_ntuso_lxfntjzo/data/agent_logs/agent_turn_8400faa474ec.md",
+        "package_catalog": [
+          {
+            "decision_hints": [
+              "Search candidate messages before loading full message records.",
+              "Load full messages for relevant message ids before writing the final answer.",
+              "Synchronize mail first only when the user asks to sync, asks for the latest mailbox state, or local mail may be stale.",
+              "This package reads and syncs mail evidence; use another registered persistence package for tasks, events, or matters."
+            ],
+            "description": "Search, load, and sync local mail knowledge. Matter persistence lives in the matter package.",
+            "name": "mail",
+            "observation_cache": {
+              "description": "Reuse loaded complete mail records from the same session when relevant.",
+              "tool_names": [
+                "mail.load_messages"
+              ]
+            },
+            "requires_expansion": true,
+            "risk": "low_to_medium",
+            "routing_hints": [
+              "Use this package when the user needs evidence from local or synced email.",
+              "Use this package when the user asks about mailbox contents, mail notifications, or mail-derived facts."
+            ],
+            "tool_names": [
+              "mail.search",
+              "mail.load_messages",
+              "mail.sync"
+            ]
+          },
+          {
+            "decision_hints": [
+              "Inspect existing records when there is a realistic chance of duplicates before creating new records.",
+              "Use create for one record, create_many for a controlled batch, update to change existing records, and link_source to attach evidence.",
+              "Follow every tool input_schema exactly, especially required fields and allowed_values."
+            ],
+            "description": "Create, search, list, update, and link independent local matters.",
+            "name": "matter",
+            "observation_cache": {},
+            "requires_expansion": true,
+            "risk": "low_to_medium",
+            "routing_hints": [
+              "Use this package when the user asks to inspect, create, update, or link local tasks, events, reminders, or matters."
+            ],
+            "tool_names": [
+              "matter.create",
+              "matter.create_many",
+              "matter.search",
+              "matter.list",
+              "matter.update",
+              "matter.link_source"
+            ]
+          },
+          {
+            "decision_hints": [
+              "Use runtime tools when the session context does not already contain sufficient deterministic runtime data."
+            ],
+            "description": "Read deterministic runtime context such as the current time.",
+            "name": "runtime",
+            "observation_cache": {},
+            "requires_expansion": true,
+            "risk": "low",
+            "routing_hints": [
+              "Use this package when a direct answer requires deterministic runtime context."
+            ],
+            "tool_names": [
+              "runtime.now"
+            ]
+          }
+        ],
+        "progress_events": [
+          {
+            "created_at": "2026-08-22T05:58:12.067399+00:00",
+            "event_index": 1,
+            "message": "Selected `mail` package.",
+            "metadata": {
+              "reason": "The session context window is empty and contains no NTUSO audition requirement details. Such information most plausibly lives in local or synced email (e.g., an NTUSO audition notice or confirmation), so the mail package should be searched for relevant messages before answering."
+            },
+            "package_name": "mail",
+            "stage": "route",
+            "status": "completed",
+            "tool_name": null,
+            "type": "package_selected"
+          },
+          {
+            "created_at": "2026-08-22T05:58:15.480981+00:00",
+            "event_index": 2,
+            "message": "正在搜索本地邮件中的 NTUSO audition 相关信息…",
+            "metadata": {
+              "action": "call_tool",
+              "step_index": 2
+            },
+            "package_name": null,
+            "stage": "decision",
+            "status": "completed",
+            "tool_name": "mail.search",
+            "type": "assistant_message"
+          },
+          {
+            "created_at": "2026-08-22T05:58:15.481001+00:00",
+            "event_index": 3,
+            "message": "Calling `mail.search`.",
+            "metadata": {
+              "input": {
+                "limit": 20,
+                "query": "NTUSO audition"
+              }
+            },
+            "package_name": null,
+            "stage": "tool_execute",
+            "status": "running",
+            "tool_name": "mail.search",
+            "type": "tool_started"
+          },
+          {
+            "created_at": "2026-08-22T05:58:15.481621+00:00",
+            "event_index": 4,
+            "message": "`mail.search` completed with 2 `messages` items.",
+            "metadata": {
+              "result": {
+                "error": null,
+                "invocation_id": "tool_invocation_cc21f7e4100a",
+                "output": {
+                  "messages": [
+                    {
+                      "folder": "Inbox",
+                      "message_id": "mail_msg_1e836c3e6c9e",
+                      "received_at": "2026-08-05T09:30:00Z",
+                      "sender": "ntuso@example.edu",
+                      "snippet": "[NTUSO] [audition] requires G major scale, one prepared piece, sight reading, and...",
+                      "subject": "NTUSO Audition requirements 2026"
+                    },
+                    {
+                      "folder": "Inbox",
+                      "message_id": "mail_msg_df04b623c7e8",
+                      "received_at": "2026-08-12T10:00:00Z",
+                      "sender": "ntuso@example.edu",
+                      "snippet": "Updated [NTUSO] [audition] schedule: violin candidates should attend on 2026-08-28...",
+                      "subject": "Updated NTUSO Audition schedule"
+                    }
+                  ],
+                  "query": "NTUSO audition"
+                },
+                "status": "completed",
+                "tool_name": "mail.search"
+              }
+            },
+            "package_name": null,
+            "stage": "tool_execute",
+            "status": "completed",
+            "tool_name": "mail.search",
+            "type": "tool_completed"
+          },
+          {
+            "created_at": "2026-08-22T05:58:18.654403+00:00",
+            "event_index": 5,
+            "message": "mail.search executed successfully and returned two relevant messages about NTUSO audition (requirements 2026 and updated schedule). This is a valid observation for the search call; full requirement details are not yet available from snippets.",
+            "metadata": {
+              "llm_output": "{\"status\":\"accepted\",\"message\":\"mail.search executed successfully and returned two relevant messages about NTUSO audition (requirements 2026 and updated schedule). This is a valid observation for the search call; full requirement details are not yet available from snippets.\",\"remaining_work\":\"Load full content of mail_msg_1e836c3e6c9e (and mail_msg_df04b623c7e8 if needed) to extract complete NTUSO audition requirements for the user.\"}",
+              "local_status": "accepted",
+              "message": "mail.search executed successfully and returned two relevant messages about NTUSO audition (requirements 2026 and updated schedule). This is a valid observation for the search call; full requirement details are not yet available from snippets.",
+              "remaining_work": "Load full content of mail_msg_1e836c3e6c9e (and mail_msg_df04b623c7e8 if needed) to extract complete NTUSO audition requirements for the user.",
+              "source": "llm",
+              "status": "accepted"
+            },
+            "package_name": null,
+            "stage": "tool_result_check",
+            "status": "accepted",
+            "tool_name": "mail.search",
+            "type": "tool_feedback"
+          },
+          {
+            "created_at": "2026-08-22T05:58:22.642627+00:00",
+            "event_index": 6,
+            "message": "已找到相关邮件，正在读取完整考试要求内容。",
+            "metadata": {
+              "action": "call_tool",
+              "step_index": 3
+            },
+            "package_name": null,
+            "stage": "decision",
+            "status": "completed",
+            "tool_name": "mail.load_messages",
+            "type": "assistant_message"
+          },
+          {
+            "created_at": "2026-08-22T05:58:22.642644+00:00",
+            "event_index": 7,
+            "message": "Calling `mail.load_messages`.",
+            "metadata": {
+              "input": {
+                "message_ids": [
+                  "mail_msg_1e836c3e6c9e",
+                  "mail_msg_df04b623c7e8"
+                ]
+              }
+            },
+            "package_name": null,
+            "stage": "tool_execute",
+            "status": "running",
+            "tool_name": "mail.load_messages",
+            "type": "tool_started"
+          },
+          {
+            "created_at": "2026-08-22T05:58:22.643193+00:00",
+            "event_index": 8,
+            "message": "`mail.load_messages` completed with 2 `messages` items.",
+            "metadata": {
+              "result": {
+                "error": null,
+                "invocation_id": "tool_invocation_0e137e6fda1a",
+                "output": {
+                  "messages": [
+                    {
+                      "attachments": [],
+                      "body_text": "NTUSO audition requires G major scale, one prepared piece, sight reading, and arrival 15 minutes early. The audition room is Music Studio 3.",
+                      "cc": [],
+                      "folder": "Inbox",
+                      "message_id": "mail_msg_1e836c3e6c9e",
+                      "received_at": "2026-08-05T09:30:00Z",
+                      "recipients": [
+                        "eval-user@example.com"
+                      ],
+                      "sender": "ntuso@example.edu",
+                      "subject": "NTUSO Audition requirements 2026"
+                    },
+                    {
+                      "attachments": [],
+                      "body_text": "Updated NTUSO audition schedule: violin candidates should attend on 2026-08-28 at 14:00. Bring student card and printed repertoire list.",
+                      "cc": [],
+                      "folder": "Inbox",
+                      "message_id": "mail_msg_df04b623c7e8",
+                      "received_at": "2026-08-12T10:00:00Z",
+                      "recipients": [
+                        "eval-user@example.com"
+                      ],
+                      "sender": "ntuso@example.edu",
+                      "subject": "Updated NTUSO Audition schedule"
+                    }
+                  ]
+                },
+                "status": "completed",
+                "tool_name": "mail.load_messages"
+              }
+            },
+            "package_name": null,
+            "stage": "tool_execute",
+            "status": "completed",
+            "tool_name": "mail.load_messages",
+            "type": "tool_completed"
+          },
+          {
+            "created_at": "2026-08-22T05:58:26.547624+00:00",
+            "event_index": 9,
+            "message": "邮件已成功读取，包含 NTUSO audition 考试要求及更新日程。",
+            "metadata": {
+              "llm_output": "{\"status\":\"accepted\",\"message\":\"邮件已成功读取，包含 NTUSO audition 考试要求及更新日程。\",\"remaining_work\":\"提取并整理考试要求（G 大调音阶、自备曲目、视奏、提前15分钟到场、考场 Music Studio 3）及更新安排（小提琴考生 2026-08-28 14:00，需携带学生证和打印曲目单），向用户呈现完整答案。\"}",
+              "local_status": "accepted",
+              "message": "邮件已成功读取，包含 NTUSO audition 考试要求及更新日程。",
+              "remaining_work": "提取并整理考试要求（G 大调音阶、自备曲目、视奏、提前15分钟到场、考场 Music Studio 3）及更新安排（小提琴考生 2026-08-28 14:00，需携带学生证和打印曲目单），向用户呈现完整答案。",
+              "source": "llm",
+              "status": "accepted"
+            },
+            "package_name": null,
+            "stage": "tool_result_check",
+            "status": "accepted",
+            "tool_name": "mail.load_messages",
+            "type": "tool_feedback"
+          },
+          {
+            "created_at": "2026-08-22T05:58:51.996546+00:00",
+            "event_index": 10,
+            "message": "已从本地邮件中查找到 NTUSO audition 的考试要求。",
+            "metadata": {
+              "action": "final_answer",
+              "step_index": 4
+            },
+            "package_name": null,
+            "stage": "decision",
+            "status": "completed",
+            "tool_name": null,
+            "type": "assistant_message"
+          },
+          {
+            "created_at": "2026-08-22T05:58:55.637327+00:00",
+            "event_index": 11,
+            "message": "已从你的本地邮件中找到 NTUSO（南洋理工大学交响乐团）audition 的相关通知，考试要求如下： **考试要求（来自 2026-08-05 邮件）** - 演奏 G 大调音阶 - 准备一首自选曲目 - 视奏测试 - 需提前 15 分钟到场 - 考场地点：Music Studio 3 **日程更新（来自 2026-08-12 邮件）** - 小提琴考生：**2026-08-28 14:00** 参加面试 - 需携带：学生证 + 打印的曲目清单（repertoire list） 建议你提前准备好曲目单并打印，并按照要求提前到达考场。如需查看邮件原文，可以在收件箱中搜索“NTUSO”即可找到这两封邮件。",
+            "metadata": {
+              "answer": "已从你的本地邮件中找到 NTUSO（南洋理工大学交响乐团）audition 的相关通知，考试要求如下：\n\n**考试要求（来自 2026-08-05 邮件）**\n- 演奏 G 大调音阶\n- 准备一首自选曲目\n- 视奏测试\n- 需提前 15 分钟到场\n- 考场地点：Music Studio 3\n\n**日程更新（来自 2026-08-12 邮件）**\n- 小提琴考生：**2026-08-28 14:00** 参加面试\n- 需携带：学生证 + 打印的曲目清单（repertoire list）\n\n建议你提前准备好曲目单并打印，并按照要求提前到达考场。如需查看邮件原文，可以在收件箱中搜索“NTUSO”即可找到这两封邮件。"
+            },
+            "package_name": null,
+            "stage": "answer",
+            "status": "completed",
+            "tool_name": null,
+            "type": "final_answer"
+          }
+        ],
+        "run_id": "agent_run_767116e1a2fa",
+        "selected_package": "mail",
+        "session_context_window": {
+          "current_time": {
+            "date": "2026-08-22",
+            "local": "2026-08-22T13:58:07.435402+08:00",
+            "timezone": "Asia/Shanghai",
+            "utc": "2026-08-22T05:58:07.435402+00:00"
+          },
+          "recent_messages": [],
+          "session_id": "eval_smoke_mail_basic_ntuso",
+          "summary": "",
+          "token_budget": 65536,
+          "token_estimate": 0,
+          "updated_at": "2026-08-22T05:58:07.435355+00:00"
+        },
+        "session_id": "eval_smoke_mail_basic_ntuso",
+        "tool_events": [
+          {
+            "completed_at": "2026-08-22T05:58:15.481596+00:00",
+            "feedback": {
+              "llm_output": "{\"status\":\"accepted\",\"message\":\"mail.search executed successfully and returned two relevant messages about NTUSO audition (requirements 2026 and updated schedule). This is a valid observation for the search call; full requirement details are not yet available from snippets.\",\"remaining_work\":\"Load full content of mail_msg_1e836c3e6c9e (and mail_msg_df04b623c7e8 if needed) to extract complete NTUSO audition requirements for the user.\"}",
+              "local_status": "accepted",
+              "message": "mail.search executed successfully and returned two relevant messages about NTUSO audition (requirements 2026 and updated schedule). This is a valid observation for the search call; full requirement details are not yet available from snippets.",
+              "remaining_work": "Load full content of mail_msg_1e836c3e6c9e (and mail_msg_df04b623c7e8 if needed) to extract complete NTUSO audition requirements for the user.",
+              "source": "llm",
+              "status": "accepted"
+            },
+            "input": {
+              "limit": 20,
+              "query": "NTUSO audition"
+            },
+            "result": {
+              "error": null,
+              "invocation_id": "tool_invocation_cc21f7e4100a",
+              "output": {
+                "messages": [
+                  {
+                    "folder": "Inbox",
+                    "message_id": "mail_msg_1e836c3e6c9e",
+                    "received_at": "2026-08-05T09:30:00Z",
+                    "sender": "ntuso@example.edu",
+                    "snippet": "[NTUSO] [audition] requires G major scale, one prepared piece, sight reading, and...",
+                    "subject": "NTUSO Audition requirements 2026"
+                  },
+                  {
+                    "folder": "Inbox",
+                    "message_id": "mail_msg_df04b623c7e8",
+                    "received_at": "2026-08-12T10:00:00Z",
+                    "sender": "ntuso@example.edu",
+                    "snippet": "Updated [NTUSO] [audition] schedule: violin candidates should attend on 2026-08-28...",
+                    "subject": "Updated NTUSO Audition schedule"
+                  }
+                ],
+                "query": "NTUSO audition"
+              },
+              "status": "completed",
+              "tool_name": "mail.search"
+            },
+            "selected_at": "2026-08-22T05:58:15.480998+00:00",
+            "tool_name": "mail.search"
+          },
+          {
+            "completed_at": "2026-08-22T05:58:22.643154+00:00",
+            "feedback": {
+              "llm_output": "{\"status\":\"accepted\",\"message\":\"邮件已成功读取，包含 NTUSO audition 考试要求及更新日程。\",\"remaining_work\":\"提取并整理考试要求（G 大调音阶、自备曲目、视奏、提前15分钟到场、考场 Music Studio 3）及更新安排（小提琴考生 2026-08-28 14:00，需携带学生证和打印曲目单），向用户呈现完整答案。\"}",
+              "local_status": "accepted",
+              "message": "邮件已成功读取，包含 NTUSO audition 考试要求及更新日程。",
+              "remaining_work": "提取并整理考试要求（G 大调音阶、自备曲目、视奏、提前15分钟到场、考场 Music Studio 3）及更新安排（小提琴考生 2026-08-28 14:00，需携带学生证和打印曲目单），向用户呈现完整答案。",
+              "source": "llm",
+              "status": "accepted"
+            },
+            "input": {
+              "message_ids": [
+                "mail_msg_1e836c3e6c9e",
+                "mail_msg_df04b623c7e8"
+              ]
+            },
+            "result": {
+              "error": null,
+              "invocation_id": "tool_invocation_0e137e6fda1a",
+              "output": {
+                "messages": [
+                  {
+                    "attachments": [],
+                    "body_text": "NTUSO audition requires G major scale, one prepared piece, sight reading, and arrival 15 minutes early. The audition room is Music Studio 3.",
+                    "cc": [],
+                    "folder": "Inbox",
+                    "message_id": "mail_msg_1e836c3e6c9e",
+                    "received_at": "2026-08-05T09:30:00Z",
+                    "recipients": [
+                      "eval-user@example.com"
+                    ],
+                    "sender": "ntuso@example.edu",
+                    "subject": "NTUSO Audition requirements 2026"
+                  },
+                  {
+                    "attachments": [],
+                    "body_text": "Updated NTUSO audition schedule: violin candidates should attend on 2026-08-28 at 14:00. Bring student card and printed repertoire list.",
+                    "cc": [],
+                    "folder": "Inbox",
+                    "message_id": "mail_msg_df04b623c7e8",
+                    "received_at": "2026-08-12T10:00:00Z",
+                    "recipients": [
+                      "eval-user@example.com"
+                    ],
+                    "sender": "ntuso@example.edu",
+                    "subject": "Updated NTUSO Audition schedule"
+                  }
+                ]
+              },
+              "status": "completed",
+              "tool_name": "mail.load_messages"
+            },
+            "selected_at": "2026-08-22T05:58:22.642642+00:00",
+            "tool_name": "mail.load_messages"
+          }
+        ],
+        "trace_id": "agent_turn_8400faa474ec",
+        "verification_warnings": []
+      },
+      "score": 0.875,
+      "sse_event_count": 0,
+      "subject": "runtime",
+      "timings": {
+        "wall_time_ms": 48559.325
+      }
+    }
+  ],
+  "generated_at": "2026-08-22T05:58:55.680077+00:00",
+  "subject": "runtime",
+  "suite_id": "smoke",
+  "summary": {
+    "case_count": 1,
+    "failed_count": 1,
+    "passed": false,
+    "passed_count": 0,
+    "score": 0.875
+  }
+}

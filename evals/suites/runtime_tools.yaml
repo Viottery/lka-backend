@@ -1,0 +1,28 @@
+{
+  "suite_id": "runtime_tools",
+  "description": "Agent-visible deterministic runtime tool benchmark.",
+  "cases": [
+    {
+      "case_id": "runtime_now_tool",
+      "workflow": "tool_plan",
+      "request": {"user_input": "现在的确定性运行时日期时间是什么？"},
+      "tool_plan": [
+        {
+          "tool_name": "runtime.now",
+          "tool_input": {}
+        }
+      ],
+      "scripted_answer": "已通过 runtime.now 获取当前确定性时间上下文。",
+      "expect": {
+        "selected_package": "runtime",
+        "tool_sequence": ["runtime.now"],
+        "required_tools": ["runtime.now"],
+        "answer_contains_all": ["runtime.now"],
+        "tool_output_contains_all": ["local", "timezone", "utc", "date"],
+        "max_schema_rejections": 0,
+        "max_llm_calls": 5,
+        "max_wall_time_ms": 5000
+      }
+    }
+  ]
+}

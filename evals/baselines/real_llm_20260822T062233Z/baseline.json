@@ -1,0 +1,1328 @@
+{
+  "baseline_id": "real_llm_20260822T062233Z",
+  "generated_at": "2026-08-22T06:34:53.403363+00:00",
+  "git": {
+    "head": "d16f8c6bc0d926b3e9a80b143c34eb1b99207edd",
+    "dirty": true,
+    "status_short": [
+      " M .gitignore",
+      " M app/core/agent_turn.py",
+      " M app/core/llm/__init__.py",
+      " M app/core/llm/audit.py",
+      " M app/core/llm/errors.py",
+      " M app/core/llm/openai_compatible.py",
+      " M app/core/runtime.py",
+      " M app/tool_packages/matter.py",
+      " M docs/api_contract.md",
+      " M docs/backend_engineering_guide.md",
+      " M docs/current_system_architecture.md",
+      " M docs/mvp_todolist.md",
+      " M tests/test_agent_turn.py",
+      " M tests/test_llm_audit.py",
+      " M tests/test_mail_service.py",
+      "?? evals/",
+      "?? tests/test_evals_smoke.py"
+    ],
+    "note": "HEAD identifies the committed base; working tree was dirty when this baseline was recorded."
+  },
+  "configuration": {
+    "llm_mode": "real",
+    "local_config_path": "config/local.toml",
+    "data_isolation": "runtime cases used temporary LKA_DATA_DIR; stream_contract used /tmp/lka_eval_stream_data on port 18765.",
+    "source_report_dir": "/tmp/lka_eval_real_reports_net"
+  },
+  "commands": [
+    "uv --cache-dir .uv-cache run python -m evals.lka_evals.runner <suite> --subject runtime --llm-mode real --local-config config/local.toml --timeout 240 --report-dir /tmp/lka_eval_real_reports_net",
+    "env LKA_DATA_DIR=/tmp/lka_eval_stream_data LKA_LOCAL_CONFIG=config/local.toml uv --cache-dir .uv-cache run uvicorn app.api.main:app --host 127.0.0.1 --port 18765",
+    "uv --cache-dir .uv-cache run python -m evals.lka_evals.runner evals/suites/stream_contract.yaml --subject stream --base-url http://127.0.0.1:18765 --allow-http-setup --timeout 240 --report-dir /tmp/lka_eval_real_reports_net"
+  ],
+  "overall": {
+    "case_count": 31,
+    "passed_count": 4,
+    "failed_count": 27,
+    "pass_rate": 0.129032,
+    "weighted_score": 0.850377
+  },
+  "subjects": [
+    {
+      "subject": "runtime",
+      "case_count": 30,
+      "passed_count": 4,
+      "pass_rate": 0.133333,
+      "weighted_score": 0.84842,
+      "wall_time_ms_sum": 1208434.224,
+      "llm_event_count": 187,
+      "provider_failure_event_count": 1,
+      "reported_token_total": 469374
+    },
+    {
+      "subject": "stream",
+      "case_count": 1,
+      "passed_count": 0,
+      "pass_rate": 0.0,
+      "weighted_score": 0.9091,
+      "wall_time_ms_sum": 37733.298,
+      "llm_event_count": 0,
+      "provider_failure_event_count": 0,
+      "reported_token_total": 0
+    }
+  ],
+  "suites": [
+    {
+      "suite_id": "capabilities",
+      "subject": "runtime",
+      "report_file": "reports/capabilities_runtime_20260822T061928Z.json",
+      "case_count": 2,
+      "passed_count": 2,
+      "failed_count": 0,
+      "passed": true,
+      "score": 1.0,
+      "wall_time_ms_avg": 416.512,
+      "wall_time_ms_sum": 833.023,
+      "llm_event_count": 0,
+      "provider_failure_event_count": 0,
+      "reported_token_total": 0,
+      "failed_cases": []
+    },
+    {
+      "suite_id": "failure_recovery",
+      "subject": "runtime",
+      "report_file": "reports/failure_recovery_runtime_20260822T061926Z.json",
+      "case_count": 1,
+      "passed_count": 0,
+      "failed_count": 1,
+      "passed": false,
+      "score": 0.9412,
+      "wall_time_ms_avg": 46998.346,
+      "wall_time_ms_sum": 46998.346,
+      "llm_event_count": 7,
+      "provider_failure_event_count": 0,
+      "reported_token_total": 15794,
+      "failed_cases": [
+        {
+          "case_id": "no_schema_rejections_on_valid_mail_qa",
+          "score": 0.9412,
+          "failed_metrics": [
+            "answer_contains_all"
+          ]
+        }
+      ]
+    },
+    {
+      "suite_id": "hard_mail_tasks",
+      "subject": "runtime",
+      "report_file": "reports/hard_mail_tasks_runtime_20260822T061237Z.json",
+      "case_count": 6,
+      "passed_count": 0,
+      "failed_count": 6,
+      "passed": false,
+      "score": 0.8646,
+      "wall_time_ms_avg": 41389.807,
+      "wall_time_ms_sum": 248338.843,
+      "llm_event_count": 48,
+      "provider_failure_event_count": 0,
+      "reported_token_total": 131575,
+      "failed_cases": [
+        {
+          "case_id": "multi_deadline_digest_with_distractors",
+          "score": 0.8725,
+          "failed_metrics": [
+            "answer_contains_all",
+            "evidence_recall_at_k",
+            "loaded_required_messages",
+            "wall_time_ms"
+          ]
+        },
+        {
+          "case_id": "conflicting_thesis_defense_updates",
+          "score": 0.9074,
+          "failed_metrics": [
+            "loaded_required_messages",
+            "wall_time_ms"
+          ]
+        },
+        {
+          "case_id": "finance_reimbursement_scam_filter",
+          "score": 0.85,
+          "failed_metrics": [
+            "forbidden_evidence_not_loaded",
+            "wall_time_ms"
+          ]
+        },
+        {
+          "case_id": "old_vs_current_visa_photo_requirement",
+          "score": 0.875,
+          "failed_metrics": [
+            "answer_contains_all",
+            "wall_time_ms"
+          ]
+        },
+        {
+          "case_id": "capstone_multisource_to_matter",
+          "score": 0.7329,
+          "failed_metrics": [
+            "tool_sequence_exact_match",
+            "tool_sequence_f1",
+            "answer_contains_all",
+            "matter_write_precision",
+            "llm_call_count",
+            "wall_time_ms"
+          ]
+        },
+        {
+          "case_id": "lab_incident_specific_vs_general_training",
+          "score": 0.95,
+          "failed_metrics": [
+            "wall_time_ms"
+          ]
+        }
+      ]
+    },
+    {
+      "suite_id": "mail_qa",
+      "subject": "runtime",
+      "report_file": "reports/mail_qa_runtime_20260822T060729Z.json",
+      "case_count": 11,
+      "passed_count": 0,
+      "failed_count": 11,
+      "passed": false,
+      "score": 0.8824,
+      "wall_time_ms_avg": 40599.96,
+      "wall_time_ms_sum": 446599.562,
+      "llm_event_count": 83,
+      "provider_failure_event_count": 0,
+      "reported_token_total": 203216,
+      "failed_cases": [
+        {
+          "case_id": "ntuso_requirements",
+          "score": 0.9412,
+          "failed_metrics": [
+            "wall_time_ms"
+          ]
+        },
+        {
+          "case_id": "ntuso_latest_schedule",
+          "score": 0.9118,
+          "failed_metrics": [
+            "answer_contains_all",
+            "wall_time_ms"
+          ]
+        },
+        {
+          "case_id": "ica_checklist",
+          "score": 0.8941,
+          "failed_metrics": [
+            "answer_contains_all",
+            "wall_time_ms"
+          ]
+        },
+        {
+          "case_id": "attachment_metadata",
+          "score": 0.9412,
+          "failed_metrics": [
+            "wall_time_ms"
+          ]
+        },
+        {
+          "case_id": "scholarship_deadline_with_noise",
+          "score": 0.7148,
+          "failed_metrics": [
+            "tool_sequence_exact_match",
+            "tool_sequence_f1",
+            "answer_contains_all",
+            "llm_call_count",
+            "wall_time_ms"
+          ]
+        },
+        {
+          "case_id": "rescheduled_event_overrides_original",
+          "score": 0.9074,
+          "failed_metrics": [
+            "answer_contains_all",
+            "wall_time_ms"
+          ]
+        },
+        {
+          "case_id": "cancelled_event",
+          "score": 0.8824,
+          "failed_metrics": [
+            "answer_contains_all",
+            "wall_time_ms"
+          ]
+        },
+        {
+          "case_id": "bilingual_orientation",
+          "score": 0.9176,
+          "failed_metrics": [
+            "answer_contains_all",
+            "wall_time_ms"
+          ]
+        },
+        {
+          "case_id": "library_overdue",
+          "score": 0.7137,
+          "failed_metrics": [
+            "tool_sequence_exact_match",
+            "tool_sequence_f1",
+            "answer_contains_all",
+            "llm_call_count",
+            "wall_time_ms"
+          ]
+        },
+        {
+          "case_id": "timezone_event",
+          "score": 0.9412,
+          "failed_metrics": [
+            "wall_time_ms"
+          ]
+        },
+        {
+          "case_id": "admin_attachment_bundle",
+          "score": 0.9412,
+          "failed_metrics": [
+            "wall_time_ms"
+          ]
+        }
+      ]
+    },
+    {
+      "suite_id": "mail_to_matter",
+      "subject": "runtime",
+      "report_file": "reports/mail_to_matter_runtime_20260822T060828Z.json",
+      "case_count": 1,
+      "passed_count": 0,
+      "failed_count": 1,
+      "passed": false,
+      "score": 0.8788,
+      "wall_time_ms_avg": 58246.996,
+      "wall_time_ms_sum": 58246.996,
+      "llm_event_count": 10,
+      "provider_failure_event_count": 0,
+      "reported_token_total": 33260,
+      "failed_cases": [
+        {
+          "case_id": "course_deadline_to_matter",
+          "score": 0.8788,
+          "failed_metrics": [
+            "answer_contains_all",
+            "matter_write_precision",
+            "wall_time_ms"
+          ]
+        }
+      ]
+    },
+    {
+      "suite_id": "matter_tools",
+      "subject": "runtime",
+      "report_file": "reports/matter_tools_runtime_20260822T061757Z.json",
+      "case_count": 1,
+      "passed_count": 0,
+      "failed_count": 1,
+      "passed": false,
+      "score": 0.4118,
+      "wall_time_ms_avg": 102772.664,
+      "wall_time_ms_sum": 102772.664,
+      "llm_event_count": 2,
+      "provider_failure_event_count": 1,
+      "reported_token_total": 858,
+      "failed_cases": [
+        {
+          "case_id": "matter_create_search_update_link",
+          "score": 0.4118,
+          "failed_metrics": [
+            "selected_package_match",
+            "tool_sequence_exact_match",
+            "tool_sequence_f1",
+            "required_tool_called",
+            "answer_contains_all",
+            "tool_output_contains_all",
+            "wall_time_ms"
+          ]
+        }
+      ]
+    },
+    {
+      "suite_id": "real_llm_hard_mail_tasks",
+      "subject": "runtime",
+      "report_file": "reports/real_llm_hard_mail_tasks_runtime_20260822T061613Z.json",
+      "case_count": 4,
+      "passed_count": 1,
+      "failed_count": 3,
+      "passed": false,
+      "score": 0.7894,
+      "wall_time_ms_avg": 53997.202,
+      "wall_time_ms_sum": 215988.807,
+      "llm_event_count": 21,
+      "provider_failure_event_count": 0,
+      "reported_token_total": 48914,
+      "failed_cases": [
+        {
+          "case_id": "real_multi_deadline_digest_with_distractors",
+          "score": 0.9306,
+          "failed_metrics": [
+            "answer_contains_all",
+            "evidence_recall_at_k",
+            "loaded_required_messages"
+          ]
+        },
+        {
+          "case_id": "real_conflicting_thesis_defense_updates",
+          "score": 0.9271,
+          "failed_metrics": [
+            "answer_contains_all",
+            "loaded_required_messages"
+          ]
+        },
+        {
+          "case_id": "real_capstone_multisource_to_matter",
+          "score": 0.3,
+          "failed_metrics": [
+            "no_runtime_error",
+            "selected_package_match",
+            "required_tool_called",
+            "answer_contains_any",
+            "evidence_recall_at_k",
+            "loaded_required_messages",
+            "matter_write_precision",
+            "matter_source_link_recall",
+            "wall_time_ms",
+            "run_log_completeness_rate"
+          ]
+        }
+      ]
+    },
+    {
+      "suite_id": "runtime_tools",
+      "subject": "runtime",
+      "report_file": "reports/runtime_tools_runtime_20260822T061803Z.json",
+      "case_count": 1,
+      "passed_count": 0,
+      "failed_count": 1,
+      "passed": false,
+      "score": 0.4118,
+      "wall_time_ms_avg": 5532.248,
+      "wall_time_ms_sum": 5532.248,
+      "llm_event_count": 2,
+      "provider_failure_event_count": 0,
+      "reported_token_total": 1701,
+      "failed_cases": [
+        {
+          "case_id": "runtime_now_tool",
+          "score": 0.4118,
+          "failed_metrics": [
+            "selected_package_match",
+            "tool_sequence_exact_match",
+            "tool_sequence_f1",
+            "required_tool_called",
+            "answer_contains_all",
+            "tool_output_contains_all",
+            "wall_time_ms"
+          ]
+        }
+      ]
+    },
+    {
+      "suite_id": "session_followup",
+      "subject": "runtime",
+      "report_file": "reports/session_followup_runtime_20260822T061838Z.json",
+      "case_count": 1,
+      "passed_count": 0,
+      "failed_count": 1,
+      "passed": false,
+      "score": 0.8824,
+      "wall_time_ms_avg": 34124.26,
+      "wall_time_ms_sum": 34124.26,
+      "llm_event_count": 7,
+      "provider_failure_event_count": 0,
+      "reported_token_total": 16133,
+      "failed_cases": [
+        {
+          "case_id": "cached_mail_reuse_single_turn_contract",
+          "score": 0.8824,
+          "failed_metrics": [
+            "answer_contains_all"
+          ]
+        }
+      ]
+    },
+    {
+      "suite_id": "smoke",
+      "subject": "runtime",
+      "report_file": "reports/smoke_runtime_20260822T055855Z.json",
+      "case_count": 1,
+      "passed_count": 0,
+      "failed_count": 1,
+      "passed": false,
+      "score": 0.875,
+      "wall_time_ms_avg": 48559.325,
+      "wall_time_ms_sum": 48559.325,
+      "llm_event_count": 7,
+      "provider_failure_event_count": 0,
+      "reported_token_total": 17923,
+      "failed_cases": [
+        {
+          "case_id": "mail_basic_ntuso",
+          "score": 0.875,
+          "failed_metrics": [
+            "answer_contains_all",
+            "wall_time_ms"
+          ]
+        }
+      ]
+    },
+    {
+      "suite_id": "workspace_context",
+      "subject": "runtime",
+      "report_file": "reports/workspace_context_runtime_20260822T061927Z.json",
+      "case_count": 1,
+      "passed_count": 1,
+      "failed_count": 0,
+      "passed": true,
+      "score": 1.0,
+      "wall_time_ms_avg": 440.15,
+      "wall_time_ms_sum": 440.15,
+      "llm_event_count": 0,
+      "provider_failure_event_count": 0,
+      "reported_token_total": 0,
+      "failed_cases": []
+    },
+    {
+      "suite_id": "stream_contract",
+      "subject": "stream",
+      "report_file": "reports/stream_contract_stream_20260822T062233Z.json",
+      "case_count": 1,
+      "passed_count": 0,
+      "failed_count": 1,
+      "passed": false,
+      "score": 0.9091,
+      "wall_time_ms_avg": 37733.298,
+      "wall_time_ms_sum": 37733.298,
+      "llm_event_count": 0,
+      "provider_failure_event_count": 0,
+      "reported_token_total": 0,
+      "failed_cases": [
+        {
+          "case_id": "stream_mail_basic_ntuso",
+          "score": 0.9091,
+          "failed_metrics": [
+            "wall_time_ms"
+          ]
+        }
+      ]
+    }
+  ],
+  "mail_search_summary": {
+    "case_count": 25,
+    "recall_at_k_avg": 0.94,
+    "recall_full_count": 22,
+    "precision_at_k_avg": 0.628,
+    "mrr_avg": 0.873,
+    "forbidden_case_count": 8,
+    "forbidden_clean_count": 3,
+    "forbidden_at_k_avg": 0.375
+  },
+  "mail_search_cases": [
+    {
+      "suite_id": "failure_recovery",
+      "case_id": "no_schema_rejections_on_valid_mail_qa",
+      "subject": "runtime",
+      "recall_at_k": 1.0,
+      "recall_passed": true,
+      "precision_at_k": 0.5,
+      "mrr": 1.0,
+      "forbidden_at_k": null,
+      "forbidden_passed": null,
+      "k": 10,
+      "search_event_count": 1,
+      "retrieved_message_count": 2,
+      "missing_message_ids": []
+    },
+    {
+      "suite_id": "hard_mail_tasks",
+      "case_id": "multi_deadline_digest_with_distractors",
+      "subject": "runtime",
+      "recall_at_k": 0.75,
+      "recall_passed": false,
+      "precision_at_k": 1.0,
+      "mrr": 1.0,
+      "forbidden_at_k": 1.0,
+      "forbidden_passed": true,
+      "k": 10,
+      "search_event_count": 1,
+      "retrieved_message_count": 3,
+      "missing_message_ids": [
+        "mail_msg_1d5b26037f6c"
+      ]
+    },
+    {
+      "suite_id": "hard_mail_tasks",
+      "case_id": "conflicting_thesis_defense_updates",
+      "subject": "runtime",
+      "recall_at_k": 1.0,
+      "recall_passed": true,
+      "precision_at_k": 1.0,
+      "mrr": 1.0,
+      "forbidden_at_k": null,
+      "forbidden_passed": null,
+      "k": 10,
+      "search_event_count": 1,
+      "retrieved_message_count": 3,
+      "missing_message_ids": []
+    },
+    {
+      "suite_id": "hard_mail_tasks",
+      "case_id": "finance_reimbursement_scam_filter",
+      "subject": "runtime",
+      "recall_at_k": 1.0,
+      "recall_passed": true,
+      "precision_at_k": 0.5,
+      "mrr": 1.0,
+      "forbidden_at_k": 0.0,
+      "forbidden_passed": false,
+      "k": 10,
+      "search_event_count": 1,
+      "retrieved_message_count": 2,
+      "missing_message_ids": []
+    },
+    {
+      "suite_id": "hard_mail_tasks",
+      "case_id": "old_vs_current_visa_photo_requirement",
+      "subject": "runtime",
+      "recall_at_k": 1.0,
+      "recall_passed": true,
+      "precision_at_k": 0.3333,
+      "mrr": 1.0,
+      "forbidden_at_k": 0.0,
+      "forbidden_passed": false,
+      "k": 10,
+      "search_event_count": 1,
+      "retrieved_message_count": 3,
+      "missing_message_ids": []
+    },
+    {
+      "suite_id": "hard_mail_tasks",
+      "case_id": "capstone_multisource_to_matter",
+      "subject": "runtime",
+      "recall_at_k": 1.0,
+      "recall_passed": true,
+      "precision_at_k": 0.6667,
+      "mrr": 1.0,
+      "forbidden_at_k": 0.0,
+      "forbidden_passed": false,
+      "k": 10,
+      "search_event_count": 1,
+      "retrieved_message_count": 3,
+      "missing_message_ids": []
+    },
+    {
+      "suite_id": "hard_mail_tasks",
+      "case_id": "lab_incident_specific_vs_general_training",
+      "subject": "runtime",
+      "recall_at_k": 1.0,
+      "recall_passed": true,
+      "precision_at_k": 0.5,
+      "mrr": 1.0,
+      "forbidden_at_k": 0.0,
+      "forbidden_passed": false,
+      "k": 10,
+      "search_event_count": 1,
+      "retrieved_message_count": 2,
+      "missing_message_ids": []
+    },
+    {
+      "suite_id": "mail_qa",
+      "case_id": "ntuso_requirements",
+      "subject": "runtime",
+      "recall_at_k": 1.0,
+      "recall_passed": true,
+      "precision_at_k": 0.5,
+      "mrr": 1.0,
+      "forbidden_at_k": null,
+      "forbidden_passed": null,
+      "k": 10,
+      "search_event_count": 1,
+      "retrieved_message_count": 2,
+      "missing_message_ids": []
+    },
+    {
+      "suite_id": "mail_qa",
+      "case_id": "ntuso_latest_schedule",
+      "subject": "runtime",
+      "recall_at_k": 1.0,
+      "recall_passed": true,
+      "precision_at_k": 0.5,
+      "mrr": 1.0,
+      "forbidden_at_k": null,
+      "forbidden_passed": null,
+      "k": 10,
+      "search_event_count": 1,
+      "retrieved_message_count": 2,
+      "missing_message_ids": []
+    },
+    {
+      "suite_id": "mail_qa",
+      "case_id": "ica_checklist",
+      "subject": "runtime",
+      "recall_at_k": 1.0,
+      "recall_passed": true,
+      "precision_at_k": 0.5,
+      "mrr": 1.0,
+      "forbidden_at_k": null,
+      "forbidden_passed": null,
+      "k": 10,
+      "search_event_count": 1,
+      "retrieved_message_count": 2,
+      "missing_message_ids": []
+    },
+    {
+      "suite_id": "mail_qa",
+      "case_id": "attachment_metadata",
+      "subject": "runtime",
+      "recall_at_k": 1.0,
+      "recall_passed": true,
+      "precision_at_k": 1.0,
+      "mrr": 1.0,
+      "forbidden_at_k": null,
+      "forbidden_passed": null,
+      "k": 10,
+      "search_event_count": 1,
+      "retrieved_message_count": 1,
+      "missing_message_ids": []
+    },
+    {
+      "suite_id": "mail_qa",
+      "case_id": "scholarship_deadline_with_noise",
+      "subject": "runtime",
+      "recall_at_k": 1.0,
+      "recall_passed": true,
+      "precision_at_k": 0.1,
+      "mrr": 0.125,
+      "forbidden_at_k": null,
+      "forbidden_passed": null,
+      "k": 10,
+      "search_event_count": 3,
+      "retrieved_message_count": 10,
+      "missing_message_ids": []
+    },
+    {
+      "suite_id": "mail_qa",
+      "case_id": "rescheduled_event_overrides_original",
+      "subject": "runtime",
+      "recall_at_k": 1.0,
+      "recall_passed": true,
+      "precision_at_k": 0.5,
+      "mrr": 0.5,
+      "forbidden_at_k": null,
+      "forbidden_passed": null,
+      "k": 10,
+      "search_event_count": 1,
+      "retrieved_message_count": 2,
+      "missing_message_ids": []
+    },
+    {
+      "suite_id": "mail_qa",
+      "case_id": "cancelled_event",
+      "subject": "runtime",
+      "recall_at_k": 1.0,
+      "recall_passed": true,
+      "precision_at_k": 1.0,
+      "mrr": 1.0,
+      "forbidden_at_k": null,
+      "forbidden_passed": null,
+      "k": 10,
+      "search_event_count": 1,
+      "retrieved_message_count": 1,
+      "missing_message_ids": []
+    },
+    {
+      "suite_id": "mail_qa",
+      "case_id": "bilingual_orientation",
+      "subject": "runtime",
+      "recall_at_k": 1.0,
+      "recall_passed": true,
+      "precision_at_k": 1.0,
+      "mrr": 1.0,
+      "forbidden_at_k": null,
+      "forbidden_passed": null,
+      "k": 10,
+      "search_event_count": 1,
+      "retrieved_message_count": 1,
+      "missing_message_ids": []
+    },
+    {
+      "suite_id": "mail_qa",
+      "case_id": "library_overdue",
+      "subject": "runtime",
+      "recall_at_k": 1.0,
+      "recall_passed": true,
+      "precision_at_k": 0.1,
+      "mrr": 0.2,
+      "forbidden_at_k": null,
+      "forbidden_passed": null,
+      "k": 10,
+      "search_event_count": 2,
+      "retrieved_message_count": 10,
+      "missing_message_ids": []
+    },
+    {
+      "suite_id": "mail_qa",
+      "case_id": "timezone_event",
+      "subject": "runtime",
+      "recall_at_k": 1.0,
+      "recall_passed": true,
+      "precision_at_k": 1.0,
+      "mrr": 1.0,
+      "forbidden_at_k": null,
+      "forbidden_passed": null,
+      "k": 10,
+      "search_event_count": 1,
+      "retrieved_message_count": 1,
+      "missing_message_ids": []
+    },
+    {
+      "suite_id": "mail_qa",
+      "case_id": "admin_attachment_bundle",
+      "subject": "runtime",
+      "recall_at_k": 1.0,
+      "recall_passed": true,
+      "precision_at_k": 1.0,
+      "mrr": 1.0,
+      "forbidden_at_k": null,
+      "forbidden_passed": null,
+      "k": 10,
+      "search_event_count": 1,
+      "retrieved_message_count": 1,
+      "missing_message_ids": []
+    },
+    {
+      "suite_id": "mail_to_matter",
+      "case_id": "course_deadline_to_matter",
+      "subject": "runtime",
+      "recall_at_k": 1.0,
+      "recall_passed": true,
+      "precision_at_k": 0.5,
+      "mrr": 1.0,
+      "forbidden_at_k": null,
+      "forbidden_passed": null,
+      "k": 10,
+      "search_event_count": 1,
+      "retrieved_message_count": 2,
+      "missing_message_ids": []
+    },
+    {
+      "suite_id": "real_llm_hard_mail_tasks",
+      "case_id": "real_multi_deadline_digest_with_distractors",
+      "subject": "runtime",
+      "recall_at_k": 0.75,
+      "recall_passed": false,
+      "precision_at_k": 1.0,
+      "mrr": 1.0,
+      "forbidden_at_k": 1.0,
+      "forbidden_passed": true,
+      "k": 10,
+      "search_event_count": 1,
+      "retrieved_message_count": 3,
+      "missing_message_ids": [
+        "mail_msg_1d5b26037f6c"
+      ]
+    },
+    {
+      "suite_id": "real_llm_hard_mail_tasks",
+      "case_id": "real_conflicting_thesis_defense_updates",
+      "subject": "runtime",
+      "recall_at_k": 1.0,
+      "recall_passed": true,
+      "precision_at_k": 1.0,
+      "mrr": 1.0,
+      "forbidden_at_k": null,
+      "forbidden_passed": null,
+      "k": 10,
+      "search_event_count": 1,
+      "retrieved_message_count": 3,
+      "missing_message_ids": []
+    },
+    {
+      "suite_id": "real_llm_hard_mail_tasks",
+      "case_id": "real_finance_reimbursement_scam_filter",
+      "subject": "runtime",
+      "recall_at_k": 1.0,
+      "recall_passed": true,
+      "precision_at_k": 0.5,
+      "mrr": 1.0,
+      "forbidden_at_k": 0.0,
+      "forbidden_passed": false,
+      "k": 10,
+      "search_event_count": 1,
+      "retrieved_message_count": 2,
+      "missing_message_ids": []
+    },
+    {
+      "suite_id": "real_llm_hard_mail_tasks",
+      "case_id": "real_capstone_multisource_to_matter",
+      "subject": "runtime",
+      "recall_at_k": 0.0,
+      "recall_passed": false,
+      "precision_at_k": 0.0,
+      "mrr": 0.0,
+      "forbidden_at_k": 1.0,
+      "forbidden_passed": true,
+      "k": 10,
+      "search_event_count": 0,
+      "retrieved_message_count": 0,
+      "missing_message_ids": [
+        "mail_msg_34139bb38969",
+        "mail_msg_46195099f9d9"
+      ]
+    },
+    {
+      "suite_id": "session_followup",
+      "case_id": "cached_mail_reuse_single_turn_contract",
+      "subject": "runtime",
+      "recall_at_k": 1.0,
+      "recall_passed": true,
+      "precision_at_k": 0.5,
+      "mrr": 1.0,
+      "forbidden_at_k": null,
+      "forbidden_passed": null,
+      "k": 10,
+      "search_event_count": 1,
+      "retrieved_message_count": 2,
+      "missing_message_ids": []
+    },
+    {
+      "suite_id": "smoke",
+      "case_id": "mail_basic_ntuso",
+      "subject": "runtime",
+      "recall_at_k": 1.0,
+      "recall_passed": true,
+      "precision_at_k": 0.5,
+      "mrr": 1.0,
+      "forbidden_at_k": null,
+      "forbidden_passed": null,
+      "k": 10,
+      "search_event_count": 1,
+      "retrieved_message_count": 2,
+      "missing_message_ids": []
+    }
+  ],
+  "cases": [
+    {
+      "suite_id": "capabilities",
+      "case_id": "health_contract",
+      "subject": "runtime",
+      "passed": true,
+      "score": 1.0,
+      "wall_time_ms": 424.67,
+      "failed_metrics": [],
+      "error": null
+    },
+    {
+      "suite_id": "capabilities",
+      "case_id": "capability_catalog_contract",
+      "subject": "runtime",
+      "passed": true,
+      "score": 1.0,
+      "wall_time_ms": 408.353,
+      "failed_metrics": [],
+      "error": null
+    },
+    {
+      "suite_id": "failure_recovery",
+      "case_id": "no_schema_rejections_on_valid_mail_qa",
+      "subject": "runtime",
+      "passed": false,
+      "score": 0.9412,
+      "wall_time_ms": 46998.346,
+      "failed_metrics": [
+        "answer_contains_all"
+      ],
+      "error": null
+    },
+    {
+      "suite_id": "hard_mail_tasks",
+      "case_id": "multi_deadline_digest_with_distractors",
+      "subject": "runtime",
+      "passed": false,
+      "score": 0.8725,
+      "wall_time_ms": 41538.745,
+      "failed_metrics": [
+        "answer_contains_all",
+        "evidence_recall_at_k",
+        "loaded_required_messages",
+        "wall_time_ms"
+      ],
+      "error": null
+    },
+    {
+      "suite_id": "hard_mail_tasks",
+      "case_id": "conflicting_thesis_defense_updates",
+      "subject": "runtime",
+      "passed": false,
+      "score": 0.9074,
+      "wall_time_ms": 34172.083,
+      "failed_metrics": [
+        "loaded_required_messages",
+        "wall_time_ms"
+      ],
+      "error": null
+    },
+    {
+      "suite_id": "hard_mail_tasks",
+      "case_id": "finance_reimbursement_scam_filter",
+      "subject": "runtime",
+      "passed": false,
+      "score": 0.85,
+      "wall_time_ms": 36187.794,
+      "failed_metrics": [
+        "forbidden_evidence_not_loaded",
+        "wall_time_ms"
+      ],
+      "error": null
+    },
+    {
+      "suite_id": "hard_mail_tasks",
+      "case_id": "old_vs_current_visa_photo_requirement",
+      "subject": "runtime",
+      "passed": false,
+      "score": 0.875,
+      "wall_time_ms": 28125.941,
+      "failed_metrics": [
+        "answer_contains_all",
+        "wall_time_ms"
+      ],
+      "error": null
+    },
+    {
+      "suite_id": "hard_mail_tasks",
+      "case_id": "capstone_multisource_to_matter",
+      "subject": "runtime",
+      "passed": false,
+      "score": 0.7329,
+      "wall_time_ms": 77522.902,
+      "failed_metrics": [
+        "tool_sequence_exact_match",
+        "tool_sequence_f1",
+        "answer_contains_all",
+        "matter_write_precision",
+        "llm_call_count",
+        "wall_time_ms"
+      ],
+      "error": null
+    },
+    {
+      "suite_id": "hard_mail_tasks",
+      "case_id": "lab_incident_specific_vs_general_training",
+      "subject": "runtime",
+      "passed": false,
+      "score": 0.95,
+      "wall_time_ms": 30791.378,
+      "failed_metrics": [
+        "wall_time_ms"
+      ],
+      "error": null
+    },
+    {
+      "suite_id": "mail_qa",
+      "case_id": "ntuso_requirements",
+      "subject": "runtime",
+      "passed": false,
+      "score": 0.9412,
+      "wall_time_ms": 29828.045,
+      "failed_metrics": [
+        "wall_time_ms"
+      ],
+      "error": null
+    },
+    {
+      "suite_id": "mail_qa",
+      "case_id": "ntuso_latest_schedule",
+      "subject": "runtime",
+      "passed": false,
+      "score": 0.9118,
+      "wall_time_ms": 25151.897,
+      "failed_metrics": [
+        "answer_contains_all",
+        "wall_time_ms"
+      ],
+      "error": null
+    },
+    {
+      "suite_id": "mail_qa",
+      "case_id": "ica_checklist",
+      "subject": "runtime",
+      "passed": false,
+      "score": 0.8941,
+      "wall_time_ms": 73354.18,
+      "failed_metrics": [
+        "answer_contains_all",
+        "wall_time_ms"
+      ],
+      "error": null
+    },
+    {
+      "suite_id": "mail_qa",
+      "case_id": "attachment_metadata",
+      "subject": "runtime",
+      "passed": false,
+      "score": 0.9412,
+      "wall_time_ms": 38736.22,
+      "failed_metrics": [
+        "wall_time_ms"
+      ],
+      "error": null
+    },
+    {
+      "suite_id": "mail_qa",
+      "case_id": "scholarship_deadline_with_noise",
+      "subject": "runtime",
+      "passed": false,
+      "score": 0.7148,
+      "wall_time_ms": 62182.151,
+      "failed_metrics": [
+        "tool_sequence_exact_match",
+        "tool_sequence_f1",
+        "answer_contains_all",
+        "llm_call_count",
+        "wall_time_ms"
+      ],
+      "error": null
+    },
+    {
+      "suite_id": "mail_qa",
+      "case_id": "rescheduled_event_overrides_original",
+      "subject": "runtime",
+      "passed": false,
+      "score": 0.9074,
+      "wall_time_ms": 33468.641,
+      "failed_metrics": [
+        "answer_contains_all",
+        "wall_time_ms"
+      ],
+      "error": null
+    },
+    {
+      "suite_id": "mail_qa",
+      "case_id": "cancelled_event",
+      "subject": "runtime",
+      "passed": false,
+      "score": 0.8824,
+      "wall_time_ms": 29556.088,
+      "failed_metrics": [
+        "answer_contains_all",
+        "wall_time_ms"
+      ],
+      "error": null
+    },
+    {
+      "suite_id": "mail_qa",
+      "case_id": "bilingual_orientation",
+      "subject": "runtime",
+      "passed": false,
+      "score": 0.9176,
+      "wall_time_ms": 37871.794,
+      "failed_metrics": [
+        "answer_contains_all",
+        "wall_time_ms"
+      ],
+      "error": null
+    },
+    {
+      "suite_id": "mail_qa",
+      "case_id": "library_overdue",
+      "subject": "runtime",
+      "passed": false,
+      "score": 0.7137,
+      "wall_time_ms": 53100.707,
+      "failed_metrics": [
+        "tool_sequence_exact_match",
+        "tool_sequence_f1",
+        "answer_contains_all",
+        "llm_call_count",
+        "wall_time_ms"
+      ],
+      "error": null
+    },
+    {
+      "suite_id": "mail_qa",
+      "case_id": "timezone_event",
+      "subject": "runtime",
+      "passed": false,
+      "score": 0.9412,
+      "wall_time_ms": 34877.124,
+      "failed_metrics": [
+        "wall_time_ms"
+      ],
+      "error": null
+    },
+    {
+      "suite_id": "mail_qa",
+      "case_id": "admin_attachment_bundle",
+      "subject": "runtime",
+      "passed": false,
+      "score": 0.9412,
+      "wall_time_ms": 28472.715,
+      "failed_metrics": [
+        "wall_time_ms"
+      ],
+      "error": null
+    },
+    {
+      "suite_id": "mail_to_matter",
+      "case_id": "course_deadline_to_matter",
+      "subject": "runtime",
+      "passed": false,
+      "score": 0.8788,
+      "wall_time_ms": 58246.996,
+      "failed_metrics": [
+        "answer_contains_all",
+        "matter_write_precision",
+        "wall_time_ms"
+      ],
+      "error": null
+    },
+    {
+      "suite_id": "matter_tools",
+      "case_id": "matter_create_search_update_link",
+      "subject": "runtime",
+      "passed": false,
+      "score": 0.4118,
+      "wall_time_ms": 102772.664,
+      "failed_metrics": [
+        "selected_package_match",
+        "tool_sequence_exact_match",
+        "tool_sequence_f1",
+        "required_tool_called",
+        "answer_contains_all",
+        "tool_output_contains_all",
+        "wall_time_ms"
+      ],
+      "error": null
+    },
+    {
+      "suite_id": "real_llm_hard_mail_tasks",
+      "case_id": "real_multi_deadline_digest_with_distractors",
+      "subject": "runtime",
+      "passed": false,
+      "score": 0.9306,
+      "wall_time_ms": 29618.823,
+      "failed_metrics": [
+        "answer_contains_all",
+        "evidence_recall_at_k",
+        "loaded_required_messages"
+      ],
+      "error": null
+    },
+    {
+      "suite_id": "real_llm_hard_mail_tasks",
+      "case_id": "real_conflicting_thesis_defense_updates",
+      "subject": "runtime",
+      "passed": false,
+      "score": 0.9271,
+      "wall_time_ms": 39406.59,
+      "failed_metrics": [
+        "answer_contains_all",
+        "loaded_required_messages"
+      ],
+      "error": null
+    },
+    {
+      "suite_id": "real_llm_hard_mail_tasks",
+      "case_id": "real_finance_reimbursement_scam_filter",
+      "subject": "runtime",
+      "passed": true,
+      "score": 1.0,
+      "wall_time_ms": 32268.583,
+      "failed_metrics": [],
+      "error": null
+    },
+    {
+      "suite_id": "real_llm_hard_mail_tasks",
+      "case_id": "real_capstone_multisource_to_matter",
+      "subject": "runtime",
+      "passed": false,
+      "score": 0.3,
+      "wall_time_ms": 114694.811,
+      "failed_metrics": [
+        "no_runtime_error",
+        "selected_package_match",
+        "required_tool_called",
+        "answer_contains_any",
+        "evidence_recall_at_k",
+        "loaded_required_messages",
+        "matter_write_precision",
+        "matter_source_link_recall",
+        "wall_time_ms",
+        "run_log_completeness_rate"
+      ],
+      "error": {
+        "message": "Remote end closed connection without response",
+        "type": "RemoteDisconnected"
+      }
+    },
+    {
+      "suite_id": "runtime_tools",
+      "case_id": "runtime_now_tool",
+      "subject": "runtime",
+      "passed": false,
+      "score": 0.4118,
+      "wall_time_ms": 5532.248,
+      "failed_metrics": [
+        "selected_package_match",
+        "tool_sequence_exact_match",
+        "tool_sequence_f1",
+        "required_tool_called",
+        "answer_contains_all",
+        "tool_output_contains_all",
+        "wall_time_ms"
+      ],
+      "error": null
+    },
+    {
+      "suite_id": "session_followup",
+      "case_id": "cached_mail_reuse_single_turn_contract",
+      "subject": "runtime",
+      "passed": false,
+      "score": 0.8824,
+      "wall_time_ms": 34124.26,
+      "failed_metrics": [
+        "answer_contains_all"
+      ],
+      "error": null
+    },
+    {
+      "suite_id": "smoke",
+      "case_id": "mail_basic_ntuso",
+      "subject": "runtime",
+      "passed": false,
+      "score": 0.875,
+      "wall_time_ms": 48559.325,
+      "failed_metrics": [
+        "answer_contains_all",
+        "wall_time_ms"
+      ],
+      "error": null
+    },
+    {
+      "suite_id": "workspace_context",
+      "case_id": "simple_project_workspace_index",
+      "subject": "runtime",
+      "passed": true,
+      "score": 1.0,
+      "wall_time_ms": 440.15,
+      "failed_metrics": [],
+      "error": null
+    },
+    {
+      "suite_id": "stream_contract",
+      "case_id": "stream_mail_basic_ntuso",
+      "subject": "stream",
+      "passed": false,
+      "score": 0.9091,
+      "wall_time_ms": 37733.298,
+      "failed_metrics": [
+        "wall_time_ms"
+      ],
+      "error": null
+    }
+  ]
+}

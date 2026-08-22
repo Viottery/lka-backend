@@ -18,3 +18,5 @@ config/secrets*.toml
 config/tokens*.json
 config/cache/
 scratch/
+evals/reports/*.json
+evals/reports/*.md

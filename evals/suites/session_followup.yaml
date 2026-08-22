@@ -1,0 +1,21 @@
+{
+  "suite_id": "session_followup",
+  "description": "Contract placeholder for multi-turn context and cached observation reuse.",
+  "cases": [
+    {
+      "case_id": "cached_mail_reuse_single_turn_contract",
+      "workflow": "mail_qa",
+      "setup": {"mail_fixtures": ["core_mailbox"]},
+      "request": {"user_input": "帮我读取 NTUSO audition 邮件，后续要复用。"},
+      "search_query": "NTUSO audition",
+      "scripted_answer": "已读取 NTUSO audition 邮件，包含 G major scale、one prepared piece 和 sight reading。",
+      "expect": {
+        "selected_package": "mail",
+        "tool_sequence": ["mail.search", "mail.load_messages"],
+        "answer_contains_all": ["G major scale", "one prepared piece"],
+        "evidence_external_ids": ["eval_ntuso_audition_20260805"],
+        "max_llm_calls": 8
+      }
+    }
+  ]
+}

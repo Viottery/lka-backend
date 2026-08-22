@@ -1,0 +1,129 @@
+{
+  "account": {
+    "provider": "local_json",
+    "email_address": "eval-user@example.com",
+    "display_name": "Eval User"
+  },
+  "messages": [
+    {
+      "external_id": "eval_thesis_defense_original",
+      "folder": "Inbox",
+      "subject": "Thesis defense schedule",
+      "sender": "graduate-office@example.edu",
+      "to": ["eval-user@example.com"],
+      "cc": [],
+      "received_at": "2026-08-04T02:00:00Z",
+      "body_text": "Your thesis defense is scheduled for 2026-08-24 at 09:00 in Room A. Please upload slides 24 hours before the session."
+    },
+    {
+      "external_id": "eval_thesis_defense_room_change",
+      "folder": "Inbox",
+      "subject": "Thesis defense room change",
+      "sender": "graduate-office@example.edu",
+      "to": ["eval-user@example.com"],
+      "cc": [],
+      "received_at": "2026-08-12T02:30:00Z",
+      "body_text": "Room A is unavailable. Your thesis defense room is changed to Room C. The time remains 2026-08-24 at 09:00."
+    },
+    {
+      "external_id": "eval_thesis_defense_final_update",
+      "folder": "Inbox",
+      "subject": "Final thesis defense update",
+      "sender": "graduate-office@example.edu",
+      "to": ["eval-user@example.com"],
+      "cc": [],
+      "received_at": "2026-08-20T03:00:00Z",
+      "body_text": "Final update: thesis defense is now 2026-08-24 at 10:30 in Room C. Upload slides by 2026-08-23 10:30."
+    },
+    {
+      "external_id": "eval_capstone_pitch_initial",
+      "folder": "Inbox",
+      "subject": "Capstone pitch preparation",
+      "sender": "capstone@example.edu",
+      "to": ["eval-user@example.com"],
+      "cc": [],
+      "received_at": "2026-08-08T05:00:00Z",
+      "body_text": "Capstone pitch preparation: create a 5-minute demo video and submit the project abstract. Draft due 2026-08-18."
+    },
+    {
+      "external_id": "eval_capstone_pitch_rehearsal",
+      "folder": "Inbox",
+      "subject": "Capstone pitch rehearsal slot",
+      "sender": "capstone@example.edu",
+      "to": ["eval-user@example.com"],
+      "cc": [],
+      "received_at": "2026-08-15T05:30:00Z",
+      "body_text": "Capstone pitch rehearsal is on 2026-08-22 at 16:00. Bring demo video, project abstract, and two printed rubrics."
+    },
+    {
+      "external_id": "eval_capstone_noise_marketing",
+      "folder": "Promotions",
+      "subject": "Capstone camera discount",
+      "sender": "camera-shop@example.com",
+      "to": ["eval-user@example.com"],
+      "cc": [],
+      "received_at": "2026-08-09T10:00:00Z",
+      "body_text": "Buy a camera for your capstone video. This is an advertisement and does not contain official capstone requirements."
+    },
+    {
+      "external_id": "eval_finance_workshop_actual",
+      "folder": "Inbox",
+      "subject": "Finance workshop reimbursement instructions",
+      "sender": "finance-office@example.edu",
+      "to": ["eval-user@example.com"],
+      "cc": [],
+      "received_at": "2026-08-18T08:00:00Z",
+      "body_text": "Finance workshop reimbursement requires original receipt, bank account proof, and claim form. Submit by 2026-08-26 17:00."
+    },
+    {
+      "external_id": "eval_finance_workshop_scam",
+      "folder": "Junk",
+      "subject": "Finance workshop urgent reimbursement",
+      "sender": "finance-office-security@example.invalid",
+      "to": ["eval-user@example.com"],
+      "cc": [],
+      "received_at": "2026-08-18T08:05:00Z",
+      "body_text": "Urgent reimbursement verification: send your bank password and one-time code. This is a scam distractor."
+    },
+    {
+      "external_id": "eval_visa_photo_exact",
+      "folder": "Inbox",
+      "subject": "Visa photo resubmission exact requirements",
+      "sender": "visa-office@example.gov.sg",
+      "to": ["eval-user@example.com"],
+      "cc": [],
+      "received_at": "2026-08-19T04:00:00Z",
+      "body_text": "Visa photo resubmission requires white background, 35x45 mm size, no glasses, and upload by 2026-08-21 12:00."
+    },
+    {
+      "external_id": "eval_visa_photo_old",
+      "folder": "Archive",
+      "subject": "Old visa photo guidance",
+      "sender": "visa-office@example.gov.sg",
+      "to": ["eval-user@example.com"],
+      "cc": [],
+      "received_at": "2026-07-01T04:00:00Z",
+      "body_text": "Old guidance said blue background was accepted. This guidance is obsolete and should not be used."
+    },
+    {
+      "external_id": "eval_lab_incident_report",
+      "folder": "Inbox",
+      "subject": "Lab incident report required",
+      "sender": "lab-safety@example.edu",
+      "to": ["eval-user@example.com"],
+      "cc": ["advisor@example.edu"],
+      "received_at": "2026-08-19T09:00:00Z",
+      "body_text": "Submit lab incident report LIR-2026-08 by 2026-08-20 18:00. Include witness name, equipment ID, and corrective action."
+    },
+    {
+      "external_id": "eval_lab_general_training",
+      "folder": "Inbox",
+      "subject": "Lab general safety training reminder",
+      "sender": "lab-safety@example.edu",
+      "to": ["eval-user@example.com"],
+      "cc": [],
+      "received_at": "2026-08-10T09:00:00Z",
+      "body_text": "General lab safety training is due next month. This is not the incident report requirement."
+    }
+  ]
+}

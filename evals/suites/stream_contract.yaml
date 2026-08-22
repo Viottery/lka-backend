@@ -1,0 +1,22 @@
+{
+  "suite_id": "stream_contract",
+  "description": "SSE contract suite intended for --subject stream against a disposable running backend.",
+  "cases": [
+    {
+      "case_id": "stream_mail_basic_ntuso",
+      "workflow": "mail_qa",
+      "setup": {"mail_fixtures": ["core_mailbox"]},
+      "request": {
+        "user_input": "帮我查询 NTUSO audition 的考试要求。",
+        "llm": {"response_mode": "stream"}
+      },
+      "search_query": "NTUSO audition",
+      "expect": {
+        "stream": true,
+        "selected_package": "mail",
+        "answer_contains_any": ["NTUSO", "audition"],
+        "max_wall_time_ms": 30000
+      }
+    }
+  ]
+}

@@ -1,0 +1,515 @@
+{
+  "cases": [
+    {
+      "case_id": "runtime_now_tool",
+      "error": null,
+      "fixture_index": {
+        "mail": {
+          "account_ids": [],
+          "messages_by_external_id": {}
+        },
+        "matters": {
+          "matter_ids": []
+        },
+        "workspaces": []
+      },
+      "log": {
+        "exists": true,
+        "json_parse_errors": [],
+        "missing_sections": [],
+        "path": "/tmp/lka_eval_runtime_tools_runtime_now_tool_wrlma_3l/data/agent_logs/agent_turn_86bb9523b157.md"
+      },
+      "metrics": [
+        {
+          "details": {
+            "error": null
+          },
+          "name": "no_runtime_error",
+          "passed": true,
+          "score": 1.0,
+          "weight": 2.0
+        },
+        {
+          "details": {
+            "actual": null,
+            "expected": "runtime"
+          },
+          "name": "selected_package_match",
+          "passed": false,
+          "score": 0.0,
+          "weight": 1.0
+        },
+        {
+          "details": {
+            "actual": [],
+            "expected": [
+              "runtime.now"
+            ]
+          },
+          "name": "tool_sequence_exact_match",
+          "passed": false,
+          "score": 0.0,
+          "weight": 2.0
+        },
+        {
+          "details": {
+            "actual": [],
+            "expected": [
+              "runtime.now"
+            ]
+          },
+          "name": "tool_sequence_f1",
+          "passed": false,
+          "score": 0.0,
+          "weight": 1.0
+        },
+        {
+          "details": {
+            "actual": [],
+            "missing": [
+              "runtime.now"
+            ]
+          },
+          "name": "required_tool_called",
+          "passed": false,
+          "score": 0.0,
+          "weight": 1.0
+        },
+        {
+          "details": {
+            "missing": [
+              "runtime.now"
+            ]
+          },
+          "name": "answer_contains_all",
+          "passed": false,
+          "score": 0.0,
+          "weight": 2.0
+        },
+        {
+          "details": {
+            "missing": [
+              "local",
+              "timezone",
+              "utc",
+              "date"
+            ]
+          },
+          "name": "tool_output_contains_all",
+          "passed": false,
+          "score": 0.0,
+          "weight": 2.0
+        },
+        {
+          "details": {
+            "tool_event_count": 0
+          },
+          "name": "tool_success_rate",
+          "passed": true,
+          "score": 1.0,
+          "weight": 1.0
+        },
+        {
+          "details": {
+            "actual": 0,
+            "maximum": 0
+          },
+          "name": "schema_rejection_count",
+          "passed": true,
+          "score": 1.0,
+          "weight": 1.0
+        },
+        {
+          "details": {
+            "actual": 2,
+            "maximum": 5
+          },
+          "name": "llm_call_count",
+          "passed": true,
+          "score": 1.0,
+          "weight": 1.0
+        },
+        {
+          "details": {
+            "actual": 1701,
+            "maximum": null
+          },
+          "name": "reported_token_total",
+          "passed": true,
+          "score": 1.0,
+          "weight": 1.0
+        },
+        {
+          "details": {
+            "actual": 5532.248,
+            "maximum": 5000
+          },
+          "name": "wall_time_ms",
+          "passed": false,
+          "score": 0.0,
+          "weight": 1.0
+        },
+        {
+          "details": {
+            "json_parse_errors": [],
+            "missing_sections": []
+          },
+          "name": "run_log_completeness_rate",
+          "passed": true,
+          "score": 1.0,
+          "weight": 1.0
+        }
+      ],
+      "name": "runtime_now_tool",
+      "passed": false,
+      "request": {
+        "session_id": "eval_runtime_tools_runtime_now_tool",
+        "user_input": "现在的确定性运行时日期时间是什么？"
+      },
+      "result": {
+        "answer": "确定性运行时日期时间为：\n\n- UTC：2026-08-22 06:17:58.505867\n- 本地时间（Asia/Shanghai，UTC+8）：2026-08-22 14:17:58.505867",
+        "answer_preview": "确定性运行时日期时间为：\n\n- UTC：2026-08-22 06:17:58.505867\n- 本地时间（Asia/Shanghai，UTC+8）：2026-08-22 14:17:58.505867",
+        "decision_events": [
+          {
+            "action": "select_package",
+            "answer": null,
+            "assistant_message": null,
+            "decided_at": "2026-08-22T06:18:01.752409+00:00",
+            "operation": {},
+            "raw_output": "{\"selected_package\":null,\"reason\":\"The session context window already contains the deterministic runtime current time (UTC 2026-08-22T06:17:58.505867+00:00, local 2026-08-22T14:17:58.505867+08:00, Asia/Shanghai). No additional tool call is required.\",\"search_query\":null}",
+            "reason": "The session context window already contains the deterministic runtime current time (UTC 2026-08-22T06:17:58.505867+00:00, local 2026-08-22T14:17:58.505867+08:00, Asia/Shanghai). No additional tool call is required.",
+            "selected_package": null,
+            "source": "llm",
+            "step_index": 1,
+            "tool_input": {},
+            "tool_name": null
+          },
+          {
+            "action": "answer",
+            "answer": "确定性运行时日期时间为：\n\n- UTC：2026-08-22 06:17:58.505867\n- 本地时间（Asia/Shanghai，UTC+8）：2026-08-22 14:17:58.505867",
+            "assistant_message": null,
+            "decided_at": "2026-08-22T06:18:03.479790+00:00",
+            "operation": {},
+            "raw_output": null,
+            "reason": "The session context window already contains the deterministic runtime current time (UTC 2026-08-22T06:17:58.505867+00:00, local 2026-08-22T14:17:58.505867+08:00, Asia/Shanghai). No additional tool call is required.",
+            "selected_package": null,
+            "source": "llm",
+            "step_index": 2,
+            "tool_input": {},
+            "tool_name": null
+          }
+        ],
+        "expanded_tools": [],
+        "llm_events": [
+          {
+            "attempt": 1,
+            "audit_record": {
+              "client_name": "packyapi",
+              "completed_at": "2026-08-22T06:18:01.751944+00:00",
+              "content_length": 271,
+              "duration_ms": 3245,
+              "error_category": null,
+              "error_message": null,
+              "failed_at": null,
+              "finish_reason": "stop",
+              "http_status": null,
+              "input_token_count": 961,
+              "is_retriable": null,
+              "llm_call_id": "llm_call_d3fa4d6e94d4d9c6",
+              "metadata": {
+                "headers": {},
+                "prompt": {
+                  "message_count": 2,
+                  "system_prompt_length": 539,
+                  "user_prompt_length": 3202
+                }
+              },
+              "model": "deepseek-v4-flash",
+              "output_token_count": 248,
+              "partial": false,
+              "prompt_summary": "agent_turn_route user_input=现在的确定性运行时日期时间是什么？",
+              "provider": "packyapi",
+              "provider_error_code": null,
+              "provider_error_param": null,
+              "provider_error_type": null,
+              "provider_request_id": null,
+              "response_mode": "text",
+              "retry_after": null,
+              "run_id": "agent_run_90ab2fdbaee1",
+              "session_id": "eval_runtime_tools_runtime_now_tool",
+              "stage": "route",
+              "started_at": "2026-08-22T06:17:58.506851+00:00",
+              "status": "completed",
+              "total_token_count": 1209,
+              "trace_id": "agent_turn_86bb9523b157"
+            },
+            "client_name": "packyapi",
+            "completed_at": "2026-08-22T06:18:01.751944+00:00",
+            "content_length": 271,
+            "duration_ms": 3245,
+            "error": null,
+            "error_category": null,
+            "error_message": null,
+            "error_type": null,
+            "failed_at": null,
+            "finish_reason": "stop",
+            "http_status": null,
+            "input_token_count": 961,
+            "is_retriable": null,
+            "llm_call_id": "llm_call_d3fa4d6e94d4d9c6",
+            "metadata": {
+              "headers": {},
+              "prompt": {
+                "message_count": 2,
+                "system_prompt_length": 539,
+                "user_prompt_length": 3202
+              }
+            },
+            "model": "deepseek-v4-flash",
+            "output": "{\"selected_package\":null,\"reason\":\"The session context window already contains the deterministic runtime current time (UTC 2026-08-22T06:17:58.505867+00:00, local 2026-08-22T14:17:58.505867+08:00, Asia/Shanghai). No additional tool call is required.\",\"search_query\":null}",
+            "output_token_count": 248,
+            "partial": false,
+            "prompt_summary": "agent_turn_route user_input=现在的确定性运行时日期时间是什么？",
+            "provider": "packyapi",
+            "provider_error_code": null,
+            "provider_error_param": null,
+            "provider_error_type": null,
+            "provider_request_id": null,
+            "response_mode": "text",
+            "retry_after": null,
+            "run_id": "agent_run_90ab2fdbaee1",
+            "session_id": "eval_runtime_tools_runtime_now_tool",
+            "stage": "route",
+            "started_at": "2026-08-22T06:17:58.506851+00:00",
+            "status": "completed",
+            "status_code": null,
+            "system_prompt": "You are the Main Agent Brain for Local Knowledge Agent OS. Choose at most one tool package for the current turn. Do not choose concrete tools yet. Return only null when the provided session context window, including cached local resources, is sufficient to answer without another tool call. Use only package names present in package_catalog, and use each package description and routing_hints as the source of truth. Return only strict JSON: {\"selected_package\":\"<package name or null>\",\"reason\":\"...\",\"search_query\":\"optional query hint\"}",
+            "total_token_count": 1209,
+            "trace_id": "agent_turn_86bb9523b157",
+            "user_prompt": "{\n  \"user_input\": \"现在的确定性运行时日期时间是什么？\",\n  \"session_context_window\": {\n    \"session_id\": \"eval_runtime_tools_runtime_now_tool\",\n    \"token_budget\": 65536,\n    \"summary\": \"\",\n    \"recent_messages\": [],\n    \"token_estimate\": 0,\n    \"updated_at\": \"2026-08-22T06:17:58.505775+00:00\",\n    \"current_time\": {\n      \"utc\": \"2026-08-22T06:17:58.505867+00:00\",\n      \"local\": \"2026-08-22T14:17:58.505867+08:00\",\n      \"timezone\": \"Asia/Shanghai\",\n      \"date\": \"2026-08-22\"\n    }\n  },\n  \"package_catalog\": [\n    {\n      \"name\": \"mail\",\n      \"description\": \"Search, load, and sync local mail knowledge. Matter persistence lives in the matter package.\",\n      \"risk\": \"low_to_medium\",\n      \"requires_expansion\": true,\n      \"tool_names\": [\n        \"mail.search\",\n        \"mail.load_messages\",\n        \"mail.sync\"\n      ],\n      \"routing_hints\": [\n        \"Use this package when the user needs evidence from local or synced email.\",\n        \"Use this package when the user asks about mailbox contents, mail notifications, or mail-derived facts.\"\n      ],\n      \"decision_hints\": [\n        \"Search candidate messages before loading full message records.\",\n        \"Load full messages for relevant message ids before writing the final answer.\",\n        \"Synchronize mail first only when the user asks to sync, asks for the latest mailbox state, or local mail may be stale.\",\n        \"This package reads and syncs mail evidence; use another registered persistence package for tasks, events, or matters.\"\n      ],\n      \"observation_cache\": {\n        \"tool_names\": [\n          \"mail.load_messages\"\n        ],\n        \"description\": \"Reuse loaded complete mail records from the same session when relevant.\"\n      }\n    },\n    {\n      \"name\": \"matter\",\n      \"description\": \"Create, search, list, update, and link independent local matters.\",\n      \"risk\": \"low_to_medium\",\n      \"requires_expansion\": true,\n      \"tool_names\": [\n        \"matter.create\",\n        \"matter.create_many\",\n        \"matter.search\",\n        \"matter.list\",\n        \"matter.update\",\n        \"matter.link_source\"\n      ],\n      \"routing_hints\": [\n        \"Use this package when the user asks to inspect, create, update, or link local tasks, events, reminders, or matters.\"\n      ],\n      \"decision_hints\": [\n        \"Inspect existing records when there is a realistic chance of duplicates before creating new records.\",\n        \"Use create for one record, create_many for a controlled batch, update to change existing records, and link_source to attach evidence.\",\n        \"Follow every tool input_schema exactly, especially required fields and allowed_values.\"\n      ],\n      \"observation_cache\": {}\n    },\n    {\n      \"name\": \"runtime\",\n      \"description\": \"Read deterministic runtime context such as the current time.\",\n      \"risk\": \"low\",\n      \"requires_expansion\": true,\n      \"tool_names\": [\n        \"runtime.now\"\n      ],\n      \"routing_hints\": [\n        \"Use this package when a direct answer requires deterministic runtime context.\"\n      ],\n      \"decision_hints\": [\n        \"Use runtime tools when the session context does not already contain sufficient deterministic runtime data.\"\n      ],\n      \"observation_cache\": {}\n    }\n  ]\n}"
+          },
+          {
+            "attempt": 1,
+            "audit_record": {
+              "client_name": "packyapi",
+              "completed_at": "2026-08-22T06:18:03.479450+00:00",
+              "content_length": 101,
+              "duration_ms": 1726,
+              "error_category": null,
+              "error_message": null,
+              "failed_at": null,
+              "finish_reason": "stop",
+              "http_status": null,
+              "input_token_count": 418,
+              "is_retriable": null,
+              "llm_call_id": "llm_call_e400eaf9cdefbfcd",
+              "metadata": {
+                "headers": {},
+                "prompt": {
+                  "message_count": 2,
+                  "system_prompt_length": 350,
+                  "user_prompt_length": 752
+                }
+              },
+              "model": "deepseek-v4-flash",
+              "output_token_count": 74,
+              "partial": false,
+              "prompt_summary": "agent_turn_context_answer user_input=现在的确定性运行时日期时间是什么？",
+              "provider": "packyapi",
+              "provider_error_code": null,
+              "provider_error_param": null,
+              "provider_error_type": null,
+              "provider_request_id": null,
+              "response_mode": "text",
+              "retry_after": null,
+              "run_id": "agent_run_90ab2fdbaee1",
+              "session_id": "eval_runtime_tools_runtime_now_tool",
+              "stage": "context_answer",
+              "started_at": "2026-08-22T06:18:01.752682+00:00",
+              "status": "completed",
+              "total_token_count": 492,
+              "trace_id": "agent_turn_86bb9523b157"
+            },
+            "client_name": "packyapi",
+            "completed_at": "2026-08-22T06:18:03.479450+00:00",
+            "content_length": 101,
+            "duration_ms": 1726,
+            "error": null,
+            "error_category": null,
+            "error_message": null,
+            "error_type": null,
+            "failed_at": null,
+            "finish_reason": "stop",
+            "http_status": null,
+            "input_token_count": 418,
+            "is_retriable": null,
+            "llm_call_id": "llm_call_e400eaf9cdefbfcd",
+            "metadata": {
+              "headers": {},
+              "prompt": {
+                "message_count": 2,
+                "system_prompt_length": 350,
+                "user_prompt_length": 752
+              }
+            },
+            "model": "deepseek-v4-flash",
+            "output": "确定性运行时日期时间为：\n\n- UTC：2026-08-22 06:17:58.505867\n- 本地时间（Asia/Shanghai，UTC+8）：2026-08-22 14:17:58.505867",
+            "output_token_count": 74,
+            "partial": false,
+            "prompt_summary": "agent_turn_context_answer user_input=现在的确定性运行时日期时间是什么？",
+            "provider": "packyapi",
+            "provider_error_code": null,
+            "provider_error_param": null,
+            "provider_error_type": null,
+            "provider_request_id": null,
+            "response_mode": "text",
+            "retry_after": null,
+            "run_id": "agent_run_90ab2fdbaee1",
+            "session_id": "eval_runtime_tools_runtime_now_tool",
+            "stage": "context_answer",
+            "started_at": "2026-08-22T06:18:01.752682+00:00",
+            "status": "completed",
+            "status_code": null,
+            "system_prompt": "You are the Main Agent Brain for Local Knowledge Agent OS. Answer the current user turn directly in Chinese using only the provided session context window when it is sufficient. Do not invent unavailable local facts. If the context is insufficient and no tool package was selected, explain what information is missing. Do not wrap the answer in JSON.",
+            "total_token_count": 492,
+            "trace_id": "agent_turn_86bb9523b157",
+            "user_prompt": "{\n  \"user_input\": \"现在的确定性运行时日期时间是什么？\",\n  \"route\": {\n    \"selected_package\": null,\n    \"reason\": \"The session context window already contains the deterministic runtime current time (UTC 2026-08-22T06:17:58.505867+00:00, local 2026-08-22T14:17:58.505867+08:00, Asia/Shanghai). No additional tool call is required.\"\n  },\n  \"session_context_window\": {\n    \"session_id\": \"eval_runtime_tools_runtime_now_tool\",\n    \"token_budget\": 65536,\n    \"summary\": \"\",\n    \"recent_messages\": [],\n    \"token_estimate\": 0,\n    \"updated_at\": \"2026-08-22T06:17:58.505775+00:00\",\n    \"current_time\": {\n      \"utc\": \"2026-08-22T06:17:58.505867+00:00\",\n      \"local\": \"2026-08-22T14:17:58.505867+08:00\",\n      \"timezone\": \"Asia/Shanghai\",\n      \"date\": \"2026-08-22\"\n    }\n  }\n}"
+          }
+        ],
+        "log_path": "/tmp/lka_eval_runtime_tools_runtime_now_tool_wrlma_3l/data/agent_logs/agent_turn_86bb9523b157.md",
+        "package_catalog": [
+          {
+            "decision_hints": [
+              "Search candidate messages before loading full message records.",
+              "Load full messages for relevant message ids before writing the final answer.",
+              "Synchronize mail first only when the user asks to sync, asks for the latest mailbox state, or local mail may be stale.",
+              "This package reads and syncs mail evidence; use another registered persistence package for tasks, events, or matters."
+            ],
+            "description": "Search, load, and sync local mail knowledge. Matter persistence lives in the matter package.",
+            "name": "mail",
+            "observation_cache": {
+              "description": "Reuse loaded complete mail records from the same session when relevant.",
+              "tool_names": [
+                "mail.load_messages"
+              ]
+            },
+            "requires_expansion": true,
+            "risk": "low_to_medium",
+            "routing_hints": [
+              "Use this package when the user needs evidence from local or synced email.",
+              "Use this package when the user asks about mailbox contents, mail notifications, or mail-derived facts."
+            ],
+            "tool_names": [
+              "mail.search",
+              "mail.load_messages",
+              "mail.sync"
+            ]
+          },
+          {
+            "decision_hints": [
+              "Inspect existing records when there is a realistic chance of duplicates before creating new records.",
+              "Use create for one record, create_many for a controlled batch, update to change existing records, and link_source to attach evidence.",
+              "Follow every tool input_schema exactly, especially required fields and allowed_values."
+            ],
+            "description": "Create, search, list, update, and link independent local matters.",
+            "name": "matter",
+            "observation_cache": {},
+            "requires_expansion": true,
+            "risk": "low_to_medium",
+            "routing_hints": [
+              "Use this package when the user asks to inspect, create, update, or link local tasks, events, reminders, or matters."
+            ],
+            "tool_names": [
+              "matter.create",
+              "matter.create_many",
+              "matter.search",
+              "matter.list",
+              "matter.update",
+              "matter.link_source"
+            ]
+          },
+          {
+            "decision_hints": [
+              "Use runtime tools when the session context does not already contain sufficient deterministic runtime data."
+            ],
+            "description": "Read deterministic runtime context such as the current time.",
+            "name": "runtime",
+            "observation_cache": {},
+            "requires_expansion": true,
+            "risk": "low",
+            "routing_hints": [
+              "Use this package when a direct answer requires deterministic runtime context."
+            ],
+            "tool_names": [
+              "runtime.now"
+            ]
+          }
+        ],
+        "progress_events": [
+          {
+            "created_at": "2026-08-22T06:18:01.752456+00:00",
+            "event_index": 1,
+            "message": "No tool package selected; answering from context if possible.",
+            "metadata": {
+              "reason": "The session context window already contains the deterministic runtime current time (UTC 2026-08-22T06:17:58.505867+00:00, local 2026-08-22T14:17:58.505867+08:00, Asia/Shanghai). No additional tool call is required."
+            },
+            "package_name": null,
+            "stage": "route",
+            "status": "completed",
+            "tool_name": null,
+            "type": "no_package"
+          },
+          {
+            "created_at": "2026-08-22T06:18:03.479836+00:00",
+            "event_index": 2,
+            "message": "确定性运行时日期时间为： - UTC：2026-08-22 06:17:58.505867 - 本地时间（Asia/Shanghai，UTC+8）：2026-08-22 14:17:58.505867",
+            "metadata": {
+              "answer": "确定性运行时日期时间为：\n\n- UTC：2026-08-22 06:17:58.505867\n- 本地时间（Asia/Shanghai，UTC+8）：2026-08-22 14:17:58.505867"
+            },
+            "package_name": null,
+            "stage": "answer",
+            "status": "completed",
+            "tool_name": null,
+            "type": "final_answer"
+          }
+        ],
+        "run_id": "agent_run_90ab2fdbaee1",
+        "selected_package": null,
+        "session_context_window": {
+          "current_time": {
+            "date": "2026-08-22",
+            "local": "2026-08-22T14:17:58.505867+08:00",
+            "timezone": "Asia/Shanghai",
+            "utc": "2026-08-22T06:17:58.505867+00:00"
+          },
+          "recent_messages": [],
+          "session_id": "eval_runtime_tools_runtime_now_tool",
+          "summary": "",
+          "token_budget": 65536,
+          "token_estimate": 0,
+          "updated_at": "2026-08-22T06:17:58.505775+00:00"
+        },
+        "session_id": "eval_runtime_tools_runtime_now_tool",
+        "tool_events": [],
+        "trace_id": "agent_turn_86bb9523b157",
+        "verification_warnings": []
+      },
+      "score": 0.4118,
+      "sse_event_count": 0,
+      "subject": "runtime",
+      "timings": {
+        "wall_time_ms": 5532.248
+      }
+    }
+  ],
+  "generated_at": "2026-08-22T06:18:03.530728+00:00",
+  "subject": "runtime",
+  "suite_id": "runtime_tools",
+  "summary": {
+    "case_count": 1,
+    "failed_count": 1,
+    "passed": false,
+    "passed_count": 0,
+    "score": 0.4118
+  }
+}

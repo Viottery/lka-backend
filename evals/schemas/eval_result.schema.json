@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LKA Eval Result",
+  "type": "object",
+  "required": ["suite_id", "subject", "summary", "cases"],
+  "properties": {
+    "suite_id": {"type": "string"},
+    "subject": {"type": "string"},
+    "generated_at": {"type": "string"},
+    "summary": {"type": "object"},
+    "cases": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["case_id", "score", "passed", "metrics"],
+        "properties": {
+          "case_id": {"type": "string"},
+          "score": {"type": "number"},
+          "passed": {"type": "boolean"},
+          "metrics": {"type": "array"},
+          "result": {"type": "object"}
+        }
+      }
+    }
+  }
+}

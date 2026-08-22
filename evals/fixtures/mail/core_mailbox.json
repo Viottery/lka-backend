@@ -1,0 +1,73 @@
+{
+  "account": {
+    "provider": "local_json",
+    "email_address": "eval-user@example.com",
+    "display_name": "Eval User"
+  },
+  "messages": [
+    {
+      "external_id": "eval_ntuso_audition_20260805",
+      "folder": "Inbox",
+      "subject": "NTUSO Audition requirements 2026",
+      "sender": "ntuso@example.edu",
+      "to": ["eval-user@example.com"],
+      "cc": [],
+      "received_at": "2026-08-05T09:30:00Z",
+      "body_text": "NTUSO audition requires G major scale, one prepared piece, sight reading, and arrival 15 minutes early. The audition room is Music Studio 3."
+    },
+    {
+      "external_id": "eval_ntuso_audition_update_20260812",
+      "folder": "Inbox",
+      "subject": "Updated NTUSO Audition schedule",
+      "sender": "ntuso@example.edu",
+      "to": ["eval-user@example.com"],
+      "cc": [],
+      "received_at": "2026-08-12T10:00:00Z",
+      "body_text": "Updated NTUSO audition schedule: violin candidates should attend on 2026-08-28 at 14:00. Bring student card and printed repertoire list."
+    },
+    {
+      "external_id": "eval_ica_student_pass_checklist",
+      "folder": "Inbox",
+      "subject": "ICA Student Pass completion checklist",
+      "sender": "ica@example.gov.sg",
+      "to": ["eval-user@example.com"],
+      "cc": [],
+      "received_at": "2026-08-07T03:15:00Z",
+      "body_text": "Complete the ICA Student Pass formalities with IPA letter, passport, SG Arrival Card, recent photo, and appointment confirmation. Deadline: 2026-08-20."
+    },
+    {
+      "external_id": "eval_course_deadline_reminder",
+      "folder": "Inbox",
+      "subject": "Course registration deadline reminder",
+      "sender": "registrar@example.edu",
+      "to": ["eval-user@example.com"],
+      "cc": [],
+      "received_at": "2026-08-10T01:00:00Z",
+      "body_text": "Course registration closes on 2026-08-18 at 17:00. Submit appeals before the deadline if any required module is missing."
+    },
+    {
+      "external_id": "eval_lab_attachment_metadata",
+      "folder": "Inbox",
+      "subject": "Lab onboarding documents",
+      "sender": "lab-admin@example.edu",
+      "to": ["eval-user@example.com"],
+      "cc": [],
+      "received_at": "2026-08-11T06:00:00Z",
+      "body_text": "Please review the attached lab safety guide and workstation policy before onboarding.",
+      "attachments": [
+        {
+          "external_id": "att_lab_safety_pdf",
+          "name": "lab_safety_guide.pdf",
+          "content_type": "application/pdf",
+          "size": 245760
+        },
+        {
+          "external_id": "att_workstation_policy_docx",
+          "name": "workstation_policy.docx",
+          "content_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+          "size": 98304
+        }
+      ]
+    }
+  ]
+}

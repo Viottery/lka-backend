@@ -1,0 +1,30 @@
+{
+  "suite_id": "smoke",
+  "description": "Small deterministic benchmark proving eval plumbing, fixture isolation, Agent turn logs, and mail QA path.",
+  "cases": [
+    {
+      "case_id": "mail_basic_ntuso",
+      "workflow": "mail_qa",
+      "setup": {
+        "mail_fixtures": ["core_mailbox"]
+      },
+      "request": {
+        "user_input": "帮我查询 NTUSO audition 的考试要求。"
+      },
+      "search_query": "NTUSO audition",
+      "scripted_answer": "根据本地邮件证据：NTUSO audition 需要 G major scale、one prepared piece、sight reading，并提前 15 minutes 到 Music Studio 3。",
+      "expect": {
+        "selected_package": "mail",
+        "tool_sequence": ["mail.search", "mail.load_messages"],
+        "required_tools": ["mail.search", "mail.load_messages"],
+        "forbidden_tools": ["matter.create", "mail.sync"],
+        "answer_contains_all": ["G major scale", "one prepared piece", "sight reading", "Music Studio 3"],
+        "answer_excludes_all": ["hallucinated"],
+        "evidence_external_ids": ["eval_ntuso_audition_20260805"],
+        "max_schema_rejections": 0,
+        "max_llm_calls": 8,
+        "max_wall_time_ms": 5000
+      }
+    }
+  ]
+}

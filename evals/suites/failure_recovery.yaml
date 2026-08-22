@@ -1,0 +1,22 @@
+{
+  "suite_id": "failure_recovery",
+  "description": "First-version deterministic failure-budget contracts. More adversarial LLM scripts can be added here.",
+  "cases": [
+    {
+      "case_id": "no_schema_rejections_on_valid_mail_qa",
+      "workflow": "mail_qa",
+      "setup": {"mail_fixtures": ["core_mailbox"]},
+      "request": {"user_input": "查询 ICA Student Pass checklist。"},
+      "search_query": "ICA Student Pass checklist",
+      "scripted_answer": "ICA checklist 包含 IPA letter、passport、SG Arrival Card、recent photo 和 appointment confirmation。",
+      "expect": {
+        "selected_package": "mail",
+        "tool_sequence": ["mail.search", "mail.load_messages"],
+        "answer_contains_all": ["IPA letter", "passport"],
+        "evidence_external_ids": ["eval_ica_student_pass_checklist"],
+        "max_schema_rejections": 0,
+        "max_llm_calls": 8
+      }
+    }
+  ]
+}

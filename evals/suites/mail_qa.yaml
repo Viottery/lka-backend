@@ -1,0 +1,184 @@
+{
+  "suite_id": "mail_qa",
+  "description": "Mail question-answering benchmark with isolated virtual mailbox data.",
+  "cases": [
+    {
+      "case_id": "ntuso_requirements",
+      "workflow": "mail_qa",
+      "setup": {"mail_fixtures": ["core_mailbox"]},
+      "request": {"user_input": "NTUSO 的 audition 要求是什么？"},
+      "search_query": "NTUSO requirements",
+      "scripted_answer": "NTUSO audition 要求包括 G major scale、one prepared piece、sight reading，并提前 15 minutes 到 Music Studio 3。",
+      "expect": {
+        "selected_package": "mail",
+        "tool_sequence": ["mail.search", "mail.load_messages"],
+        "answer_contains_all": ["G major scale", "one prepared piece", "sight reading"],
+        "evidence_external_ids": ["eval_ntuso_audition_20260805"],
+        "max_llm_calls": 8,
+        "max_wall_time_ms": 5000
+      }
+    },
+    {
+      "case_id": "ntuso_latest_schedule",
+      "workflow": "mail_qa",
+      "setup": {"mail_fixtures": ["core_mailbox"]},
+      "request": {"user_input": "找最新的 NTUSO audition schedule，告诉我时间和要带什么。"},
+      "search_query": "Updated NTUSO schedule",
+      "scripted_answer": "最新 NTUSO audition schedule 是 2026-08-28 14:00，violin candidates 需要带 student card 和 printed repertoire list。",
+      "expect": {
+        "selected_package": "mail",
+        "tool_sequence": ["mail.search", "mail.load_messages"],
+        "answer_contains_all": ["2026-08-28", "14:00", "student card", "printed repertoire list"],
+        "evidence_external_ids": ["eval_ntuso_audition_update_20260812"],
+        "max_llm_calls": 8,
+        "max_wall_time_ms": 5000
+      }
+    },
+    {
+      "case_id": "ica_checklist",
+      "workflow": "mail_qa",
+      "setup": {"mail_fixtures": ["core_mailbox"]},
+      "request": {"user_input": "ICA Student Pass formalities 需要准备哪些材料？"},
+      "search_query": "ICA Student Pass checklist",
+      "scripted_answer": "ICA Student Pass formalities 需要 IPA letter、passport、SG Arrival Card、recent photo 和 appointment confirmation，deadline 是 2026-08-20。",
+      "expect": {
+        "selected_package": "mail",
+        "tool_sequence": ["mail.search", "mail.load_messages"],
+        "answer_contains_all": ["IPA letter", "passport", "SG Arrival Card", "recent photo", "2026-08-20"],
+        "evidence_external_ids": ["eval_ica_student_pass_checklist"],
+        "max_llm_calls": 8,
+        "max_wall_time_ms": 5000
+      }
+    },
+    {
+      "case_id": "attachment_metadata",
+      "workflow": "mail_qa",
+      "setup": {"mail_fixtures": ["core_mailbox"]},
+      "request": {"user_input": "Lab onboarding 邮件里有哪些附件？"},
+      "search_query": "Lab onboarding documents",
+      "scripted_answer": "Lab onboarding 邮件包含附件 lab_safety_guide.pdf 和 workstation_policy.docx。",
+      "expect": {
+        "selected_package": "mail",
+        "tool_sequence": ["mail.search", "mail.load_messages"],
+        "answer_contains_all": ["lab_safety_guide.pdf", "workstation_policy.docx"],
+        "evidence_external_ids": ["eval_lab_attachment_metadata"],
+        "max_llm_calls": 8,
+        "max_wall_time_ms": 5000
+      }
+    },
+    {
+      "case_id": "scholarship_deadline_with_noise",
+      "workflow": "mail_qa",
+      "setup": {"mail_fixtures": ["core_mailbox", "expanded_mailbox"]},
+      "request": {"user_input": "奖学金申请延期到什么时候？需要哪些材料？"},
+      "search_query": "Scholarship application deadline",
+      "scripted_answer": "Scholarship application deadline 已延期到 2026-08-25 23:59 SGT，需要 transcript、personal statement 和 referee contact。",
+      "expect": {
+        "selected_package": "mail",
+        "tool_sequence": ["mail.search", "mail.load_messages"],
+        "answer_contains_all": ["2026-08-25", "23:59 SGT", "transcript", "personal statement", "referee contact"],
+        "answer_excludes_all": ["wire", "refundable deposit"],
+        "evidence_external_ids": ["eval_scholarship_deadline"],
+        "max_llm_calls": 8,
+        "max_wall_time_ms": 5000
+      }
+    },
+    {
+      "case_id": "rescheduled_event_overrides_original",
+      "workflow": "mail_qa",
+      "setup": {"mail_fixtures": ["expanded_mailbox"]},
+      "request": {"user_input": "Quantum seminar 最终改到什么时候、哪里？不要用旧地点。"},
+      "search_query": "Quantum seminar rescheduled",
+      "scripted_answer": "Quantum seminar 最终改到 2026-08-21 15:30，在 Seminar Room B；旧的 LT5 时间已不再有效。",
+      "expect": {
+        "selected_package": "mail",
+        "tool_sequence": ["mail.search", "mail.load_messages"],
+        "answer_contains_all": ["2026-08-21", "15:30", "Seminar Room B"],
+        "answer_excludes_all": ["2026-08-19 at 10:00 in LT5"],
+        "evidence_external_ids": ["eval_quantum_seminar_rescheduled"],
+        "max_llm_calls": 8,
+        "max_wall_time_ms": 5000
+      }
+    },
+    {
+      "case_id": "cancelled_event",
+      "workflow": "mail_qa",
+      "setup": {"mail_fixtures": ["expanded_mailbox"]},
+      "request": {"user_input": "career fair booth training 还要去吗？"},
+      "search_query": "career fair booth cancelled",
+      "scripted_answer": "不用去；career fair booth training session on 2026-08-16 has been cancelled，并且 no replacement session is planned。",
+      "expect": {
+        "selected_package": "mail",
+        "tool_sequence": ["mail.search", "mail.load_messages"],
+        "answer_contains_all": ["cancelled", "no replacement session"],
+        "evidence_external_ids": ["eval_career_fair_cancelled"],
+        "max_llm_calls": 8,
+        "max_wall_time_ms": 5000
+      }
+    },
+    {
+      "case_id": "bilingual_orientation",
+      "workflow": "mail_qa",
+      "setup": {"mail_fixtures": ["expanded_mailbox"]},
+      "request": {"user_input": "迎新活动是什么时候？要带什么？"},
+      "search_query": "迎新活动 Orientation",
+      "scripted_answer": "迎新活动在 2026-08-22 09:00 于 Auditorium A 举行，需要带 student card 和 water bottle。",
+      "expect": {
+        "selected_package": "mail",
+        "tool_sequence": ["mail.search", "mail.load_messages"],
+        "answer_contains_all": ["2026-08-22", "09:00", "Auditorium A", "student card", "water bottle"],
+        "evidence_external_ids": ["eval_bilingual_orientation"],
+        "max_llm_calls": 8,
+        "max_wall_time_ms": 5000
+      }
+    },
+    {
+      "case_id": "library_overdue",
+      "workflow": "mail_qa",
+      "setup": {"mail_fixtures": ["expanded_mailbox"]},
+      "request": {"user_input": "图书馆逾期书最晚什么时候还？罚款怎么算？"},
+      "search_query": "Library overdue warning",
+      "scripted_answer": "Book 'Distributed Systems' 需要在 2026-08-19 前归还，否则罚款是 SGD 3.00 per day。",
+      "expect": {
+        "selected_package": "mail",
+        "tool_sequence": ["mail.search", "mail.load_messages"],
+        "answer_contains_all": ["Distributed Systems", "2026-08-19", "SGD 3.00 per day"],
+        "evidence_external_ids": ["eval_library_overdue_warning"],
+        "max_llm_calls": 8,
+        "max_wall_time_ms": 5000
+      }
+    },
+    {
+      "case_id": "timezone_event",
+      "workflow": "mail_qa",
+      "setup": {"mail_fixtures": ["expanded_mailbox"]},
+      "request": {"user_input": "Research meeting 的时区和议程是什么？"},
+      "search_query": "Research meeting timezone",
+      "scripted_answer": "Research meeting 是 2026-08-23 09:00 SGT，不是 UTC；议程是 draft review 和 experiment plan。",
+      "expect": {
+        "selected_package": "mail",
+        "tool_sequence": ["mail.search", "mail.load_messages"],
+        "answer_contains_all": ["2026-08-23", "09:00 SGT", "不是 UTC", "draft review", "experiment plan"],
+        "evidence_external_ids": ["eval_meeting_timezone"],
+        "max_llm_calls": 8,
+        "max_wall_time_ms": 5000
+      }
+    },
+    {
+      "case_id": "admin_attachment_bundle",
+      "workflow": "mail_qa",
+      "setup": {"mail_fixtures": ["expanded_mailbox"]},
+      "request": {"user_input": "Admin forms 邮件附件有哪些？"},
+      "search_query": "Admin forms attachment bundle",
+      "scripted_answer": "Admin forms 邮件包含 reimbursement_form.xlsx、consent_form.pdf 和 room_booking_policy.pdf。",
+      "expect": {
+        "selected_package": "mail",
+        "tool_sequence": ["mail.search", "mail.load_messages"],
+        "answer_contains_all": ["reimbursement_form.xlsx", "consent_form.pdf", "room_booking_policy.pdf"],
+        "evidence_external_ids": ["eval_forms_attachment_bundle"],
+        "max_llm_calls": 8,
+        "max_wall_time_ms": 5000
+      }
+    }
+  ]
+}

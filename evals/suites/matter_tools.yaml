@@ -1,0 +1,56 @@
+{
+  "suite_id": "matter_tools",
+  "description": "Agent-visible matter package benchmark covering create, search, update, and source linking.",
+  "cases": [
+    {
+      "case_id": "matter_create_search_update_link",
+      "workflow": "tool_plan",
+      "request": {"user_input": "创建并更新一个本地事务，然后关联证据来源。"},
+      "tool_plan": [
+        {
+          "tool_name": "matter.create",
+          "tool_input": {
+            "title": "Prepare evaluation report",
+            "summary": "Draft the benchmark evaluation report.",
+            "status": "open",
+            "priority": "normal",
+            "tags": ["eval", "report"],
+            "metadata": {"source": "matter_tools_suite"}
+          }
+        },
+        {
+          "tool_name": "matter.search",
+          "tool_input": {"query": "evaluation report", "limit": 5}
+        },
+        {
+          "tool_name": "matter.update",
+          "tool_input": {
+            "matter_id": "$matter_id_from_create",
+            "status": "in_progress",
+            "priority": "high"
+          }
+        },
+        {
+          "tool_name": "matter.link_source",
+          "tool_input": {
+            "matter_id": "$matter_id_from_create",
+            "source_type": "eval_source",
+            "source_id": "source_eval_report_001",
+            "reason": "Synthetic source for matter tool benchmark."
+          }
+        }
+      ],
+      "scripted_answer": "已创建、检索、更新并关联事务 Prepare evaluation report。",
+      "expect": {
+        "selected_package": "matter",
+        "tool_sequence": ["matter.create", "matter.search", "matter.update", "matter.link_source"],
+        "required_tools": ["matter.create", "matter.search", "matter.update", "matter.link_source"],
+        "answer_contains_all": ["Prepare evaluation report"],
+        "tool_output_contains_all": ["Prepare evaluation report", "in_progress", "high", "eval_source", "source_eval_report_001"],
+        "max_schema_rejections": 0,
+        "max_llm_calls": 12,
+        "max_wall_time_ms": 5000
+      }
+    }
+  ]
+}

@@ -1,0 +1,159 @@
+{
+  "account": {
+    "provider": "local_json",
+    "email_address": "eval-user@example.com",
+    "display_name": "Eval User"
+  },
+  "messages": [
+    {
+      "external_id": "eval_noise_newsletter_weekly",
+      "folder": "Inbox",
+      "subject": "Weekly campus newsletter",
+      "sender": "newsletter@example.edu",
+      "to": ["eval-user@example.com"],
+      "cc": [],
+      "received_at": "2026-08-01T01:00:00Z",
+      "body_text": "This weekly newsletter mentions music, courses, cafeteria updates, and generic audition tips, but it is not an official NTUSO audition notice."
+    },
+    {
+      "external_id": "eval_noise_store_receipt",
+      "folder": "Receipts",
+      "subject": "Receipt for music stand purchase",
+      "sender": "store@example.com",
+      "to": ["eval-user@example.com"],
+      "cc": [],
+      "received_at": "2026-08-02T12:00:00Z",
+      "body_text": "Your receipt total is SGD 42.70 for a folding music stand. This is unrelated to any audition requirement."
+    },
+    {
+      "external_id": "eval_phishing_urgent_bank",
+      "folder": "Junk",
+      "subject": "URGENT account verification required",
+      "sender": "security-alert@example.invalid",
+      "to": ["eval-user@example.com"],
+      "cc": [],
+      "received_at": "2026-08-03T08:00:00Z",
+      "body_text": "Urgent action required. Verify your account by wiring a refundable deposit. This message is a phishing distractor."
+    },
+    {
+      "external_id": "eval_scholarship_deadline",
+      "folder": "Inbox",
+      "subject": "Scholarship application deadline extended",
+      "sender": "financial-aid@example.edu",
+      "to": ["eval-user@example.com"],
+      "cc": [],
+      "received_at": "2026-08-13T02:00:00Z",
+      "body_text": "The scholarship application deadline has been extended to 2026-08-25 23:59 SGT. Required documents: transcript, personal statement, and referee contact."
+    },
+    {
+      "external_id": "eval_quantum_seminar_original",
+      "folder": "Inbox",
+      "subject": "Quantum seminar invitation",
+      "sender": "seminars@example.edu",
+      "to": ["eval-user@example.com"],
+      "cc": [],
+      "received_at": "2026-08-06T04:00:00Z",
+      "body_text": "Quantum seminar originally scheduled for 2026-08-19 at 10:00 in LT5. Speaker: Dr. Lin."
+    },
+    {
+      "external_id": "eval_quantum_seminar_rescheduled",
+      "folder": "Inbox",
+      "subject": "Quantum seminar rescheduled",
+      "sender": "seminars@example.edu",
+      "to": ["eval-user@example.com"],
+      "cc": [],
+      "received_at": "2026-08-14T04:30:00Z",
+      "body_text": "The Quantum seminar has been rescheduled to 2026-08-21 at 15:30 in Seminar Room B. The old LT5 time is no longer valid."
+    },
+    {
+      "external_id": "eval_career_fair_cancelled",
+      "folder": "Inbox",
+      "subject": "Career fair booth session cancelled",
+      "sender": "career@example.edu",
+      "to": ["eval-user@example.com"],
+      "cc": [],
+      "received_at": "2026-08-09T07:00:00Z",
+      "body_text": "The career fair booth training session on 2026-08-16 has been cancelled. No replacement session is planned."
+    },
+    {
+      "external_id": "eval_bilingual_orientation",
+      "folder": "Inbox",
+      "subject": "迎新活动 Orientation bilingual notice",
+      "sender": "student-life@example.edu",
+      "to": ["eval-user@example.com"],
+      "cc": [],
+      "received_at": "2026-08-15T03:00:00Z",
+      "body_text": "迎新活动将在 2026-08-22 09:00 于 Auditorium A 举行。Please bring your student card and water bottle."
+    },
+    {
+      "external_id": "eval_library_overdue_warning",
+      "folder": "Inbox",
+      "subject": "Library overdue warning",
+      "sender": "library@example.edu",
+      "to": ["eval-user@example.com"],
+      "cc": [],
+      "received_at": "2026-08-16T02:00:00Z",
+      "body_text": "Book 'Distributed Systems' is overdue. Return it by 2026-08-19 to avoid a fine of SGD 3.00 per day."
+    },
+    {
+      "external_id": "eval_travel_itinerary_noise",
+      "folder": "Travel",
+      "subject": "Flight itinerary for September break",
+      "sender": "airline@example.com",
+      "to": ["eval-user@example.com"],
+      "cc": [],
+      "received_at": "2026-08-17T05:00:00Z",
+      "body_text": "Your flight departs on 2026-09-05. This travel itinerary is unrelated to school deadlines."
+    },
+    {
+      "external_id": "eval_meeting_timezone",
+      "folder": "Inbox",
+      "subject": "Research meeting timezone clarification",
+      "sender": "advisor@example.edu",
+      "to": ["eval-user@example.com"],
+      "cc": [],
+      "received_at": "2026-08-18T06:00:00Z",
+      "body_text": "Research meeting is on 2026-08-23 at 09:00 SGT, not UTC. Agenda: draft review and experiment plan."
+    },
+    {
+      "external_id": "eval_forms_attachment_bundle",
+      "folder": "Inbox",
+      "subject": "Admin forms attachment bundle",
+      "sender": "admin@example.edu",
+      "to": ["eval-user@example.com"],
+      "cc": [],
+      "received_at": "2026-08-18T07:00:00Z",
+      "body_text": "Attached are the reimbursement form, consent form, and room booking policy.",
+      "attachments": [
+        {
+          "external_id": "att_reimbursement_form",
+          "name": "reimbursement_form.xlsx",
+          "content_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+          "size": 36864
+        },
+        {
+          "external_id": "att_consent_form",
+          "name": "consent_form.pdf",
+          "content_type": "application/pdf",
+          "size": 112640
+        },
+        {
+          "external_id": "att_room_policy",
+          "name": "room_booking_policy.pdf",
+          "content_type": "application/pdf",
+          "size": 90112
+        }
+      ]
+    },
+    {
+      "external_id": "eval_misc_empty_body",
+      "folder": "Inbox",
+      "subject": "Empty body placeholder",
+      "sender": "empty@example.edu",
+      "to": ["eval-user@example.com"],
+      "cc": [],
+      "received_at": "2026-08-19T01:00:00Z",
+      "body_text": ""
+    }
+  ]
+}

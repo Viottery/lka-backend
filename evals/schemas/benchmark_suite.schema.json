@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LKA Benchmark Suite",
+  "type": "object",
+  "required": ["suite_id", "cases"],
+  "properties": {
+    "suite_id": {"type": "string"},
+    "description": {"type": "string"},
+    "cases": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["case_id", "request", "expect"],
+        "properties": {
+          "case_id": {"type": "string"},
+          "name": {"type": "string"},
+          "operation": {"type": "string"},
+          "workflow": {"type": "string"},
+          "llm_mode": {"type": "string"},
+          "local_config": {"type": "string"},
+          "setup": {"type": "object"},
+          "params": {"type": "object"},
+          "request": {"type": "object"},
+          "search_query": {"type": "string"},
+          "scripted_answer": {"type": "string"},
+          "matter": {"type": "object"},
+          "tool_plan": {"type": "array"},
+          "expect": {"type": "object"}
+        }
+      }
+    }
+  }
+}

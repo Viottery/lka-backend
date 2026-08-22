@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Current Agent Markdown Log Contract",
+  "type": "object",
+  "required": [
+    "User Input",
+    "Package Catalog",
+    "Session Context Window",
+    "Expanded Tools",
+    "Decision Events",
+    "Tool Events",
+    "Progress Events",
+    "Verification Warnings",
+    "LLM Events",
+    "Answer"
+  ],
+  "additionalProperties": true
+}

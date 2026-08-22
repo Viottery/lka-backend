@@ -1,0 +1,36 @@
+{
+  "suite_id": "mail_to_matter",
+  "description": "Mail evidence to independent matter persistence benchmark.",
+  "cases": [
+    {
+      "case_id": "course_deadline_to_matter",
+      "workflow": "mail_to_matter",
+      "setup": {"mail_fixtures": ["core_mailbox"]},
+      "request": {"user_input": "把 course registration deadline 邮件整理成一个待办事项。"},
+      "search_query": "Course registration deadline",
+      "matter": {
+        "title": "Submit course registration before deadline",
+        "summary": "Course registration closes on 2026-08-18 at 17:00; submit appeals before the deadline if needed.",
+        "status": "open",
+        "priority": "high",
+        "due_at": "2026-08-18T17:00:00+08:00",
+        "tags": ["course_registration", "eval"],
+        "source_links": [],
+        "metadata": {"created_from": "eval_mail_to_matter"}
+      },
+      "scripted_answer": "已根据邮件证据创建本地事务：Submit course registration before deadline，截止 2026-08-18 17:00。",
+      "expect": {
+        "selected_package": "mail",
+        "tool_sequence": ["mail.search", "mail.load_messages", "matter.create"],
+        "required_tools": ["mail.search", "mail.load_messages", "matter.create"],
+        "answer_contains_all": ["创建本地事务", "2026-08-18"],
+        "evidence_external_ids": ["eval_course_deadline_reminder"],
+        "created_matter_contains": ["Submit course registration", "2026-08-18", "high"],
+        "matter_source_external_ids": ["eval_course_deadline_reminder"],
+        "max_schema_rejections": 0,
+        "max_llm_calls": 10,
+        "max_wall_time_ms": 5000
+      }
+    }
+  ]
+}
