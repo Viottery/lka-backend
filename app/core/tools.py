@@ -97,6 +97,13 @@ class ToolRegistry:
         return self._tools.get(name)
 
 
+def effective_tool_read_only(tool: Tool, tool_input: dict[str, Any]) -> bool | None:
+    checker = getattr(tool, "is_read_only_invocation", None)
+    if callable(checker):
+        return bool(checker(tool_input))
+    return tool.spec.read_only
+
+
 class ToolExecutor:
     """Execute registered tools and normalize failures into ToolResult."""
 
@@ -119,14 +126,15 @@ class ToolExecutor:
                 status="rejected",
                 error="Tool is not registered.",
             )
-        if tool.spec.read_only is not True and not context.safety_review_approved:
+        read_only = effective_tool_read_only(tool, tool_input)
+        if read_only is not True and not context.safety_review_approved:
             return ToolResult(
                 invocation_id=invocation_id,
                 tool_name=tool_name,
                 status="rejected",
                 output={
                     "safety_review_required": True,
-                    "read_only": tool.spec.read_only,
+                    "read_only": read_only,
                     "risk": tool.spec.risk,
                     "side_effects": tool.spec.side_effects,
                 },

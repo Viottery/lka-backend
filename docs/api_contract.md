@@ -129,6 +129,13 @@ GET /capabilities
       "read_only": false
     },
     {
+      "name": "bash",
+      "type": "tool_package",
+      "risk": "high",
+      "requires_confirmation": true,
+      "read_only": false
+    },
+    {
       "name": "summarize_folder",
       "type": "native_skill",
       "risk": "low",
@@ -251,6 +258,8 @@ response mode、耗时、usage、finish reason、provider request id、rate-limi
 - Agent 第一层只读取 Tool Package catalog；可展开 package 和可调用工具来自 Tool Registry。
 - 所有非只读工具调用都会先进入 safety review。审查模式由本地配置选择：
   `skip` 记录并自动通过、`llm` 调用 LLM 审查、`manual` 进入等待前端确认状态。
+- `bash.run` 会按具体命令动态判断只读性。白名单只读命令可直接执行；白名单之外、
+  写入、信号、stdin 交互等都按非只读处理并进入 safety review。
 - Agent core 不硬编码具体 package 名、工具名、领域流程、路由关键词或工具调用示例。
   具体策略必须由 package metadata、tool description、input/output schema、routing hints、
   decision hints 和 cache policy 提供。
@@ -314,7 +323,113 @@ response mode、耗时、usage、finish reason、provider request id、rate-limi
 
 ---
 
-## 6. Agent Safety Reviews
+## 6. Bash Tool Protocol
+
+bash 工具只通过 Agent tool-call 暴露，不提供独立 HTTP endpoint。前端通过
+`/agent/turn/stream` 观察 tool events 和 safety review events。
+
+### 6.1 `bash.run`
+
+同步命令：
+
+```json
+{
+  "command": "rg \"needle\" .",
+  "cwd": "/home/user/project",
+  "mode": "sync",
+  "timeout_seconds": 30,
+  "max_output_bytes": 32768
+}
+```
+
+返回：
+
+```json
+{
+  "mode": "sync",
+  "command": "rg \"needle\" .",
+  "cwd": "/home/user/project",
+  "read_only": true,
+  "status": "exited",
+  "running": false,
+  "exit_code": 0,
+  "timed_out": false,
+  "stdout": "...",
+  "stderr": "",
+  "output": "...",
+  "session_id": null,
+  "next_offset": null
+}
+```
+
+后台终端：
+
+```json
+{
+  "command": "npm run dev",
+  "cwd": "/home/user/project",
+  "mode": "background"
+}
+```
+
+返回：
+
+```json
+{
+  "mode": "background",
+  "status": "running",
+  "running": true,
+  "session_id": "bash_session_000001",
+  "next_offset": 0
+}
+```
+
+只读判断是按命令白名单保守执行：`pwd`、`ls`、`find`、`rg`、`grep`、`cat`、
+`sed`、`head`、`tail`、`wc`、`git status`、`git diff`、`git log`、`git show`
+等可判为只读。无法判断、重定向写入、非白名单命令默认非只读。
+
+### 6.2 `bash.read_session`
+
+```json
+{
+  "session_id": "bash_session_000001",
+  "offset": 0,
+  "max_bytes": 32768
+}
+```
+
+返回：
+
+```json
+{
+  "session_id": "bash_session_000001",
+  "status": "running",
+  "running": true,
+  "exit_code": null,
+  "offset": 0,
+  "next_offset": 120,
+  "output_start_offset": 0,
+  "output": "...",
+  "truncated": false,
+  "reader_error": null
+}
+```
+
+模型应保存 `next_offset`，下一次从该 offset 继续查询，避免重复读取。
+
+### 6.3 Session Control
+
+- `bash.list_sessions`: 查询所有终端或 `active_only=true` 的活跃终端。
+- `bash.write_session`: 向后台终端写入 stdin 文本，例如 `"hello\n"`。
+- `bash.interrupt_session`: 发送 Ctrl-C / SIGINT。
+- `bash.terminate_session`: 发送 SIGTERM。
+
+`write_session`、`interrupt_session`、`terminate_session` 都是非只读工具调用，必须经过
+safety review。
+
+---
+
+## 7. Agent Safety Reviews
 
 ```http
 GET /agent/runs/{run_id}/safety-reviews
@@ -371,7 +486,7 @@ POST /agent/safety-reviews/{review_id}/decision
 
 ---
 
-## 7. Agent Turn Stream
+## 8. Agent Turn Stream
 
 ```http
 POST /agent/turn/stream
@@ -441,7 +556,7 @@ final_answer
 作为最终回答实时输出；`final_answer` event 只作为最终校准 / 补全事件，不是首个显示最终
 答案的主要来源。
 
-### 6.1 Linux CLI Frontend
+### 8.1 Linux CLI Frontend
 
 仓库内 `debug_frontend/` 提供一个最小 Linux 命令行 HTTP 前端。它与后端保持前后端分离，
 只通过 HTTP / SSE 调用已有 API，不导入或调用 `app/core` 内部运行时代码：
@@ -483,9 +598,9 @@ hidden|collapsed|expanded` 在会话中切换过程事件显示方式。
 
 ---
 
-## 8. Sessions
+## 9. Sessions
 
-### 8.1 Create Session
+### 9.1 Create Session
 
 ```http
 POST /sessions
@@ -532,7 +647,7 @@ POST /sessions
 }
 ```
 
-### 8.2 List Sessions
+### 9.2 List Sessions
 
 ```http
 GET /sessions?limit=50
@@ -555,7 +670,7 @@ GET /sessions?limit=50
 }
 ```
 
-### 8.3 Get Session
+### 9.3 Get Session
 
 ```http
 GET /sessions/session_xxx
@@ -570,7 +685,7 @@ GET /sessions/session_xxx
 }
 ```
 
-### 8.4 Append Session Message
+### 9.4 Append Session Message
 
 ```http
 POST /sessions/session_xxx/messages
@@ -598,7 +713,7 @@ POST /sessions/session_xxx/messages
 
 ---
 
-## 9. Mail Import
+## 10. Mail Import
 
 ```http
 POST /mail/import
@@ -648,7 +763,7 @@ POST /mail/import
 
 ---
 
-## 10. Mail Search
+## 11. Mail Search
 
 ```http
 GET /mail/search?q=document&limit=10
@@ -684,7 +799,7 @@ GET /mail/search?q=document&limit=10
 
 ---
 
-## 11. List Mail Matters
+## 12. List Mail Matters
 
 ```http
 GET /mail/matters
@@ -708,12 +823,12 @@ GET /mail/matters
 
 ---
 
-## 12. Matters
+## 13. Matters
 
 独立事务系统用于保存任务、事件、待办和提醒候选项，不从属于邮件。邮件、Agent trace、
 本地文件或后续日历对象都可以作为 `source_links` 关联到同一个 matter。
 
-### 12.1 Create Matter
+### 13.1 Create Matter
 
 ```http
 POST /matters
@@ -742,7 +857,7 @@ POST /matters
 
 响应：返回完整 `matter` 记录。
 
-### 12.2 List / Search / Update
+### 13.2 List / Search / Update
 
 ```http
 GET /matters?limit=50&status=open
@@ -760,7 +875,7 @@ POST /matters/{matter_id}/source-links
 
 ---
 
-## 13. Outlook Auth Start
+## 14. Outlook Auth Start
 
 ```http
 POST /mail/outlook/auth/start
@@ -788,7 +903,7 @@ POST /mail/outlook/auth/start
 
 ---
 
-## 14. Outlook Auth Complete
+## 15. Outlook Auth Complete
 
 ```http
 POST /mail/outlook/auth/complete
@@ -817,7 +932,7 @@ POST /mail/outlook/auth/complete
 
 ---
 
-## 15. Outlook Sync
+## 16. Outlook Sync
 
 ```http
 POST /mail/outlook/sync
@@ -860,7 +975,7 @@ POST /mail/outlook/sync
 
 ---
 
-## 16. Compatibility Notes
+## 17. Compatibility Notes
 
 - 当前后端实现是轻量骨架，因此部分返回值是规则化输出而非真实 agent 结果。
 - 这份契约保留了未来完整系统需要的字段，便于逐步替换实现。

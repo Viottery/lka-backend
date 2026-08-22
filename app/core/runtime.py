@@ -16,6 +16,17 @@ from app.core.agent_turn import AgentTurnLoop, AgentTurnResult
 from app.core.config import Settings
 from app.core.context import ContextAssembler
 from app.core.llm import LLMResponseMode, MockLLMClient, build_text_llm_client
+from app.tool_packages.bash import (
+    BASH_PACKAGE,
+    BashAccessPolicy,
+    BashInterruptSessionTool,
+    BashListSessionsTool,
+    BashReadSessionTool,
+    BashRunTool,
+    BashSessionManager,
+    BashTerminateSessionTool,
+    BashWriteSessionTool,
+)
 from app.tool_packages.filesystem import (
     FILESYSTEM_PACKAGE,
     EditFileTool,
@@ -111,6 +122,7 @@ class LocalKnowledgeAgentRuntime:
         self.tool_registry.register_package(MAIL_PACKAGE)
         self.tool_registry.register_package(MATTER_PACKAGE)
         self.tool_registry.register_package(FILESYSTEM_PACKAGE)
+        self.tool_registry.register_package(BASH_PACKAGE)
         self.tool_registry.register_tool(SearchMailTool(self.mail_service))
         self.tool_registry.register_tool(LoadMailMessagesTool(self.mail_service))
         self.tool_registry.register_tool(SyncMailTool(self.sync_outlook_mail))
@@ -125,6 +137,25 @@ class LocalKnowledgeAgentRuntime:
         )
         self.tool_registry.register_tool(ReadFileTool(file_policy))
         self.tool_registry.register_tool(EditFileTool(file_policy))
+        bash_policy = BashAccessPolicy.from_workspace_roots(
+            self.settings.parsed_workspace_roots()
+        )
+        self.bash_session_manager = BashSessionManager()
+        self.tool_registry.register_tool(
+            BashRunTool(
+                policy=bash_policy,
+                session_manager=self.bash_session_manager,
+            )
+        )
+        self.tool_registry.register_tool(BashListSessionsTool(self.bash_session_manager))
+        self.tool_registry.register_tool(BashReadSessionTool(self.bash_session_manager))
+        self.tool_registry.register_tool(BashWriteSessionTool(self.bash_session_manager))
+        self.tool_registry.register_tool(
+            BashInterruptSessionTool(self.bash_session_manager)
+        )
+        self.tool_registry.register_tool(
+            BashTerminateSessionTool(self.bash_session_manager)
+        )
         self.tool_executor = ToolExecutor(self.tool_registry)
         self.agent_run_manager = InMemoryAgentRunManager()
         self.agent_llm_client = build_text_llm_client(self.local_app_config.llm)

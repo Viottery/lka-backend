@@ -60,7 +60,12 @@ from app.core.runtime_context import current_time_payload
 from app.core.sessions import SessionService
 from app.core.sessions import AgentSession
 from app.core.sessions import SessionRecentMessage
-from app.core.tools import ToolContext, ToolExecutor, ToolResult
+from app.core.tools import (
+    ToolContext,
+    ToolExecutor,
+    ToolResult,
+    effective_tool_read_only,
+)
 
 
 def _now_iso() -> str:
@@ -1590,7 +1595,8 @@ class AgentTurnLoop:
         tool = self.tool_executor.registry.get_tool_or_none(tool_name)
         if tool is None:
             return None, None
-        if tool.spec.read_only is True:
+        read_only = effective_tool_read_only(tool, tool_input)
+        if read_only is True:
             return None, None
         run_manager = _turn_run_manager.get()
         run_id = _turn_run_id.get()
@@ -1610,7 +1616,7 @@ class AgentTurnLoop:
                 ),
                 None,
             )
-        reason = self._safety_review_reason(read_only=tool.spec.read_only)
+        reason = self._safety_review_reason(read_only=read_only)
         review = run_manager.create_safety_review(
             SafetyReviewRequest(
                 review_id=stable_safety_review_id(run_id, invocation_id, tool_name),
@@ -1622,7 +1628,7 @@ class AgentTurnLoop:
                 tool_input=tool_input,
                 tool_risk=tool.spec.risk,
                 side_effects=tool.spec.side_effects,
-                read_only=tool.spec.read_only,
+                read_only=read_only,
                 mode=self.safety_review_mode,
                 reason=reason,
                 created_at=_now_iso(),

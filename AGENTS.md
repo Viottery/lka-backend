@@ -92,6 +92,9 @@ integration logic back into `app/core/`.
   `read_only != true` as requiring the mandatory safety review gate before
   execution. The gate may run in `skip`, `llm`, or `manual` mode, but the review
   record must still exist.
+- Command execution belongs in the `bash` tool package. `bash.run` uses a
+  conservative read-only whitelist per command; anything outside the whitelist
+  is non-read-only and must pass safety review.
 - Agent core must remain package/domain agnostic. Do not hard-code concrete
   package names, tool names, domain workflows, routing keywords, or tool-call
   examples in `app/core/` prompts or fallback logic.
