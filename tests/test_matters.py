@@ -87,7 +87,7 @@ def test_matter_api_create_search_update_and_link(tmp_path, monkeypatch):
     assert [matter.matter_id for matter in listed.matters] == [created.matter_id]
 
 
-def test_matter_tools_and_runtime_now_are_registered(tmp_path, monkeypatch):
+def test_matter_tools_are_registered(tmp_path, monkeypatch):
     monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
     get_settings.cache_clear()
@@ -97,6 +97,8 @@ def test_matter_tools_and_runtime_now_are_registered(tmp_path, monkeypatch):
         session_id="session_matter_tools",
         trace_id="trace_matter_tools",
         context_id="ctx_matter_tools",
+        safety_review_approved=True,
+        safety_review_id="test_review_matter_tools",
     )
 
     matter_tool_names = {
@@ -106,10 +108,6 @@ def test_matter_tools_and_runtime_now_are_registered(tmp_path, monkeypatch):
         tool.name: tool
         for tool in app.state.runtime.tool_registry.list_tools(package="matter")
     }
-    runtime_tool_names = {
-        tool.name for tool in app.state.runtime.tool_registry.list_tools(package="runtime")
-    }
-
     assert matter_tool_names == {
         "matter.create",
         "matter.create_many",
@@ -118,7 +116,7 @@ def test_matter_tools_and_runtime_now_are_registered(tmp_path, monkeypatch):
         "matter.update",
         "matter.link_source",
     }
-    assert runtime_tool_names == {"runtime.now"}
+    assert app.state.runtime.tool_registry.list_tools(package="runtime") == []
     create_schema = matter_tool_specs["matter.create"].input_schema
     create_many_schema = matter_tool_specs["matter.create_many"].input_schema
     assert create_schema["required"] == ["title", "summary"]
@@ -190,23 +188,12 @@ def test_matter_tools_and_runtime_now_are_registered(tmp_path, monkeypatch):
         tool_input={"query": "registration", "limit": 10},
         context=context,
     )
-    now_result = app.state.runtime.tool_executor.execute(
-        invocation_id="runtime_now_001",
-        tool_name="runtime.now",
-        tool_input={"timezone": "Asia/Shanghai"},
-        context=context,
-    )
-
     assert search_result.output["matters"][0]["matter_id"] == matter_id
     assert create_many_result.status == "completed"
     assert create_many_result.output["matters_created"] == 2
     assert create_many_result.output["matters"][0]["source_links"][0]["source_id"] == (
         "mail_msg_ica"
     )
-    assert now_result.status == "completed"
-    assert now_result.output["timezone"] == "Asia/Shanghai"
-    assert "T" in now_result.output["local"]
-
     invalid_create = app.state.runtime.tool_executor.execute(
         invocation_id="matter_create_invalid_001",
         tool_name="matter.create",
@@ -256,7 +243,7 @@ def test_agent_turn_can_create_matter_and_receives_current_time(tmp_path, monkey
     assert response.selected_package == "matter"
     assert [event.tool_name for event in response.tool_events] == ["matter.create"]
     assert response.tool_events[0].feedback["status"] == "accepted"
-    assert response.tool_events[0].feedback["source"] == "llm"
+    assert response.tool_events[0].feedback["source"] == "local"
     assert response.answer == "已创建 ICA 学生签证材料准备事项。"
     assert fake_llm.route_context is not None
     assert fake_llm.decision_context is not None

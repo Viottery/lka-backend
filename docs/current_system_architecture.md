@@ -58,15 +58,17 @@ Local Knowledge Agent OS 当前已经从“邮件问答 Demo”推进到一个�
 | 事务搜索/列表 | 已实现 | `matter.search`, `matter.list`, `/matters/search`, `GET /matters` |
 | 事务更新 | 已实现 | `matter.update`, `PATCH /matters/{matter_id}` |
 | 事务来源链接 | 已实现 | `matter.link_source`, `POST /matters/{matter_id}/source-links` |
-| 实时时间工具 | 已实现 | `runtime.now` |
+| 显式文件读取 | 已实现 | `filesystem.read_file` |
+| 显式文件编辑 | 已实现 | `filesystem.edit_file` |
+| 实时时间上下文 | 已实现 | `session_context_window.current_time` |
 | 多轮会话 | 已实现基础版 | `SessionService` |
 | 会话切换 | 已实现基础版 | 显式 `session_id` |
 | 上下文窗口 | 已实现，默认 65536 token 估算预算 | `SessionService.get_context_window` |
 | 上下文压缩 | 已实现基础版，窗口超预算时触发 LLM 摘要 | `record_context_exchange` |
-| 邮件原文会话缓存 | 已实现基础版 | 从历史 `mail.load_messages` 工具事件恢复 |
+| 工具观察会话缓存 | 已实现基础版 | 从 Tool Package metadata 标记的历史工具事件恢复 |
 | LLM 错误分类与重试 | 已实现基础版 | `app/core/llm.py`, `AgentTurnLoop._complete_text_with_retry` |
 | 工具输入校验 | 已实现 | `ToolExecutor._validate_input` |
-| 工具反馈机制 | 已实现基础版 | `AgentTurnLoop._check_tool_result_with_llm` |
+| 工具反馈机制 | 已实现基础版 | 本地输出协议校验，异常时 `tool_result_check` |
 | 最终回答校验 | 已实现基础版 | `AgentTurnLoop._verify_final_answer` |
 | Markdown 运行日志 | 已实现 | `data/agent_logs/*.md` |
 | Windows 桌宠前端适配 | 已在外部前端目录完成 | `/mnt/d/agent-bot-frontend` |
@@ -280,7 +282,8 @@ POST /agent/turn
     - `matter.list`
     - `matter.update`
     - `matter.link_source`
-    - `runtime.now`
+    - `filesystem.read_file`
+    - `filesystem.edit_file`
 11. 创建 `ToolExecutor`。
 12. 根据本地配置创建真实或 mock LLM client。
 13. 创建 `AgentTurnLoop`。
@@ -426,7 +429,7 @@ run(session_id: str | None, user_input: str) -> AgentTurnResult
       -> append user message
       -> get_context_window
       -> 注入 current_time
-      -> 注入 cached_mail_messages
+      -> 注入 cached_tool_observations
       -> 获取 package_catalog
       -> LLM route 选择一个工具包或 null
       -> 记录 package_selected/no_package progress
@@ -689,6 +692,7 @@ class ToolSpec(BaseModel):
     package: str | None = None
     risk: str = "low"
     requires_confirmation: bool = False
+    read_only: bool | None = None
     side_effects: list[str] = Field(default_factory=list)
     input_schema: dict[str, Any] = Field(default_factory=dict)
     output_schema: dict[str, Any] = Field(default_factory=dict)
@@ -699,7 +703,8 @@ class ToolSpec(BaseModel):
 - `name`：工具名，例如 `mail.search`
 - `package`：所属工具包
 - `risk`：风险等级
-- `requires_confirmation`：未来确认门使用
+- `requires_confirmation`：前端展示和兼容字段
+- `read_only`：工具是否显式只读；`read_only != true` 必须进入 safety review
 - `side_effects`：读写本地库、读远程邮件等副作用描述
 - `input_schema`：后端执行前校验
 - `output_schema`：给 LLM 和开发者理解返回结构
@@ -833,7 +838,7 @@ MAIL_PACKAGE = ToolPackageSpec(
 
 ```json
 {
-  "message_ids": ["mail_msg_xxx"]
+  "message_ids": ["message_id_001"]
 }
 ```
 
@@ -859,7 +864,8 @@ MAIL_PACKAGE = ToolPackageSpec(
 业务含义：
 
 - 这是 LLM 获取邮件完整内容的主要工具。
-- 加载过的邮件会通过会话历史 payload 在后续 turn 中被恢复为 `cached_mail_messages`，减少重复读取。
+- 如果对应 Tool Package metadata 标记该工具结果可缓存，加载过的邮件会通过会话历史
+  payload 在后续 turn 中被恢复为 `cached_tool_observations`，减少重复读取。
 
 ### 11.4 mail.sync
 
@@ -1098,8 +1104,8 @@ low, normal, high, urgent
 ```json
 {
   "source_type": "mail_message",
-  "source_id": "mail_msg_xxx",
-  "reason": "Extracted from loaded ICA email."
+  "source_id": "message_id_001",
+  "reason": "Extracted from loaded local evidence."
 }
 ```
 
@@ -1133,20 +1139,10 @@ low, normal, high, urgent
 
 文件：`app/tool_packages/runtime.py`
 
-当前工具：
+`AgentTurnLoop.run()` 每次都会把 `current_time_payload()` 注入 `session_context_window`。
 
-```text
-runtime.now
-```
-
-职责：
-
-- 返回当前时间。
-- 提供 timezone-aware 时间上下文。
-
-此外，`AgentTurnLoop.run()` 每次都会把 `current_time_payload()` 注入 `session_context_window`。
-
-这意味着 LLM 即使没有显式调用 `runtime.now`，也能看到当前时间上下文。显式工具保留给用户直接问当前时间或后续需要可追踪时间证据的场景。
+这意味着 LLM 不需要显式调用工具，也能看到当前时间上下文。`runtime.now` 暂不注册为 Agent
+可见工具，避免在当前邮件处理 MVP 中干扰工具路由。
 
 ---
 
@@ -1210,7 +1206,7 @@ SessionService
 - `token_estimate`
 - `updated_at`
 - 运行时注入的 `current_time`
-- 运行时注入的 `cached_mail_messages`
+- 运行时注入的 `cached_tool_observations`
 
 默认 token budget：
 
@@ -1255,19 +1251,20 @@ recent messages 只保存核心对话内容：
 
 ---
 
-## 18. 会话内邮件原文缓存
+## 18. 会话内工具观察缓存
 
 ### 18.1 目的
 
 之前发现一个问题：
 
-用户追问时，前一轮已经通过 `mail.load_messages` 加载过邮件原文，后一轮仍然可能重复调用 `mail.load_messages`。
+用户追问时，前一轮已经通过某个工具加载过完整本地证据，后一轮仍然可能重复调用等价工具。
 
 当前做法是：
 
 - 不把完整运行过程写进 context。
-- 但从当前 session 的历史 agent message payload 中恢复已经加载过的邮件。
-- 将这些邮件以 `cached_mail_messages` 注入当前 context window。
+- 但从当前 session 的历史 agent message payload 中恢复已被 Tool Package metadata
+  标记为可缓存的工具观察。
+- 将这些观察以 `cached_tool_observations` 注入当前 context window。
 
 ### 18.2 缓存边界
 
@@ -1379,17 +1376,18 @@ LLM checker 用于更细地判断工具结果是否满足预期，但有一条�
 如果 ToolResult.status 不是 completed，LLM checker 不能把它升级为 accepted。
 ```
 
-### 20.3 matter domain summary
+### 20.3 工具反馈 summary
 
-事务工具会额外生成 `domain_summary`，让 LLM 更容易区分：
+Tool Package 或 domain service 可以在工具输出或反馈中提供领域 summary，帮助 LLM 区分：
 
 - tool execution status
-- matter object status
-- matter 数量
-- open / in_progress / done 等数量
+- business object status
+- 对象数量
+- 领域状态计数
 - rejected 时的 validation errors
 
-这样避免 LLM 把事务对象里的 `status="open"` 误解成工具执行失败。
+这类 summary 不由 Agent core 硬编码；如果某个 package 需要领域摘要，应由该 package
+或 domain service 生成，再作为工具结果 / metadata 输入 Agent Loop。
 
 ---
 
@@ -1748,21 +1746,29 @@ UV_CACHE_DIR=/tmp/uv-cache uv run python scripts/run_agent_turn.py \
 - 非 JSON 直接当作 invalid decision。
 - 允许一次 format repair，但 repair 也必须只输出 JSON。
 
-### 28.2 工具确认门尚未完成
+### 28.2 工具安全审查门
 
 `ToolSpec` 已有：
 
 - `risk`
 - `requires_confirmation`
+- `read_only`
 - `side_effects`
 
-但当前还没有完整 confirmation gate。
+当前已经有强制 safety review gate：
 
-后续应实现：
+- 所有 Agent-visible 工具必须显式声明 `read_only`。
+- `read_only != true` 的工具调用在执行前必须生成 safety review record。
+- review mode 支持 `skip`、`llm`、`manual`。
+- `skip` 仍会记录审查并自动通过。
+- `llm` 由配置的 LLM 审查，通过可解析批准才执行。
+- `manual` 会把 run 标记为 `waiting_confirmation`，前端通过
+  `/agent/safety-reviews/{review_id}/decision` 放行或拒绝。
+- `ToolExecutor` 也会拒绝未带 approved safety review context 的非只读工具，
+  防止绕过 Agent 层直接执行写工具。
 
-- 高风险工具执行前暂停。
-- 返回 `request_confirmation` 给前端。
-- 用户确认后继续同一 trace 或创建 continuation turn。
+`request_confirmation` 仍是 LLM 决策输出类型，但真实执行控制以 runtime safety review gate
+为准，不依赖 LLM 自觉请求确认。
 
 ### 28.3 跨 package 决策还需要强化
 

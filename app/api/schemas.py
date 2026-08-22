@@ -38,6 +38,7 @@ from app.core.sessions import (
     AgentSessionMessage,
     SessionRole,
 )
+from app.core.safety import SafetyReviewDecision, SafetyReviewRecord
 from app.core.tools import ToolInvocation, ToolResult
 from app.core.tracing import TraceRecord
 
@@ -66,6 +67,7 @@ class CapabilityItem(BaseModel):
     type: str
     risk: str
     requires_confirmation: bool
+    read_only: bool | None = None
 
 
 class CapabilityListResponse(BaseModel):
@@ -104,6 +106,20 @@ class AgentTurnRequest(BaseModel):
 
 class AgentTurnResponse(AgentTurnResult):
     pass
+
+
+class SafetyReviewResponse(SafetyReviewRecord):
+    pass
+
+
+class SafetyReviewListResponse(BaseModel):
+    reviews: list[SafetyReviewRecord]
+
+
+class SafetyReviewDecisionRequest(BaseModel):
+    decision: SafetyReviewDecision
+    reason: str | None = None
+    decided_by: str = "user"
 
 
 class SessionCreateRequest(BaseModel):

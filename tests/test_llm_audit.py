@@ -278,8 +278,11 @@ def test_openai_compatible_stream_parses_chat_completion_delta_chunks(monkeypatc
             [
                 'data: {"choices":[{"delta":{"content":"Hello "}}]}\n\n',
                 'data: {"choices":[{"delta":{"content":"world"}}]}\n\n',
+                'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+                'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}\n\n',
                 "data: [DONE]\n\n",
-            ]
+            ],
+            headers={"x-request-id": "req_stream_123"},
         )
 
     monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
@@ -316,6 +319,96 @@ def test_openai_compatible_stream_parses_chat_completion_delta_chunks(monkeypatc
         "world",
     ]
     assert events[-1].content_snapshot == "Hello world"
+    assert events[-1].metadata["provider_request_id"] == "req_stream_123"
+    assert events[-1].metadata["finish_reason"] == "stop"
+    assert events[-1].metadata["usage"] == {
+        "prompt_tokens": 3,
+        "completion_tokens": 2,
+        "total_tokens": 5,
+    }
+
+
+def test_openai_compatible_stream_emits_failed_event_for_provider_error_chunk(monkeypatch):
+    def fake_urlopen(request, timeout):
+        return _fake_stream_response(
+            [
+                'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n',
+                (
+                    'data: {"type":"error","event_id":"evt_stream_error",'
+                    '"error":{"type":"invalid_request_error","code":"bad_stream",'
+                    '"message":"Bad stream chunk.","param":"input"}}\n\n'
+                ),
+            ],
+            headers={"x-request-id": "req_stream_error"},
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    client = OpenAICompatibleLLMClient(
+        name="test-client",
+        provider_name="openai-compatible",
+        base_url="https://example.invalid/v1",
+        api_key="test-key",
+        default_model="test-model",
+    )
+
+    async def collect():
+        events = []
+        async for event in client.stream(
+            LLMRequest(
+                messages=[LLMMessage(role="user", content="hello")],
+                prompt_summary="stream-error-test",
+                metadata={"stage": "answer"},
+            )
+        ):
+            events.append(event)
+        return events
+
+    events = asyncio.run(collect())
+
+    assert [event.event_type for event in events] == [
+        "llm_started",
+        "llm_delta",
+        "llm_failed",
+    ]
+    failed = events[-1]
+    assert failed.error == "Bad stream chunk."
+    assert failed.content_snapshot == "partial"
+    assert failed.metadata["provider_request_id"] == "req_stream_error"
+    assert failed.metadata["partial_content"] == "partial"
+    assert failed.metadata["error_event"]["event_id"] == "evt_stream_error"
+
+
+def test_openai_compatible_stream_emits_failed_event_for_malformed_chunk(monkeypatch):
+    def fake_urlopen(request, timeout):
+        return _fake_stream_response(["data: {not-json}\n\n"])
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    client = OpenAICompatibleLLMClient(
+        name="test-client",
+        provider_name="openai-compatible",
+        base_url="https://example.invalid/v1",
+        api_key="test-key",
+        default_model="test-model",
+    )
+
+    async def collect():
+        events = []
+        async for event in client.stream(
+            LLMRequest(
+                messages=[LLMMessage(role="user", content="hello")],
+                prompt_summary="stream-malformed-test",
+            )
+        ):
+            events.append(event)
+        return events
+
+    events = asyncio.run(collect())
+
+    assert [event.event_type for event in events] == ["llm_started", "llm_failed"]
+    failed = events[-1]
+    assert "invalid stream JSON" in failed.error
+    assert failed.metadata["error_event"]["error"]["type"] == "response_parse_error"
+    assert failed.metadata["error_event"]["error"]["code"] == "invalid_stream_json"
 
 
 def test_stream_error_call_record_preserves_partial_content_and_event_fields():
@@ -388,12 +481,15 @@ def _fake_http_response(payload: dict, *, headers: dict[str, str]):
     return FakeHTTPResponse()
 
 
-def _fake_stream_response(lines: list[str]):
+def _fake_stream_response(lines: list[str], *, headers: dict[str, str] | None = None):
     class FakeStreamResponse:
         def __init__(self):
             self.lines = [line.encode("utf-8") for line in lines]
             self.index = 0
             self.closed = False
+            self.headers = Message()
+            for key, value in (headers or {}).items():
+                self.headers[key] = value
 
         def readline(self):
             if self.index >= len(self.lines):

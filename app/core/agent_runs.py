@@ -10,6 +10,13 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from app.core.safety import (
+    InMemorySafetyReviewStore,
+    SafetyReviewDecision,
+    SafetyReviewRecord,
+    SafetyReviewRequest,
+)
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -73,6 +80,7 @@ class InMemoryAgentRunManager:
         self._runs: dict[str, AgentRunRecord] = {}
         self._events: dict[str, list[AgentRunEvent]] = {}
         self._cancel_requests: dict[str, str | None] = {}
+        self.safety_reviews = InMemorySafetyReviewStore()
 
     def create_run(
         self,
@@ -118,6 +126,55 @@ class InMemoryAgentRunManager:
             status=AgentRunStatus.WAITING_CONFIRMATION,
             waiting_since=_now_iso(),
             metadata_patch={"confirmation_id": confirmation_id},
+        )
+
+    def resume_running(self, run_id: str) -> AgentRunRecord:
+        return self._update_run(run_id, status=AgentRunStatus.RUNNING)
+
+    def create_safety_review(self, request: SafetyReviewRequest) -> SafetyReviewRecord:
+        return self.safety_reviews.create(request)
+
+    def get_safety_review(self, review_id: str) -> SafetyReviewRecord | None:
+        return self.safety_reviews.get(review_id)
+
+    def list_safety_reviews(self, run_id: str) -> list[SafetyReviewRecord]:
+        return self.safety_reviews.list_for_run(run_id)
+
+    def decide_safety_review(
+        self,
+        *,
+        review_id: str,
+        decision: SafetyReviewDecision,
+        decided_by: str,
+        reason: str | None,
+    ) -> SafetyReviewRecord:
+        review = self.safety_reviews.decide(
+            review_id=review_id,
+            decision=decision,
+            decided_by=decided_by,
+            reason=reason,
+            decided_at=_now_iso(),
+        )
+        self.append_event(
+            review.run_id,
+            "safety_review_decided",
+            f"Safety review {review.status.value}.",
+            stage="safety_review",
+            payload={"review": review.model_dump(mode="json")},
+        )
+        if review.status.value == "approved":
+            self.resume_running(review.run_id)
+        return review
+
+    def attach_safety_review_llm_output(
+        self,
+        *,
+        review_id: str,
+        llm_output: str | None,
+    ) -> SafetyReviewRecord:
+        return self.safety_reviews.attach_llm_output(
+            review_id=review_id,
+            llm_output=llm_output,
         )
 
     def mark_cancelled(

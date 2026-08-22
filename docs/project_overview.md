@@ -191,13 +191,8 @@ matter.update
 matter.link_source
 ```
 
-例如 `runtime` package 展开后才暴露：
-
-```text
-runtime.now
-```
-
-这样可以避免一次性把大量工具 schema 塞进上下文，也让后续 skill / plugin / MCP 能力更容易按领域组织。
+当前邮件处理 MVP 暂不注册 `runtime` package。这样可以避免一次性把大量工具 schema
+塞进上下文，也让后续 skill / plugin / MCP 能力更容易按领域组织。
 
 ### 3.4.2 不维护全局 intent 枚举
 
@@ -250,8 +245,15 @@ mail tools 读取证据，再由通用 Agent Loop 决定是否调用 matter tool
 旧的 `mail.persist_matters` / `mail_matters` 只作为历史兼容和迁移对象保留，不再暴露给
 Main Agent Brain 的 Tool Registry。
 
-实时时间属于 runtime context。后端应提供确定性的 `runtime.now` 工具，同时在每次 Agent
-turn 的 context window 中注入当前 UTC / 本地时间 / 时区 / 日期，帮助 LLM 处理相对时间。
+文件访问也分为两层：workspace context 负责文件结构索引、摘要、检索和长期上下文管理；
+`filesystem` Tool Package 只处理模型主动要求读写某个明确文本文件的场景。读取工具默认返回
+受限片段并携带 full-file sha256；编辑工具使用 `expected_sha256` 和唯一
+`old_text -> new_text` 替换，避免基于过期上下文覆盖用户修改。目录 listing、文本搜索和
+命令执行不放在 filesystem package 中，后续由 shell/command 工具承担。
+
+实时时间属于 runtime context。后端在每次 Agent turn 的 context window 中注入当前
+UTC / 本地时间 / 时区 / 日期，帮助 LLM 处理相对时间。`runtime.now` 暂不注册为
+Agent 可见工具。
 
 ### 3.4.4 Agent Run Log
 

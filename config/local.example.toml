@@ -19,6 +19,15 @@ fallback_client = ""
 default_response_mode = "json"
 max_attempts = 2
 
+[safety]
+# Tool calls with read_only != true must always enter the safety review step.
+# Modes:
+# - skip: record the review and auto-approve it.
+# - llm: ask the configured LLM to approve/reject.
+# - manual: wait for frontend/user approval through /agent/safety-reviews/{id}/decision.
+tool_review_mode = "skip"
+manual_wait_poll_seconds = 0.5
+
 # Optional named clients. Keep commented until configured locally.
 # [[llm.clients]]
 # name = "mock"

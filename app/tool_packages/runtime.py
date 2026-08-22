@@ -28,6 +28,7 @@ class RuntimeNowTool:
         description="Return the current UTC time and configured local time.",
         risk="low",
         requires_confirmation=False,
+        read_only=True,
         side_effects=[],
         input_schema={
             "type": "object",

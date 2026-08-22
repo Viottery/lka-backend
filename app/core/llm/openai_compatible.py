@@ -86,12 +86,22 @@ class OpenAICompatibleLLMClient:
             response = await self.complete(
                 request.model_copy(update={"response_mode": LLMResponseMode.TEXT})
             )
-            yield self._stream_event("llm_completed", request, response.content)
+            yield self._stream_event(
+                "llm_completed",
+                request,
+                response.content,
+                metadata=self._metadata_from_response(response),
+            )
             return
 
         response = await _run_blocking(self._open_stream, request)
         snapshot = ""
-        yield self._stream_event("llm_started", request, snapshot)
+        headers = audit_headers(getattr(response, "headers", {}))
+        stream_metadata: dict[str, Any] = {"headers": headers}
+        provider_request_id = provider_request_id_from_headers(headers)
+        if provider_request_id:
+            stream_metadata["provider_request_id"] = provider_request_id
+        yield self._stream_event("llm_started", request, snapshot, metadata=stream_metadata)
         try:
             while True:
                 line = await _run_blocking(response.readline)
@@ -103,15 +113,51 @@ class OpenAICompatibleLLMClient:
                 data = text.removeprefix("data:").strip()
                 if data == "[DONE]":
                     break
-                delta = self._stream_delta(data)
+                try:
+                    payload = self._stream_payload(data)
+                except LLMResponseParseError as exc:
+                    yield self._stream_event(
+                        "llm_failed",
+                        request,
+                        snapshot,
+                        error=str(exc),
+                        metadata={
+                            **stream_metadata,
+                            "error_event": self._stream_parse_error_event(str(exc), data),
+                            "partial_content": snapshot,
+                        },
+                    )
+                    return
+                error_event = self._stream_error_event(payload)
+                if error_event is not None:
+                    yield self._stream_event(
+                        "llm_failed",
+                        request,
+                        snapshot,
+                        error=self._stream_error_message(error_event),
+                        metadata={
+                            **stream_metadata,
+                            "error_event": error_event,
+                            "partial_content": snapshot,
+                        },
+                    )
+                    return
+                delta, chunk_metadata = self._stream_delta_and_metadata(payload)
+                stream_metadata.update(chunk_metadata)
                 if not delta:
                     continue
                 snapshot += delta
-                yield self._stream_event("llm_delta", request, snapshot, delta=delta)
+                yield self._stream_event(
+                    "llm_delta",
+                    request,
+                    snapshot,
+                    delta=delta,
+                    metadata=stream_metadata,
+                )
         finally:
             response.close()
 
-        yield self._stream_event("llm_completed", request, snapshot)
+        yield self._stream_event("llm_completed", request, snapshot, metadata=stream_metadata)
 
     def _post_chat_completion(
         self,
@@ -189,14 +235,64 @@ class OpenAICompatibleLLMClient:
         finish_reason = choice.get("finish_reason") if isinstance(choice, dict) else None
         return content, usage if isinstance(usage, dict) else {}, finish_reason
 
-    def _stream_delta(self, data: str) -> str:
+    def _stream_payload(self, data: str) -> dict[str, Any]:
         try:
             payload = json.loads(data)
-            delta = payload["choices"][0].get("delta") or {}
-            content = delta.get("content")
-        except (json.JSONDecodeError, KeyError, IndexError, TypeError):
-            return ""
-        return content if isinstance(content, str) else ""
+        except json.JSONDecodeError as exc:
+            raise LLMResponseParseError(
+                f"LLM provider returned invalid stream JSON: {exc}"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise LLMResponseParseError("LLM provider stream chunk was not a JSON object.")
+        return payload
+
+    def _stream_error_event(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+        error = payload.get("error")
+        if isinstance(error, dict):
+            return payload
+        if payload.get("type") == "error":
+            return payload
+        return None
+
+    def _stream_error_message(self, error_event: dict[str, Any]) -> str:
+        error = error_event.get("error") if isinstance(error_event.get("error"), dict) else {}
+        message = error.get("message") if isinstance(error.get("message"), str) else None
+        if message:
+            return message
+        return "LLM provider stream returned an error event."
+
+    def _stream_parse_error_event(self, message: str, raw_data: str) -> dict[str, Any]:
+        return {
+            "type": "error",
+            "error": {
+                "type": "response_parse_error",
+                "code": "invalid_stream_json",
+                "message": message,
+            },
+            "raw_data_preview": raw_data[:500],
+        }
+
+    def _stream_delta_and_metadata(self, payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        metadata: dict[str, Any] = {}
+        usage = payload.get("usage")
+        if isinstance(usage, dict):
+            metadata["usage"] = usage
+        choices = payload.get("choices")
+        if choices == [] and metadata:
+            return "", metadata
+        if not isinstance(choices, list) or not choices:
+            raise LLMResponseParseError("LLM provider stream chunk did not include choices.")
+        choice = choices[0]
+        if not isinstance(choice, dict):
+            raise LLMResponseParseError("LLM provider stream choice was not an object.")
+        finish_reason = choice.get("finish_reason")
+        if isinstance(finish_reason, str):
+            metadata["finish_reason"] = finish_reason
+        delta = choice.get("delta") or {}
+        if not isinstance(delta, dict):
+            raise LLMResponseParseError("LLM provider stream delta was not an object.")
+        content = delta.get("content")
+        return content if isinstance(content, str) else "", metadata
 
     def _stream_event(
         self,
@@ -205,6 +301,8 @@ class OpenAICompatibleLLMClient:
         snapshot: str,
         *,
         delta: str = "",
+        error: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> LLMStreamEvent:
         return LLMStreamEvent(
             event_type=event_type,  # type: ignore[arg-type]
@@ -214,7 +312,19 @@ class OpenAICompatibleLLMClient:
             model=self._model_for(request),
             delta=delta,
             content_snapshot=snapshot,
+            error=error,
+            metadata=metadata or {},
         )
+
+    def _metadata_from_response(self, response: LLMResponse) -> dict[str, Any]:
+        metadata = dict(response.metadata)
+        if response.provider_request_id:
+            metadata["provider_request_id"] = response.provider_request_id
+        if response.finish_reason:
+            metadata["finish_reason"] = response.finish_reason
+        if response.usage:
+            metadata["usage"] = response.usage
+        return metadata
 
     def _raise_http_error(self, exc: urllib.error.HTTPError) -> None:
         error_body = exc.read().decode("utf-8", errors="replace")

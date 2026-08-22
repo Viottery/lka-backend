@@ -16,7 +16,7 @@
       "operation": "capabilities",
       "request": {"user_input": "List capabilities."},
       "expect": {
-        "capabilities_include": ["mail", "matter", "runtime", "summarize_folder", "claude_code", "codex"],
+        "capabilities_include": ["mail", "matter", "filesystem", "summarize_folder", "claude_code", "codex"],
         "output_contains_all": ["tool_package", "native_skill", "expert_tool"],
         "max_wall_time_ms": 2000
       }

@@ -27,6 +27,7 @@ class ToolSpec(BaseModel):
     package: str | None = None
     risk: str = "low"
     requires_confirmation: bool = False
+    read_only: bool | None = None
     side_effects: list[str] = Field(default_factory=list)
     input_schema: dict[str, Any] = Field(default_factory=dict)
     output_schema: dict[str, Any] = Field(default_factory=dict)
@@ -44,6 +45,8 @@ class ToolContext(BaseModel):
     session_id: str
     trace_id: str | None = None
     context_id: str | None = None
+    safety_review_approved: bool = False
+    safety_review_id: str | None = None
 
 
 class ToolResult(BaseModel):
@@ -116,6 +119,19 @@ class ToolExecutor:
                 status="rejected",
                 error="Tool is not registered.",
             )
+        if tool.spec.read_only is not True and not context.safety_review_approved:
+            return ToolResult(
+                invocation_id=invocation_id,
+                tool_name=tool_name,
+                status="rejected",
+                output={
+                    "safety_review_required": True,
+                    "read_only": tool.spec.read_only,
+                    "risk": tool.spec.risk,
+                    "side_effects": tool.spec.side_effects,
+                },
+                error="Non-read-only tools require an approved safety review.",
+            )
         validation_errors = self._validate_input(
             schema=tool.spec.input_schema,
             value=tool_input,
@@ -145,6 +161,74 @@ class ToolExecutor:
                 status="failed",
                 error=str(exc),
             )
+
+    def validate_output(
+        self,
+        *,
+        tool_name: str,
+        result: ToolResult,
+    ) -> list[str]:
+        errors: list[str] = []
+        if not result.invocation_id:
+            errors.append("ToolResult.invocation_id is required.")
+        if result.tool_name != tool_name:
+            errors.append(
+                f"ToolResult.tool_name must be {tool_name!r}, got {result.tool_name!r}."
+            )
+        if not result.status:
+            errors.append("ToolResult.status is required.")
+        try:
+            result.model_dump(mode="json")
+        except Exception as exc:
+            errors.append(f"ToolResult must be JSON serializable: {exc}")
+
+        tool = self.registry.get_tool_or_none(tool_name)
+        if tool is None:
+            errors.append("Tool is not registered.")
+            return errors
+
+        if result.status != "completed":
+            if not result.error:
+                errors.append("Non-completed ToolResult must include error.")
+            return errors
+
+        if tool.spec.output_schema:
+            errors.extend(
+                self._validate_output(
+                    schema=tool.spec.output_schema,
+                    value=result.output,
+                    path="output",
+                )
+            )
+        elif not isinstance(result.output, dict):
+            errors.append("ToolResult.output must be a JSON object.")
+        return errors
+
+    def _validate_output(
+        self,
+        *,
+        schema: dict[str, Any],
+        value: Any,
+        path: str,
+    ) -> list[str]:
+        normalized_schema = self._normalize_output_schema(schema)
+        return self._validate_value(
+            schema=normalized_schema,
+            value=value,
+            path=path,
+        )
+
+    def _normalize_output_schema(self, schema: dict[str, Any]) -> dict[str, Any]:
+        if schema.get("type") == "object":
+            return schema
+        return {
+            "type": "object",
+            "required": [key for key in schema if isinstance(key, str)],
+            "properties": {
+                key: self._normalize_type_schema(spec)
+                for key, spec in schema.items()
+            },
+        }
 
     def _validate_input(
         self,
@@ -290,6 +374,7 @@ class MockToolExecutor:
         description="Echo structured task context metadata for runtime debugging.",
         risk="low",
         requires_confirmation=False,
+        read_only=True,
         input_schema={"goal_summary": "string", "related_file_count": "integer"},
         output_schema={"message": "string", "context_id": "string"},
     )

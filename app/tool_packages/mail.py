@@ -45,6 +45,7 @@ class SearchMailTool:
         ),
         risk="low",
         requires_confirmation=False,
+        read_only=True,
         side_effects=["read_local_db"],
         input_schema={
             "type": "object",
@@ -91,6 +92,7 @@ class LoadMailMessagesTool:
         description="Load complete local mail records, including full body text and attachment metadata.",
         risk="low",
         requires_confirmation=False,
+        read_only=True,
         side_effects=["read_local_db"],
         input_schema={
             "type": "object",
@@ -124,6 +126,7 @@ class PersistMailMattersTool:
         description="Persist extracted mail matter drafts and link them to source messages.",
         risk="medium",
         requires_confirmation=False,
+        read_only=False,
         side_effects=["write_local_db"],
         input_schema={
             "type": "object",
@@ -170,6 +173,7 @@ class SyncMailTool:
         ),
         risk="low_to_medium",
         requires_confirmation=False,
+        read_only=False,
         side_effects=["read_remote_mail", "write_local_db"],
         input_schema={
             "type": "object",

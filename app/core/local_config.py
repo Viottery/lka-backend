@@ -92,6 +92,11 @@ class LLMProviderConfig(BaseModel):
         ]
 
 
+class SafetyReviewConfig(BaseModel):
+    tool_review_mode: str = "skip"
+    manual_wait_poll_seconds: float = 0.5
+
+
 class OutlookMailConfig(BaseModel):
     enabled: bool = False
     auth_method: str = "device_code"
@@ -152,6 +157,7 @@ class EmbeddingConfig(BaseModel):
 
 class LocalAppConfig(BaseModel):
     llm: LLMProviderConfig = Field(default_factory=LLMProviderConfig)
+    safety: SafetyReviewConfig = Field(default_factory=SafetyReviewConfig)
     mail: MailProviderConfig = Field(default_factory=MailProviderConfig)
     embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
 

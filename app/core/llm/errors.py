@@ -38,6 +38,23 @@ class LLMProviderHTTPError(LLMClientError):
         self.is_retriable = is_retriable
 
 
+class LLMProviderStreamError(LLMClientError):
+    def __init__(
+        self,
+        *,
+        message: str,
+        error_event: dict[str, Any],
+        partial_content: str = "",
+        headers: dict[str, str] | None = None,
+        provider_request_id: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.error_event = error_event
+        self.partial_content = partial_content
+        self.headers = headers or {}
+        self.provider_request_id = provider_request_id
+
+
 class LLMRateLimitError(LLMProviderHTTPError):
     """Raised when a provider rejects a request due rate limiting."""
 

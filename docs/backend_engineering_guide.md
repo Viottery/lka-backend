@@ -89,9 +89,11 @@ session context window 直接回答；“不需要工具”和“系统无法处
 或 `tool_call`，Agent Loop 必须 fail closed：先尝试 `decision_repair` 修复为合法
 operation，修复失败则停止本轮执行，不能把工具调用残片当作最终 answer。
 每次真实工具调用后都必须生成反馈 observation。反馈至少包含执行成功 / 失败状态和可读
-message；当 LLM 可用时，还要追加独立 `tool_result_check` 调用，让 LLM 检查工具结果是否
-符合上一条 tool-call decision。底层 `ToolResult.status` 已失败时，反馈不能被升级为成功。
-工具包可以按自身 metadata 或工具输出提供额外 summary，但这不是 Agent core 的领域特判。
+message。Agent Loop 必须先执行本地协议校验：工具声明 `output_schema` 时按该 schema
+校验 `ToolResult.output`；未声明时只要求 `ToolResult` 是完整 JSON 对象形状。只有工具
+执行失败、被拒绝、输出协议不匹配或本地无法确认时，才追加独立 `tool_result_check` LLM
+调用。底层 `ToolResult.status` 已失败时，反馈不能被升级为成功。工具包可以按自身
+metadata 或工具输出提供额外 summary，但这不是 Agent core 的领域特判。
 Agent core 只能把工具返回的原始结果、通用反馈和 package metadata 交给 LLM；如果某个领域
 需要状态计数、去重提示、读写边界或业务摘要，应由对应 Tool Package 或 domain service 生成。
 Agent Loop 还会由本地 harness 生成 `progress_events`，用于前端展示用户友好的运行过程：
@@ -107,9 +109,9 @@ runtime 中所有 LLM stage 都通过 `LLMService.stream()` 接收 provider toke
 会标记为 `assistant_answer`，其他 LLM stage 会标记为 `agent_process`。前端应只把
 `llm_delta.payload.display_target == "assistant_answer"` 的 delta 当作最终回答实时输出；
 `final_answer` event 只作为最终校准 / 补全事件。
-最终回答会经过一层本地轻量校验，结果写入 `verification_warnings`。当前校验只记录 warning，
-不自动改写答案；例如模型声称已经写入日历但本轮没有 calendar tool 完成时，会标记
-`unsupported_calendar_claim`，供前端和后续 verifier 使用。
+最终回答可以经过本地轻量校验，结果写入 `verification_warnings`。当前 Agent core 不硬编码
+具体 package / domain 的 verifier；如果某个领域需要事实或副作用校验，应通过 package
+metadata 或独立 verifier 注册，校验只记录 warning，不自动改写答案。
 
 会话基础设施当前由本地 SQLite 管理，使用显式 `session_id` 支撑平行会话和多轮会话。
 后端不维护隐式全局当前会话；前端切换会话时必须把目标 `session_id` 传给运行入口。
@@ -147,9 +149,9 @@ Agent 可见的 matter tool schema 必须明确必填字段、枚举和示例。
 它是独立新事项后再 create。
 旧的 `mail.persist_matters` / `mail_matters` 是邮件优先 MVP 早期遗留能力，只作为历史
 数据和迁移路径保留，不再注册进 Agent 可见的 Tool Registry。
-runtime context 也通过工具和上下文双路径提供：`runtime.now` 是可调用工具；每次
-Agent turn 还会把 `current_time` 注入 session context window，包含 UTC、本地时间、
-时区和日期，用于处理“今天”“明天”“8月5号之后”这类相对时间。
+runtime context 目前通过上下文提供：每次 Agent turn 都会把 `current_time` 注入 session
+context window，包含 UTC、本地时间、时区和日期，用于处理“今天”“明天”“8月5号之后”
+这类相对时间。`runtime.now` 暂不注册为 Agent 可见工具，避免在当前 MVP 中干扰工具路由。
 
 每次 Agent Loop 运行都必须生成本地自然语言友好的 run log。run log 由代码模板生成，
 不调用 LLM，至少记录：
@@ -255,6 +257,11 @@ backend/
 - Qdrant 只作为可选语义检索扩展，不作为 MVP 必需项。
 - 非向量检索应优先依赖 workspace 的结构化索引、文件构成索引和本地文件系统检索。
 - Workspace 路径必须先经过 `PathResolver`，文件扫描必须优先经过 `FilesystemScanner`。
+- Agent 主动读取或修改明确文件路径时使用 `filesystem` Tool Package，不走 workspace
+  index/context 摘要路径。`filesystem.read_file` 返回受限片段、行号和 full-file sha256；
+  `filesystem.edit_file` 只做已存在 UTF-8 文本文件的 targeted `old_text -> new_text`
+  替换，必须带 `expected_sha256`，默认要求 `old_text` 唯一匹配。目录 listing、全文搜索和
+  测试命令后续由 shell/command 工具承担。
 - 后续本地命令、专家工具、测试命令应经过统一 `CommandRunner`，避免业务代码写死 shell。
 - Capability Registry 第一层应优先暴露 Tool Package，而不是一次性暴露所有具体工具。
 - 具体工具应在 Agent 决定展开某个 package 后再进入上下文。

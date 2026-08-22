@@ -76,17 +76,17 @@ MATTER_CREATE_SCHEMA = {
     },
     "examples": [
         {
-            "title": "ICA Student Pass appointment",
-            "summary": "Attend ICA formalities on 2026-08-14 13:00.",
+            "title": "Prepare application materials",
+            "summary": "Collect required documents before the submission deadline.",
             "status": "open",
             "priority": "normal",
             "due_at": "2026-08-14T13:00:00+08:00",
-            "tags": ["ICA"],
+            "tags": ["application"],
             "source_links": [
                 {
-                    "source_type": "mail_message",
-                    "source_id": "mail_msg_xxx",
-                    "reason": "Extracted from loaded ICA email.",
+                    "source_type": "local_evidence",
+                    "source_id": "evidence_001",
+                    "reason": "Extracted from loaded local evidence.",
                 }
             ],
             "metadata": {"created_from": "agent_turn"},
@@ -106,6 +106,7 @@ class CreateMatterTool:
         description="Create an independent local matter with optional source links.",
         risk="medium",
         requires_confirmation=False,
+        read_only=False,
         side_effects=["write_local_db"],
         input_schema=MATTER_CREATE_SCHEMA,
         output_schema={"matter": "object"},
@@ -134,6 +135,7 @@ class CreateManyMattersTool:
         description="Create multiple independent local matters in one controlled batch.",
         risk="medium",
         requires_confirmation=False,
+        read_only=False,
         side_effects=["write_local_db"],
         input_schema={
             "type": "object",
@@ -180,6 +182,7 @@ class SearchMattersTool:
         description="Search independent local matters with SQLite FTS.",
         risk="low",
         requires_confirmation=False,
+        read_only=True,
         side_effects=["read_local_db"],
         input_schema={
             "type": "object",
@@ -216,6 +219,7 @@ class ListMattersTool:
         description="List independent local matters ordered by due date and recent updates.",
         risk="low",
         requires_confirmation=False,
+        read_only=True,
         side_effects=["read_local_db"],
         input_schema={
             "type": "object",
@@ -255,6 +259,7 @@ class UpdateMatterTool:
         description="Update an independent local matter by id.",
         risk="medium",
         requires_confirmation=False,
+        read_only=False,
         side_effects=["write_local_db"],
         input_schema={
             "type": "object",
@@ -311,6 +316,7 @@ class LinkMatterSourceTool:
         description="Link an existing matter to a source object such as a mail message.",
         risk="medium",
         requires_confirmation=False,
+        read_only=False,
         side_effects=["write_local_db"],
         input_schema={
             "type": "object",

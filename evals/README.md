@@ -178,7 +178,6 @@ No benchmark case should depend on or mutate the user's real mailbox.
   `--llm-mode real` to evaluate the full real LLM Agent loop.
 - `mail_to_matter`: mail evidence to independent matter creation and source link.
 - `matter_tools`: Agent-visible matter create/search/update/link tool sequence.
-- `runtime_tools`: Agent-visible `runtime.now`.
 - `workspace_context`: direct workspace indexing against a local fixture project.
 - `capabilities`: direct health and capability catalog contracts.
 - `failure_recovery`: deterministic failure-budget contracts.

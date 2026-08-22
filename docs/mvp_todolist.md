@@ -53,7 +53,7 @@ Urgent track 的阶段目标：
 - [x] 对 LLM 认证、网络、超时、非 429 HTTP 和 provider 响应解析错误做分类记录和针对性降级。
 - [x] 建立第一版平行 / 多轮会话基础设施，支持创建会话、追加消息、列出会话和读取历史；邮件工具调用只接收 `session_id` 作为访问上下文，不自动写会话历史。
 - [x] 建立独立事务管理 MVP，提供 `MatterService`、`/matters` API 和 `matter` Tool Package。
-- [x] 提供 `runtime.now` 工具，并在每次 Agent turn 的 context window 中注入当前时间。
+- [x] 在每次 Agent turn 的 context window 中注入当前时间；`runtime.now` 暂不作为 Agent 可见工具注册。
 - [ ] 将邮件纳入本地持久化存储管理，补齐邮件整理、检索和概括工具。
 - [ ] 将 TaskContext / MatterContext / trace 查询进一步接入 session，让前端会话切换能恢复完整运行上下文。
 - [ ] 接入本地 `BAAI/bge-m3` embedding provider，并兼容 Windows / Linux 模型缓存路径。
@@ -100,9 +100,11 @@ Urgent track 的阶段目标：
   一个工具包里。邮件事务整理应先展开 `mail` 读取证据，再展开 `matter` 写入独立事务。
 - 旧 `mail.persist_matters` 已从 Agent 可见 Tool Registry 中隐藏；它只作为
   `mail_matters` 历史兼容 / 迁移路径保留。
-- 每个真实工具调用后都会生成 `feedback`，至少记录成功 / 失败状态和可读 message；LLM
-  可用时还会通过独立 `tool_result_check` 阶段检查工具结果是否符合上一条调用决策，并把
-  检查结果写回 tool event 和后续 observation。
+- 每个真实工具调用后都会生成 `feedback`，至少记录成功 / 失败状态和可读 message。Agent
+  会先做本地协议校验：工具声明 `output_schema` 时按该 schema 校验输出；未声明时只检查
+  `ToolResult` 是完整 JSON 对象形状。只有工具执行失败、被拒绝、输出协议不匹配或本地无法
+  确认时，才通过独立 `tool_result_check` 阶段检查工具结果，并把检查结果写回 tool event
+  和后续 observation。
 - decision 阶段的非 JSON 自然语言会先触发一次格式重试，重试 prompt 必须带上上一条
   plain-text 输出并强调返回 operation-first JSON；重试仍失败时记录
   `invalid_plain_text_decision`，不能恢复为 `answer`。疑似工具调用的损坏 JSON 必须先尝试
@@ -116,10 +118,11 @@ Urgent track 的阶段目标：
   `mail`，Agent 会保守恢复该 package 选择并继续执行工具链。
 - SSE 中，最终回答实时 token 必须来自 `display_target == "assistant_answer"` 的
   `llm_delta`；`display_target == "agent_process"` 只表示 route / decision /
-  tool_result_check 等内部过程，`final_answer` event 只做最终校准 / 补全。
+  异常工具检查等内部过程，`final_answer` event 只做最终校准 / 补全。
 - Tool Executor 已在执行前统一校验 `input_schema`，包括 required fields、基础类型、
   数组元素、嵌套 object、枚举值和 minimum。校验失败会返回 `status=rejected` 和
-  `validation_errors`，不执行工具副作用；Agent Loop 会把 rejection 作为 observation
+  `validation_errors`，不执行工具副作用；执行后会按工具声明的 `output_schema` 做本地输出
+  协议校验，没有声明时只检查完整 JSON 对象形状。Agent Loop 会把 rejection 作为 observation
   反馈给 LLM，让模型修正参数后继续。
 - 同一 session 中由 Tool Package metadata 标记为可缓存的工具结果会作为
   `cached_tool_observations` 注入后续 turn；追问应优先复用相关缓存或把缓存作为已有
@@ -135,14 +138,13 @@ Urgent track 的阶段目标：
   必须通过通用 loop 先读取证据，再选择 `matter` tools 写入或更新。
 - Agent turn 会输出本地生成的 `progress_events`，用于展示 package 选择、模型过程文本、
   工具开始 / 完成、工具反馈、最终回答和校验 warning；这些运行过程不进入上下文窗口。
-- 工具反馈支持按工具适配的可选 `domain_summary`，不要求每个工具都实现。当前仅
-  `matter.*` 工具提供 matter 数量、状态计数、优先级计数和 due date 数量，用于区分
-  工具执行状态和业务对象状态。
+- 工具反馈支持按 Tool Package 或 domain service 适配可选领域 summary，不要求每个工具都实现；
+  领域 summary 不能在 Agent core 中按具体 package 硬编码。
 - Agent turn 已有轻量最终回答校验，当前只记录 `verification_warnings`，不自动改写答案。
   Matter tools 的 schema 已补充 required fields、allowed values 和 examples，decision
   prompt 会要求模型遵循这些合同，并在有重复风险时先检索已有 matters。
-- 每次 Agent turn 都会注入 `current_time`，并可按需调用 `runtime.now`；相对时间解析
-  应优先基于这个确定性上下文，而不是让 LLM 猜当前日期。
+- 每次 Agent turn 都会注入 `current_time`；相对时间解析应优先基于这个确定性上下文，
+  而不是让 LLM 猜当前日期。`runtime.now` 暂不注册为 Agent 可见工具。
 - Agent 不应默认拥有裸数据库写权限。未来可以通过受控 DB inspection / query tools 让它读取
   schema、统计量和历史轨迹，再由 Skill Evolution Layer 生成遍历、批处理和去重策略的
   skill proposal；真正落库仍应走明确注册的 domain tools 和风险控制。

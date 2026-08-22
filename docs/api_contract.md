@@ -111,19 +111,22 @@ GET /capabilities
       "name": "mail",
       "type": "tool_package",
       "risk": "low_to_medium",
-      "requires_confirmation": false
+      "requires_confirmation": true,
+      "read_only": false
     },
     {
       "name": "matter",
       "type": "tool_package",
       "risk": "low_to_medium",
-      "requires_confirmation": false
+      "requires_confirmation": true,
+      "read_only": false
     },
     {
-      "name": "runtime",
+      "name": "filesystem",
       "type": "tool_package",
-      "risk": "low",
-      "requires_confirmation": false
+      "risk": "medium",
+      "requires_confirmation": true,
+      "read_only": false
     },
     {
       "name": "summarize_folder",
@@ -145,7 +148,10 @@ GET /capabilities
 
 - 能力清单是显式注册制，不是隐式能力发现。
 - `native_skill` 与 `expert_tool` 的风险模型不同。
-- `requires_confirmation` 用于前端和运行时共同判断。
+- `read_only` 表示该 capability 是否整体只读。任一工具 `read_only != true` 时，
+  package 的 `requires_confirmation` 为 `true`。
+- `requires_confirmation` 用于前端展示；运行时强制审查以具体工具的 `read_only`
+  标签为准。
 
 ---
 
@@ -243,6 +249,8 @@ response mode、耗时、usage、finish reason、provider request id、rate-limi
 - 这是第一版通用 Agent turn 入口，不是邮件专属 agent endpoint。
 - 每次调用都会创建独立 Agent Run；`run_id` 用于后续 stream、取消、确认、重试和事件查询。
 - Agent 第一层只读取 Tool Package catalog；可展开 package 和可调用工具来自 Tool Registry。
+- 所有非只读工具调用都会先进入 safety review。审查模式由本地配置选择：
+  `skip` 记录并自动通过、`llm` 调用 LLM 审查、`manual` 进入等待前端确认状态。
 - Agent core 不硬编码具体 package 名、工具名、领域流程、路由关键词或工具调用示例。
   具体策略必须由 package metadata、tool description、input/output schema、routing hints、
   decision hints 和 cache policy 提供。
@@ -271,8 +279,9 @@ response mode、耗时、usage、finish reason、provider request id、rate-limi
   阶段尝试修复；修复失败时记录 `malformed_tool_call` 并停止执行，不会把该残片恢复为
   `answer`。
 - 每个真实 `tool_event` 都包含 `feedback`。反馈至少包含执行成功 / 失败状态和可读
-  message；真实 LLM 可用时，Agent 还会记录 `tool_result_check` LLM 事件，用来确认工具
-  结果是否符合上一条工具调用决策。
+  message。Agent 会先做本地协议校验：工具声明 `output_schema` 时按该 schema 校验
+  `ToolResult.output`；未声明时只检查 `ToolResult` 是完整 JSON 对象形状。只有工具执行
+  失败、被拒绝、输出协议不匹配或本地无法确认时，才记录 `tool_result_check` LLM 事件。
 - `progress_events` 是由 harness 本地代码生成的自然语言运行过程流，不调用 LLM。它会记录
   package 选择、模型过程文本、package 展开、工具开始 / 完成、工具反馈、最终回答和校验
   warning，供前端展示“系统正在做什么”。
@@ -305,7 +314,64 @@ response mode、耗时、usage、finish reason、provider request id、rate-limi
 
 ---
 
-## 6. Agent Turn Stream
+## 6. Agent Safety Reviews
+
+```http
+GET /agent/runs/{run_id}/safety-reviews
+```
+
+返回指定 run 下的审查记录：
+
+```json
+{
+  "reviews": [
+    {
+      "review_id": "safety_review_xxx",
+      "run_id": "agent_run_xxx",
+      "session_id": "session_xxx",
+      "trace_id": "agent_turn_xxx",
+      "invocation_id": "tool_invocation_xxx",
+      "tool_name": "filesystem.edit_file",
+      "tool_input": {},
+      "tool_risk": "medium",
+      "side_effects": ["write_local_file"],
+      "read_only": false,
+      "mode": "manual",
+      "reason": "Tool is explicitly non-read-only.",
+      "status": "pending",
+      "decided_by": null,
+      "decision_reason": null
+    }
+  ]
+}
+```
+
+```http
+GET /agent/safety-reviews/{review_id}
+```
+
+返回单个审查记录。
+
+```http
+POST /agent/safety-reviews/{review_id}/decision
+```
+
+请求体：
+
+```json
+{
+  "decision": "approve",
+  "reason": "User approved this scoped local write.",
+  "decided_by": "user"
+}
+```
+
+`decision` 只能是 `approve` 或 `reject`。`approve` 会恢复对应 run 的执行；
+`reject` 会把工具调用作为 rejected observation 反馈给 Agent，Agent 可以生成解释性回答。
+
+---
+
+## 7. Agent Turn Stream
 
 ```http
 POST /agent/turn/stream
@@ -333,9 +399,10 @@ data: <AgentRunEvent JSON plus stream_part>
 
 ```
 
-第一版会输出 run/progress/tool/LLM/final answer 事件，例如 `run_started`、
+第一版会输出 run/progress/tool/LLM/safety/final answer 事件，例如 `run_started`、
 `package_selected`、`tool_started`、`tool_completed`、`llm_started`、`llm_completed`、
-`llm_failed`、`llm_delta`、`final_answer`、`run_completed`、`run_failed`。
+`llm_failed`、`llm_delta`、`safety_review_required`、`safety_review_decided`、
+`final_answer`、`run_completed`、`run_failed`。
 每个 SSE `data` 都会带 `stream_part`，用于前端区分结构：
 
 ```text
@@ -344,12 +411,16 @@ progress
 tool_result
 llm_audit
 llm_delta
+safety_review
 final_answer
 ```
 
+当审查模式为 `manual` 时，stream 会在 `safety_review_required` 后保持打开；
+前端应调用 `POST /agent/safety-reviews/{review_id}/decision` 提交用户决策。
+
 `POST /agent/turn/stream` 默认以 `llm.response_mode=stream` 运行。所有 Agent runtime
 中的 LLM stage 都可以发送 provider token delta，包括 route、decision、decision_repair、
-tool_result_check、context_summarize、context_answer 和 answer。JSON 决策阶段只流式接收
+异常工具检查的 tool_result_check、context_summarize、context_answer 和 answer。JSON 决策阶段只流式接收
 并审计 token；Agent 必须等完整内容累计完成后再解析 JSON 和执行下一步，避免半截 JSON
 驱动工具调用，也不能用 JSON stage 的 delta 解析或显示最终答案。最终自然语言回答必须来自
 `answer` / `context_answer` stage 的 `llm_delta`。`llm_delta.payload` 至少包含：
@@ -365,7 +436,7 @@ tool_result_check、context_summarize、context_answer 和 answer。JSON 决策�
 ```
 
 非最终回答类 stage 的 `display_target` 为 `agent_process`，例如 `route_decision`、
-`agent_decision`、`decision_repair` 和 `tool_result_check`；最终自然语言回答使用
+`agent_decision`、`decision_repair` 和异常工具检查的 `tool_result_check`；最终自然语言回答使用
 `assistant_answer`。前端只应把 `display_target == "assistant_answer"` 的 `llm_delta`
 作为最终回答实时输出；`final_answer` event 只作为最终校准 / 补全事件，不是首个显示最终
 答案的主要来源。
@@ -412,9 +483,9 @@ hidden|collapsed|expanded` 在会话中切换过程事件显示方式。
 
 ---
 
-## 7. Sessions
+## 8. Sessions
 
-### 7.1 Create Session
+### 8.1 Create Session
 
 ```http
 POST /sessions
@@ -461,7 +532,7 @@ POST /sessions
 }
 ```
 
-### 7.2 List Sessions
+### 8.2 List Sessions
 
 ```http
 GET /sessions?limit=50
@@ -484,7 +555,7 @@ GET /sessions?limit=50
 }
 ```
 
-### 7.3 Get Session
+### 8.3 Get Session
 
 ```http
 GET /sessions/session_xxx
@@ -499,7 +570,7 @@ GET /sessions/session_xxx
 }
 ```
 
-### 7.4 Append Session Message
+### 8.4 Append Session Message
 
 ```http
 POST /sessions/session_xxx/messages
@@ -527,7 +598,7 @@ POST /sessions/session_xxx/messages
 
 ---
 
-## 8. Mail Import
+## 9. Mail Import
 
 ```http
 POST /mail/import
@@ -577,7 +648,7 @@ POST /mail/import
 
 ---
 
-## 9. Mail Search
+## 10. Mail Search
 
 ```http
 GET /mail/search?q=document&limit=10
@@ -590,7 +661,7 @@ GET /mail/search?q=document&limit=10
   "query": "document",
   "messages": [
     {
-      "message_id": "mail_msg_xxx",
+      "message_id": "message_id_001",
       "subject": "Visa document reminder",
       "sender": "admin@example.com",
       "folder": "Inbox",
@@ -613,7 +684,7 @@ GET /mail/search?q=document&limit=10
 
 ---
 
-## 10. List Mail Matters
+## 11. List Mail Matters
 
 ```http
 GET /mail/matters
@@ -637,12 +708,12 @@ GET /mail/matters
 
 ---
 
-## 11. Matters
+## 12. Matters
 
 独立事务系统用于保存任务、事件、待办和提醒候选项，不从属于邮件。邮件、Agent trace、
 本地文件或后续日历对象都可以作为 `source_links` 关联到同一个 matter。
 
-### 11.1 Create Matter
+### 12.1 Create Matter
 
 ```http
 POST /matters
@@ -652,17 +723,17 @@ POST /matters
 
 ```json
 {
-  "title": "Submit ICA student pass documents",
-  "summary": "Prepare IPA letter and appointment documents.",
+  "title": "Submit required application documents",
+  "summary": "Prepare required documents before the deadline.",
   "status": "open",
   "priority": "high",
   "due_at": "2026-08-10T09:00:00+08:00",
-  "tags": ["ICA", "NTU"],
+  "tags": ["application"],
   "source_links": [
     {
       "source_type": "mail_message",
-      "source_id": "mail_msg_xxx",
-      "reason": "Extracted from ICA email."
+      "source_id": "message_id_001",
+      "reason": "Extracted from loaded local evidence."
     }
   ],
   "metadata": {}
@@ -671,7 +742,7 @@ POST /matters
 
 响应：返回完整 `matter` 记录。
 
-### 11.2 List / Search / Update
+### 12.2 List / Search / Update
 
 ```http
 GET /matters?limit=50&status=open
@@ -689,7 +760,7 @@ POST /matters/{matter_id}/source-links
 
 ---
 
-## 12. Outlook Auth Start
+## 13. Outlook Auth Start
 
 ```http
 POST /mail/outlook/auth/start
@@ -717,7 +788,7 @@ POST /mail/outlook/auth/start
 
 ---
 
-## 13. Outlook Auth Complete
+## 14. Outlook Auth Complete
 
 ```http
 POST /mail/outlook/auth/complete
@@ -746,7 +817,7 @@ POST /mail/outlook/auth/complete
 
 ---
 
-## 14. Outlook Sync
+## 15. Outlook Sync
 
 ```http
 POST /mail/outlook/sync
@@ -789,7 +860,7 @@ POST /mail/outlook/sync
 
 ---
 
-## 15. Compatibility Notes
+## 16. Compatibility Notes
 
 - 当前后端实现是轻量骨架，因此部分返回值是规则化输出而非真实 agent 结果。
 - 这份契约保留了未来完整系统需要的字段，便于逐步替换实现。

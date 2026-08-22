@@ -197,6 +197,8 @@ def stream_error_category(error_type: str | None) -> tuple[str, bool]:
         return "permission_denied", False
     if "rate_limit" in marker or "rate" in marker:
         return "rate_limited", True
+    if "parse" in marker or "json" in marker:
+        return "response_parse_failed", False
     if "server" in marker:
         return "provider_internal_error", True
     return "provider_stream_error", False
@@ -240,6 +242,8 @@ def build_stream_error_call_record(
     response_mode: str,
     error_event: dict[str, Any],
     partial_content: str = "",
+    provider_request_id: str | None = None,
+    headers: dict[str, str] | None = None,
     run_id: str | None = None,
     trace_id: str | None = None,
     session_id: str | None = None,
@@ -262,6 +266,7 @@ def build_stream_error_call_record(
         started_at=started_at,
         failed_at=now_iso(),
         duration_ms=duration_ms,
+        provider_request_id=provider_request_id,
         provider_error_type=_str_or_none(error.get("type")),
         provider_error_code=_str_or_none(error.get("code")),
         provider_error_param=_str_or_none(error.get("param")),
@@ -274,6 +279,7 @@ def build_stream_error_call_record(
             "event_id": error_event.get("event_id") or error.get("event_id"),
             "sequence_number": error_event.get("sequence_number"),
             "partial_content_length": len(partial_content),
+            "headers": headers or {},
         },
     )
 

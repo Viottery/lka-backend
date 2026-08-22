@@ -88,6 +88,10 @@ integration logic back into `app/core/`.
 - Tool Package Registry exposes packages first; expand a package before calling tools.
 - Each Agent step may either call one tool or produce a final answer.
 - Tool execution must go through Tool Executor schema validation.
+- Every Agent-visible tool must explicitly declare `read_only`. Treat
+  `read_only != true` as requiring the mandatory safety review gate before
+  execution. The gate may run in `skip`, `llm`, or `manual` mode, but the review
+  record must still exist.
 - Agent core must remain package/domain agnostic. Do not hard-code concrete
   package names, tool names, domain workflows, routing keywords, or tool-call
   examples in `app/core/` prompts or fallback logic.

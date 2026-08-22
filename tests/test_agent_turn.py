@@ -10,7 +10,8 @@ from app.api.routes.mail import import_mail
 from app.api.routes.sessions import get_session
 from app.api.schemas import AgentTurnRequest, MailImportRequest
 from app.core.config import get_settings
-from app.core.llm import LLMRateLimitError, LLMResponse
+from app.core.llm import LLMRateLimitError, LLMResponse, LLMStreamEvent
+from app.core.tools import ToolContext, ToolExecutor, ToolRegistry, ToolResult, ToolSpec
 from app.domains.matters import MatterCreateInput
 
 
@@ -155,13 +156,11 @@ def test_agent_turn_retries_rate_limited_llm_and_logs_failure(tmp_path, monkeypa
         request,
     )
 
-    assert fake_llm.calls == 8
-    assert fake_llm.max_output_tokens_seen == [None, None, None, None, None, None, None, None]
+    assert fake_llm.calls == 6
+    assert fake_llm.max_output_tokens_seen == [None, None, None, None, None, None]
     assert response.answer == "LLM final answer after retry."
     assert [event.status for event in response.llm_events] == [
         "rate_limited",
-        "completed",
-        "completed",
         "completed",
         "completed",
         "completed",
@@ -172,9 +171,7 @@ def test_agent_turn_retries_rate_limited_llm_and_logs_failure(tmp_path, monkeypa
         "route",
         "route",
         "decision",
-        "tool_result_check",
         "decision",
-        "tool_result_check",
         "decision",
         "answer",
     ]
@@ -197,8 +194,12 @@ def test_agent_turn_retries_rate_limited_llm_and_logs_failure(tmp_path, monkeypa
         "mail.load_messages",
     ]
     assert [event.feedback["source"] for event in response.tool_events] == [
-        "llm",
-        "llm",
+        "local",
+        "local",
+    ]
+    assert [event.feedback["protocol_status"] for event in response.tool_events] == [
+        "valid",
+        "valid",
     ]
 
     log_text = Path(response.log_path or "").read_text(encoding="utf-8")
@@ -206,6 +207,39 @@ def test_agent_turn_retries_rate_limited_llm_and_logs_failure(tmp_path, monkeypa
     assert "Choose at most one tool package" in log_text
     assert "Choose the next single action" in log_text
     assert "## Decision Events" in log_text
+
+
+def test_agent_turn_records_provider_stream_error_as_partial_failed(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
+    get_settings.cache_clear()
+
+    app = create_app()
+    request = SimpleNamespace(app=app)
+    app.state.runtime.agent_turn_loop.llm_client = _ProviderStreamErrorLLM()
+
+    response = run_agent_turn(
+        AgentTurnRequest(
+            session_id="session_stream_error_audit",
+            user_input="直接根据上下文回答",
+            llm={"response_mode": "stream"},
+        ),
+        request,
+    )
+
+    failed = next(event for event in response.llm_events if event.status == "partial_failed")
+    assert failed.stage == "context_answer"
+    assert failed.output == "partial answer"
+    assert failed.partial is True
+    assert failed.provider_request_id == "req_stream_failed"
+    assert failed.provider_error_type == "invalid_request_error"
+    assert failed.provider_error_code == "bad_stream"
+    assert failed.provider_error_param == "input"
+    assert failed.error_category == "bad_request"
+    assert failed.audit_record["metadata"]["headers"]["x-request-id"] == "req_stream_failed"
 
 
 def test_agent_turn_passes_request_llm_options_to_client(tmp_path, monkeypatch):
@@ -665,7 +699,7 @@ def test_agent_turn_accepts_operation_envelope_decisions(tmp_path, monkeypatch):
     assert any(event.stage == "answer" for event in response.llm_events)
     assert response.decision_events[1].assistant_message == "我先检索相关邮件。"
     assert response.decision_events[1].operation["type"] == "tool_call"
-    assert response.tool_events[0].feedback["source"] == "llm"
+    assert response.tool_events[0].feedback["source"] == "local"
 
 
 def test_agent_turn_does_not_use_assistant_message_as_missing_final_answer(
@@ -802,7 +836,7 @@ def test_agent_turn_can_expand_matter_package_after_mail_observation(tmp_path, m
         "matter.create_many",
     ]
     assert "matter.create_many" in [tool["name"] for tool in response.expanded_tools]
-    assert response.tool_events[-1].feedback["source"] == "llm"
+    assert response.tool_events[-1].feedback["source"] == "local"
     assert response.tool_events[-1].result["output"]["matters_created"] == 1
     progress_types = [event.type for event in response.progress_events]
     assert "package_expanded" in progress_types
@@ -846,12 +880,15 @@ def test_agent_turn_feeds_tool_input_validation_errors_back_to_llm(
         response.tool_events[0].result["output"]["validation_errors"][0]
     )
     assert response.tool_events[0].feedback["status"] == "failed"
+    assert response.tool_events[0].feedback["source"] == "llm"
+    assert response.tool_events[0].feedback["local_status"] == "failed"
     assert response.tool_events[1].result["status"] == "completed"
+    assert response.tool_events[1].feedback["source"] == "local"
     assert response.tool_events[1].result["output"]["matters_created"] == 1
     assert response.answer == "已创建 NTUSO audition 准备事项。"
 
 
-def test_agent_turn_adds_matter_domain_summary_to_tool_feedback(
+def test_agent_turn_uses_local_feedback_for_valid_tool_result(
     tmp_path,
     monkeypatch,
 ):
@@ -890,9 +927,80 @@ def test_agent_turn_adds_matter_domain_summary_to_tool_feedback(
 
     feedback = response.tool_events[0].feedback
     assert feedback["status"] == "accepted"
-    assert feedback["message"] == "Tool ran; raw tool result is authoritative."
+    assert feedback["source"] == "local"
+    assert feedback["message"] == "matter.search executed successfully."
+    assert feedback["protocol_status"] == "valid"
     assert "domain_summary" not in feedback
-    assert "domain_summary" not in fake_llm.checker_payloads[0]["tool_feedback"]
+    assert fake_llm.checker_payloads == []
+
+
+def test_tool_executor_validates_output_protocol():
+    class ValidTool:
+        spec = ToolSpec(
+            name="valid.tool",
+            type="local_tool",
+            description="Return a valid payload.",
+            input_schema={},
+            output_schema={"items": "array", "count": "integer"},
+        )
+
+        def invoke(self, *, invocation, context):
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=self.spec.name,
+                status="completed",
+                output={"items": [], "count": 0},
+            )
+
+    class UnspecifiedOutputTool:
+        spec = ToolSpec(
+            name="unspecified.tool",
+            type="local_tool",
+            description="Return a generic JSON object.",
+            input_schema={},
+            output_schema={},
+        )
+
+        def invoke(self, *, invocation, context):
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=self.spec.name,
+                status="completed",
+                output={"anything": ["json"]},
+            )
+
+    registry = ToolRegistry()
+    registry.register_tool(ValidTool())
+    registry.register_tool(UnspecifiedOutputTool())
+    executor = ToolExecutor(registry)
+    context = ToolContext(session_id="session_protocol")
+
+    valid = executor.execute(
+        invocation_id="tool_invocation_valid",
+        tool_name="valid.tool",
+        tool_input={},
+        context=context,
+    )
+    assert executor.validate_output(tool_name="valid.tool", result=valid) == []
+
+    invalid = ToolResult(
+        invocation_id="tool_invocation_invalid",
+        tool_name="valid.tool",
+        status="completed",
+        output={"items": {}, "count": "zero"},
+    )
+    assert executor.validate_output(tool_name="valid.tool", result=invalid) == [
+        "output.items must be array, got dict.",
+        "output.count must be integer, got str.",
+    ]
+
+    generic = executor.execute(
+        invocation_id="tool_invocation_generic",
+        tool_name="unspecified.tool",
+        tool_input={},
+        context=context,
+    )
+    assert executor.validate_output(tool_name="unspecified.tool", result=generic) == []
 
 
 def test_agent_turn_warns_when_final_answer_claims_unsupported_calendar_action(
@@ -1037,6 +1145,80 @@ class _RateLimitedThenWorkingLLM:
             status="completed",
             content=content,
             prompt_summary=prompt_summary,
+        )
+
+
+class _ProviderStreamErrorLLM:
+    async def stream(self, request):
+        stage = str(request.metadata.get("stage") or "llm")
+        yield LLMStreamEvent(
+            event_type="llm_started",
+            stage=stage,
+            client_name=request.client_name or "stream-error-client",
+            provider="stream-error-provider",
+            model=request.model or "stream-error-model",
+            metadata={
+                "provider_request_id": "req_stream_failed",
+                "headers": {"x-request-id": "req_stream_failed"},
+            },
+        )
+        if stage == "route":
+            content = '{"selected_package":null,"reason":"context is enough"}'
+            yield LLMStreamEvent(
+                event_type="llm_delta",
+                stage=stage,
+                client_name=request.client_name or "stream-error-client",
+                provider="stream-error-provider",
+                model=request.model or "stream-error-model",
+                delta=content,
+                content_snapshot=content,
+            )
+            yield LLMStreamEvent(
+                event_type="llm_completed",
+                stage=stage,
+                client_name=request.client_name or "stream-error-client",
+                provider="stream-error-provider",
+                model=request.model or "stream-error-model",
+                content_snapshot=content,
+            )
+            return
+
+        yield LLMStreamEvent(
+            event_type="llm_delta",
+            stage=stage,
+            client_name=request.client_name or "stream-error-client",
+            provider="stream-error-provider",
+            model=request.model or "stream-error-model",
+            delta="partial answer",
+            content_snapshot="partial answer",
+            metadata={
+                "provider_request_id": "req_stream_failed",
+                "headers": {"x-request-id": "req_stream_failed"},
+            },
+        )
+        yield LLMStreamEvent(
+            event_type="llm_failed",
+            stage=stage,
+            client_name=request.client_name or "stream-error-client",
+            provider="stream-error-provider",
+            model=request.model or "stream-error-model",
+            error="Bad stream chunk.",
+            content_snapshot="partial answer",
+            metadata={
+                "provider_request_id": "req_stream_failed",
+                "headers": {"x-request-id": "req_stream_failed"},
+                "partial_content": "partial answer",
+                "error_event": {
+                    "type": "error",
+                    "event_id": "evt_stream_failed",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "code": "bad_stream",
+                        "message": "Bad stream chunk.",
+                        "param": "input",
+                    },
+                },
+            },
         )
 
 

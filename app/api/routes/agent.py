@@ -3,10 +3,16 @@ import json
 import time
 from collections.abc import AsyncIterator
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
-from app.api.schemas import AgentTurnRequest, AgentTurnResponse
+from app.api.schemas import (
+    AgentTurnRequest,
+    AgentTurnResponse,
+    SafetyReviewDecisionRequest,
+    SafetyReviewListResponse,
+    SafetyReviewResponse,
+)
 from app.core.agent_runs import AgentRunEvent, AgentRunStatus
 from app.core.llm import LLMResponseMode
 
@@ -61,6 +67,55 @@ async def stream_agent_turn(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@router.get(
+    "/runs/{run_id}/safety-reviews",
+    response_model=SafetyReviewListResponse,
+)
+async def list_agent_run_safety_reviews(
+    run_id: str,
+    request: Request,
+) -> SafetyReviewListResponse:
+    run_manager = request.app.state.runtime.agent_run_manager
+    if run_manager.get_run(run_id) is None:
+        raise HTTPException(status_code=404, detail="Agent run not found.")
+    return SafetyReviewListResponse(reviews=run_manager.list_safety_reviews(run_id))
+
+
+@router.get(
+    "/safety-reviews/{review_id}",
+    response_model=SafetyReviewResponse,
+)
+async def get_agent_safety_review(
+    review_id: str,
+    request: Request,
+) -> SafetyReviewResponse:
+    review = request.app.state.runtime.agent_run_manager.get_safety_review(review_id)
+    if review is None:
+        raise HTTPException(status_code=404, detail="Safety review not found.")
+    return SafetyReviewResponse(**review.model_dump(mode="python"))
+
+
+@router.post(
+    "/safety-reviews/{review_id}/decision",
+    response_model=SafetyReviewResponse,
+)
+async def decide_agent_safety_review(
+    review_id: str,
+    payload: SafetyReviewDecisionRequest,
+    request: Request,
+) -> SafetyReviewResponse:
+    run_manager = request.app.state.runtime.agent_run_manager
+    if run_manager.get_safety_review(review_id) is None:
+        raise HTTPException(status_code=404, detail="Safety review not found.")
+    review = run_manager.decide_safety_review(
+        review_id=review_id,
+        decision=payload.decision,
+        decided_by=payload.decided_by,
+        reason=payload.reason,
+    )
+    return SafetyReviewResponse(**review.model_dump(mode="python"))
 
 
 async def _agent_turn_event_stream(
@@ -160,6 +215,8 @@ def _stream_part_for_event(event: AgentRunEvent) -> str:
         return "llm_delta"
     if event.type in {"llm_started", "llm_completed", "llm_failed"}:
         return "llm_audit"
+    if event.type in {"safety_review_required", "safety_review_decided"}:
+        return "safety_review"
     if event.type == "final_answer":
         return "final_answer"
     return "progress"

@@ -78,6 +78,24 @@ def test_agent_turn_stream_emits_run_tool_and_final_events(tmp_path, monkeypatch
     assert run.result_snapshot["selected_package"] == "mail"
 
 
+def test_sse_event_frame_marks_safety_review_events():
+    event = AgentRunEvent(
+        event_id="evt_safety_review_required",
+        run_id="run_safety_review",
+        sequence=3,
+        type="safety_review_required",
+        stage="safety_review",
+        message="Safety review required.",
+        payload={"review": {"review_id": "review_001"}},
+        created_at="2026-08-22T00:00:00Z",
+    )
+
+    [frame] = _parse_sse(_sse_event_frame(event))
+
+    assert frame["event"] == "safety_review_required"
+    assert frame["data"]["stream_part"] == "safety_review"
+
+
 def test_agent_turn_stream_emits_provider_token_delta_events(tmp_path, monkeypatch):
     monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
@@ -141,7 +159,7 @@ def test_agent_turn_stream_emits_provider_token_delta_events(tmp_path, monkeypat
     )
     assert answer_delta_frames[-1]["data"]["payload"]["content_snapshot"] == "流式回答"
     assert {frame["data"]["payload"]["content_role"] for frame in delta_frames}.issuperset(
-        {"route_decision", "agent_decision", "tool_result_check", "final_answer"}
+        {"route_decision", "agent_decision", "final_answer"}
     )
     assert all(
         frame["data"]["payload"]["display_target"] == "agent_process"

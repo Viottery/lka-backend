@@ -16,6 +16,12 @@ from app.core.agent_turn import AgentTurnLoop, AgentTurnResult
 from app.core.config import Settings
 from app.core.context import ContextAssembler
 from app.core.llm import LLMResponseMode, MockLLMClient, build_text_llm_client
+from app.tool_packages.filesystem import (
+    FILESYSTEM_PACKAGE,
+    EditFileTool,
+    FileAccessPolicy,
+    ReadFileTool,
+)
 from app.tool_packages.mail import (
     MAIL_PACKAGE,
     LoadMailMessagesTool,
@@ -56,7 +62,6 @@ from app.integrations.outlook import (
     OutlookSyncResult,
 )
 from app.core.retrieval import LocalDebugRetrievalProvider
-from app.tool_packages.runtime import RUNTIME_PACKAGE, RuntimeNowTool
 from app.core.runtime_loop import RuntimeDebugRun, RuntimeLoop
 from app.core.sessions import (
     AgentSessionDetail,
@@ -105,7 +110,7 @@ class LocalKnowledgeAgentRuntime:
         self.tool_registry = ToolRegistry()
         self.tool_registry.register_package(MAIL_PACKAGE)
         self.tool_registry.register_package(MATTER_PACKAGE)
-        self.tool_registry.register_package(RUNTIME_PACKAGE)
+        self.tool_registry.register_package(FILESYSTEM_PACKAGE)
         self.tool_registry.register_tool(SearchMailTool(self.mail_service))
         self.tool_registry.register_tool(LoadMailMessagesTool(self.mail_service))
         self.tool_registry.register_tool(SyncMailTool(self.sync_outlook_mail))
@@ -115,7 +120,11 @@ class LocalKnowledgeAgentRuntime:
         self.tool_registry.register_tool(ListMattersTool(self.matter_service))
         self.tool_registry.register_tool(UpdateMatterTool(self.matter_service))
         self.tool_registry.register_tool(LinkMatterSourceTool(self.matter_service))
-        self.tool_registry.register_tool(RuntimeNowTool())
+        file_policy = FileAccessPolicy.from_workspace_roots(
+            self.settings.parsed_workspace_roots()
+        )
+        self.tool_registry.register_tool(ReadFileTool(file_policy))
+        self.tool_registry.register_tool(EditFileTool(file_policy))
         self.tool_executor = ToolExecutor(self.tool_registry)
         self.agent_run_manager = InMemoryAgentRunManager()
         self.agent_llm_client = build_text_llm_client(self.local_app_config.llm)
@@ -125,6 +134,10 @@ class LocalKnowledgeAgentRuntime:
             llm_client=self.agent_llm_client,
             log_dir=self.settings.data_dir / "agent_logs",
             run_manager=self.agent_run_manager,
+            safety_review_mode=self.local_app_config.safety.tool_review_mode,
+            safety_manual_wait_poll_seconds=(
+                self.local_app_config.safety.manual_wait_poll_seconds
+            ),
         )
         self.debug_loop = RuntimeLoop(
             context_assembler=ContextAssembler(),
@@ -307,10 +320,23 @@ class LocalKnowledgeAgentRuntime:
     def list_capabilities(self) -> list[CapabilityItem]:
         """Return the currently advertised capability catalog."""
 
-        return [
-            CapabilityItem(name="mail", type="tool_package", risk="low_to_medium", requires_confirmation=False),
-            CapabilityItem(name="matter", type="tool_package", risk="low_to_medium", requires_confirmation=False),
-            CapabilityItem(name="runtime", type="tool_package", risk="low", requires_confirmation=False),
+        package_capabilities = [
+            CapabilityItem(
+                name=package.name,
+                type="tool_package",
+                risk=package.risk,
+                requires_confirmation=any(
+                    tool.requires_confirmation or tool.read_only is not True
+                    for tool in self.tool_registry.list_tools(package=package.name)
+                ),
+                read_only=all(
+                    tool.read_only is True
+                    for tool in self.tool_registry.list_tools(package=package.name)
+                ),
+            )
+            for package in self.tool_registry.list_packages()
+        ]
+        return package_capabilities + [
             CapabilityItem(name="summarize_folder", type="native_skill", risk="low", requires_confirmation=False),
             CapabilityItem(name="extract_tasks", type="native_skill", risk="low", requires_confirmation=False),
             CapabilityItem(name="organize_files", type="native_skill", risk="medium", requires_confirmation=True),

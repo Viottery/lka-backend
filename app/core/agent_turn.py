@@ -22,8 +22,17 @@ from app.core.agent_runs import (
     AgentRunRecord,
     InMemoryAgentRunManager,
 )
+from app.core.safety import (
+    SafetyReviewDecision,
+    SafetyReviewMode,
+    SafetyReviewRecord,
+    SafetyReviewRequest,
+    SafetyReviewStatus,
+    stable_safety_review_id,
+)
 from app.core.llm.audit import (
     LLMCallRecord,
+    build_stream_error_call_record,
     classify_openai_sdk_exception,
     classify_provider_error,
     now_iso as llm_audit_now_iso,
@@ -37,6 +46,7 @@ from app.core.llm import (
     LLMMessage,
     LLMNetworkError,
     LLMProviderHTTPError,
+    LLMProviderStreamError,
     LLMRequest,
     LLMRateLimitError,
     LLMResponse,
@@ -192,6 +202,8 @@ class AgentTurnLoop:
         llm_client: TextLLMClient | LLMService | None,
         log_dir: Path,
         run_manager: InMemoryAgentRunManager | None = None,
+        safety_review_mode: SafetyReviewMode | str = SafetyReviewMode.SKIP,
+        safety_manual_wait_poll_seconds: float = 0.5,
     ) -> None:
         self.session_service = session_service
         self.tool_executor = tool_executor
@@ -204,6 +216,19 @@ class AgentTurnLoop:
         self.decision_format_max_attempts = 2
         self.llm_generation_token_budget: int | None = None
         self.session_context_token_budget = 65_536
+        self.safety_review_mode = self._normalize_safety_review_mode(safety_review_mode)
+        self.safety_manual_wait_poll_seconds = safety_manual_wait_poll_seconds
+
+    def _normalize_safety_review_mode(
+        self,
+        mode: SafetyReviewMode | str,
+    ) -> SafetyReviewMode:
+        if isinstance(mode, SafetyReviewMode):
+            return mode
+        try:
+            return SafetyReviewMode(str(mode))
+        except ValueError:
+            return SafetyReviewMode.SKIP
 
     def run(
         self,
@@ -950,8 +975,9 @@ class AgentTurnLoop:
                 context=context,
                 tool_events=tool_events,
                 progress_events=progress_events,
+                llm_events=llm_events,
             )
-            feedback = self._check_tool_result_with_llm(
+            feedback = self._check_tool_result(
                 user_input=user_input,
                 selected_package=selected_package,
                 decision=decision,
@@ -1045,8 +1071,8 @@ class AgentTurnLoop:
                     "it was plain text instead of strict JSON. You must now correct that "
                     "specific output. Return only the JSON envelope. If the rejected text "
                     "said you would read, load, fetch, or inspect details, produce a "
-                    "tool_call JSON operation using the available tools and message ids from "
-                    "observations. Do not repeat the rejected plain text."
+                    "tool_call JSON operation using the available tools and stable resource "
+                    "identifiers from observations. Do not repeat the rejected plain text."
                 )
             prompt_payload = {
                 "user_input": user_input,
@@ -1477,8 +1503,33 @@ class AgentTurnLoop:
         context: ToolContext,
         tool_events: list[AgentTurnToolEvent],
         progress_events: list[AgentTurnProgressEvent] | None = None,
+        llm_events: list[AgentTurnLLMEvent] | None = None,
     ) -> ToolResult:
         selected_at = _now_iso()
+        invocation_id = _stable_id("tool_invocation", context.trace_id, tool_name, selected_at)
+        review_result, approved_review = self._review_tool_call_before_execute(
+            invocation_id=invocation_id,
+            tool_name=tool_name,
+            tool_input=tool_input,
+            context=context,
+            progress_events=progress_events,
+            llm_events=llm_events,
+        )
+        if review_result is not None:
+            tool_events.append(
+                AgentTurnToolEvent(
+                    tool_name=tool_name,
+                    selected_at=selected_at,
+                    completed_at=_now_iso(),
+                    input=tool_input,
+                    result=review_result.model_dump(mode="json"),
+                    feedback=self._local_tool_feedback(
+                        tool_name=tool_name,
+                        result=review_result,
+                    ),
+                )
+            )
+            return review_result
         if progress_events is not None:
             self._append_progress(
                 progress_events,
@@ -1490,11 +1541,19 @@ class AgentTurnLoop:
                 metadata={"input": tool_input},
             )
         self._raise_if_cancel_requested()
+        execution_context = context
+        if approved_review is not None:
+            execution_context = context.model_copy(
+                update={
+                    "safety_review_approved": True,
+                    "safety_review_id": approved_review.review_id,
+                }
+            )
         result = self.tool_executor.execute(
-            invocation_id=_stable_id("tool_invocation", context.trace_id, tool_name, selected_at),
+            invocation_id=invocation_id,
             tool_name=tool_name,
             tool_input=tool_input,
-            context=context,
+            context=execution_context,
         )
         tool_events.append(
             AgentTurnToolEvent(
@@ -1517,6 +1576,229 @@ class AgentTurnLoop:
                 metadata={"result": result.model_dump(mode="json")},
             )
         return result
+
+    def _review_tool_call_before_execute(
+        self,
+        *,
+        invocation_id: str,
+        tool_name: str,
+        tool_input: dict[str, Any],
+        context: ToolContext,
+        progress_events: list[AgentTurnProgressEvent] | None,
+        llm_events: list[AgentTurnLLMEvent] | None,
+    ) -> tuple[ToolResult | None, SafetyReviewRecord | None]:
+        tool = self.tool_executor.registry.get_tool_or_none(tool_name)
+        if tool is None:
+            return None, None
+        if tool.spec.read_only is True:
+            return None, None
+        run_manager = _turn_run_manager.get()
+        run_id = _turn_run_id.get()
+        if run_manager is None or run_id is None:
+            return (
+                ToolResult(
+                    invocation_id=invocation_id,
+                    tool_name=tool_name,
+                    status="rejected",
+                    error="Safety review is required but no Agent run is active.",
+                    output={
+                        "safety_review": {
+                            "status": "rejected",
+                            "reason": "No active Agent run can host the safety review.",
+                        }
+                    },
+                ),
+                None,
+            )
+        reason = self._safety_review_reason(read_only=tool.spec.read_only)
+        review = run_manager.create_safety_review(
+            SafetyReviewRequest(
+                review_id=stable_safety_review_id(run_id, invocation_id, tool_name),
+                run_id=run_id,
+                session_id=context.session_id,
+                trace_id=context.trace_id or "",
+                invocation_id=invocation_id,
+                tool_name=tool_name,
+                tool_input=tool_input,
+                tool_risk=tool.spec.risk,
+                side_effects=tool.spec.side_effects,
+                read_only=tool.spec.read_only,
+                mode=self.safety_review_mode,
+                reason=reason,
+                created_at=_now_iso(),
+            )
+        )
+        self._append_safety_review_progress(
+            progress_events=progress_events,
+            review=review,
+            status="required",
+            message=f"Safety review required for `{tool_name}`.",
+        )
+        self._append_run_event(
+            type="safety_review_required",
+            message=f"Safety review required for `{tool_name}`.",
+            stage="safety_review",
+            payload={"review": review.model_dump(mode="json")},
+        )
+        if self.safety_review_mode == SafetyReviewMode.SKIP:
+            decided = run_manager.decide_safety_review(
+                review_id=review.review_id,
+                decision=SafetyReviewDecision.APPROVE,
+                decided_by="system.skip",
+                reason="Safety review mode is skip; review recorded and automatically approved.",
+            )
+            self._append_safety_review_progress(
+                progress_events=progress_events,
+                review=decided,
+                status="approved",
+                message=f"Safety review skipped for `{tool_name}`.",
+            )
+            return None, decided
+        if self.safety_review_mode == SafetyReviewMode.LLM:
+            decided = self._decide_safety_review_with_llm(
+                review,
+                llm_events=llm_events,
+            )
+            self._append_safety_review_progress(
+                progress_events=progress_events,
+                review=decided,
+                status=decided.status.value,
+                message=f"Safety review {decided.status.value} for `{tool_name}`.",
+            )
+            if decided.status == SafetyReviewStatus.APPROVED:
+                return None, decided
+            return (
+                self._safety_rejected_tool_result(
+                    invocation_id=invocation_id,
+                    tool_name=tool_name,
+                    review=decided,
+                ),
+                None,
+            )
+
+        run_manager.mark_waiting_confirmation(run_id, confirmation_id=review.review_id)
+        decided = run_manager.safety_reviews.wait_for_decision(
+            review.review_id,
+            timeout_seconds=self.safety_manual_wait_poll_seconds,
+            cancel_check=lambda: run_manager.is_cancel_requested(run_id),
+        )
+        self._raise_if_cancel_requested()
+        self._append_safety_review_progress(
+            progress_events=progress_events,
+            review=decided,
+            status=decided.status.value,
+            message=f"Safety review {decided.status.value} for `{tool_name}`.",
+        )
+        if decided.status == SafetyReviewStatus.APPROVED:
+            return None, decided
+        return (
+            self._safety_rejected_tool_result(
+                invocation_id=invocation_id,
+                tool_name=tool_name,
+                review=decided,
+            ),
+            None,
+        )
+
+    def _safety_review_reason(self, *, read_only: bool | None) -> str:
+        if read_only is None:
+            return "Tool did not explicitly declare read_only=true."
+        return "Tool is explicitly non-read-only."
+
+    def _append_safety_review_progress(
+        self,
+        *,
+        progress_events: list[AgentTurnProgressEvent] | None,
+        review: SafetyReviewRecord,
+        status: str,
+        message: str,
+    ) -> None:
+        if progress_events is None:
+            return
+        self._append_progress(
+            progress_events,
+            type="safety_review",
+            stage="safety_review",
+            tool_name=review.tool_name,
+            status=status,
+            message=message,
+            metadata={"review": review.model_dump(mode="json")},
+        )
+
+    def _safety_rejected_tool_result(
+        self,
+        *,
+        invocation_id: str,
+        tool_name: str,
+        review: SafetyReviewRecord,
+    ) -> ToolResult:
+        return ToolResult(
+            invocation_id=invocation_id,
+            tool_name=tool_name,
+            status="rejected",
+            output={"safety_review": review.model_dump(mode="json")},
+            error=review.decision_reason or "Safety review rejected tool call.",
+        )
+
+    def _decide_safety_review_with_llm(
+        self,
+        review: SafetyReviewRecord,
+        *,
+        llm_events: list[AgentTurnLLMEvent] | None,
+    ) -> SafetyReviewRecord:
+        run_manager = _turn_run_manager.get()
+        if run_manager is None:
+            return review
+        if self.llm_client is None:
+            return run_manager.decide_safety_review(
+                review_id=review.review_id,
+                decision=SafetyReviewDecision.REJECT,
+                decided_by="system.llm_unavailable",
+                reason="Safety review mode is llm but no LLM client is available.",
+            )
+        system_prompt = (
+            "You are a safety reviewer for local agent tool calls. Decide whether this "
+            "single non-read-only operation may proceed. Return only strict JSON: "
+            "{\"approve\":true|false,\"reason\":\"...\"}. Approve only when the "
+            "operation is clearly requested by the user, scoped, and consistent with the "
+            "tool metadata. Reject ambiguous, destructive, broad, or unsupported operations."
+        )
+        user_prompt = json.dumps(
+            {"review": review.model_dump(mode="json")},
+            ensure_ascii=False,
+            indent=2,
+        )
+        response = self._complete_text_with_retry(
+            stage="safety_review",
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            prompt_summary=f"safety_review tool={review.tool_name}",
+            max_output_tokens=512,
+            llm_events=llm_events if llm_events is not None else [],
+        )
+        parsed = (
+            self._parse_json_object(response.content)
+            if response is not None
+            else None
+        )
+        approve = bool(parsed.get("approve")) if isinstance(parsed, dict) else False
+        reason = (
+            str(parsed.get("reason"))
+            if isinstance(parsed, dict) and parsed.get("reason")
+            else "LLM safety review did not return an approval."
+        )
+        decided = run_manager.decide_safety_review(
+            review_id=review.review_id,
+            decision=SafetyReviewDecision.APPROVE
+            if approve
+            else SafetyReviewDecision.REJECT,
+            decided_by="llm",
+            reason=reason,
+        )
+        return run_manager.attach_safety_review_llm_output(
+            review_id=decided.review_id,
+            llm_output=response.content if response is not None else None,
+        )
 
     def _append_progress(
         self,
@@ -1600,11 +1882,16 @@ class AgentTurnLoop:
         result: ToolResult,
     ) -> dict[str, Any]:
         domain_summary = self._tool_domain_summary(tool_name=tool_name, result=result)
-        if result.status == "completed":
+        validation_errors = self.tool_executor.validate_output(
+            tool_name=tool_name,
+            result=result,
+        )
+        if result.status == "completed" and not validation_errors:
             feedback = {
                 "source": "local",
                 "status": "accepted",
                 "message": f"{tool_name} executed successfully.",
+                "protocol_status": "valid",
             }
             if domain_summary:
                 feedback["domain_summary"] = domain_summary
@@ -1612,8 +1899,10 @@ class AgentTurnLoop:
         feedback = {
             "source": "local",
             "status": "failed",
-            "message": f"{tool_name} execution failed.",
+            "message": f"{tool_name} result failed local protocol validation.",
             "error": result.error,
+            "protocol_status": "invalid",
+            "validation_errors": validation_errors,
         }
         if domain_summary:
             feedback["domain_summary"] = domain_summary
@@ -1628,7 +1917,7 @@ class AgentTurnLoop:
         _ = (tool_name, result)
         return {}
 
-    def _check_tool_result_with_llm(
+    def _check_tool_result(
         self,
         *,
         user_input: str,
@@ -1641,17 +1930,19 @@ class AgentTurnLoop:
             tool_name=tool_result.tool_name,
             result=tool_result,
         )
-        if self.llm_client is None:
+        if local_feedback.get("status") == "accepted" or self.llm_client is None:
             return local_feedback
 
         system_prompt = (
             "You are the Tool Result Checker for Local Knowledge Agent OS. Check whether "
             "the just-executed tool result is a valid observation for the prior tool-call "
-            "decision. Do not make a final user answer. Do not claim success when "
-            "ToolResult.status is failed. Distinguish tool execution status from domain "
-            "record status: ToolResult.status=completed means the tool ran, not that a "
-            "business object is done. If tool_feedback.domain_summary is present, use it as "
-            "the authoritative structured summary for business records. Return only strict JSON: {\"status\":"
+            "decision after local protocol validation failed or the tool did not complete. "
+            "Do not make a final user answer. Do not claim success when ToolResult.status "
+            "is failed or when tool_feedback.protocol_status is invalid. Distinguish tool "
+            "execution status from domain record status: ToolResult.status=completed means "
+            "the tool ran, not that a business object is done. If tool_feedback.domain_summary "
+            "is present, use it as the authoritative structured summary for business records. "
+            "Return only strict JSON: {\"status\":"
             "\"accepted|needs_retry|failed\",\"message\":\"...\",\"remaining_work\":\"...\"}."
         )
         user_prompt = json.dumps(
@@ -1875,13 +2166,35 @@ class AgentTurnLoop:
                         "model": event.model,
                     }
                 )
+                if event.metadata:
+                    stream_metadata.update(event.metadata)
                 if event.event_type == "llm_failed":
+                    error_event = (
+                        event.metadata.get("error_event")
+                        if isinstance(event.metadata.get("error_event"), dict)
+                        else None
+                    )
+                    if error_event is not None:
+                        headers = (
+                            event.metadata.get("headers")
+                            if isinstance(event.metadata.get("headers"), dict)
+                            else {}
+                        )
+                        provider_request_id = event.metadata.get("provider_request_id")
+                        raise LLMProviderStreamError(
+                            message=event.error or "LLM provider stream failed.",
+                            error_event=error_event,
+                            partial_content=event.content_snapshot
+                            or str(event.metadata.get("partial_content") or ""),
+                            headers={str(key): str(value) for key, value in headers.items()},
+                            provider_request_id=provider_request_id
+                            if isinstance(provider_request_id, str)
+                            else None,
+                        )
                     raise LLMClientError(event.error or "LLM stream failed.")
                 if event.event_type == "llm_completed":
                     if event.content_snapshot:
                         snapshot = event.content_snapshot
-                    if event.metadata:
-                        stream_metadata.update(event.metadata)
                     continue
                 if event.event_type != "llm_delta" or not event.delta:
                     continue
@@ -1898,6 +2211,7 @@ class AgentTurnLoop:
                         "client_name": event.client_name,
                         "provider": event.provider,
                         "model": event.model,
+                        "provider_request_id": stream_metadata.get("provider_request_id"),
                         "delta": event.delta,
                         "content_snapshot": snapshot,
                     },
@@ -2199,6 +2513,41 @@ class AgentTurnLoop:
         llm_call_id: str,
         exc: LLMClientError,
     ) -> AgentTurnLLMEvent:
+        if isinstance(exc, LLMProviderStreamError):
+            run_context = self._current_run_context()
+            call_record = build_stream_error_call_record(
+                llm_call_id=llm_call_id,
+                stage=stage,
+                started_at=started_at,
+                duration_ms=duration_ms,
+                client_name=_turn_llm_client_name.get() or "default",
+                provider=provider,
+                model=_turn_llm_model.get() or "default",
+                response_mode=_turn_llm_response_mode.get().value,
+                error_event=exc.error_event,
+                partial_content=exc.partial_content,
+                provider_request_id=exc.provider_request_id,
+                headers=exc.headers,
+                run_id=run_context.get("run_id"),
+                trace_id=run_context.get("trace_id"),
+                session_id=run_context.get("session_id"),
+            )
+            metadata = dict(call_record.metadata)
+            metadata.update(prompt_metadata(system_prompt=system_prompt, user_prompt=user_prompt))
+            call_record = call_record.model_copy(update={"metadata": metadata})
+            return AgentTurnLLMEvent(
+                **self._event_fields_from_call_record(call_record),
+                stage=stage,
+                provider=provider,
+                status=call_record.status,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                output=exc.partial_content,
+                attempt=attempt,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+
         status_code = exc.status_code if isinstance(exc, LLMProviderHTTPError) else None
         retry_after = exc.retry_after if isinstance(exc, LLMProviderHTTPError) else None
         provider_error_type = (
@@ -2446,6 +2795,8 @@ class AgentTurnLoop:
             return "timeout"
         if isinstance(exc, LLMResponseParseError):
             return "response_parse_failed"
+        if isinstance(exc, LLMProviderStreamError):
+            return "partial_failed" if exc.partial_content else "provider_stream_failed"
         if isinstance(exc, LLMProviderHTTPError):
             return "http_failed"
         return "failed"
