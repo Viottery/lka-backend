@@ -1,0 +1,115 @@
+{
+  "suite_id": "file_ops_real_llm_file_bash_tasks",
+  "description": "Real-LLM Agent-turn benchmark for local filesystem and bash tasks. Cases intentionally omit tool_plan and scripted_answer so the LLM must choose packages, tools, arguments, verification steps, and answer content.",
+  "cases": [
+    {
+      "case_id": "medium_real_read_known_file",
+      "name": "Read a known file and answer with exact facts.",
+      "difficulty": "medium",
+      "llm_mode": "real",
+      "setup": {"file_workspace_fixture": "local_ops_project"},
+      "request": {
+        "user_input": "请读取这个本地文件：$file:docs/notes.md。回答里面当前 Status 是什么，以及 Unique marker 的值。不要猜测，必须基于文件内容。"
+      },
+      "expect": {
+        "selected_package": "filesystem",
+        "required_tools": ["filesystem.read_file"],
+        "answer_contains_all": ["Status", "red", "alpha-317"],
+        "tool_output_contains_all": ["Status: red", "alpha-317"],
+        "safety_review_count": 0,
+        "max_llm_calls": 8,
+        "max_wall_time_ms": 60000
+      }
+    },
+    {
+      "case_id": "hard_real_edit_file_with_verification",
+      "name": "Read, edit with sha, and re-read a specific file.",
+      "difficulty": "hard",
+      "llm_mode": "real",
+      "setup": {"file_workspace_fixture": "local_ops_project"},
+      "request": {
+        "user_input": "请把这个文件 $file:docs/notes.md 里的 `Status: red` 改成 `Status: green`。要求：先读取文件拿到 sha，再用 filesystem.edit_file 做 targeted edit，最后再次读取文件确认结果。"
+      },
+      "expect": {
+        "selected_package": "filesystem",
+        "required_tools": ["filesystem.read_file", "filesystem.edit_file"],
+        "answer_contains_all": ["green"],
+        "tool_output_contains_all": ["Status: green", "changed"],
+        "filesystem_snapshot_contains_all": ["Status: green"],
+        "filesystem_snapshot_excludes_all": ["Status: red"],
+        "safety_review_count": 1,
+        "safety_review_tools": ["filesystem.edit_file"],
+        "safety_review_statuses": ["approved"],
+        "safety_review_modes": ["skip"],
+        "max_llm_calls": 10,
+        "max_wall_time_ms": 90000
+      }
+    },
+    {
+      "case_id": "hard_real_bash_readonly_search",
+      "name": "Use bash for a read-only search and summarize matching lines.",
+      "difficulty": "hard",
+      "llm_mode": "real",
+      "setup": {"file_workspace_fixture": "local_ops_project"},
+      "request": {
+        "user_input": "请在工作区 $workspace_root 里用 bash 只读命令查找 `TODO`，并告诉我匹配到的两条 TODO 内容。"
+      },
+      "expect": {
+        "selected_package": "bash",
+        "required_tools": ["bash.run"],
+        "answer_contains_all": ["summarize filesystem constraints", "verify bash command safety"],
+        "tool_output_contains_all": ["TODO: summarize filesystem constraints", "TODO: verify bash command safety", "read_only", "true"],
+        "safety_review_count": 0,
+        "max_llm_calls": 8,
+        "max_wall_time_ms": 60000
+      }
+    },
+    {
+      "case_id": "challenge_real_bash_write_then_verify",
+      "name": "Use bash for a non-read-only write and verify with a read-only command.",
+      "difficulty": "challenge",
+      "llm_mode": "real",
+      "setup": {"file_workspace_fixture": "local_ops_project"},
+      "request": {
+        "user_input": "请在工作区 $workspace_root 中用 bash 创建 outputs/llm_created.txt，内容必须精确为 `LLM_OK_742`。创建后再用只读命令读取该文件确认内容。"
+      },
+      "expect": {
+        "selected_package": "bash",
+        "required_tools": ["bash.run"],
+        "answer_contains_all": ["LLM_OK_742"],
+        "tool_output_contains_all": ["LLM_OK_742", "read_only", "false", "true"],
+        "filesystem_snapshot_contains_all": ["LLM_OK_742"],
+        "safety_review_count": 1,
+        "safety_review_tools": ["bash.run"],
+        "safety_review_statuses": ["approved"],
+        "safety_review_modes": ["skip"],
+        "max_llm_calls": 10,
+        "max_wall_time_ms": 90000
+      }
+    },
+    {
+      "case_id": "challenge_real_mixed_filesystem_edit_and_bash_verify",
+      "name": "Edit a config file with filesystem tools, then verify with bash.",
+      "difficulty": "challenge",
+      "llm_mode": "real",
+      "setup": {"file_workspace_fixture": "local_ops_project"},
+      "request": {
+        "user_input": "请把 $file:src/config.env 里的 `FEATURE_FLAG=false` 改成 `FEATURE_FLAG=true`。要求先用 filesystem 读取和编辑，编辑后再用 bash 在工作区 $workspace_root 里读取 src/config.env 验证。"
+      },
+      "expect": {
+        "selected_package": "filesystem",
+        "required_tools": ["filesystem.read_file", "filesystem.edit_file", "bash.run"],
+        "answer_contains_all": ["FEATURE_FLAG=true"],
+        "tool_output_contains_all": ["FEATURE_FLAG=true", "changed"],
+        "filesystem_snapshot_contains_all": ["FEATURE_FLAG=true"],
+        "filesystem_snapshot_excludes_all": ["FEATURE_FLAG=false"],
+        "safety_review_count": 1,
+        "safety_review_tools": ["filesystem.edit_file"],
+        "safety_review_statuses": ["approved"],
+        "safety_review_modes": ["skip"],
+        "max_llm_calls": 12,
+        "max_wall_time_ms": 120000
+      }
+    }
+  ]
+}

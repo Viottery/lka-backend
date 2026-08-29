@@ -56,7 +56,7 @@ def test_eval_smoke_suite_runs_with_isolated_runtime(tmp_path):
 
 
 def test_eval_suite_files_are_json_compatible_yaml():
-    for suite_path in Path("evals/suites").glob("*.yaml"):
+    for suite_path in Path("evals/suites").rglob("*.yaml"):
         suite = load_suite(suite_path)
         assert suite["suite_id"]
         assert suite["cases"]
@@ -122,3 +122,21 @@ def test_mail_search_metrics_quantify_recall_precision_mrr_and_forbidden():
     assert metrics["mail_search_mrr"].score == 0.5
     assert metrics["mail_search_forbidden_at_k"].passed is False
     assert metrics["mail_search_forbidden_at_k"].details["violations"] == ["msg_x"]
+
+
+def test_file_ops_eval_suites_run_with_isolated_runtime(tmp_path):
+    suite_paths = [
+        Path("evals/suites/file_ops/filesystem_tools.yaml"),
+        Path("evals/suites/file_ops/bash_tools.yaml"),
+        Path("evals/suites/file_ops/safety_review_tools.yaml"),
+    ]
+
+    for suite_path in suite_paths:
+        result = run_suite(
+            suite_path,
+            subject_name="runtime",
+            report_dir=tmp_path / "reports",
+        )
+
+        assert result["passed"] is True
+        assert result["case_count"] >= 1

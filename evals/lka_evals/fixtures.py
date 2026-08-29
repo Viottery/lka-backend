@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from hashlib import sha1
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,7 @@ def apply_setup(runtime: Any, setup: dict[str, Any] | None) -> dict[str, Any]:
     fixture_index: dict[str, Any] = {
         "mail": {"messages_by_external_id": {}, "account_ids": []},
         "matters": {"matter_ids": []},
+        "filesystem": {},
         "workspaces": [],
     }
     mail_fixtures = setup.get("mail_fixtures")
@@ -71,6 +73,52 @@ def apply_setup(runtime: Any, setup: dict[str, Any] | None) -> dict[str, Any]:
     return fixture_index
 
 
+def prepare_filesystem_fixture(
+    *,
+    temp_path: Path,
+    setup: dict[str, Any] | None,
+) -> dict[str, Any]:
+    setup = setup or {}
+    fixture_name = setup.get("file_workspace_fixture")
+    if not isinstance(fixture_name, str) or not fixture_name:
+        return {}
+
+    source = FIXTURE_ROOT / "files" / fixture_name
+    if not source.exists() or not source.is_dir():
+        raise ValueError(f"File workspace fixture not found: {source}")
+    target = temp_path / "file_workspaces" / fixture_name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source, target)
+    return _index_filesystem_fixture(target)
+
+
+def snapshot_filesystem_fixture(fixture_index: dict[str, Any]) -> dict[str, Any]:
+    filesystem = fixture_index.get("filesystem")
+    if not isinstance(filesystem, dict):
+        return {}
+    root_value = filesystem.get("workspace_root")
+    if not isinstance(root_value, str) or not root_value:
+        return {}
+    root = Path(root_value)
+    snapshot: dict[str, Any] = {"files": {}}
+    if not root.exists() or not root.is_dir():
+        return snapshot
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        relative_path = path.relative_to(root).as_posix()
+        try:
+            content = path.read_text(encoding="utf-8")
+        except UnicodeError:
+            content = ""
+        snapshot["files"][relative_path] = {
+            "exists": True,
+            "sha256": _sha256(path),
+            "content": content,
+        }
+    return snapshot
+
+
 def _import_mail_fixture(runtime: Any, fixture_name: str, fixture_index: dict[str, Any]) -> None:
     relative_path = fixture_name
     if not relative_path.endswith(".json"):
@@ -103,3 +151,23 @@ def _stable_id(prefix: str, *parts: str | None) -> str:
     text = "|".join(part or "" for part in parts)
     digest = sha1(text.encode("utf-8")).hexdigest()[:12]
     return f"{prefix}_{digest}"
+
+
+def _index_filesystem_fixture(root: Path) -> dict[str, Any]:
+    files: dict[str, Any] = {}
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        relative_path = path.relative_to(root).as_posix()
+        files[relative_path] = {
+            "path": path.as_posix(),
+            "sha256": _sha256(path),
+            "size_bytes": path.stat().st_size,
+        }
+    return {"workspace_root": root.as_posix(), "files": files}
+
+
+def _sha256(path: Path) -> str:
+    import hashlib
+
+    return hashlib.sha256(path.read_bytes()).hexdigest()

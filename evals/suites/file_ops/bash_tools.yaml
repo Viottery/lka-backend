@@ -1,0 +1,140 @@
+{
+  "suite_id": "file_ops_bash_tools",
+  "description": "Bash tool benchmark with easy/medium/hard cases for read-only classification, write gating, and background session polling.",
+  "cases": [
+    {
+      "case_id": "easy_read_only_rg",
+      "name": "Run a read-only rg command without safety approval.",
+      "difficulty": "easy",
+      "operation": "tool_sequence",
+      "setup": {"file_workspace_fixture": "local_ops_project"},
+      "params": {
+        "steps": [
+          {
+            "tool_name": "bash.run",
+            "tool_input": {
+              "command": "rg TODO docs/notes.md",
+              "cwd": "$workspace_root",
+              "mode": "sync"
+            }
+          }
+        ]
+      },
+      "request": {"user_input": "在工作区中搜索 TODO。"},
+      "expect": {
+        "tool_sequence": ["bash.run"],
+        "required_tools": ["bash.run"],
+        "tool_statuses": ["completed"],
+        "tool_output_contains_all": ["read_only", "true", "TODO: summarize filesystem constraints"],
+        "safety_review_count": 0,
+        "max_wall_time_ms": 3000
+      }
+    },
+    {
+      "case_id": "medium_reject_unapproved_write_command",
+      "name": "Reject a non-read-only write command without approved safety review.",
+      "difficulty": "medium",
+      "operation": "tool_sequence",
+      "setup": {"file_workspace_fixture": "local_ops_project"},
+      "params": {
+        "steps": [
+          {
+            "tool_name": "bash.run",
+            "tool_input": {
+              "command": "printf blocked > outputs/block.txt",
+              "cwd": "$workspace_root",
+              "mode": "sync"
+            }
+          }
+        ]
+      },
+      "request": {"user_input": "尝试未审批的 shell 写入，必须阻止。"},
+      "expect": {
+        "tool_sequence": ["bash.run"],
+        "required_tools": ["bash.run"],
+        "tool_statuses": ["rejected"],
+        "min_tool_success_rate": 0.0,
+        "tool_output_contains_all": ["safety_review_required", "read_only", "false"],
+        "filesystem_snapshot_excludes_all": ["blocked"],
+        "max_wall_time_ms": 3000
+      }
+    },
+    {
+      "case_id": "medium_approved_write_then_read",
+      "name": "Allow an approved non-read-only write command and verify output.",
+      "difficulty": "medium",
+      "operation": "tool_sequence",
+      "setup": {"file_workspace_fixture": "local_ops_project"},
+      "params": {
+        "steps": [
+          {
+            "tool_name": "bash.run",
+            "safety_review_approved": true,
+            "tool_input": {
+              "command": "printf approved > outputs/approved.txt",
+              "cwd": "$workspace_root",
+              "mode": "sync"
+            }
+          },
+          {
+            "tool_name": "bash.run",
+            "tool_input": {
+              "command": "cat outputs/approved.txt",
+              "cwd": "$workspace_root",
+              "mode": "sync"
+            }
+          }
+        ]
+      },
+      "request": {"user_input": "执行已审批的写入命令并读取结果。"},
+      "expect": {
+        "tool_sequence": ["bash.run", "bash.run"],
+        "required_tools": ["bash.run"],
+        "tool_statuses": ["completed", "completed"],
+        "tool_output_contains_all": ["approved", "read_only", "false", "true"],
+        "filesystem_snapshot_contains_all": ["approved"],
+        "max_wall_time_ms": 3000
+      }
+    },
+    {
+      "case_id": "hard_background_session_polling",
+      "name": "Start a background terminal and poll output from the session.",
+      "difficulty": "hard",
+      "operation": "tool_sequence",
+      "setup": {"file_workspace_fixture": "local_ops_project"},
+      "params": {
+        "steps": [
+          {
+            "tool_name": "bash.run",
+            "safety_review_approved": true,
+            "tool_input": {
+              "command": "printf 'phase1\\n'; sleep 0.2; printf 'phase2\\n'",
+              "cwd": "$workspace_root",
+              "mode": "background"
+            }
+          },
+          {
+            "wait_seconds": 0.4,
+            "tool_name": "bash.read_session",
+            "tool_input": {
+              "session_id": "$bash_session_id_from_last_run",
+              "offset": 0
+            }
+          },
+          {
+            "tool_name": "bash.list_sessions",
+            "tool_input": {"active_only": false}
+          }
+        ]
+      },
+      "request": {"user_input": "启动后台命令并轮询输出。"},
+      "expect": {
+        "tool_sequence": ["bash.run", "bash.read_session", "bash.list_sessions"],
+        "required_tools": ["bash.run", "bash.read_session", "bash.list_sessions"],
+        "tool_statuses": ["completed", "completed", "completed"],
+        "tool_output_contains_all": ["phase1", "phase2", "bash_session_", "exited"],
+        "max_wall_time_ms": 5000
+      }
+    }
+  ]
+}

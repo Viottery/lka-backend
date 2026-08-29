@@ -232,7 +232,7 @@ class EvalScriptedLLM:
         tool_input = step.get("tool_input") if isinstance(step.get("tool_input"), dict) else {}
         return _tool_call_decision(
             tool_name=tool_name,
-            tool_input=_resolve_placeholders(tool_input, observations),
+            tool_input=_resolve_placeholders(tool_input, observations, self.case),
             message=str(step.get("message") or f"调用 {tool_name}。"),
         )
 
@@ -400,17 +400,35 @@ def _expanded_package_names_from_case(case: dict[str, Any]) -> set[str]:
     return {str(item) for item in value}
 
 
-def _resolve_placeholders(value: Any, observations: list[dict[str, Any]]) -> Any:
+def _resolve_placeholders(value: Any, observations: list[dict[str, Any]], case: dict[str, Any]) -> Any:
     if isinstance(value, dict):
         return {
-            key: _resolve_placeholders(item, observations)
+            key: _resolve_placeholders(item, observations, case)
             for key, item in value.items()
         }
     if isinstance(value, list):
-        return [_resolve_placeholders(item, observations) for item in value]
+        return [_resolve_placeholders(item, observations, case) for item in value]
     if value == "$matter_id_from_create":
         matter_id = _matter_id_from_create(observations)
         return matter_id or ""
+    if isinstance(value, str) and value == "$workspace_root":
+        filesystem = _fixture_filesystem(case)
+        return str(filesystem.get("workspace_root") or "")
+    if isinstance(value, str) and value.startswith("$file:"):
+        relative_path = value.split(":", 1)[1]
+        filesystem = _fixture_filesystem(case)
+        files = filesystem.get("files")
+        item = files.get(relative_path) if isinstance(files, dict) else None
+        return str(item.get("path") or "") if isinstance(item, dict) else ""
+    if value == "$sha256_from_read_file":
+        sha256 = _sha256_from_read_file(observations)
+        return sha256 or ""
+    if value == "$bash_session_id_from_last_run":
+        session_id = _bash_session_id_from_last_run(observations)
+        return session_id or ""
+    if value == "$bash_next_offset_from_last_read":
+        offset = _bash_next_offset_from_last_read(observations)
+        return offset if offset is not None else 0
     return value
 
 
@@ -423,4 +441,45 @@ def _matter_id_from_create(observations: list[dict[str, Any]]) -> str | None:
         matter = output.get("matter") if isinstance(output, dict) else None
         if isinstance(matter, dict) and matter.get("matter_id"):
             return str(matter["matter_id"])
+    return None
+
+
+def _fixture_filesystem(case: dict[str, Any]) -> dict[str, Any]:
+    fixture_index = case.get("_eval_fixture_index")
+    if not isinstance(fixture_index, dict):
+        return {}
+    filesystem = fixture_index.get("filesystem")
+    return filesystem if isinstance(filesystem, dict) else {}
+
+
+def _sha256_from_read_file(observations: list[dict[str, Any]]) -> str | None:
+    for observation in reversed(observations):
+        if observation.get("tool_name") != "filesystem.read_file":
+            continue
+        result = observation.get("result") if isinstance(observation.get("result"), dict) else {}
+        output = result.get("output") if isinstance(result, dict) else {}
+        if isinstance(output, dict) and isinstance(output.get("sha256"), str):
+            return output["sha256"]
+    return None
+
+
+def _bash_session_id_from_last_run(observations: list[dict[str, Any]]) -> str | None:
+    for observation in reversed(observations):
+        if observation.get("tool_name") != "bash.run":
+            continue
+        result = observation.get("result") if isinstance(observation.get("result"), dict) else {}
+        output = result.get("output") if isinstance(result, dict) else {}
+        if isinstance(output, dict) and isinstance(output.get("session_id"), str):
+            return output["session_id"]
+    return None
+
+
+def _bash_next_offset_from_last_read(observations: list[dict[str, Any]]) -> int | None:
+    for observation in reversed(observations):
+        if observation.get("tool_name") != "bash.read_session":
+            continue
+        result = observation.get("result") if isinstance(observation.get("result"), dict) else {}
+        output = result.get("output") if isinstance(result, dict) else {}
+        if isinstance(output, dict) and isinstance(output.get("next_offset"), int):
+            return int(output["next_offset"])
     return None

@@ -1,0 +1,3 @@
+duplicate target
+stable context line
+duplicate target

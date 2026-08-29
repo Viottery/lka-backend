@@ -66,9 +66,11 @@ Each case supports:
 
 - `case_id`
 - `operation`: defaults to `agent_turn`; direct runtime operations include
-  `health`, `capabilities`, and `workspace_index`
+  `health`, `capabilities`, `workspace_index`, and `tool_sequence`
 - `workflow`: currently `mail_qa` or `mail_to_matter`
+- `difficulty`: optional label such as `easy`, `medium`, or `hard`
 - `setup.mail_fixtures`: virtual fixture datasets from `evals/fixtures/mail`
+- `setup.file_workspace_fixture`: isolated file workspace from `evals/fixtures/files`
 - `request.session_id`
 - `request.user_input`
 - `search_query`: query used by the scripted runtime LLM
@@ -129,6 +131,14 @@ sidecar artifact, but the first version intentionally evaluates the current log.
 - `workspace_min_files`
 - `workspace_min_chunks`
 - `tool_output_contains_all`
+- `tool_output_excludes_all`
+- `tool_statuses_match`
+- `filesystem_snapshot_contains_all`
+- `filesystem_snapshot_excludes_all`
+- `safety_review_count`
+- `safety_review_tools`
+- `safety_review_statuses`
+- `safety_review_modes`
 - `evidence_recall_at_k`
 - `loaded_required_messages`
 - `mail_search_recall_at_k`
@@ -159,6 +169,8 @@ gating with `mail_search_min_precision_at_k` or `mail_search_min_mrr`.
 
 - creating a temporary data directory;
 - setting `LKA_DATA_DIR` to that directory;
+- copying `setup.file_workspace_fixture` into a temporary workspace and setting
+  `LKA_WORKSPACE_ROOTS` before runtime creation;
 - setting `LKA_LOCAL_CONFIG` to a missing temp file so no real provider config is loaded;
 - clearing `get_settings()` cache before and after each case;
 - importing only virtual fixtures specified by the case.
@@ -182,3 +194,11 @@ No benchmark case should depend on or mutate the user's real mailbox.
 - `capabilities`: direct health and capability catalog contracts.
 - `failure_recovery`: deterministic failure-budget contracts.
 - `stream_contract`: SSE contract for `--subject stream` against a disposable backend.
+- `file_ops/filesystem_tools`: easy/medium/hard filesystem read/edit contracts.
+- `file_ops/bash_tools`: easy/medium/hard bash read-only, write-gating, and
+  background-session contracts.
+- `file_ops/safety_review_tools`: scripted Agent-turn coverage for non-read-only
+  filesystem and bash calls that must record skip-mode safety reviews.
+- `file_ops/real_llm_file_bash_tasks`: real LLM Agent-turn file/bash tasks
+  without `tool_plan` or `scripted_answer`; run with `--llm-mode real` and a
+  real `--local-config`.

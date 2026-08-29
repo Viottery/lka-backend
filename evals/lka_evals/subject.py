@@ -17,9 +17,14 @@ from urllib.request import Request, urlopen
 from app.api.main import create_app
 from app.core.config import get_settings
 from app.core.llm import LLMResponseMode
+from app.core.tools import ToolContext
 from app.domains.matters import MatterCreateInput, MatterSourceLinkInput, MatterUpdateInput
 
-from evals.lka_evals.fixtures import apply_setup
+from evals.lka_evals.fixtures import (
+    apply_setup,
+    prepare_filesystem_fixture,
+    snapshot_filesystem_fixture,
+)
 from evals.lka_evals.log_parser import parse_agent_log
 from evals.lka_evals.scripted_llm import EvalScriptedLLM
 
@@ -61,12 +66,19 @@ class RuntimeSubject:
             old_env = {
                 "LKA_DATA_DIR": os.environ.get("LKA_DATA_DIR"),
                 "LKA_LOCAL_CONFIG": os.environ.get("LKA_LOCAL_CONFIG"),
+                "LKA_WORKSPACE_ROOTS": os.environ.get("LKA_WORKSPACE_ROOTS"),
             }
             os.environ["LKA_DATA_DIR"] = str(temp_path / "data")
             local_config = self._local_config_for(case)
             os.environ["LKA_LOCAL_CONFIG"] = (
                 str(local_config) if local_config is not None else str(temp_path / "missing-local.toml")
             )
+            filesystem_index = prepare_filesystem_fixture(
+                temp_path=temp_path,
+                setup=case.get("setup"),
+            )
+            if filesystem_index.get("workspace_root"):
+                os.environ["LKA_WORKSPACE_ROOTS"] = str(filesystem_index["workspace_root"])
             get_settings.cache_clear()
             fixture_index: dict[str, Any] = {}
             try:
@@ -74,9 +86,18 @@ class RuntimeSubject:
                 runtime = app.state.runtime
                 runtime.agent_turn_loop.default_rate_limit_wait_seconds = 0.0
                 fixture_index = apply_setup(runtime, case.get("setup"))
+                if filesystem_index:
+                    fixture_index["filesystem"] = filesystem_index
+                request_payload = _resolve_eval_placeholders(
+                    request_payload,
+                    fixture_index=fixture_index,
+                    previous_results=[],
+                )
                 effective_llm_mode = self._llm_mode_for(case)
                 if effective_llm_mode == "scripted":
-                    runtime.agent_turn_loop.llm_client = EvalScriptedLLM(case)
+                    runtime.agent_turn_loop.llm_client = EvalScriptedLLM(
+                        {**case, "_eval_fixture_index": fixture_index}
+                    )
                 elif runtime.agent_turn_loop.llm_client is None:
                     raise RuntimeError(
                         "Real LLM mode requested, but no LLM client was configured. "
@@ -92,6 +113,13 @@ class RuntimeSubject:
                         llm_response_mode=_response_mode(request_payload),
                     )
                     result = response.model_dump(mode="json")
+                    result["safety_reviews"] = [
+                        review.model_dump(mode="json")
+                        for review in runtime.agent_run_manager.list_safety_reviews(response.run_id)
+                    ]
+                    filesystem_snapshot = snapshot_filesystem_fixture(fixture_index)
+                    if filesystem_snapshot:
+                        result["filesystem_snapshot"] = filesystem_snapshot
                     log = parse_agent_log(result.get("log_path"))
                 else:
                     result = _run_direct_operation(
@@ -100,6 +128,9 @@ class RuntimeSubject:
                         temp_path=temp_path,
                         fixture_index=fixture_index,
                     )
+                    filesystem_snapshot = snapshot_filesystem_fixture(fixture_index)
+                    if filesystem_snapshot:
+                        result["filesystem_snapshot"] = filesystem_snapshot
                     log = {}
                 error = None
             except Exception as exc:
@@ -354,7 +385,112 @@ def _run_direct_operation(
             source_link=MatterSourceLinkInput.model_validate(params.get("source_link") or {}),
         )
         return {"operation": operation, "output": {"matter": matter.model_dump(mode="json")}}
+    if operation == "tool_sequence":
+        return _run_tool_sequence(runtime=runtime, case=case, fixture_index=fixture_index)
     raise ValueError(f"Unsupported direct operation: {operation}")
+
+
+def _run_tool_sequence(
+    *,
+    runtime: Any,
+    case: dict[str, Any],
+    fixture_index: dict[str, Any],
+) -> dict[str, Any]:
+    params = case.get("params") if isinstance(case.get("params"), dict) else {}
+    steps = params.get("steps")
+    steps = steps if isinstance(steps, list) else []
+    session_id = str(params.get("session_id") or f"eval_tool_sequence_{case.get('case_id') or 'case'}")
+    trace_id = str(params.get("trace_id") or f"eval_trace_{case.get('case_id') or 'case'}")
+    tool_events: list[dict[str, Any]] = []
+    previous_results: list[dict[str, Any]] = []
+    for index, step in enumerate(steps, start=1):
+        if not isinstance(step, dict):
+            continue
+        wait_seconds = step.get("wait_seconds")
+        if isinstance(wait_seconds, int | float) and wait_seconds > 0:
+            time.sleep(float(wait_seconds))
+        tool_name = str(step.get("tool_name") or "")
+        tool_input = _resolve_eval_placeholders(
+            step.get("tool_input") if isinstance(step.get("tool_input"), dict) else {},
+            fixture_index=fixture_index,
+            previous_results=previous_results,
+        )
+        approved = bool(step.get("safety_review_approved"))
+        result = runtime.tool_executor.execute(
+            invocation_id=str(step.get("invocation_id") or f"eval_tool_{index:03d}"),
+            tool_name=tool_name,
+            tool_input=tool_input,
+            context=ToolContext(
+                session_id=session_id,
+                trace_id=trace_id,
+                safety_review_approved=approved,
+                safety_review_id=str(step.get("safety_review_id") or f"eval_review_{index:03d}")
+                if approved
+                else None,
+            ),
+        )
+        payload = result.model_dump(mode="json")
+        tool_events.append({"tool_name": tool_name, "input": tool_input, "result": payload})
+        previous_results.append(payload)
+        if result.status != "completed" and not bool(step.get("continue_on_failure", True)):
+            break
+    return {"operation": "tool_sequence", "tool_events": tool_events}
+
+
+def _resolve_eval_placeholders(
+    value: Any,
+    *,
+    fixture_index: dict[str, Any],
+    previous_results: list[dict[str, Any]],
+) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _resolve_eval_placeholders(
+                item,
+                fixture_index=fixture_index,
+                previous_results=previous_results,
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _resolve_eval_placeholders(
+                item,
+                fixture_index=fixture_index,
+                previous_results=previous_results,
+            )
+            for item in value
+        ]
+    if not isinstance(value, str):
+        return value
+    if value == "$workspace_root":
+        filesystem = fixture_index.get("filesystem")
+        return str(filesystem.get("workspace_root") or "") if isinstance(filesystem, dict) else ""
+    if value.startswith("$file:"):
+        relative_path = value.split(":", 1)[1]
+        filesystem = fixture_index.get("filesystem")
+        files = filesystem.get("files") if isinstance(filesystem, dict) else {}
+        item = files.get(relative_path) if isinstance(files, dict) else None
+        return str(item.get("path") or "") if isinstance(item, dict) else ""
+    if value == "$sha256_from_read_file":
+        for result in reversed(previous_results):
+            output = result.get("output") if isinstance(result, dict) else {}
+            if isinstance(output, dict) and isinstance(output.get("sha256"), str):
+                return output["sha256"]
+        return ""
+    if value == "$bash_session_id_from_last_run":
+        for result in reversed(previous_results):
+            output = result.get("output") if isinstance(result, dict) else {}
+            if isinstance(output, dict) and isinstance(output.get("session_id"), str):
+                return output["session_id"]
+        return ""
+    if value == "$bash_next_offset_from_last_read":
+        for result in reversed(previous_results):
+            output = result.get("output") if isinstance(result, dict) else {}
+            if isinstance(output, dict) and isinstance(output.get("next_offset"), int):
+                return output["next_offset"]
+        return 0
+    return value
 
 
 def _prepare_workspace_fixture(*, temp_path: Path, fixture: str) -> Path:

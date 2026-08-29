@@ -1,0 +1,121 @@
+{
+  "suite_id": "file_ops_filesystem_tools",
+  "description": "Filesystem tool benchmark with easy/medium/hard cases for explicit file reads, safe targeted edits, and stale/ambiguous edit rejection.",
+  "cases": [
+    {
+      "case_id": "easy_read_bounded_slice",
+      "name": "Read a bounded slice from an explicit file path.",
+      "difficulty": "easy",
+      "operation": "tool_sequence",
+      "setup": {"file_workspace_fixture": "local_ops_project"},
+      "params": {
+        "steps": [
+          {
+            "tool_name": "filesystem.read_file",
+            "tool_input": {
+              "path": "$file:docs/notes.md",
+              "start_line": 1,
+              "max_lines": 4
+            }
+          }
+        ]
+      },
+      "request": {"user_input": "读取 docs/notes.md 的前几行。"},
+      "expect": {
+        "tool_sequence": ["filesystem.read_file"],
+        "required_tools": ["filesystem.read_file"],
+        "tool_statuses": ["completed"],
+        "tool_output_contains_all": ["Local Ops Notes", "Status: red", "sha256", "truncated"],
+        "max_wall_time_ms": 2000
+      }
+    },
+    {
+      "case_id": "medium_edit_with_read_sha",
+      "name": "Read before editing and apply a targeted replacement with expected sha.",
+      "difficulty": "medium",
+      "operation": "tool_sequence",
+      "setup": {"file_workspace_fixture": "local_ops_project"},
+      "params": {
+        "steps": [
+          {
+            "tool_name": "filesystem.read_file",
+            "tool_input": {"path": "$file:docs/notes.md"}
+          },
+          {
+            "tool_name": "filesystem.edit_file",
+            "safety_review_approved": true,
+            "tool_input": {
+              "path": "$file:docs/notes.md",
+              "expected_sha256": "$sha256_from_read_file",
+              "edits": [
+                {"old_text": "Status: red", "new_text": "Status: green"}
+              ]
+            }
+          },
+          {
+            "tool_name": "filesystem.read_file",
+            "tool_input": {"path": "$file:docs/notes.md"}
+          }
+        ]
+      },
+      "request": {"user_input": "把 docs/notes.md 的状态从 red 改为 green。"},
+      "expect": {
+        "tool_sequence": ["filesystem.read_file", "filesystem.edit_file", "filesystem.read_file"],
+        "required_tools": ["filesystem.read_file", "filesystem.edit_file"],
+        "tool_statuses": ["completed", "completed", "completed"],
+        "tool_output_contains_all": ["changed", "sha256_before", "sha256_after", "Status: green"],
+        "filesystem_snapshot_contains_all": ["Status: green"],
+        "filesystem_snapshot_excludes_all": ["Status: red"],
+        "max_wall_time_ms": 3000
+      }
+    },
+    {
+      "case_id": "hard_reject_stale_and_ambiguous_edits",
+      "name": "Reject stale sha and ambiguous replacement without changing the file.",
+      "difficulty": "hard",
+      "operation": "tool_sequence",
+      "setup": {"file_workspace_fixture": "local_ops_project"},
+      "params": {
+        "steps": [
+          {
+            "tool_name": "filesystem.edit_file",
+            "safety_review_approved": true,
+            "tool_input": {
+              "path": "$file:docs/notes.md",
+              "expected_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+              "edits": [
+                {"old_text": "Status: red", "new_text": "Status: green"}
+              ]
+            }
+          },
+          {
+            "tool_name": "filesystem.read_file",
+            "tool_input": {"path": "$file:repeated.txt"}
+          },
+          {
+            "tool_name": "filesystem.edit_file",
+            "safety_review_approved": true,
+            "tool_input": {
+              "path": "$file:repeated.txt",
+              "expected_sha256": "$sha256_from_read_file",
+              "edits": [
+                {"old_text": "duplicate target", "new_text": "patched target"}
+              ]
+            }
+          }
+        ]
+      },
+      "request": {"user_input": "尝试在过期和非唯一上下文下修改文件，应该被拒绝。"},
+      "expect": {
+        "tool_sequence": ["filesystem.edit_file", "filesystem.read_file", "filesystem.edit_file"],
+        "required_tools": ["filesystem.edit_file", "filesystem.read_file"],
+        "tool_statuses": ["failed", "completed", "failed"],
+        "min_tool_success_rate": 0.3,
+        "tool_output_contains_all": ["expected_sha256 does not match", "matched 2 times; expected 1"],
+        "filesystem_snapshot_contains_all": ["Status: red", "duplicate target"],
+        "filesystem_snapshot_excludes_all": ["Status: green", "patched target"],
+        "max_wall_time_ms": 3000
+      }
+    }
+  ]
+}

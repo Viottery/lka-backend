@@ -51,6 +51,32 @@ def evaluate_case(case: dict[str, Any], artifact: EvalRunArtifact) -> list[Metri
         metrics.append(_workspace_min_chunks(artifact, expected.get("workspace_min_chunks")))
     if "tool_output_contains_all" in expected:
         metrics.append(_tool_output_contains_all(artifact, expected.get("tool_output_contains_all")))
+    if "tool_output_excludes_all" in expected:
+        metrics.append(_tool_output_excludes_all(artifact, expected.get("tool_output_excludes_all")))
+    if "tool_statuses" in expected:
+        metrics.append(_tool_statuses_match(artifact, expected.get("tool_statuses")))
+    if "filesystem_snapshot_contains_all" in expected:
+        metrics.append(
+            _filesystem_snapshot_contains_all(
+                artifact,
+                expected.get("filesystem_snapshot_contains_all"),
+            )
+        )
+    if "filesystem_snapshot_excludes_all" in expected:
+        metrics.append(
+            _filesystem_snapshot_excludes_all(
+                artifact,
+                expected.get("filesystem_snapshot_excludes_all"),
+            )
+        )
+    if "safety_review_count" in expected:
+        metrics.append(_safety_review_count(artifact, expected.get("safety_review_count")))
+    if "safety_review_tools" in expected:
+        metrics.append(_safety_review_tools(artifact, expected.get("safety_review_tools")))
+    if "safety_review_statuses" in expected:
+        metrics.append(_safety_review_statuses(artifact, expected.get("safety_review_statuses")))
+    if "safety_review_modes" in expected:
+        metrics.append(_safety_review_modes(artifact, expected.get("safety_review_modes")))
     if "evidence_external_ids" in expected:
         metrics.append(_evidence_message_recall(artifact, expected.get("evidence_external_ids")))
         metrics.append(_loaded_required_messages(artifact, expected.get("evidence_external_ids")))
@@ -84,7 +110,7 @@ def evaluate_case(case: dict[str, Any], artifact: EvalRunArtifact) -> list[Metri
 
     metrics.extend(
         [
-            _tool_success_rate(artifact),
+            _tool_success_rate(artifact, expected.get("min_tool_success_rate")),
             _schema_rejection_count(artifact, expected.get("max_schema_rejections", 0)),
             _llm_call_count(artifact, expected.get("max_llm_calls")),
             _reported_token_total(artifact, expected.get("max_total_tokens")),
@@ -310,6 +336,119 @@ def _tool_output_contains_all(artifact: EvalRunArtifact, expected: Any) -> Metri
     )
 
 
+def _tool_output_excludes_all(artifact: EvalRunArtifact, expected: Any) -> MetricResult:
+    forbidden = _string_list(expected)
+    text = _tool_events_text(artifact)
+    violations = [item for item in forbidden if item in text]
+    return MetricResult(
+        name="tool_output_excludes_all",
+        score=0.0 if violations else 1.0,
+        passed=not violations,
+        details={"violations": violations},
+        weight=2.0,
+    )
+
+
+def _tool_statuses_match(artifact: EvalRunArtifact, expected: Any) -> MetricResult:
+    expected_list = _string_list(expected)
+    actual = []
+    for event in artifact.result.get("tool_events", []):
+        if not isinstance(event, dict):
+            continue
+        result = event.get("result") if isinstance(event.get("result"), dict) else {}
+        actual.append(str(result.get("status") or ""))
+    passed = actual == expected_list
+    return MetricResult(
+        name="tool_statuses_match",
+        score=_sequence_score(actual, expected_list),
+        passed=passed,
+        details={"expected": expected_list, "actual": actual},
+        weight=2.0,
+    )
+
+
+def _filesystem_snapshot_contains_all(artifact: EvalRunArtifact, expected: Any) -> MetricResult:
+    required = _string_list(expected)
+    text = _filesystem_snapshot_text(artifact)
+    missing = [item for item in required if item not in text]
+    return MetricResult(
+        name="filesystem_snapshot_contains_all",
+        score=1.0 - (len(missing) / len(required)) if required else 1.0,
+        passed=not missing,
+        details={"missing": missing},
+        weight=2.0,
+    )
+
+
+def _filesystem_snapshot_excludes_all(artifact: EvalRunArtifact, expected: Any) -> MetricResult:
+    forbidden = _string_list(expected)
+    text = _filesystem_snapshot_text(artifact)
+    violations = [item for item in forbidden if item in text]
+    return MetricResult(
+        name="filesystem_snapshot_excludes_all",
+        score=0.0 if violations else 1.0,
+        passed=not violations,
+        details={"violations": violations},
+        weight=2.0,
+    )
+
+
+def _safety_review_count(artifact: EvalRunArtifact, expected: Any) -> MetricResult:
+    expected_count = int(expected) if isinstance(expected, int) else 0
+    actual = len(_safety_reviews(artifact))
+    return MetricResult(
+        name="safety_review_count",
+        score=1.0 if actual == expected_count else 0.0,
+        passed=actual == expected_count,
+        details={"expected": expected_count, "actual": actual},
+    )
+
+
+def _safety_review_tools(artifact: EvalRunArtifact, expected: Any) -> MetricResult:
+    expected_list = _string_list(expected)
+    actual = [
+        str(review.get("tool_name"))
+        for review in _safety_reviews(artifact)
+        if review.get("tool_name")
+    ]
+    return MetricResult(
+        name="safety_review_tools",
+        score=_sequence_score(actual, expected_list),
+        passed=actual == expected_list,
+        details={"expected": expected_list, "actual": actual},
+    )
+
+
+def _safety_review_statuses(artifact: EvalRunArtifact, expected: Any) -> MetricResult:
+    expected_list = _string_list(expected)
+    actual = [
+        str(review.get("status"))
+        for review in _safety_reviews(artifact)
+        if review.get("status")
+    ]
+    return MetricResult(
+        name="safety_review_statuses",
+        score=_sequence_score(actual, expected_list),
+        passed=actual == expected_list,
+        details={"expected": expected_list, "actual": actual},
+    )
+
+
+def _safety_review_modes(artifact: EvalRunArtifact, expected: Any) -> MetricResult:
+    expected_list = _string_list(expected)
+    actual = [
+        str(review.get("mode"))
+        for review in _safety_reviews(artifact)
+        if review.get("mode")
+    ]
+    return MetricResult(
+        name="safety_review_modes",
+        score=_sequence_score(actual, expected_list),
+        passed=actual == expected_list,
+        details={"expected": expected_list, "actual": actual},
+    )
+
+
 def _evidence_message_recall(artifact: EvalRunArtifact, expected: Any) -> MetricResult:
     expected_ids = _expected_message_ids(artifact, expected)
     seen = set()
@@ -529,7 +668,7 @@ def _matter_source_link_recall(artifact: EvalRunArtifact, expected: Any) -> Metr
     )
 
 
-def _tool_success_rate(artifact: EvalRunArtifact) -> MetricResult:
+def _tool_success_rate(artifact: EvalRunArtifact, minimum: Any) -> MetricResult:
     events = [event for event in artifact.result.get("tool_events", []) if isinstance(event, dict)]
     if not events:
         return MetricResult(
@@ -544,11 +683,12 @@ def _tool_success_rate(artifact: EvalRunArtifact) -> MetricResult:
         if result.get("status") == "completed":
             completed += 1
     score = completed / len(events)
+    minimum_rate = float(minimum) if isinstance(minimum, int | float) else 1.0
     return MetricResult(
         name="tool_success_rate",
         score=round(score, 4),
-        passed=score == 1.0,
-        details={"completed": completed, "total": len(events)},
+        passed=score >= minimum_rate,
+        details={"completed": completed, "total": len(events), "minimum": minimum_rate},
     )
 
 
@@ -559,7 +699,12 @@ def _schema_rejection_count(artifact: EvalRunArtifact, maximum: Any) -> MetricRe
         if not isinstance(event, dict):
             continue
         result = event.get("result") if isinstance(event.get("result"), dict) else {}
-        if result.get("status") == "rejected":
+        output = result.get("output") if isinstance(result, dict) else {}
+        if (
+            result.get("status") == "rejected"
+            and isinstance(output, dict)
+            and output.get("validation_errors")
+        ):
             rejected += 1
     return MetricResult(
         name="schema_rejection_count",
@@ -648,6 +793,24 @@ def _tool_names(artifact: EvalRunArtifact) -> list[str]:
         for event in artifact.result.get("tool_events", [])
         if isinstance(event, dict) and event.get("tool_name")
     ]
+
+
+def _tool_events_text(artifact: EvalRunArtifact) -> str:
+    return " ".join(
+        _json_text(event.get("result"))
+        for event in artifact.result.get("tool_events", [])
+        if isinstance(event, dict)
+    )
+
+
+def _filesystem_snapshot_text(artifact: EvalRunArtifact) -> str:
+    snapshot = artifact.result.get("filesystem_snapshot")
+    return _json_text(snapshot if isinstance(snapshot, dict) else {})
+
+
+def _safety_reviews(artifact: EvalRunArtifact) -> list[dict[str, Any]]:
+    reviews = artifact.result.get("safety_reviews")
+    return [review for review in reviews if isinstance(review, dict)] if isinstance(reviews, list) else []
 
 
 def _expected_message_ids(artifact: EvalRunArtifact, expected_external_ids: Any) -> list[str]:
@@ -742,3 +905,17 @@ def _counts(values: list[str]) -> dict[str, int]:
     for value in values:
         counts[value] = counts.get(value, 0) + 1
     return counts
+
+
+def _sequence_score(actual: list[str], expected: list[str]) -> float:
+    if actual == expected:
+        return 1.0
+    if not expected and not actual:
+        return 1.0
+    if not expected or not actual:
+        return 0.0
+    overlap = sum(
+        min(_counts(actual).get(key, 0), _counts(expected).get(key, 0))
+        for key in set(expected)
+    )
+    return round(overlap / max(len(expected), len(actual)), 4)
