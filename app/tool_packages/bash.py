@@ -38,6 +38,7 @@ READ_ONLY_COMMANDS = {
     "head",
     "ls",
     "nl",
+    "printenv",
     "pwd",
     "rg",
     "sed",
@@ -64,7 +65,8 @@ BASH_PACKAGE = ToolPackageSpec(
     description=(
         "Run bash commands in configured workspace roots. Supports synchronous commands, "
         "background terminal sessions, output polling, stdin writes, Ctrl-C, termination, "
-        "and active session listing."
+        "active session listing, workspace-relative cwd values, and injected workspace "
+        "environment variables."
     ),
     risk="high",
     requires_expansion=True,
@@ -73,10 +75,13 @@ BASH_PACKAGE = ToolPackageSpec(
         "Use filesystem.read_file/edit_file for precise file reading or targeted file edits when possible.",
     ],
     decision_hints=[
-        "Prefer read-only commands first, such as pwd, ls, find, rg, grep, cat, sed, head, tail, wc, git status, git diff, git log, and git show.",
+        "Prefer read-only commands first, such as pwd, printenv, ls, find, rg, grep, cat, sed, head, tail, wc, git status, git diff, git log, and git show.",
         "Commands outside the read-only whitelist are treated as non-read-only and must pass safety review.",
         "Use mode=background for long-running or interactive commands, then poll with bash.read_session.",
         "Use bash.write_session to send stdin to a background terminal, bash.interrupt_session for Ctrl-C, and bash.terminate_session to stop it.",
+        "The default cwd is the first configured workspace root. Relative cwd values are resolved inside that workspace root.",
+        "Commands receive workspace_root, WORKSPACE_ROOT, LKA_WORKSPACE_ROOT, and LKA_WORKSPACE_ROOTS environment variables.",
+        "Use relative paths from cwd or the injected $workspace_root variable; do not invent placeholder paths.",
         "Always inspect command status and output before claiming completion.",
     ],
 )
@@ -95,12 +100,12 @@ class BashAccessPolicy:
 
     def resolve_cwd(self, cwd_value: str | None) -> Path:
         if cwd_value and cwd_value.strip():
-            path = Path(cwd_value).expanduser()
+            path = Path(self.expand_workspace_variables(cwd_value)).expanduser()
             if not path.is_absolute():
-                path = Path.cwd() / path
+                path = self.default_root / path
             resolved = path.resolve(strict=False)
         else:
-            resolved = self.roots[0]
+            resolved = self.default_root
         if not self._is_allowed(resolved):
             allowed = ", ".join(root.as_posix() for root in self.roots)
             raise PermissionError(f"cwd is outside allowed workspace roots: {allowed}")
@@ -109,6 +114,30 @@ class BashAccessPolicy:
         if not resolved.is_dir():
             raise ValueError(f"cwd is not a directory: {resolved}")
         return resolved
+
+    @property
+    def default_root(self) -> Path:
+        return self.roots[0]
+
+    def env(self) -> dict[str, str]:
+        root = self.default_root.as_posix()
+        return {
+            "workspace_root": root,
+            "WORKSPACE_ROOT": root,
+            "LKA_WORKSPACE_ROOT": root,
+            "LKA_WORKSPACE_ROOTS": ";".join(item.as_posix() for item in self.roots),
+        }
+
+    def expand_workspace_variables(self, value: str) -> str:
+        root = self.default_root.as_posix()
+        return (
+            value.replace("$workspace_root", root)
+            .replace("${workspace_root}", root)
+            .replace("$WORKSPACE_ROOT", root)
+            .replace("${WORKSPACE_ROOT}", root)
+            .replace("$LKA_WORKSPACE_ROOT", root)
+            .replace("${LKA_WORKSPACE_ROOT}", root)
+        )
 
     def _is_allowed(self, path: Path) -> bool:
         for root in self.roots:
@@ -125,6 +154,7 @@ class BashSession:
     session_id: str
     command: str
     cwd: Path
+    workspace_root: Path
     read_only: bool
     process: subprocess.Popen[bytes]
     master_fd: int
@@ -145,7 +175,9 @@ class BashSessionManager:
         *,
         command: str,
         cwd: Path,
+        workspace_root: Path,
         read_only: bool,
+        env: dict[str, str],
     ) -> BashSession:
         if pty is None:
             raise RuntimeError("background bash sessions require POSIX pty support.")
@@ -157,6 +189,7 @@ class BashSessionManager:
                 stdin=slave_fd,
                 stdout=slave_fd,
                 stderr=slave_fd,
+                env=env,
                 start_new_session=True,
                 close_fds=True,
             )
@@ -169,6 +202,7 @@ class BashSessionManager:
                 session_id=session_id,
                 command=command,
                 cwd=cwd,
+                workspace_root=workspace_root,
                 read_only=read_only,
                 process=process,
                 master_fd=master_fd,
@@ -277,6 +311,7 @@ class BashSessionManager:
             "session_id": session.session_id,
             "command": session.command,
             "cwd": session.cwd.as_posix(),
+            "workspace_root": session.workspace_root.as_posix(),
             "read_only": session.read_only,
             "status": "running" if exit_code is None else "exited",
             "running": exit_code is None,
@@ -317,6 +352,7 @@ class BashRunTool:
             "mode": "string",
             "command": "string",
             "cwd": "string",
+            "workspace_root": "string",
             "read_only": "boolean",
             "status": "string",
             "running": "boolean",
@@ -388,6 +424,7 @@ class BashRunTool:
             completed = subprocess.run(
                 ["/bin/bash", "-lc", command],
                 cwd=cwd,
+                env=self._env(),
                 capture_output=True,
                 timeout=timeout,
                 check=False,
@@ -406,6 +443,7 @@ class BashRunTool:
             "mode": "sync",
             "command": command,
             "cwd": cwd.as_posix(),
+            "workspace_root": self.policy.default_root.as_posix(),
             "read_only": read_only,
             "status": "timed_out" if timed_out else "exited",
             "running": False,
@@ -428,12 +466,15 @@ class BashRunTool:
         session = self.session_manager.start(
             command=command,
             cwd=cwd,
+            workspace_root=self.policy.default_root,
             read_only=read_only,
+            env=self._env(),
         )
         return {
             "mode": "background",
             "command": command,
             "cwd": cwd.as_posix(),
+            "workspace_root": self.policy.default_root.as_posix(),
             "read_only": read_only,
             "status": "running",
             "running": True,
@@ -445,6 +486,11 @@ class BashRunTool:
             "session_id": session.session_id,
             "next_offset": 0,
         }
+
+    def _env(self) -> dict[str, str]:
+        env = dict(os.environ)
+        env.update(self.policy.env())
+        return env
 
 
 class BashListSessionsTool:
@@ -509,6 +555,7 @@ class BashReadSessionTool:
             "session_id": "string",
             "command": "string",
             "cwd": "string",
+            "workspace_root": "string",
             "read_only": "boolean",
             "status": "string",
             "running": "boolean",
@@ -701,6 +748,9 @@ def is_read_only_command(command: str) -> bool:
 
 
 def _has_unsafe_shell_syntax(command: str) -> bool:
+    # TODO: Replace this conservative classifier when read-only parallel execution has
+    # a richer command analysis model. It intentionally over-reviews safe shell idioms
+    # such as stderr/input redirection for now.
     return any(
         marker in command
         for marker in [

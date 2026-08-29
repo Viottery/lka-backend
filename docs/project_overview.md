@@ -248,12 +248,15 @@ Main Agent Brain 的 Tool Registry。
 文件访问也分为两层：workspace context 负责文件结构索引、摘要、检索和长期上下文管理；
 `filesystem` Tool Package 只处理模型主动要求读写某个明确文本文件的场景。读取工具默认返回
 受限片段并携带 full-file sha256；编辑工具使用 `expected_sha256` 和唯一
-`old_text -> new_text` 替换，避免基于过期上下文覆盖用户修改。目录 listing、文本搜索和
-命令执行由 `bash` Tool Package 承担。
+`old_text -> new_text` 替换，避免基于过期上下文覆盖用户修改。`filesystem` 路径字段中的
+相对路径按第一个 configured workspace root 解析，并支持 `$workspace_root` 等 workspace root
+变量。目录 listing、文本搜索和命令执行由 `bash` Tool Package 承担。
 
 `bash` Tool Package 支持同步命令、后台终端、多轮 stdin 交互、输出查询、活跃终端查询、
-Ctrl-C 和终止。`bash.run` 会按具体命令使用保守只读白名单动态判定 `read_only`；白名单外、
-写入、信号和 stdin 交互都按非只读操作进入 safety review。
+Ctrl-C 和终止。`bash.run` 默认在第一个 configured workspace root 下执行；相对 `cwd`
+会按该 root 解析，命令环境中注入 `workspace_root`、`WORKSPACE_ROOT`、`LKA_WORKSPACE_ROOT`
+和 `LKA_WORKSPACE_ROOTS`。`bash.run` 会按具体命令使用保守只读白名单动态判定
+`read_only`；白名单外、写入、信号和 stdin 交互都按非只读操作进入 safety review。
 
 实时时间属于 runtime context。后端在每次 Agent turn 的 context window 中注入当前
 UTC / 本地时间 / 时区 / 日期，帮助 LLM 处理相对时间。`runtime.now` 暂不注册为

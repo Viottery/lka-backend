@@ -45,6 +45,35 @@ def test_filesystem_read_file_returns_bounded_slice_and_sha(tmp_path, monkeypatc
     ) == []
 
 
+def test_filesystem_resolves_relative_paths_from_workspace_root(tmp_path, monkeypatch):
+    runtime = _runtime(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    target = workspace / "docs" / "notes.md"
+    target.parent.mkdir()
+    target.write_text("Status: red\n", encoding="utf-8")
+
+    relative = runtime.tool_executor.execute(
+        invocation_id="fs_read_relative",
+        tool_name="filesystem.read_file",
+        tool_input={"path": "docs/notes.md"},
+        context=ToolContext(session_id="session_filesystem"),
+    )
+
+    assert relative.status == "completed"
+    assert relative.output["resolved_path"] == target.as_posix()
+    assert relative.output["content"] == "Status: red\n"
+
+    variable = runtime.tool_executor.execute(
+        invocation_id="fs_read_workspace_variable",
+        tool_name="filesystem.read_file",
+        tool_input={"path": "$workspace_root/docs/notes.md"},
+        context=ToolContext(session_id="session_filesystem"),
+    )
+
+    assert variable.status == "completed"
+    assert variable.output["resolved_path"] == target.as_posix()
+
+
 def test_filesystem_read_rejects_paths_outside_workspace(tmp_path, monkeypatch):
     runtime = _runtime(tmp_path, monkeypatch)
     outside = tmp_path / "outside.txt"

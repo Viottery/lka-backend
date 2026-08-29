@@ -94,7 +94,10 @@ integration logic back into `app/core/`.
   record must still exist.
 - Command execution belongs in the `bash` tool package. `bash.run` uses a
   conservative read-only whitelist per command; anything outside the whitelist
-  is non-read-only and must pass safety review.
+  is non-read-only and must pass safety review. Its default `cwd` is the first
+  configured workspace root, relative `cwd` values resolve under that root, and
+  commands receive `workspace_root`, `WORKSPACE_ROOT`, `LKA_WORKSPACE_ROOT`, and
+  `LKA_WORKSPACE_ROOTS` environment variables.
 - Agent core must remain package/domain agnostic. Do not hard-code concrete
   package names, tool names, domain workflows, routing keywords, or tool-call
   examples in `app/core/` prompts or fallback logic.
@@ -104,6 +107,9 @@ integration logic back into `app/core/`.
 - Package-specific constraints, such as read/write boundaries or cross-package
   workflows, must be represented by tool package metadata and enforced through
   registered tools, not by special cases in Agent core.
+- `filesystem.read_file` and `filesystem.edit_file` resolve relative paths from
+  the first configured workspace root and support `workspace_root`,
+  `WORKSPACE_ROOT`, and `LKA_WORKSPACE_ROOT` variable expansion in path fields.
 
 ## LLM And Run Requirements
 

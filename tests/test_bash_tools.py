@@ -30,6 +30,7 @@ def _approved_context() -> ToolContext:
 
 def test_bash_read_only_classifier_is_conservative():
     assert is_read_only_command("pwd")
+    assert is_read_only_command("printenv WORKSPACE_ROOT")
     assert is_read_only_command("ls -la | head -5")
     assert is_read_only_command("git status")
     assert is_read_only_command("rg needle . && git diff")
@@ -99,6 +100,60 @@ def test_bash_non_read_only_command_requires_safety_review(tmp_path, monkeypatch
     assert (workspace / "marker.txt").read_text(encoding="utf-8") == "hi"
 
 
+def test_bash_injects_workspace_variables_and_resolves_relative_cwd(
+    tmp_path,
+    monkeypatch,
+):
+    runtime = _runtime(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    subdir = workspace / "nested"
+    subdir.mkdir()
+
+    write_result = runtime.tool_executor.execute(
+        invocation_id="bash_write_with_workspace_root",
+        tool_name="bash.run",
+        tool_input={
+            "command": "printf env-ok > \"$workspace_root/nested/from_env.txt\"",
+            "cwd": str(workspace),
+            "mode": "sync",
+        },
+        context=_approved_context(),
+    )
+    assert write_result.status == "completed"
+    assert write_result.output["workspace_root"] == workspace.as_posix()
+    assert (subdir / "from_env.txt").read_text(encoding="utf-8") == "env-ok"
+
+    read_result = runtime.tool_executor.execute(
+        invocation_id="bash_relative_cwd",
+        tool_name="bash.run",
+        tool_input={
+            "command": "pwd && cat from_env.txt && printenv LKA_WORKSPACE_ROOTS",
+            "cwd": "nested",
+            "mode": "sync",
+        },
+        context=ToolContext(session_id="session_bash"),
+    )
+    assert read_result.status == "completed"
+    assert read_result.output["read_only"] is True
+    assert read_result.output["cwd"] == subdir.as_posix()
+    assert read_result.output["workspace_root"] == workspace.as_posix()
+    assert "env-ok" in read_result.output["stdout"]
+    assert workspace.as_posix() in read_result.output["stdout"]
+
+    cwd_var_result = runtime.tool_executor.execute(
+        invocation_id="bash_workspace_variable_cwd",
+        tool_name="bash.run",
+        tool_input={
+            "command": "pwd",
+            "cwd": "$workspace_root/nested",
+            "mode": "sync",
+        },
+        context=ToolContext(session_id="session_bash"),
+    )
+    assert cwd_var_result.status == "completed"
+    assert cwd_var_result.output["cwd"] == subdir.as_posix()
+
+
 def test_bash_background_session_supports_interaction_and_output_polling(
     tmp_path,
     monkeypatch,
@@ -145,6 +200,30 @@ def test_bash_background_session_supports_interaction_and_output_polling(
     done = _wait_for_output(runtime, session_id, "got:hello")
     assert done["running"] is False
     assert done["exit_code"] == 0
+
+
+def test_bash_background_session_receives_workspace_environment(
+    tmp_path,
+    monkeypatch,
+):
+    runtime = _runtime(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+
+    started = runtime.tool_executor.execute(
+        invocation_id="bash_background_env",
+        tool_name="bash.run",
+        tool_input={
+            "command": "printenv WORKSPACE_ROOT",
+            "cwd": str(workspace),
+            "mode": "background",
+        },
+        context=ToolContext(session_id="session_bash"),
+    )
+
+    assert started.status == "completed"
+    session_id = started.output["session_id"]
+    output = _wait_for_output(runtime, session_id, workspace.as_posix())
+    assert output["workspace_root"] == workspace.as_posix()
 
 
 def test_bash_interrupt_and_terminate_sessions(tmp_path, monkeypatch):

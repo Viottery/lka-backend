@@ -24,7 +24,8 @@ FILESYSTEM_PACKAGE = ToolPackageSpec(
     name="filesystem",
     description=(
         "Read and edit specific text files inside configured workspace roots. "
-        "This package is for explicit file access, not workspace indexing, search, or summaries."
+        "Relative paths resolve inside the first configured workspace root. This package "
+        "is for explicit file access, not workspace indexing, search, or summaries."
     ),
     risk="medium",
     requires_expansion=True,
@@ -35,6 +36,7 @@ FILESYSTEM_PACKAGE = ToolPackageSpec(
     ],
     decision_hints=[
         "Read a file before editing it so you can provide expected_sha256.",
+        "Use relative paths from the default workspace root, or the injected $workspace_root variable.",
         "Use edit_file for targeted old_text to new_text replacements only.",
         "If old_text is not unique, read more context and retry with a longer unique snippet.",
         "Do not use edit_file to create new files or replace large files wholesale.",
@@ -56,14 +58,29 @@ class FileAccessPolicy:
     def resolve(self, path_value: str) -> Path:
         if not path_value.strip():
             raise ValueError("path is required.")
-        path = Path(path_value).expanduser()
+        path = Path(self.expand_workspace_variables(path_value)).expanduser()
         if not path.is_absolute():
-            path = Path.cwd() / path
+            path = self.default_root / path
         resolved = path.resolve(strict=False)
         if not self._is_allowed(resolved):
             allowed = ", ".join(root.as_posix() for root in self.roots)
             raise PermissionError(f"path is outside allowed workspace roots: {allowed}")
         return resolved
+
+    @property
+    def default_root(self) -> Path:
+        return self.roots[0]
+
+    def expand_workspace_variables(self, value: str) -> str:
+        root = self.default_root.as_posix()
+        return (
+            value.replace("$workspace_root", root)
+            .replace("${workspace_root}", root)
+            .replace("$WORKSPACE_ROOT", root)
+            .replace("${WORKSPACE_ROOT}", root)
+            .replace("$LKA_WORKSPACE_ROOT", root)
+            .replace("${LKA_WORKSPACE_ROOT}", root)
+        )
 
     def _is_allowed(self, path: Path) -> bool:
         for root in self.roots:

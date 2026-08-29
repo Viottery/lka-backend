@@ -328,6 +328,23 @@ response mode、耗时、usage、finish reason、provider request id、rate-limi
 bash 工具只通过 Agent tool-call 暴露，不提供独立 HTTP endpoint。前端通过
 `/agent/turn/stream` 观察 tool events 和 safety review events。
 
+`filesystem.read_file` / `filesystem.edit_file` 的 `path` 字段也使用同一 workspace path
+基准：相对路径按第一个 configured workspace root 解析，并支持 `$workspace_root`、
+`${workspace_root}`、`$WORKSPACE_ROOT`、`${WORKSPACE_ROOT}`、`$LKA_WORKSPACE_ROOT` 和
+`${LKA_WORKSPACE_ROOT}` 展开。
+
+路径协议：
+
+- 未传 `cwd` 时，默认使用第一个 configured workspace root。
+- `cwd` 可以是绝对路径，也可以是相对路径；相对路径按第一个 workspace root 解析。
+- `cwd` 支持 `$workspace_root`、`${workspace_root}`、`$WORKSPACE_ROOT`、
+  `${WORKSPACE_ROOT}`、`$LKA_WORKSPACE_ROOT` 和 `${LKA_WORKSPACE_ROOT}` 展开。
+- `cwd` 必须位于 configured workspace roots 之内，且必须是已存在目录。
+- 命令环境会注入 `workspace_root`、`WORKSPACE_ROOT`、`LKA_WORKSPACE_ROOT` 和
+  `LKA_WORKSPACE_ROOTS`。前三者指向默认 workspace root；`LKA_WORKSPACE_ROOTS` 使用分号
+  连接所有 configured workspace roots。
+- 模型应优先使用相对路径或 `$workspace_root` 定位文件，避免凭空构造占位绝对路径。
+
 ### 6.1 `bash.run`
 
 同步命令：
@@ -335,7 +352,7 @@ bash 工具只通过 Agent tool-call 暴露，不提供独立 HTTP endpoint。�
 ```json
 {
   "command": "rg \"needle\" .",
-  "cwd": "/home/user/project",
+  "cwd": ".",
   "mode": "sync",
   "timeout_seconds": 30,
   "max_output_bytes": 32768
@@ -349,6 +366,7 @@ bash 工具只通过 Agent tool-call 暴露，不提供独立 HTTP endpoint。�
   "mode": "sync",
   "command": "rg \"needle\" .",
   "cwd": "/home/user/project",
+  "workspace_root": "/home/user/project",
   "read_only": true,
   "status": "exited",
   "running": false,
@@ -367,7 +385,7 @@ bash 工具只通过 Agent tool-call 暴露，不提供独立 HTTP endpoint。�
 ```json
 {
   "command": "npm run dev",
-  "cwd": "/home/user/project",
+  "cwd": ".",
   "mode": "background"
 }
 ```
@@ -377,14 +395,23 @@ bash 工具只通过 Agent tool-call 暴露，不提供独立 HTTP endpoint。�
 ```json
 {
   "mode": "background",
+  "command": "npm run dev",
+  "cwd": "/home/user/project",
+  "workspace_root": "/home/user/project",
+  "read_only": false,
   "status": "running",
   "running": true,
+  "exit_code": null,
+  "timed_out": false,
+  "stdout": "",
+  "stderr": "",
+  "output": "",
   "session_id": "bash_session_000001",
   "next_offset": 0
 }
 ```
 
-只读判断是按命令白名单保守执行：`pwd`、`ls`、`find`、`rg`、`grep`、`cat`、
+只读判断是按命令白名单保守执行：`pwd`、`printenv`、`ls`、`find`、`rg`、`grep`、`cat`、
 `sed`、`head`、`tail`、`wc`、`git status`、`git diff`、`git log`、`git show`
 等可判为只读。无法判断、重定向写入、非白名单命令默认非只读。
 
@@ -403,6 +430,10 @@ bash 工具只通过 Agent tool-call 暴露，不提供独立 HTTP endpoint。�
 ```json
 {
   "session_id": "bash_session_000001",
+  "command": "npm run dev",
+  "cwd": "/home/user/project",
+  "workspace_root": "/home/user/project",
+  "read_only": false,
   "status": "running",
   "running": true,
   "exit_code": null,

@@ -260,11 +260,16 @@ backend/
 - Agent 主动读取或修改明确文件路径时使用 `filesystem` Tool Package，不走 workspace
   index/context 摘要路径。`filesystem.read_file` 返回受限片段、行号和 full-file sha256；
   `filesystem.edit_file` 只做已存在 UTF-8 文本文件的 targeted `old_text -> new_text`
-  替换，必须带 `expected_sha256`，默认要求 `old_text` 唯一匹配。
+  替换，必须带 `expected_sha256`，默认要求 `old_text` 唯一匹配。filesystem 路径字段中的
+  相对路径按第一个 configured workspace root 解析，并支持 `workspace_root`、
+  `WORKSPACE_ROOT` 和 `LKA_WORKSPACE_ROOT` 变量展开。
 - 目录 listing、全文搜索、测试命令和交互式命令执行使用 `bash` Tool Package。
   `bash.run` 支持同步和后台终端；后台终端通过 `bash.read_session`、`bash.write_session`、
   `bash.interrupt_session` 和 `bash.terminate_session` 继续交互。具体命令按白名单动态判定
-  `read_only`，白名单外一律进入 safety review。
+  `read_only`，白名单外一律进入 safety review。`bash.run` 默认工作目录是第一个
+  configured workspace root，相对 `cwd` 在该 root 内解析；命令环境注入 `workspace_root`、
+  `WORKSPACE_ROOT`、`LKA_WORKSPACE_ROOT` 和以分号分隔的 `LKA_WORKSPACE_ROOTS`，模型应优先
+  使用相对路径或这些变量定位 workspace 文件。
 - Capability Registry 第一层应优先暴露 Tool Package，而不是一次性暴露所有具体工具。
 - 具体工具应在 Agent 决定展开某个 package 后再进入上下文。
 - 不维护全局 intent 枚举；Agent 应输出面向下一步执行的 routing / execution decision。
