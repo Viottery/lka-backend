@@ -28,7 +28,13 @@ from app.core.llm.audit import (
     provider_request_id_from_headers,
     retry_after_from_headers,
 )
-from app.core.llm.models import LLMRequest, LLMResponse, LLMResponseMode, LLMStreamEvent
+from app.core.llm.models import (
+    LLMRequest,
+    LLMResponse,
+    LLMResponseMode,
+    LLMStreamEvent,
+    LLMToolCall,
+)
 
 
 class OpenAICompatibleLLMClient:
@@ -46,6 +52,8 @@ class OpenAICompatibleLLMClient:
         timeout_seconds: int = 60,
         supports_stream: bool = True,
         supports_json_mode: bool = False,
+        supports_function_calling: bool = False,
+        function_calling_strict: bool = False,
     ) -> None:
         if not api_key:
             raise LLMClientError(f"Missing API key for LLM client: {name}")
@@ -58,6 +66,8 @@ class OpenAICompatibleLLMClient:
         self.timeout_seconds = timeout_seconds
         self.supports_stream = supports_stream
         self.supports_json_mode = supports_json_mode
+        self.supports_function_calling = supports_function_calling
+        self.function_calling_strict = function_calling_strict
 
     async def complete(self, request: LLMRequest) -> LLMResponse:
         response_payload, response_headers = await _run_blocking(
@@ -65,7 +75,7 @@ class OpenAICompatibleLLMClient:
             request,
             False,
         )
-        content, usage, finish_reason = self._message_content(response_payload)
+        content, tool_calls, usage, finish_reason = self._message_content(response_payload)
         headers = audit_headers(response_headers)
         return LLMResponse(
             provider=self.provider_name,
@@ -79,6 +89,7 @@ class OpenAICompatibleLLMClient:
             finish_reason=finish_reason,
             provider_request_id=provider_request_id_from_headers(headers),
             metadata={"headers": headers},
+            tool_calls=tool_calls,
         )
 
     async def stream(self, request: LLMRequest) -> AsyncIterator[LLMStreamEvent]:
@@ -96,6 +107,7 @@ class OpenAICompatibleLLMClient:
 
         response = await _run_blocking(self._open_stream, request)
         snapshot = ""
+        tool_call_parts: dict[int, dict[str, str]] = {}
         headers = audit_headers(getattr(response, "headers", {}))
         stream_metadata: dict[str, Any] = {"headers": headers}
         provider_request_id = provider_request_id_from_headers(headers)
@@ -142,9 +154,17 @@ class OpenAICompatibleLLMClient:
                         },
                     )
                     return
-                delta, chunk_metadata = self._stream_delta_and_metadata(payload)
+                delta, tool_call_deltas, chunk_metadata = self._stream_delta_and_metadata(payload)
                 stream_metadata.update(chunk_metadata)
-                if not delta:
+                for tool_call_delta in tool_call_deltas:
+                    index = int(tool_call_delta["index"])
+                    part = tool_call_parts.setdefault(
+                        index, {"id": "", "name": "", "arguments": ""}
+                    )
+                    for key in ("id", "name", "arguments"):
+                        if tool_call_delta[key]:
+                            part[key] += tool_call_delta[key]
+                if not delta and not tool_call_deltas:
                     continue
                 snapshot += delta
                 yield self._stream_event(
@@ -152,12 +172,23 @@ class OpenAICompatibleLLMClient:
                     request,
                     snapshot,
                     delta=delta,
-                    metadata=stream_metadata,
+                    metadata={
+                        **stream_metadata,
+                        "tool_calls": self._tool_calls_from_parts(tool_call_parts),
+                    },
                 )
         finally:
             response.close()
 
-        yield self._stream_event("llm_completed", request, snapshot, metadata=stream_metadata)
+        yield self._stream_event(
+            "llm_completed",
+            request,
+            snapshot,
+            metadata={
+                **stream_metadata,
+                "tool_calls": self._tool_calls_from_parts(tool_call_parts),
+            },
+        )
 
     def _post_chat_completion(
         self,
@@ -203,8 +234,22 @@ class OpenAICompatibleLLMClient:
         }
         if request.max_output_tokens is not None:
             payload["max_tokens"] = request.max_output_tokens
-        if request.require_json and self.supports_json_mode:
+        if request.require_json and self.supports_json_mode and not request.tools:
             payload["response_format"] = {"type": "json_object"}
+        if request.tools and self.supports_function_calling:
+            payload["tools"] = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.parameters,
+                        **({"strict": True} if tool.strict and self.function_calling_strict else {}),
+                    },
+                }
+                for tool in request.tools
+            ]
+            payload["tool_choice"] = request.tool_choice or "auto"
 
         return urllib.request.Request(
             f"{self.base_url}/chat/completions",
@@ -222,7 +267,7 @@ class OpenAICompatibleLLMClient:
     def _message_content(
         self,
         payload: dict[str, Any],
-    ) -> tuple[str, dict[str, Any], str | None]:
+    ) -> tuple[str, list[LLMToolCall], dict[str, Any], str | None]:
         try:
             choice = payload["choices"][0]
             message = choice["message"]
@@ -233,7 +278,12 @@ class OpenAICompatibleLLMClient:
             ) from exc
         usage = payload.get("usage")
         finish_reason = choice.get("finish_reason") if isinstance(choice, dict) else None
-        return content, usage if isinstance(usage, dict) else {}, finish_reason
+        return (
+            content,
+            self._tool_calls_from_payload(message.get("tool_calls")),
+            usage if isinstance(usage, dict) else {},
+            finish_reason,
+        )
 
     def _stream_payload(self, data: str) -> dict[str, Any]:
         try:
@@ -272,14 +322,16 @@ class OpenAICompatibleLLMClient:
             "raw_data_preview": raw_data[:500],
         }
 
-    def _stream_delta_and_metadata(self, payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    def _stream_delta_and_metadata(
+        self, payload: dict[str, Any]
+    ) -> tuple[str, list[dict[str, str]], dict[str, Any]]:
         metadata: dict[str, Any] = {}
         usage = payload.get("usage")
         if isinstance(usage, dict):
             metadata["usage"] = usage
         choices = payload.get("choices")
         if choices == [] and metadata:
-            return "", metadata
+            return "", [], metadata
         if not isinstance(choices, list) or not choices:
             raise LLMResponseParseError("LLM provider stream chunk did not include choices.")
         choice = choices[0]
@@ -292,7 +344,61 @@ class OpenAICompatibleLLMClient:
         if not isinstance(delta, dict):
             raise LLMResponseParseError("LLM provider stream delta was not an object.")
         content = delta.get("content")
-        return content if isinstance(content, str) else "", metadata
+        tool_call_deltas: list[dict[str, str]] = []
+        raw_tool_calls = delta.get("tool_calls")
+        if isinstance(raw_tool_calls, list):
+            for position, raw_call in enumerate(raw_tool_calls):
+                if not isinstance(raw_call, dict):
+                    continue
+                function = raw_call.get("function")
+                function = function if isinstance(function, dict) else {}
+                index = raw_call.get("index")
+                tool_call_deltas.append(
+                    {
+                        "index": str(index if isinstance(index, int) else position),
+                        "id": raw_call.get("id") if isinstance(raw_call.get("id"), str) else "",
+                        "name": function.get("name") if isinstance(function.get("name"), str) else "",
+                        "arguments": function.get("arguments") if isinstance(function.get("arguments"), str) else "",
+                    }
+                )
+        return content if isinstance(content, str) else "", tool_call_deltas, metadata
+
+    @staticmethod
+    def _tool_calls_from_payload(raw_calls: Any) -> list[LLMToolCall]:
+        if not isinstance(raw_calls, list):
+            return []
+        calls: list[LLMToolCall] = []
+        for raw_call in raw_calls:
+            if not isinstance(raw_call, dict):
+                continue
+            function = raw_call.get("function")
+            if not isinstance(function, dict) or not isinstance(function.get("name"), str):
+                continue
+            raw_arguments = function.get("arguments")
+            raw_arguments = raw_arguments if isinstance(raw_arguments, str) else ""
+            try:
+                arguments = json.loads(raw_arguments) if raw_arguments else {}
+            except json.JSONDecodeError:
+                arguments = None
+            calls.append(
+                LLMToolCall(
+                    id=raw_call.get("id") if isinstance(raw_call.get("id"), str) else None,
+                    name=function["name"],
+                    arguments=arguments if isinstance(arguments, dict) else None,
+                    raw_arguments=raw_arguments,
+                )
+            )
+        return calls
+
+    def _tool_calls_from_parts(self, parts: dict[int, dict[str, str]]) -> list[dict[str, Any]]:
+        raw_calls = [
+            {
+                "id": part["id"] or None,
+                "function": {"name": part["name"], "arguments": part["arguments"]},
+            }
+            for _, part in sorted(parts.items())
+        ]
+        return [call.model_dump(mode="json") for call in self._tool_calls_from_payload(raw_calls)]
 
     def _stream_event(
         self,

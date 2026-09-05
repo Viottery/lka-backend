@@ -1,0 +1,32 @@
+{
+  "documents": [
+    {
+      "source": {"source_type": "local_document", "display_name": "project_policy.md", "uri": "/kb/project_policy.md", "sensitivity": "public", "remote_policy": "allow"},
+      "title": "project_policy.md",
+      "uri": "/kb/project_policy.md",
+      "mime_type": "text/markdown",
+      "text": "项目发布政策：生产发布必须经过两名维护者批准。紧急修复允许单人发布，但必须在 24 小时内补充复盘。默认发布窗口是周二和周四 10:00-12:00。"
+    },
+    {
+      "source": {"source_type": "local_document", "display_name": "travel_notes.md", "uri": "/kb/travel_notes.md", "sensitivity": "personal", "remote_policy": "redact"},
+      "title": "travel_notes.md",
+      "uri": "/kb/travel_notes.md",
+      "mime_type": "text/markdown",
+      "text": "京都出行笔记：四月樱花季建议提前预约。住宿预算为每晚 900 元，车站附近交通最方便。"
+    },
+    {
+      "source": {"source_type": "local_document", "display_name": "incident_runbook.md", "uri": "/kb/incident_runbook.md", "sensitivity": "public", "remote_policy": "allow"},
+      "title": "incident_runbook.md",
+      "uri": "/kb/incident_runbook.md",
+      "mime_type": "text/markdown",
+      "text": "事故处理手册：发现高延迟时先记录时间窗口和请求样本，再检查依赖服务。不要直接删除生产数据。严重事故需要通知值班负责人。"
+    },
+    {
+      "source": {"source_type": "local_document", "display_name": "secrets.md", "uri": "/kb/secrets.md", "sensitivity": "secret", "remote_policy": "deny"},
+      "title": "secrets.md",
+      "uri": "/kb/secrets.md",
+      "mime_type": "text/markdown",
+      "text": "内部密钥轮换记录，不应被检索结果或 Agent 回答披露。"
+    }
+  ]
+}

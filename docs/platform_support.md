@@ -79,11 +79,17 @@ LKA_SKIP_HIDDEN=true
 LKA_MAX_SCAN_FILES=50000
 ```
 
+运行数据目录通过 `LKA_DATA_DIR` 指定，默认是 `./data/runtime`。其中只应保留个人使用的
+SQLite、导入知识、邮件同步状态、运行日志、token 和本地模型缓存；测试与评测必须使用临时
+目录，受版本控制的样本只放在 `evals/fixtures/`。
+
 说明：
 
 - `LKA_PLATFORM=auto`：由 Python 进程自动识别 `windows`、`linux` 或 `macos`。
 - `LKA_DEFAULT_SHELL=auto`：后续命令执行层使用，Windows 默认 PowerShell。
 - `LKA_WORKSPACE_ROOTS`：可选的 workspace 根目录限制，多个根目录用 `;` 分隔。
+- `LKA_WSL_WINDOWS_MOUNT_ROOT`：Linux backend 接收 Windows 路径时的 WSL 挂载根，默认 `/mnt`；
+  `C:/Users/name/project` 会映射为 `/mnt/c/Users/name/project`。
 - `LKA_ALLOW_SYMLINKS`：是否允许扫描 symlink。
 - `LKA_SKIP_HIDDEN`：是否跳过隐藏文件。
 - `LKA_MAX_SCAN_FILES`：单次 workspace 扫描最多统计的文件数。
@@ -97,7 +103,7 @@ LKA_MAX_SCAN_FILES=50000
 ```bash
 cp .env.example .env
 uv sync
-uv run uvicorn app.api.main:app --host 127.0.0.1 --port 8765
+uv run python scripts/start_backend.py personal
 ```
 
 Workspace 示例：
@@ -114,7 +120,7 @@ Workspace 示例：
 ```powershell
 Copy-Item .env.example .env
 uv sync
-uv run uvicorn app.api.main:app --host 127.0.0.1 --port 8765
+uv run python scripts/start_backend.py personal
 ```
 
 Workspace 示例推荐使用 `/`，避免 JSON 反斜杠转义：
@@ -205,20 +211,26 @@ Invoke-RestMethod `
 
 ## 7. 测试矩阵
 
+个人使用服务必须通过 `uv run python scripts/start_backend.py personal` 启动，默认监听
+`127.0.0.1:8765`，并使用真实 `config/local.toml` 与 `data/runtime`。测试服务必须通过
+`uv run python scripts/start_backend.py test` 启动，默认监听 `127.0.0.1:8766`；该模式会
+强制使用临时数据目录和不存在的 local config，因此不会发起个人邮箱同步或调用真实 LLM。
+需要在服务停止后检查测试数据时，显式设置 `--test-data-dir ./data/test-runtime`。
+
 最低验证矩阵：
 
 ```text
 Linux:
 - uv sync
 - uv run pytest
-- uv run uvicorn app.api.main:app --host 127.0.0.1 --port 8765
+- uv run python scripts/start_backend.py personal
 - GET /health
 - POST /workspaces/index with POSIX path
 
 Windows:
 - uv sync
 - uv run pytest
-- uv run uvicorn app.api.main:app --host 127.0.0.1 --port 8765
+- uv run python scripts/start_backend.py personal
 - GET /health
 - POST /workspaces/index with C:/... path
 ```

@@ -5,17 +5,68 @@ from __future__ import annotations
 import sqlite3
 import threading
 from hashlib import sha1
-from typing import Any
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import Any, Literal
 
 from app.api.schemas import (
     CapabilityItem,
     WorkspaceIndexResponse,
 )
+from app.core.agent_graph import AgentGraphRunner
+from app.core.agent_runner import AgentTurnRunner
 from app.core.agent_runs import AgentRunRecord, InMemoryAgentRunManager
 from app.core.agent_turn import AgentTurnLoop, AgentTurnResult
 from app.core.config import Settings
 from app.core.context import ContextAssembler
 from app.core.llm import LLMResponseMode, MockLLMClient, build_text_llm_client
+from app.core.retrieval import LocalDebugRetrievalProvider
+from app.core.runtime_loop import RuntimeDebugRun, RuntimeLoop
+from app.core.sessions import (
+    AgentSessionDetail,
+    AgentSessionList,
+    AgentSessionMessage,
+    SessionRole,
+    SessionService,
+    SessionWorkspace,
+)
+from app.core.tools import MockToolExecutor, ToolExecutor, ToolRegistry
+from app.core.tracing import TraceRecorder
+from app.domains.knowledge import (
+    KnowledgeChunkLoadResult,
+    KnowledgeDocumentInput,
+    KnowledgeDocumentRecord,
+    KnowledgeImportResult,
+    KnowledgeSearchResult,
+    KnowledgeService,
+)
+from app.domains.mail import (
+    MailAccountInput,
+    MailImportResult,
+    MailMatterList,
+    MailMessageInput,
+    MailSearchResult,
+    MailService,
+)
+from app.domains.mail_knowledge import MailKnowledgeMirror, MailKnowledgeMirrorResult
+from app.domains.matters import (
+    MatterCreateInput,
+    MatterList,
+    MatterRecord,
+    MatterSearchResult,
+    MatterService,
+    MatterSourceLinkInput,
+    MatterUpdateInput,
+)
+from app.integrations.local_semantic import build_local_semantic_components
+from app.integrations.outlook import (
+    OutlookAuthCompleteResult,
+    OutlookAuthStartResult,
+    OutlookService,
+    OutlookServiceError,
+    OutlookSyncResult,
+)
+from app.platform import FilesystemScanner, PathResolver, ScanOptions, detect_platform
+from app.storage.db import connect, get_db_path, init_db
 from app.tool_packages.bash import (
     BASH_PACKAGE,
     BashAccessPolicy,
@@ -33,6 +84,12 @@ from app.tool_packages.filesystem import (
     FileAccessPolicy,
     ReadFileTool,
 )
+from app.tool_packages.knowledge import (
+    KNOWLEDGE_PACKAGE,
+    LoadKnowledgeChunksTool,
+    LoadKnowledgeDocumentTool,
+    SearchKnowledgeTool,
+)
 from app.tool_packages.mail import (
     MAIL_PACKAGE,
     LoadMailMessagesTool,
@@ -48,48 +105,25 @@ from app.tool_packages.matter import (
     SearchMattersTool,
     UpdateMatterTool,
 )
-from app.domains.matters import (
-    MatterCreateInput,
-    MatterList,
-    MatterRecord,
-    MatterSearchResult,
-    MatterService,
-    MatterSourceLinkInput,
-    MatterUpdateInput,
-)
-from app.domains.mail import (
-    MailAccountInput,
-    MailImportResult,
-    MailMatterList,
-    MailMessageInput,
-    MailSearchResult,
-    MailService,
-)
-from app.integrations.outlook import (
-    OutlookAuthCompleteResult,
-    OutlookAuthStartResult,
-    OutlookServiceError,
-    OutlookService,
-    OutlookSyncResult,
-)
-from app.core.retrieval import LocalDebugRetrievalProvider
-from app.core.runtime_loop import RuntimeDebugRun, RuntimeLoop
-from app.core.sessions import (
-    AgentSessionDetail,
-    AgentSessionList,
-    AgentSessionMessage,
-    SessionRole,
-    SessionService,
-)
-from app.core.tools import MockToolExecutor, ToolExecutor, ToolRegistry
-from app.core.tracing import TraceRecorder
-from app.platform import FilesystemScanner, PathResolver, ScanOptions, detect_platform
-from app.storage.db import connect, get_db_path, init_db
 
 
 def _stable_id(prefix: str, text: str) -> str:
     digest = sha1(text.encode("utf-8")).hexdigest()[:10]
     return f"{prefix}_{digest}"
+
+
+def _is_absolute_path_for_platform(path: str, platform: str) -> bool:
+    if not path.strip():
+        return False
+    if platform == "windows":
+        return PureWindowsPath(path).is_absolute()
+    return PurePosixPath(path).is_absolute()
+
+
+def _normalized_workspace_path(path: str, platform: str) -> str:
+    if platform == "windows":
+        return PureWindowsPath(path).as_posix()
+    return PurePosixPath(path).as_posix()
 
 
 class LocalKnowledgeAgentRuntime:
@@ -99,16 +133,42 @@ class LocalKnowledgeAgentRuntime:
         self.settings = settings
         self.db_path = get_db_path(settings.data_dir)
         init_db(self.db_path)
+        self.local_app_config = settings.load_local_config()
         self.platform = detect_platform(settings.platform)
         self.path_resolver = PathResolver(
             self.platform,
             workspace_roots=settings.parsed_workspace_roots(),
+            wsl_windows_mount_root=settings.wsl_windows_mount_root,
         )
         self.filesystem_scanner = FilesystemScanner(self.platform)
         self.session_service = SessionService(self._conn)
         self.mail_service = MailService(self._conn)
         self.matter_service = MatterService(self._conn)
-        self.local_app_config = settings.load_local_config()
+        embedding_config = self.local_app_config.embedding
+        embedding_provider, semantic_index = build_local_semantic_components(
+            conn_factory=self._conn,
+            enabled=embedding_config.enabled,
+            provider_name=embedding_config.provider,
+            index_provider_name=embedding_config.index_provider,
+            model_name=embedding_config.model_name,
+            dimensions=embedding_config.dimensions,
+            cache_dir=str(embedding_config.cache_dir),
+            batch_size=embedding_config.batch_size,
+            query_prefix=embedding_config.query_prefix,
+            normalize_embeddings=embedding_config.normalize_embeddings,
+            local_files_only=embedding_config.local_files_only,
+        )
+        self.knowledge_service = KnowledgeService(
+            self._conn,
+            embedding_provider=embedding_provider,
+            semantic_index=semantic_index,
+            default_retrieval_mode=embedding_config.default_retrieval_mode,
+            auto_index_on_import=embedding_config.auto_index_on_import,
+        )
+        self.mail_knowledge_mirror = MailKnowledgeMirror(
+            mail_service=self.mail_service,
+            knowledge_service=self.knowledge_service,
+        )
         self.outlook_service = OutlookService(
             self._conn,
             self.mail_service,
@@ -121,9 +181,10 @@ class LocalKnowledgeAgentRuntime:
         self.tool_registry = ToolRegistry()
         self.tool_registry.register_package(MAIL_PACKAGE)
         self.tool_registry.register_package(MATTER_PACKAGE)
+        self.tool_registry.register_package(KNOWLEDGE_PACKAGE)
         self.tool_registry.register_package(FILESYSTEM_PACKAGE)
         self.tool_registry.register_package(BASH_PACKAGE)
-        self.tool_registry.register_tool(SearchMailTool(self.mail_service))
+        self.tool_registry.register_tool(SearchMailTool(self.mail_knowledge_mirror))
         self.tool_registry.register_tool(LoadMailMessagesTool(self.mail_service))
         self.tool_registry.register_tool(SyncMailTool(self.sync_outlook_mail))
         self.tool_registry.register_tool(CreateMatterTool(self.matter_service))
@@ -132,6 +193,9 @@ class LocalKnowledgeAgentRuntime:
         self.tool_registry.register_tool(ListMattersTool(self.matter_service))
         self.tool_registry.register_tool(UpdateMatterTool(self.matter_service))
         self.tool_registry.register_tool(LinkMatterSourceTool(self.matter_service))
+        self.tool_registry.register_tool(SearchKnowledgeTool(self.knowledge_service))
+        self.tool_registry.register_tool(LoadKnowledgeChunksTool(self.knowledge_service))
+        self.tool_registry.register_tool(LoadKnowledgeDocumentTool(self.knowledge_service))
         file_policy = FileAccessPolicy.from_workspace_roots(
             self.settings.parsed_workspace_roots()
         )
@@ -164,12 +228,16 @@ class LocalKnowledgeAgentRuntime:
             tool_executor=self.tool_executor,
             llm_client=self.agent_llm_client,
             log_dir=self.settings.data_dir / "agent_logs",
+            max_decision_steps=self.local_app_config.agent.max_decision_steps,
             run_manager=self.agent_run_manager,
             safety_review_mode=self.local_app_config.safety.tool_review_mode,
             safety_manual_wait_poll_seconds=(
                 self.local_app_config.safety.manual_wait_poll_seconds
             ),
         )
+        self.agent_turn_runner: AgentTurnRunner = self.agent_turn_loop
+        if self.local_app_config.agent.orchestrator == "langgraph":
+            self.agent_turn_runner = AgentGraphRunner(self.agent_turn_loop)
         self.debug_loop = RuntimeLoop(
             context_assembler=ContextAssembler(),
             retrieval_provider=LocalDebugRetrievalProvider(
@@ -402,7 +470,7 @@ class LocalKnowledgeAgentRuntime:
     ) -> AgentTurnResult:
         """Run the minimal general agent turn loop."""
 
-        return self.agent_turn_loop.run(
+        return self.agent_turn_runner.run(
             session_id=session_id,
             user_input=user_input,
             llm_client_name=llm_client_name,
@@ -423,7 +491,7 @@ class LocalKnowledgeAgentRuntime:
     ) -> AgentTurnResult:
         """Run one agent turn without blocking the event loop."""
 
-        return await self.agent_turn_loop.run_async(
+        return await self.agent_turn_runner.run_async(
             session_id=session_id,
             user_input=user_input,
             llm_client_name=llm_client_name,
@@ -441,7 +509,7 @@ class LocalKnowledgeAgentRuntime:
     ) -> AgentRunRecord:
         """Create a queued run before an HTTP stream starts consuming events."""
 
-        return self.agent_turn_loop.create_run_for_turn(
+        return self.agent_turn_runner.create_run_for_turn(
             session_id=session_id,
             user_input=user_input,
             parent_run_id=parent_run_id,
@@ -455,12 +523,92 @@ class LocalKnowledgeAgentRuntime:
     ) -> MailImportResult:
         """Persist locally imported mail messages."""
 
-        return self.mail_service.import_messages(account=account, messages=messages)
+        result = self.mail_service.import_messages(account=account, messages=messages)
+        self.mail_knowledge_mirror.sync(
+            account_id=result.account_id,
+            external_ids=[message.external_id for message in messages],
+        )
+        return result
 
-    def search_mail(self, *, query: str, limit: int = 10) -> MailSearchResult:
-        """Search locally persisted mail with SQLite FTS."""
+    def search_mail(
+        self,
+        *,
+        query: str,
+        limit: int = 10,
+        mode: str | None = None,
+        order_by: Literal["relevance", "source_time_desc"] = "relevance",
+        max_snippet_chars: int = 420,
+    ) -> MailSearchResult:
+        """Search local mail evidence through the knowledge retrieval layer."""
 
-        return self.mail_service.search_messages(query=query, limit=limit)
+        return self.mail_knowledge_mirror.search(
+            query=query,
+            limit=limit,
+            mode=mode,
+            order_by=order_by,
+            max_snippet_chars=max_snippet_chars,
+        )
+
+    def import_knowledge_document(
+        self,
+        *,
+        payload: KnowledgeDocumentInput,
+    ) -> KnowledgeImportResult:
+        """Persist one local knowledge document and its chunks."""
+
+        return self.knowledge_service.import_text_document(payload)
+
+    def search_knowledge(
+        self,
+        *,
+        query: str,
+        limit: int = 10,
+        source_types: list[str] | None = None,
+        mode: str | None = None,
+    ) -> KnowledgeSearchResult:
+        """Search local source-agnostic knowledge chunks."""
+
+        return self.knowledge_service.search(
+            query=query,
+            limit=limit,
+            source_types=source_types,
+            mode=mode,
+        )
+
+    def sync_knowledge_semantic_index(self, *, allow_model_download: bool = False) -> Any:
+        """Embed eligible local chunks and synchronize the configured local semantic index."""
+
+        return self.knowledge_service.sync_semantic_index(
+            allow_model_download=allow_model_download,
+        )
+
+    def load_knowledge_chunks(
+        self,
+        *,
+        chunk_ids: list[str],
+        max_chars_per_chunk: int = 420,
+    ) -> KnowledgeChunkLoadResult:
+        """Load selected privacy-filtered local knowledge chunks."""
+
+        return self.knowledge_service.load_chunks(
+            chunk_ids=chunk_ids,
+            max_chars_per_chunk=max_chars_per_chunk,
+        )
+
+    def load_knowledge_document(
+        self,
+        *,
+        document_id: str,
+        include_text: bool = False,
+        max_chars: int = 12000,
+    ) -> KnowledgeDocumentRecord:
+        """Load one local knowledge document record."""
+
+        return self.knowledge_service.load_document(
+            document_id=document_id,
+            include_text=include_text,
+            max_chars=max_chars,
+        )
 
     def create_session(
         self,
@@ -486,6 +634,48 @@ class LocalKnowledgeAgentRuntime:
         """Return one session with its ordered message history."""
 
         return self.session_service.get_session(session_id=session_id)
+
+    def set_session_workspace(
+        self,
+        *,
+        session_id: str,
+        path: str,
+        platform: str,
+    ) -> SessionWorkspace:
+        """Persist a backend-accessible workspace root for one Agent session."""
+
+        normalized_platform = platform.strip().lower()
+        if normalized_platform not in {"linux", "windows", "macos"}:
+            raise ValueError("platform must be one of: linux, windows, macos")
+        is_windows_via_wsl = (
+            self.platform.name == "linux" and normalized_platform == "windows"
+        )
+        if normalized_platform != self.platform.name and not is_windows_via_wsl:
+            raise ValueError(
+                "workspace platform does not match this backend: "
+                f"frontend selected {normalized_platform}, backend runs on {self.platform.name}"
+            )
+        if not _is_absolute_path_for_platform(path, normalized_platform):
+            raise ValueError(f"workspace path must be an absolute {normalized_platform} path")
+
+        if is_windows_via_wsl:
+            resolved_workspace = self.path_resolver.resolve_windows_workspace_from_wsl(path)
+        else:
+            resolved = Path(path).expanduser().resolve(strict=False)
+            resolved_workspace = self.path_resolver.resolve_workspace(
+                str(resolved), source_frontend=f"{normalized_platform}-native"
+            )
+        if not resolved_workspace.exists or not resolved_workspace.resolved_path.is_dir():
+            raise ValueError(f"workspace directory does not exist: {resolved_workspace.resolved_path}")
+        if not self.path_resolver.is_allowed_workspace(resolved_workspace):
+            raise ValueError("workspace path is outside configured LKA_WORKSPACE_ROOTS")
+        workspace = SessionWorkspace(
+            path=_normalized_workspace_path(path, normalized_platform),
+            platform=normalized_platform,
+            backend_path=resolved_workspace.normalized_path,
+        )
+        self.session_service.set_workspace(session_id=session_id, workspace=workspace)
+        return workspace
 
     def append_session_message(
         self,
@@ -578,8 +768,18 @@ class LocalKnowledgeAgentRuntime:
                 limit=limit,
                 max_pages=max_pages,
             )
+            self.mail_knowledge_mirror.sync(account_id=result.account_id)
             payload = result.model_dump(mode="json")
             payload["provider"] = "outlook"
             payload["trigger"] = trigger
             self.last_mail_sync_result = payload
             return result
+
+    def sync_mail_knowledge_mirror(
+        self,
+        *,
+        account_id: str | None = None,
+    ) -> MailKnowledgeMirrorResult:
+        """Project persisted local mail evidence into the generic knowledge store."""
+
+        return self.mail_knowledge_mirror.sync(account_id=account_id)

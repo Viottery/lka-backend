@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from app.platform.base import PlatformInfo
 
@@ -23,9 +23,15 @@ class ResolvedWorkspacePath:
 class PathResolver:
     """Resolve workspace paths for the backend's native platform."""
 
-    def __init__(self, platform: PlatformInfo, workspace_roots: list[Path] | None = None) -> None:
+    def __init__(
+        self,
+        platform: PlatformInfo,
+        workspace_roots: list[Path] | None = None,
+        wsl_windows_mount_root: Path = Path("/mnt"),
+    ) -> None:
         self.platform = platform
         self.workspace_roots = workspace_roots or []
+        self.wsl_windows_mount_root = wsl_windows_mount_root
 
     def resolve_workspace(
         self,
@@ -44,6 +50,21 @@ class PathResolver:
             source_frontend=source_frontend,
             exists=resolved.exists(),
         )
+
+    def resolve_windows_workspace_from_wsl(self, workspace: str) -> ResolvedWorkspacePath:
+        """Resolve a Windows drive path through the standard WSL mount layout."""
+
+        if self.platform.name != "linux":
+            raise ValueError("Windows-to-WSL path mapping requires a Linux backend.")
+        windows_path = PureWindowsPath(workspace)
+        if not windows_path.is_absolute() or not windows_path.drive:
+            raise ValueError("workspace path must be an absolute Windows drive path")
+        if windows_path.drive.startswith("\\\\"):
+            raise ValueError("Windows UNC paths are not supported by the default WSL mount mapping")
+        drive = windows_path.drive.rstrip(":").lower()
+        mapped = self.wsl_windows_mount_root / drive
+        mapped = mapped.joinpath(*windows_path.parts[1:])
+        return self.resolve_workspace(str(mapped), source_frontend="windows-via-wsl")
 
     def is_allowed_workspace(self, resolved: ResolvedWorkspacePath) -> bool:
         """Return whether the path is under configured roots.

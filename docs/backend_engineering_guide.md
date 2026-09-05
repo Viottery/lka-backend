@@ -60,6 +60,11 @@ ReAct 过程中可以通过 `expand_package` decision 继续展开其他 Tool Pa
 只决定起始 package，不应把整个 turn 锁死在单一领域工具里。典型邮件事务流程应是先展开
 `mail` 检索 / 加载证据，再展开 `matter` 调用 `matter.create` 或 `matter.create_many`
 写入独立事务。
+`selected_package` 只作为兼容输出字段保留，语义等同于 `initial_package`，用于日志、
+旧客户端和 route 质量评估；它不能作为后续 decision、decision_repair、tool_result_check
+或 answer prompt 的上下文。跨 package 状态应通过 `expanded_packages`、`used_packages`
+和 `active_package` 记录。工具结果检查必须使用真实 tool 所属 package，而不是初始
+route package。
 Tool Executor 在真正执行工具前会基于 Tool Registry 中的 `input_schema` 做统一校验，当前
 支持必填字段、基础类型、数组元素类型、嵌套 object、枚举值和最小数值。校验失败时工具不会
 执行，而是返回 `status=rejected`、`validation_errors` 和本地失败反馈；Agent Loop 会把这类
@@ -94,6 +99,9 @@ message。Agent Loop 必须先执行本地协议校验：工具声明 `output_sc
 执行失败、被拒绝、输出协议不匹配或本地无法确认时，才追加独立 `tool_result_check` LLM
 调用。底层 `ToolResult.status` 已失败时，反馈不能被升级为成功。工具包可以按自身
 metadata 或工具输出提供额外 summary，但这不是 Agent core 的领域特判。
+进入后续 LLM prompt 的 observation 可以是压缩副本；长字符串和长列表应被截断并标记
+`_prompt_compacted=true`。完整工具输入输出必须继续保留在 `tool_events`、session payload
+和本地 run log，避免为了节省 token 牺牲审计与可回放性。
 Agent core 只能把工具返回的原始结果、通用反馈和 package metadata 交给 LLM；如果某个领域
 需要状态计数、去重提示、读写边界或业务摘要，应由对应 Tool Package 或 domain service 生成。
 Agent Loop 还会由本地 harness 生成 `progress_events`，用于前端展示用户友好的运行过程：
@@ -131,6 +139,14 @@ metadata 决定，不能在 Agent core 中写死。
 中按当前 `session_id` 读取一次性信息并返回观察结果；是否把用户输入、工具观察、`run_id`
 或 `log_path` 写入会话历史，必须由通用 Agent turn / Session 层显式决定，邮件工具和
 `MailService` 不应自动写会话消息。
+`knowledge` domain 是 source-agnostic 的本地证据库，负责导入 Markdown/TXT/网页文本快照、
+生成 chunk、写入 SQLite FTS、保留 source refs，并在检索输出进入 Agent prompt 前执行最小
+Privacy Gateway 过滤。`knowledge.search` 只能返回 Top-K 最小必要片段；`knowledge.load_chunks`
+返回选中 chunk 的有界文本；`knowledge.load_document` 默认只返回 metadata 和 chunk ids。
+所有 retrieved content 都必须标记为 untrusted data，不能被当作 Agent 指令。Minecraft Wiki、
+PRTS 等大型 wiki 的页面抓取应作为外部 crawler 或前端流程，把页面文本以 `web_page` source
+导入 knowledge；Agent 可见工具不负责自动爬站。后续可以将 `mail_chunks` 映射或同步进
+`knowledge_chunks`，但 `mail` schema 和 mail-specific tools 必须继续保留。
 远程邮箱同步由 runtime 管理，不属于独立邮件 Agent。服务启动时 runtime 可以执行一次
 Outlook 自检同步，把最新邮件写入本地 SQLite；服务运行期间可以通过后台轮询继续同步。
 按需同步则暴露为 `mail.sync` 工具，由 Main Agent Brain 在用户要求“最新/同步/当前邮箱”
@@ -261,13 +277,13 @@ backend/
   index/context 摘要路径。`filesystem.read_file` 返回受限片段、行号和 full-file sha256；
   `filesystem.edit_file` 只做已存在 UTF-8 文本文件的 targeted `old_text -> new_text`
   替换，必须带 `expected_sha256`，默认要求 `old_text` 唯一匹配。filesystem 路径字段中的
-  相对路径按第一个 configured workspace root 解析，并支持 `workspace_root`、
+  相对路径按当前 session workspace（未设置时为第一个 configured workspace root）解析，并支持 `workspace_root`、
   `WORKSPACE_ROOT` 和 `LKA_WORKSPACE_ROOT` 变量展开。
 - 目录 listing、全文搜索、测试命令和交互式命令执行使用 `bash` Tool Package。
   `bash.run` 支持同步和后台终端；后台终端通过 `bash.read_session`、`bash.write_session`、
   `bash.interrupt_session` 和 `bash.terminate_session` 继续交互。具体命令按白名单动态判定
-  `read_only`，白名单外一律进入 safety review。`bash.run` 默认工作目录是第一个
-  configured workspace root，相对 `cwd` 在该 root 内解析；命令环境注入 `workspace_root`、
+  `read_only`，白名单外一律进入 safety review。`bash.run` 默认工作目录是当前 session
+  workspace（未设置时为第一个 configured workspace root），相对 `cwd` 在该 root 内解析；命令环境注入 `workspace_root`、
   `WORKSPACE_ROOT`、`LKA_WORKSPACE_ROOT` 和以分号分隔的 `LKA_WORKSPACE_ROOTS`，模型应优先
   使用相对路径或这些变量定位 workspace 文件。
 - Capability Registry 第一层应优先暴露 Tool Package，而不是一次性暴露所有具体工具。

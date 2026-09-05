@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from app.api.main import create_app
 from app.api.routes.agent import _sse_event_frame, stream_agent_turn
 from app.api.schemas import AgentTurnRequest
@@ -16,9 +18,19 @@ async def _is_never_disconnected() -> bool:
     return False
 
 
-def test_agent_turn_stream_emits_run_tool_and_final_events(tmp_path, monkeypatch):
+@pytest.mark.parametrize("orchestrator", ["legacy", "langgraph"])
+def test_agent_turn_stream_emits_run_tool_and_final_events(
+    tmp_path,
+    monkeypatch,
+    orchestrator,
+):
+    config_path = tmp_path / "local.toml"
+    config_path.write_text(
+        f'[agent]\norchestrator = "{orchestrator}"\n',
+        encoding="utf-8",
+    )
     monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
-    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(config_path))
     get_settings.cache_clear()
 
     app = create_app()

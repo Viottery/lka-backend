@@ -17,8 +17,18 @@ def test_missing_local_config_uses_safe_defaults(tmp_path):
     assert config.mail.outlook.sync_interval_seconds == 300
     assert config.mail.outlook.sync_limit == 25
     assert config.mail.outlook.sync_max_pages == 1
-    assert config.embedding.provider == "local_bge"
-    assert config.embedding.model_name == "BAAI/bge-m3"
+    assert config.embedding.provider == "fastembed"
+    assert config.embedding.index_provider == "sqlite_vec"
+    assert config.embedding.model_name == "BAAI/bge-small-zh-v1.5"
+    assert config.agent.orchestrator == "legacy"
+
+
+def test_settings_default_runtime_data_directory_is_isolated_from_fixtures(monkeypatch):
+    monkeypatch.delenv("LKA_DATA_DIR", raising=False)
+
+    settings = Settings(_env_file=None)
+
+    assert settings.data_dir == Path("data/runtime")
 
 
 def test_local_config_loads_provider_mail_and_embedding_sections(tmp_path, monkeypatch):

@@ -45,6 +45,7 @@ class ToolContext(BaseModel):
     session_id: str
     trace_id: str | None = None
     context_id: str | None = None
+    workspace_root: str | None = None
     safety_review_approved: bool = False
     safety_review_id: str | None = None
 

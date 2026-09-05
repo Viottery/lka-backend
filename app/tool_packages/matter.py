@@ -20,7 +20,8 @@ MATTER_PACKAGE = ToolPackageSpec(
         "Use this package when the user asks to inspect, create, update, or link local tasks, events, reminders, or matters.",
     ],
     decision_hints=[
-        "Inspect existing records when there is a realistic chance of duplicates before creating new records.",
+        "Before create or create_many, call matter.search with the candidate title or key subject unless recent observations already prove no duplicate risk.",
+        "If matter.search returns a likely duplicate, update or link the existing matter instead of creating a new one.",
         "Use create for one record, create_many for a controlled batch, update to change existing records, and link_source to attach evidence.",
         "Follow every tool input_schema exactly, especially required fields and allowed_values.",
     ],

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -12,6 +13,9 @@ from evals.lka_evals.case_loader import load_suite
 from evals.lka_evals.metrics import evaluate_case, summarize_metrics
 from evals.lka_evals.report import write_reports
 from evals.lka_evals.subject import EvalRunArtifact, build_subject
+from evals.lka_evals.judge import judge_answer
+from app.core.local_config import load_local_config
+from app.core.llm import build_text_llm_client
 
 
 def run_suite(
@@ -24,6 +28,7 @@ def run_suite(
     local_config: Path | None = None,
     timeout: float = 120.0,
     report_dir: Path = Path("evals/reports"),
+    judge: bool = False,
 ) -> dict[str, Any]:
     suite = load_suite(suite_path)
     suite_id = str(suite.get("suite_id") or suite_path.stem)
@@ -36,11 +41,24 @@ def run_suite(
         timeout=timeout,
     )
     case_results: list[dict[str, Any]] = []
+    judge_client = None
+    if judge:
+        config_path = local_config or Path("config/local.toml")
+        judge_client = build_text_llm_client(load_local_config(config_path))
+        if judge_client is None:
+            raise RuntimeError("LLM judge requested but no configured LLM client is available")
     for case in suite.get("cases", []):
         if not isinstance(case, dict):
             continue
         artifact = subject.run_case(suite_id=suite_id, case=case)
         metrics = evaluate_case(case, artifact)
+        if judge_client is not None:
+            expected = case.get("expect") if isinstance(case.get("expect"), dict) else {}
+            gold = str(expected.get("answer") or expected.get("answer_gold") or "")
+            if gold:
+                judged = asyncio.run(judge_answer(client=judge_client, question=str(case.get("request", {}).get("user_input", "")), answer=str(artifact.result.get("answer") or ""), gold=gold, evidence=[str(x) for x in expected.get("evidence_text", [])]))
+                from evals.lka_evals.metrics import MetricResult
+                metrics.append(MetricResult("llm_judge_answer_quality", float(judged.get("score", 0.0)), judged.get("status") == "completed" and float(judged.get("score", 0.0)) >= float(expected.get("judge_min_score", 0.7)), judged))
         metric_summary = summarize_metrics(metrics)
         case_results.append(_case_result(case=case, artifact=artifact, summary=metric_summary))
 
@@ -90,6 +108,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--report-dir", type=Path, default=Path("evals/reports"))
+    parser.add_argument("--judge", action="store_true", help="Run optional LLM-as-judge answer scoring.")
     parser.add_argument("--json", action="store_true", help="Print machine-readable summary.")
     args = parser.parse_args(argv)
 
@@ -102,6 +121,7 @@ def main(argv: list[str] | None = None) -> int:
         local_config=args.local_config,
         timeout=args.timeout,
         report_dir=args.report_dir,
+        judge=args.judge,
     )
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))

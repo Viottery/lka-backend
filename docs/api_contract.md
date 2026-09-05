@@ -91,6 +91,39 @@ Windows 原生后端示例：
 - `workspace` 表示后端进程可访问的本地路径。Windows 原生后端应传 Windows 路径，
   Linux 原生后端应传 POSIX 路径。
 - Windows JSON 推荐使用 `C:/Users/...` 写法，避免反斜杠转义。
+
+### 会话工作目录
+
+```http
+PUT /sessions/{session_id}/workspace
+```
+
+```json
+{
+  "path": "/home/chuan/Documents/project",
+  "platform": "linux"
+}
+```
+
+响应中的 `workspace` 会同时出现在该会话的 `GET /sessions/{session_id}` 结果中。它是
+`bash` 和 `filesystem` 的默认根目录：相对路径、`$workspace_root` 和命令环境变量均按此目录
+解析。`filesystem` 会拒绝目录之外的路径；`bash` 将其作为受校验的 `cwd`，但不是 OS 级
+sandbox，shell 命令本身仍须经过既有安全审查。
+
+路径协议：
+
+- `platform` 必须是 `linux`、`windows` 或 `macos`。通常必须等于后端实际运行平台；但 Linux
+  backend 支持 WSL 的 Windows drive-path 桥接。
+- Linux/macOS 使用绝对 POSIX 路径；Windows 使用绝对盘符或 UNC 路径，JSON 推荐 `C:/...`。
+- Linux backend 在 WSL 中接收 `C:/Users/...` 时，会按 `LKA_WSL_WINDOWS_MOUNT_ROOT`（默认
+  `/mnt`）映射为 `/mnt/c/Users/...` 后执行；响应保留原 Windows 路径，并额外返回实际的
+  `backend_path`。默认映射不支持 Windows UNC 路径（如 `//server/share/...`）。
+- 前端可选择和切换目录，但只能选择后端进程实际可访问的本地目录；Windows backend 不能直接
+  执行 `/home/...`，非 WSL Linux backend 的 Windows 路径也必须有可访问的对应挂载点。
+- 配置了 `LKA_WORKSPACE_ROOTS` 时，所选目录必须位于其中之一；未配置时，用户显式选择的目录
+  本身成为该会话唯一工具根目录。
+- 该设置影响后续工具调用。已启动的 `bash` 后台终端保留创建时的 `cwd`，不会在切换目录时被
+  静默迁移。
 - 当前 `options` 支持 `recursive`、`skip_hidden`、`allow_symlinks`、`max_files`
   和 `sample_limit`。
 
@@ -120,6 +153,13 @@ GET /capabilities
       "risk": "low_to_medium",
       "requires_confirmation": true,
       "read_only": false
+    },
+    {
+      "name": "knowledge",
+      "type": "tool_package",
+      "risk": "low_to_medium",
+      "requires_confirmation": false,
+      "read_only": true
     },
     {
       "name": "filesystem",
@@ -162,7 +202,206 @@ GET /capabilities
 
 ---
 
-## 4. Runtime Debug Entry
+## 4. Knowledge Import And Retrieval
+
+`knowledge` 是 source-agnostic 的本地证据库。第一版支持导入 Markdown/TXT 本地文档，
+写入 SQLite FTS，并通过只读工具提供最小必要片段给 Agent。
+
+网页抓取不由 Agent 工具自动执行。当前公开网页样本先由外部脚本转换为分层本地 Markdown，
+例如 `data/knowledge_samples/minecraft/mobs/creeper.md`，再以
+`source_type="local_document"` 导入；原 URL、抓取时间、collection、section 和校验和仅
+保存在 metadata 中作为证据溯源。网页来源模型和 crawler 是后续数据源能力，不是当前
+`knowledge` 的前提。
+
+本地邮件会在 `/mail/import` 和 `/mail/outlook/sync` 成功写入后自动镜像为
+`source_type="mail_message"` 的知识文档。镜像使用 `mail_message:<message_id>` 作为
+document-level `source_ref`，chunk 结果会追加 `#chunk=<n>`；`uri` 为稳定的
+`mail://<account_id>/messages/<message_id>`。邮件内容默认属于 `personal`，并使用
+`redact` 远程策略。邮件专属筛选仍应使用 `/mail/search`，统一跨来源检索可通过
+`source_type=mail_message` 过滤 `/knowledge/search`。
+
+### 4.1 Import Knowledge Document
+
+```http
+POST /knowledge/import
+```
+
+请求：
+
+```json
+{
+  "source": {
+    "source_type": "local_document",
+    "display_name": "prts.wiki.md",
+    "uri": "data/knowledge_samples/prts.wiki.md",
+    "metadata": {"seed_site": "prts"},
+    "sensitivity": "public",
+    "remote_policy": "allow"
+  },
+  "title": "prts.wiki.md",
+  "uri": "data/knowledge_samples/prts.wiki.md",
+  "text": "页面正文文本...",
+  "mime_type": "text/markdown",
+  "metadata": {"original_url": "https://prts.wiki", "ingestion_kind": "public_page_snapshot"},
+  "sensitivity": "public",
+  "remote_policy": "allow"
+}
+```
+
+响应：
+
+```json
+{
+  "source_id": "knowledge_source_xxx",
+  "document_id": "knowledge_doc_xxx",
+  "imported_chunks": 12,
+  "checksum": "sha256...",
+  "sensitivity": "public",
+  "remote_policy": "allow",
+  "secret_chunks_redacted": 0
+}
+```
+
+### 4.2 Search Knowledge
+
+```http
+GET /knowledge/search?q=红石&limit=10&source_type=local_document&mode=hybrid
+```
+
+响应：
+
+```json
+{
+  "query": "红石",
+  "query_id": "knowledge_query_xxx",
+  "requested_mode": "hybrid",
+  "applied_mode": "hybrid",
+  "retrieval_warning": null,
+  "results": [
+    {
+      "chunk_id": "knowledge_chunk_xxx",
+      "document_id": "knowledge_doc_xxx",
+      "title": "Minecraft Wiki",
+      "source_type": "local_document",
+      "uri": "data/knowledge_samples/zh.minecraft.wiki_w_Minecraft_Wiki.md",
+      "chunk_index": 0,
+      "snippet": "最小必要片段...",
+      "source_ref": "local_document:data/knowledge_samples/zh.minecraft.wiki_w_Minecraft_Wiki.md#chunk=0",
+      "sensitivity": "public",
+      "remote_policy": "allow",
+      "policy_decision": "allowed",
+      "retrieval_channels": ["keyword", "semantic"],
+      "retrieval_score": 0.0328,
+      "untrusted_data": true
+    }
+  ],
+  "filtered_count": 0
+}
+```
+
+`mode` 可选值为 `keyword`、`semantic` 和 `hybrid`。后端通过可替换的 retrieval
+接口选择实现；当语义索引尚未同步时，`semantic` / `hybrid` 会保守回退到关键词检索，并在
+`retrieval_warning` 中明确返回原因。
+
+### 4.3 Rebuild Mail Knowledge Mirror
+
+```http
+POST /knowledge/mail-mirror/sync
+```
+
+请求可限定一个本地邮件账户：
+
+```json
+{"account_id": "mail_account_xxx"}
+```
+
+不传 `account_id` 时会重建所有本地持久化邮件的镜像。该接口只投影本地邮件数据，
+不访问远程邮箱；向量索引同步仍使用 `/knowledge/semantic-index/sync`，或由本地
+`auto_index_on_import` 配置控制。
+
+响应：
+
+```json
+{
+  "scope": "account",
+  "scanned_messages": 25,
+  "mirrored_messages": 25,
+  "imported_chunks": 31,
+  "document_ids": ["knowledge_doc_xxx"]
+}
+```
+
+### 4.4 Sync Local Semantic Index
+
+```http
+POST /knowledge/semantic-index/sync
+```
+
+显式为已导入、非 `secret` 且非 `deny` 的 chunk 生成本地 embedding，并同步已配置的本地
+语义索引。默认实现为 FastEmbed 本地 ONNX embedding 和 sqlite-vec；原文不发送到远程
+embedding 服务。
+
+首次初始化模型时，必须显式请求下载：
+
+```json
+{"allow_model_download": true}
+```
+
+默认 `allow_model_download=false`，已缓存模型后的索引同步和所有查询均为离线操作。
+
+```json
+{
+  "enabled": true,
+  "index_key": "fastembed:BAAI/bge-small-zh-v1.5:512",
+  "scanned_chunks": 46,
+  "embedded_chunks": 46,
+  "updated_chunks": 0,
+  "removed_chunks": 0,
+  "indexed_chunks": 46
+}
+```
+
+### 4.5 Load Knowledge Chunks
+
+```http
+POST /knowledge/chunks/load
+```
+
+请求：
+
+```json
+{
+  "chunk_ids": ["knowledge_chunk_xxx"],
+  "max_chars_per_chunk": 420
+}
+```
+
+### 4.6 Load Knowledge Document
+
+```http
+GET /knowledge/documents/{document_id}?include_text=false
+```
+
+默认只返回 metadata 和 `chunk_ids`。只有显式 `include_text=true` 时才返回有界、
+privacy-filtered 的文本视图。
+
+### 设计说明
+
+- `knowledge.search`、`knowledge.load_chunks`、`knowledge.load_document` 都是 Agent 可见
+  只读工具。
+- `knowledge.search` 只返回 Top-K 最小片段，不返回整篇文档。
+- 关键词、语义和 hybrid 融合策略不是 Agent core 或工具协议中的硬编码；它们由本地
+  retrieval implementation 和配置决定。
+- 默认 FastEmbed/sqlite-vec 实现完全本地运行。`secret` / `deny` chunk 不生成向量。
+- 所有返回给 Agent 的 retrieved content 都标记为 `untrusted_data=true`。
+- `sensitivity="secret"` 或 `remote_policy="deny"` 不进入 Agent prompt 输出。
+- 导入时检测到 secret-like chunk 时，默认只保存占位内容和 metadata，不保存原 secret 原文。
+- `mail_message` 镜像保留邮件特有查询能力的边界；邮件同步、按文件夹/发件人精确筛选和
+  完整邮件加载仍通过 `mail` package 完成。
+
+---
+
+## 5. Runtime Debug Entry
 
 ```http
 POST /runtime/debug
@@ -203,7 +442,7 @@ POST /runtime/debug
 
 ---
 
-## 5. Agent Turn
+## 6. Agent Turn
 
 ```http
 POST /agent/turn
@@ -224,8 +463,8 @@ POST /agent/turn
 ```
 
 `llm` 是可选字段；不传时使用会话 / 配置默认值。`model` 是运行时可切换选项，不应由
-后端代码写死。当前 `/agent/turn` 仍返回完整非流式结果；`response_mode=stream` 先作为
-LLM service 层能力预留，用户可见 stream endpoint 后续单独提供。
+后端代码写死。`/agent/turn` 返回完整结果；`POST /agent/turn/stream` 提供用户可见的 SSE
+token-delta 输出。
 每次 LLM 调用都会在响应的 `llm_events` 中带上 `llm_call_id`、provider / model、
 response mode、耗时、usage、finish reason、provider request id、rate-limit headers、
 错误分类和 retry 判断等审计字段。完整 prompt / output 仍只写入本地 markdown run log；
@@ -240,6 +479,10 @@ response mode、耗时、usage、finish reason、provider request id、rate-limi
   "trace_id": "agent_turn_xxx",
   "answer": "我已调用本地 mail tools...",
   "selected_package": "mail",
+  "initial_package": "mail",
+  "expanded_packages": ["mail", "matter"],
+  "used_packages": ["mail", "matter"],
+  "active_package": "matter",
   "package_catalog": [],
   "expanded_tools": [],
   "decision_events": [],
@@ -265,7 +508,15 @@ response mode、耗时、usage、finish reason、provider request id、rate-limi
   decision hints 和 cache policy 提供。
 - 展开 package 后，Agent 会进入单次 turn 内的 step-limited loop：每一步生成一个
   `decision_event`，动作可以是调用一个工具、展开 package、请求确认，或进入最终回答阶段；
-  工具结果作为 observation 进入下一步。
+  工具结果作为 observation 进入下一步。默认 step budget 为 10，可通过
+  `config/local.toml` 的 `[agent].max_decision_steps` 调整。
+- 当当前 LLM client 在 `config/local.toml` 声明 `supports_function_calling = true` 时，
+  decision stage 优先使用 provider-native Function Calling：已展开工具的 input schema 与通用
+  package 展开动作会作为 functions 发给 provider。没有 function call 表示进入独立 `answer`
+  stage；最终用户答案仍只来自 `answer` / `context_answer` 的 token-delta。所有 native 调用仍会
+  经过既有 Tool Executor、input schema 与 safety review。未声明该 capability、provider 拒绝
+  tools，或 native 响应不可用时，自动回退 operation-first JSON 决策协议。对支持严格 schema
+  的 provider 可额外设置 `function_calling_strict = true`；该选项依赖 provider/base URL 支持。
 - `decision_event` 会同时记录 `assistant_message` 和 `operation`。`assistant_message`
   是用户可见的过程文本；`operation` 是内部结构化动作，例如
   `tool_call`、`expand_package`、`final_answer`、`request_confirmation` 或 `no_op`。
@@ -275,6 +526,10 @@ response mode、耗时、usage、finish reason、provider request id、rate-limi
 - route 只决定起始 package；在 ReAct loop 中，如果已展开工具不足，LLM 可以输出
   `expand_package` 来展开另一个已注册 package。跨 package 工作流必须来自 registry
   metadata 和 tool schema，而不是 Agent core 特判。
+- `selected_package` 是兼容字段，语义等同于 `initial_package`，只用于 route 质量评估、
+  日志和旧客户端兼容；后续 decision、decision_repair、tool_result_check、answer 等
+  LLM 上下文不再接收该字段。前端展示跨 package 状态应使用 `initial_package`、
+  `expanded_packages`、`used_packages` 和 `active_package`。
 - 如果 LLM 选择不展开 package，Agent 可以进入 `context_answer` 阶段，基于当前
   session context window 直接回答，不应把“无需工具”当成“无法处理”。
 - 如果 LLM 返回不完整 JSON 但原始输出明确选择了某个已注册 package，Agent 会保守恢复该
@@ -291,6 +546,14 @@ response mode、耗时、usage、finish reason、provider request id、rate-limi
   message。Agent 会先做本地协议校验：工具声明 `output_schema` 时按该 schema 校验
   `ToolResult.output`；未声明时只检查 `ToolResult` 是完整 JSON 对象形状。只有工具执行
   失败、被拒绝、输出协议不匹配或本地无法确认时，才记录 `tool_result_check` LLM 事件。
+- 长工具结果会在进入后续 LLM prompt 的 `observations` 前做通用压缩，并用
+  `_prompt_compacted=true` 标记。完整工具结果仍保留在 `tool_events`、session payload 和
+  本地 markdown run log 中。
+- 每轮 decision prompt 还会包含 `completed_tool_calls`，以简洁形式列出当前 turn 已成功的
+  调用和其输入。模型在已有结果覆盖请求时必须进入 `final_answer`，不得仅为增加置信度而重放
+  相同工具和输入；如用户明确要求重复执行，模型必须在 operation 中显式设置
+  `repeat_successful_call=true`。无此标记的重复成功调用会被 harness 拦截，并直接以已有证据
+  进入 answer stage。
 - `progress_events` 是由 harness 本地代码生成的自然语言运行过程流，不调用 LLM。它会记录
   package 选择、模型过程文本、package 展开、工具开始 / 完成、工具反馈、最终回答和校验
   warning，供前端展示“系统正在做什么”。
@@ -323,7 +586,7 @@ response mode、耗时、usage、finish reason、provider request id、rate-limi
 
 ---
 
-## 6. Bash Tool Protocol
+## 7. Bash Tool Protocol
 
 bash 工具只通过 Agent tool-call 暴露，不提供独立 HTTP endpoint。前端通过
 `/agent/turn/stream` 观察 tool events 和 safety review events。
@@ -345,7 +608,7 @@ bash 工具只通过 Agent tool-call 暴露，不提供独立 HTTP endpoint。�
   连接所有 configured workspace roots。
 - 模型应优先使用相对路径或 `$workspace_root` 定位文件，避免凭空构造占位绝对路径。
 
-### 6.1 `bash.run`
+### 7.1 `bash.run`
 
 同步命令：
 
@@ -415,7 +678,7 @@ bash 工具只通过 Agent tool-call 暴露，不提供独立 HTTP endpoint。�
 `sed`、`head`、`tail`、`wc`、`git status`、`git diff`、`git log`、`git show`
 等可判为只读。无法判断、重定向写入、非白名单命令默认非只读。
 
-### 6.2 `bash.read_session`
+### 7.2 `bash.read_session`
 
 ```json
 {
@@ -448,7 +711,7 @@ bash 工具只通过 Agent tool-call 暴露，不提供独立 HTTP endpoint。�
 
 模型应保存 `next_offset`，下一次从该 offset 继续查询，避免重复读取。
 
-### 6.3 Session Control
+### 7.3 Session Control
 
 - `bash.list_sessions`: 查询所有终端或 `active_only=true` 的活跃终端。
 - `bash.write_session`: 向后台终端写入 stdin 文本，例如 `"hello\n"`。
@@ -460,7 +723,7 @@ safety review。
 
 ---
 
-## 7. Agent Safety Reviews
+## 8. Agent Safety Reviews
 
 ```http
 GET /agent/runs/{run_id}/safety-reviews
@@ -517,7 +780,7 @@ POST /agent/safety-reviews/{review_id}/decision
 
 ---
 
-## 8. Agent Turn Stream
+## 9. Agent Turn Stream
 
 ```http
 POST /agent/turn/stream
@@ -587,7 +850,7 @@ final_answer
 作为最终回答实时输出；`final_answer` event 只作为最终校准 / 补全事件，不是首个显示最终
 答案的主要来源。
 
-### 8.1 Linux CLI Frontend
+### 9.1 Linux CLI Frontend
 
 仓库内 `debug_frontend/` 提供一个最小 Linux 命令行 HTTP 前端。它与后端保持前后端分离，
 只通过 HTTP / SSE 调用已有 API，不导入或调用 `app/core` 内部运行时代码：
@@ -629,9 +892,9 @@ hidden|collapsed|expanded` 在会话中切换过程事件显示方式。
 
 ---
 
-## 9. Sessions
+## 10. Sessions
 
-### 9.1 Create Session
+### 10.1 Create Session
 
 ```http
 POST /sessions
@@ -678,7 +941,7 @@ POST /sessions
 }
 ```
 
-### 9.2 List Sessions
+### 10.2 List Sessions
 
 ```http
 GET /sessions?limit=50
@@ -701,7 +964,7 @@ GET /sessions?limit=50
 }
 ```
 
-### 9.3 Get Session
+### 10.3 Get Session
 
 ```http
 GET /sessions/session_xxx
@@ -716,7 +979,7 @@ GET /sessions/session_xxx
 }
 ```
 
-### 9.4 Append Session Message
+### 10.4 Append Session Message
 
 ```http
 POST /sessions/session_xxx/messages
@@ -744,7 +1007,7 @@ POST /sessions/session_xxx/messages
 
 ---
 
-## 10. Mail Import
+## 11. Mail Import
 
 ```http
 POST /mail/import
@@ -794,10 +1057,10 @@ POST /mail/import
 
 ---
 
-## 11. Mail Search
+## 12. Mail Search
 
 ```http
-GET /mail/search?q=document&limit=10
+GET /mail/search?q=document&limit=10&mode=hybrid&order_by=relevance&max_snippet_chars=420
 ```
 
 响应：
@@ -812,7 +1075,11 @@ GET /mail/search?q=document&limit=10
       "sender": "admin@example.com",
       "folder": "Inbox",
       "received_at": "2026-08-03T09:30:00Z",
-      "snippet": "Please submit the missing document by Friday."
+      "snippet": "Please submit the missing document by Friday.",
+      "document_id": "knowledge_doc_...",
+      "chunk_id": "knowledge_chunk_...",
+      "source_ref": "mail_message:message_id_001#chunk=0",
+      "excerpt_truncated": false
     }
   ]
 }
@@ -823,14 +1090,16 @@ GET /mail/search?q=document&limit=10
 说明：
 
 - 当前没有 `/mail/process` 或其他邮件专属 agent endpoint。
+- `/mail/search` 通过本地 KnowledgeService 检索 `mail_message` 镜像，返回受预算约束的
+  正文证据片段；空 query 搭配 `order_by=source_time_desc` 返回最新邮件。
 - 邮件能力通过 Tool Package 暴露给后续通用 Agent turn：`mail.search`、
-  `mail.load_messages`、`mail.sync`。
+  `mail.load_messages`、`mail.sync`；`mail.load_messages` 仅用于最多三封邮件的精确原文查阅。
 - 邮件整理、概括、匹配等行为应由通用 Agent turn 决定是否调用 mail tools，而不是通过
   mail 路由直接启动独立 agent loop。
 
 ---
 
-## 12. List Mail Matters
+## 13. List Mail Matters
 
 ```http
 GET /mail/matters
@@ -854,12 +1123,12 @@ GET /mail/matters
 
 ---
 
-## 13. Matters
+## 14. Matters
 
 独立事务系统用于保存任务、事件、待办和提醒候选项，不从属于邮件。邮件、Agent trace、
 本地文件或后续日历对象都可以作为 `source_links` 关联到同一个 matter。
 
-### 13.1 Create Matter
+### 14.1 Create Matter
 
 ```http
 POST /matters
@@ -888,7 +1157,7 @@ POST /matters
 
 响应：返回完整 `matter` 记录。
 
-### 13.2 List / Search / Update
+### 14.2 List / Search / Update
 
 ```http
 GET /matters?limit=50&status=open
@@ -906,7 +1175,7 @@ POST /matters/{matter_id}/source-links
 
 ---
 
-## 14. Outlook Auth Start
+## 15. Outlook Auth Start
 
 ```http
 POST /mail/outlook/auth/start
@@ -934,7 +1203,7 @@ POST /mail/outlook/auth/start
 
 ---
 
-## 15. Outlook Auth Complete
+## 16. Outlook Auth Complete
 
 ```http
 POST /mail/outlook/auth/complete
@@ -963,7 +1232,7 @@ POST /mail/outlook/auth/complete
 
 ---
 
-## 16. Outlook Sync
+## 17. Outlook Sync
 
 ```http
 POST /mail/outlook/sync
@@ -1006,7 +1275,7 @@ POST /mail/outlook/sync
 
 ---
 
-## 17. Compatibility Notes
+## 18. Compatibility Notes
 
 - 当前后端实现是轻量骨架，因此部分返回值是规则化输出而非真实 agent 结果。
 - 这份契约保留了未来完整系统需要的字段，便于逐步替换实现。

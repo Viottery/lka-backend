@@ -49,6 +49,16 @@ def evaluate_case(case: dict[str, Any], artifact: EvalRunArtifact) -> list[Metri
         metrics.append(_workspace_min_files(artifact, expected.get("workspace_min_files")))
     if "workspace_min_chunks" in expected:
         metrics.append(_workspace_min_chunks(artifact, expected.get("workspace_min_chunks")))
+    if "knowledge_relevant_titles" in expected:
+        metrics.append(_knowledge_search_recall(artifact, expected.get("knowledge_relevant_titles")))
+    if "knowledge_forbidden_titles" in expected:
+        metrics.append(_knowledge_search_precision(artifact, expected.get("knowledge_forbidden_titles")))
+    if "knowledge_required_chunk_titles" in expected:
+        metrics.append(_knowledge_loaded_evidence(artifact, expected.get("knowledge_required_chunk_titles")))
+    if "knowledge_answer_contains_all" in expected:
+        metrics.append(_knowledge_answer_contains(artifact, expected.get("knowledge_answer_contains_all")))
+    if "answer_exact" in expected or "answer_f1" in expected:
+        metrics.append(_answer_quality(artifact, expected))
     if "tool_output_contains_all" in expected:
         metrics.append(_tool_output_contains_all(artifact, expected.get("tool_output_contains_all")))
     if "tool_output_excludes_all" in expected:
@@ -317,6 +327,82 @@ def _workspace_min_chunks(artifact: EvalRunArtifact, expected: Any) -> MetricRes
         passed=actual >= minimum,
         details={"minimum": minimum, "actual": actual},
     )
+
+
+def _knowledge_search_events(artifact: EvalRunArtifact) -> list[dict[str, Any]]:
+    return [event for event in artifact.result.get("tool_events", [])
+            if isinstance(event, dict) and event.get("tool_name") == "knowledge.search"]
+
+
+def _knowledge_search_items(artifact: EvalRunArtifact) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    if artifact.result.get("operation") == "knowledge_search":
+        output = artifact.result.get("output", {})
+        return output.get("results", []) if isinstance(output, dict) else []
+    for event in _knowledge_search_events(artifact):
+        result = event.get("result", {})
+        output = result.get("output", {}) if isinstance(result, dict) else {}
+        if isinstance(output, dict) and isinstance(output.get("results"), list):
+            items.extend(item for item in output["results"] if isinstance(item, dict))
+    return items
+
+
+def _knowledge_search_recall(artifact: EvalRunArtifact, expected: Any) -> MetricResult:
+    expected_titles = {str(item) for item in expected} if isinstance(expected, list) else set()
+    found_titles = {str(item.get("title")) for item in _knowledge_search_items(artifact)}
+    missing = sorted(expected_titles - found_titles)
+    score = len(expected_titles & found_titles) / len(expected_titles) if expected_titles else 1.0
+    return MetricResult("knowledge_search_recall", score, not missing, {"expected_titles": sorted(expected_titles), "found_titles": sorted(found_titles), "missing": missing})
+
+
+def _knowledge_search_precision(artifact: EvalRunArtifact, expected: Any) -> MetricResult:
+    forbidden = {str(item) for item in expected} if isinstance(expected, list) else set()
+    found = [str(item.get("title")) for item in _knowledge_search_items(artifact)]
+    violations = sorted(forbidden & set(found))
+    score = 1.0 if not found else (len(set(found) - forbidden) / len(found))
+    return MetricResult("knowledge_search_precision", score, not violations, {"retrieved_titles": found, "forbidden_titles": sorted(forbidden), "violations": violations})
+
+
+def _knowledge_loaded_evidence(artifact: EvalRunArtifact, expected: Any) -> MetricResult:
+    required = {str(item) for item in expected} if isinstance(expected, list) else set()
+    loaded: set[str] = set()
+    for event in artifact.result.get("tool_events", []):
+        if not isinstance(event, dict) or event.get("tool_name") != "knowledge.load_chunks":
+            continue
+        output = (event.get("result") or {}).get("output", {})
+        for chunk in output.get("chunks", []) if isinstance(output, dict) else []:
+            if isinstance(chunk, dict):
+                loaded.add(str(chunk.get("title")))
+    missing = sorted(required - loaded)
+    score = len(required & loaded) / len(required) if required else 1.0
+    return MetricResult("knowledge_evidence_recall", score, not missing, {"required_titles": sorted(required), "loaded_titles": sorted(loaded), "missing": missing})
+
+
+def _knowledge_answer_contains(artifact: EvalRunArtifact, expected: Any) -> MetricResult:
+    answer = str(artifact.result.get("answer") or "").casefold()
+    terms = [str(item) for item in expected] if isinstance(expected, list) else []
+    missing = [term for term in terms if term.casefold() not in answer]
+    score = (len(terms) - len(missing)) / len(terms) if terms else 1.0
+    return MetricResult("knowledge_answer_fact_accuracy", score, not missing, {"missing_terms": missing, "checked_terms": terms})
+
+
+def _answer_quality(artifact: EvalRunArtifact, expected: dict[str, Any]) -> MetricResult:
+    actual = _normalize_answer(str(artifact.result.get("answer") or ""))
+    gold = _normalize_answer(str(expected.get("answer_exact") or expected.get("answer_f1") or ""))
+    actual_tokens = actual.split(); gold_tokens = gold.split()
+    exact = float(actual == gold and bool(gold))
+    common = sum(min(actual_tokens.count(t), gold_tokens.count(t)) for t in set(gold_tokens))
+    precision = common / len(actual_tokens) if actual_tokens else 0.0
+    recall = common / len(gold_tokens) if gold_tokens else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+    minimum = expected.get("answer_min_f1", 1.0 if "answer_f1" in expected else None)
+    passed = exact >= 1.0 if "answer_exact" in expected else (minimum is None or f1 >= float(minimum))
+    return MetricResult("answer_quality", round(exact if "answer_exact" in expected else f1, 4), passed, {"exact_match": exact, "f1": round(f1,4), "gold": gold, "actual_preview": actual[:500], "minimum_f1": minimum}, weight=2.0)
+
+
+def _normalize_answer(value: str) -> str:
+    import re
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", value.casefold())).strip()
 
 
 def _tool_output_contains_all(artifact: EvalRunArtifact, expected: Any) -> MetricResult:

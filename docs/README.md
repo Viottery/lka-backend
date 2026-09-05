@@ -11,6 +11,8 @@ This folder contains the working documentation set for Local Knowledge Agent OS.
 - [HTTP API Contract](./api_contract.md) - the current HTTP surface and response shapes.
 - [AI Coding Standard](./ai_coding_standard.md) - the execution and reporting contract for coding work.
 - [MVP Todolist](./mvp_todolist.md) - the step-by-step implementation checklist for the MVP.
+- [LangGraph Core Migration Plan](./langgraph_core_migration_plan.md) - executable plan for moving Agent orchestration to LangGraph while preserving project-owned semantics.
+- [Personal Knowledge And Agent Memory Plan](./personal_knowledge_memory_plan.md) - local-first knowledge base, memory layers, and phased retrieval roadmap.
 
 ## Source Draft
 
@@ -25,3 +27,5 @@ This folder contains the working documentation set for Local Knowledge Agent OS.
 5. HTTP API Contract
 6. AI Coding Standard
 7. MVP Todolist
+8. LangGraph Core Migration Plan
+9. Personal Knowledge And Agent Memory Plan

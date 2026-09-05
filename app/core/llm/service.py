@@ -81,6 +81,16 @@ class LLMService:
         async for event in client.stream(request):
             yield event
 
+    def supports_function_calling(self, *, client_name: str | None = None) -> bool:
+        """Return the configured capability for the selected provider client."""
+
+        resolved_name = client_name or self.config.default_client
+        client = self.registry.get(resolved_name) if resolved_name else None
+        if client is None and not resolved_name:
+            clients = self.registry.list_clients()
+            client = clients[0] if clients else None
+        return bool(client and getattr(client, "supports_function_calling", False))
+
     def _client_name_for(self, request: LLMRequest) -> str:
         if request.client_name:
             return request.client_name

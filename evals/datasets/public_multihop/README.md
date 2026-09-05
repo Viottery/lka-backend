@@ -1,0 +1,1 @@
+MultiHop-RAG 600-query sampled benchmark. Source: https://github.com/yixuantt/MultiHop-RAG. License: ODC-BY. Sample seed: 20260829. Generated from the public dataset; verify upstream license before redistribution.

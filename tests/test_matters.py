@@ -108,6 +108,11 @@ def test_matter_tools_are_registered(tmp_path, monkeypatch):
         tool.name: tool
         for tool in app.state.runtime.tool_registry.list_tools(package="matter")
     }
+    matter_package = next(
+        package
+        for package in app.state.runtime.tool_registry.list_packages()
+        if package.name == "matter"
+    )
     assert matter_tool_names == {
         "matter.create",
         "matter.create_many",
@@ -117,6 +122,9 @@ def test_matter_tools_are_registered(tmp_path, monkeypatch):
         "matter.link_source",
     }
     assert app.state.runtime.tool_registry.list_tools(package="runtime") == []
+    assert "Before create or create_many, call matter.search" in " ".join(
+        matter_package.decision_hints
+    )
     create_schema = matter_tool_specs["matter.create"].input_schema
     create_many_schema = matter_tool_specs["matter.create_many"].input_schema
     assert create_schema["required"] == ["title", "summary"]

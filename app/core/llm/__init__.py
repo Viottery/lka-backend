@@ -20,6 +20,8 @@ from app.core.llm.models import (
     LLMResponse,
     LLMResponseMode,
     LLMStreamEvent,
+    LLMToolCall,
+    LLMToolDefinition,
 )
 from app.core.llm.audit import LLMCallRecord
 from app.core.llm.registry import LLMClientRegistry, build_llm_registry
@@ -61,6 +63,8 @@ __all__ = [
     "LLMResponseMode",
     "LLMResponseParseError",
     "LLMStreamEvent",
+    "LLMToolCall",
+    "LLMToolDefinition",
     "LLMService",
     "LLMTimeoutError",
     "MockLLMClient",

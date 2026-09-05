@@ -7,6 +7,8 @@ from app.api.schemas import (
     SessionCreateResponse,
     SessionDetailResponse,
     SessionListResponse,
+    SessionWorkspaceResponse,
+    SessionWorkspaceUpdateRequest,
 )
 
 router = APIRouter(prefix="/sessions", tags=["sessions"])
@@ -38,6 +40,25 @@ def get_session(session_id: str, request: Request) -> SessionDetailResponse:
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return SessionDetailResponse(**result.model_dump())
+
+
+@router.put("/{session_id}/workspace", response_model=SessionWorkspaceResponse)
+def set_session_workspace(
+    session_id: str,
+    payload: SessionWorkspaceUpdateRequest,
+    request: Request,
+) -> SessionWorkspaceResponse:
+    try:
+        workspace = request.app.state.runtime.set_session_workspace(
+            session_id=session_id,
+            path=payload.path,
+            platform=payload.platform,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return SessionWorkspaceResponse(session_id=session_id, workspace=workspace)
 
 
 @router.post("/{session_id}/messages", response_model=SessionAppendMessageResponse)

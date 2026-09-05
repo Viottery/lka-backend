@@ -15,6 +15,7 @@ class MockLLMClient:
     available_models = ["mock"]
     supports_stream = True
     supports_json_mode = True
+    supports_function_calling = False
 
     def complete(self, *, user_input: str, task_context: TaskContext) -> LLMResponse:
         return LLMResponse(
@@ -63,6 +64,7 @@ class AsyncMockLLMClient:
     available_models = ["mock"]
     supports_stream = True
     supports_json_mode = True
+    supports_function_calling = False
 
     async def complete(self, request: LLMRequest) -> LLMResponse:
         return _mock_response(

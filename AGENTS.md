@@ -94,8 +94,9 @@ integration logic back into `app/core/`.
   record must still exist.
 - Command execution belongs in the `bash` tool package. `bash.run` uses a
   conservative read-only whitelist per command; anything outside the whitelist
-  is non-read-only and must pass safety review. Its default `cwd` is the first
-  configured workspace root, relative `cwd` values resolve under that root, and
+  is non-read-only and must pass safety review. Its default `cwd` is the current
+  session workspace when configured, otherwise the first configured workspace root;
+  relative `cwd` values resolve under that root, and
   commands receive `workspace_root`, `WORKSPACE_ROOT`, `LKA_WORKSPACE_ROOT`, and
   `LKA_WORKSPACE_ROOTS` environment variables.
 - Agent core must remain package/domain agnostic. Do not hard-code concrete
@@ -107,8 +108,16 @@ integration logic back into `app/core/`.
 - Package-specific constraints, such as read/write boundaries or cross-package
   workflows, must be represented by tool package metadata and enforced through
   registered tools, not by special cases in Agent core.
+- `selected_package` is a deprecated compatibility/run-log field equivalent to
+  `initial_package`. Do not pass it into decision, decision repair, tool result
+  check, or answer prompts. Use `expanded_packages`, `used_packages`, and
+  `active_package` for cross-package run state.
+- Long tool results may be compacted before entering later LLM prompt
+  observations. Full tool results must remain in `tool_events` and local run
+  logs.
 - `filesystem.read_file` and `filesystem.edit_file` resolve relative paths from
-  the first configured workspace root and support `workspace_root`,
+  the current session workspace when configured, otherwise the first configured
+  workspace root, and support `workspace_root`,
   `WORKSPACE_ROOT`, and `LKA_WORKSPACE_ROOT` variable expansion in path fields.
 
 ## LLM And Run Requirements

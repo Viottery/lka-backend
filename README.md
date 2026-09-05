@@ -108,15 +108,41 @@ uv run lka chat --session-id cli_chat
 ```bash
 cp .env.example .env
 uv sync
-uv run uvicorn app.api.main:app --host 127.0.0.1 --port 8765
+uv run python scripts/start_backend.py personal
 ```
+
+The default `LKA_DATA_DIR=./data/runtime` is the personal runtime boundary: it
+contains the SQLite database, imported documents, local mail state, run logs,
+tokens, and local embedding models. Test fixtures live under `evals/fixtures/`
+and tests/evaluations use temporary data directories, so do not import test
+samples into `data/runtime`.
+
+## Backend Profiles
+
+Use the profile launcher instead of manually exporting runtime variables:
+
+```bash
+# Personal data, real config/local.toml, default port 8765.
+uv run python scripts/start_backend.py personal
+
+# Ephemeral test data, mock provider/mail config, default port 8766.
+uv run python scripts/start_backend.py test
+
+# Keep an inspectable but isolated test database after the server exits.
+uv run python scripts/start_backend.py test --test-data-dir ./data/test-runtime
+```
+
+`test` always overrides `LKA_DATA_DIR` and `LKA_LOCAL_CONFIG`; it cannot use
+`--reload`. This prevents test requests from syncing personal mail, using a
+real LLM provider, or writing to `data/runtime`. `personal --reload` is allowed
+for local development.
 
 ## Quick Start: Windows PowerShell
 
 ```powershell
 Copy-Item .env.example .env
 uv sync
-uv run uvicorn app.api.main:app --host 127.0.0.1 --port 8765
+uv run python scripts/start_backend.py personal
 ```
 
 The service listens on `http://127.0.0.1:8765` by default.
@@ -166,8 +192,9 @@ secret environment variable names:
 - `mail.outlook`: Microsoft Graph Device Code Flow settings. Outlook does not
   require storing an email password for this path.
 - `mail.imap`: optional IMAP settings for providers that require an app password.
-- `embedding`: local embedding provider config. The default is `BAAI/bge-m3`
-  for multilingual retrieval, with model files cached under `./data/models`.
+- `embedding`: local embedding provider config. The default is
+  `BAAI/bge-small-zh-v1.5`, with model files cached under
+  `./data/runtime/models`.
 
 On Windows PowerShell, set secrets outside the TOML file:
 

@@ -19,6 +19,24 @@ class LLMMessage(BaseModel):
     content: str
 
 
+class LLMToolDefinition(BaseModel):
+    """Provider-neutral function definition for a single LLM request."""
+
+    name: str
+    description: str
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    strict: bool = False
+
+
+class LLMToolCall(BaseModel):
+    """A complete provider-native function call."""
+
+    id: str | None = None
+    name: str
+    arguments: dict[str, Any] | None = None
+    raw_arguments: str = ""
+
+
 class LLMRequest(BaseModel):
     messages: list[LLMMessage]
     prompt_summary: str
@@ -28,6 +46,8 @@ class LLMRequest(BaseModel):
     temperature: float = 0.0
     max_output_tokens: int | None = None
     require_json: bool = False
+    tools: list[LLMToolDefinition] = Field(default_factory=list)
+    tool_choice: str | dict[str, Any] | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -43,6 +63,7 @@ class LLMResponse(BaseModel):
     finish_reason: str | None = None
     provider_request_id: str | None = None
     partial: bool = False
+    tool_calls: list[LLMToolCall] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 

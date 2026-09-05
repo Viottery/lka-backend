@@ -130,6 +130,16 @@ def _build_parser() -> argparse.ArgumentParser:
     sessions_show.add_argument("session_id")
     sessions_show.add_argument("--json", action="store_true")
     sessions_show.set_defaults(handler=_cmd_sessions_show)
+    sessions_workspace = session_subparsers.add_parser(
+        "workspace", help="Set the backend-local working directory for one session."
+    )
+    sessions_workspace.add_argument("session_id")
+    sessions_workspace.add_argument("path")
+    sessions_workspace.add_argument(
+        "--platform", choices=["linux", "windows", "macos"], default="linux"
+    )
+    sessions_workspace.add_argument("--json", action="store_true")
+    sessions_workspace.set_defaults(handler=_cmd_sessions_workspace)
 
     mail = subparsers.add_parser("mail", help="Mail frontend commands.")
     mail_subparsers = mail.add_subparsers(dest="mail_command", required=True)
@@ -293,9 +303,27 @@ def _cmd_sessions_show(config: CliConfig, args: argparse.Namespace) -> int:
     print(f"session_id: {session.get('session_id', args.session_id)}")
     print(f"title: {session.get('title') or ''}")
     print(f"status: {session.get('status') or ''}")
+    workspace = session.get("workspace")
+    if isinstance(workspace, dict):
+        print(f"workspace: {workspace.get('path')} ({workspace.get('platform')})")
     print("messages:")
     for message in data.get("messages", []):
         print(f"- {message.get('role')}: {message.get('content')}")
+    return 0
+
+
+def _cmd_sessions_workspace(config: CliConfig, args: argparse.Namespace) -> int:
+    data = _request_json(
+        config,
+        "PUT",
+        f"/sessions/{args.session_id}/workspace",
+        payload={"path": args.path, "platform": args.platform},
+    )
+    if args.json:
+        _print_json(data)
+        return 0
+    workspace = data.get("workspace", {})
+    print(f"workspace: {workspace.get('path', '')} ({workspace.get('platform', '')})")
     return 0
 
 

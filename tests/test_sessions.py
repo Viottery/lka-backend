@@ -4,6 +4,8 @@ import json
 import sqlite3
 from types import SimpleNamespace
 
+import pytest
+
 from app.api.main import create_app
 from app.api.routes.mail import import_mail
 from app.api.routes.sessions import (
@@ -14,6 +16,8 @@ from app.api.routes.sessions import (
 )
 from app.api.schemas import MailImportRequest
 from app.api.schemas import SessionAppendMessageRequest, SessionCreateRequest
+from app.api.schemas import SessionWorkspaceUpdateRequest
+from app.api.routes.sessions import set_session_workspace
 from app.core.config import get_settings
 from app.core.sessions import SessionService
 from app.core.tools import ToolContext
@@ -138,6 +142,96 @@ def test_session_context_window_summarizes_old_messages(tmp_path, monkeypatch):
     assert "alpha" in window.summary
     assert window.recent_messages
     assert any("second" in message.content for message in window.recent_messages)
+
+
+def test_session_workspace_controls_file_and_bash_tool_roots(tmp_path, monkeypatch):
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
+    monkeypatch.delenv("LKA_WORKSPACE_ROOTS", raising=False)
+    get_settings.cache_clear()
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "inside.txt").write_text("session workspace content\n", encoding="utf-8")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside content\n", encoding="utf-8")
+    app = create_app()
+    request = SimpleNamespace(app=app)
+    created = create_session(SessionCreateRequest(title="workspace test"), request)
+    session_id = created.session.session_id
+
+    updated = set_session_workspace(
+        session_id,
+        SessionWorkspaceUpdateRequest(path=str(workspace), platform="linux"),
+        request,
+    )
+    assert updated.workspace.path == workspace.as_posix()
+    assert get_session(session_id, request).session.workspace == updated.workspace
+
+    context = ToolContext(session_id=session_id, workspace_root=updated.workspace.path)
+    bash_result = app.state.runtime.tool_executor.execute(
+        invocation_id="workspace_pwd",
+        tool_name="bash.run",
+        tool_input={"command": "pwd"},
+        context=context,
+    )
+    assert bash_result.status == "completed"
+    assert bash_result.output["cwd"] == workspace.as_posix()
+    assert bash_result.output["workspace_root"] == workspace.as_posix()
+    assert bash_result.output["stdout"].strip() == workspace.as_posix()
+
+    read_result = app.state.runtime.tool_executor.execute(
+        invocation_id="workspace_read",
+        tool_name="filesystem.read_file",
+        tool_input={"path": "inside.txt"},
+        context=context,
+    )
+    assert read_result.status == "completed"
+    assert read_result.output["content"] == "session workspace content\n"
+
+    outside_result = app.state.runtime.tool_executor.execute(
+        invocation_id="workspace_outside",
+        tool_name="filesystem.read_file",
+        tool_input={"path": str(outside)},
+        context=context,
+    )
+    assert outside_result.status == "failed"
+    assert "outside allowed workspace roots" in (outside_result.error or "")
+
+
+def test_session_workspace_maps_windows_path_through_wsl_mount(tmp_path, monkeypatch):
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
+    mount_root = tmp_path / "wsl-mount"
+    workspace = mount_root / "c" / "Users" / "example" / "project"
+    workspace.mkdir(parents=True)
+    monkeypatch.setenv("LKA_WSL_WINDOWS_MOUNT_ROOT", str(mount_root))
+    get_settings.cache_clear()
+    app = create_app()
+    session = app.state.runtime.create_session(title="platform test").session
+
+    selected = app.state.runtime.set_session_workspace(
+        session_id=session.session_id,
+        path="C:/Users/example/project",
+        platform="windows",
+    )
+    assert selected.path == "C:/Users/example/project"
+    assert selected.backend_path == workspace.as_posix()
+
+
+def test_session_workspace_rejects_windows_unc_path_on_wsl(tmp_path, monkeypatch):
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
+    get_settings.cache_clear()
+    app = create_app()
+    session = app.state.runtime.create_session(title="unc test").session
+
+    with pytest.raises(ValueError, match="UNC"):
+        app.state.runtime.set_session_workspace(
+            session_id=session.session_id,
+            path="//server/share/project",
+            platform="windows",
+        )
 
 
 def test_context_window_migration_copies_legacy_core_messages(tmp_path):

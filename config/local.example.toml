@@ -28,6 +28,14 @@ max_attempts = 2
 tool_review_mode = "skip"
 manual_wait_poll_seconds = 0.5
 
+[agent]
+# Orchestration backend. Keep legacy during migration; langgraph enables the
+# checkpointed graph runner while preserving the existing Agent semantics.
+orchestrator = "legacy"
+# Maximum decision-loop steps after the initial route. Raise for longer workflows
+# such as sync -> search -> load -> dedupe -> create/update -> verify -> answer.
+max_decision_steps = 10
+
 # Optional named clients. Keep commented until configured locally.
 # [[llm.clients]]
 # name = "mock"
@@ -36,6 +44,9 @@ manual_wait_poll_seconds = 0.5
 # available_models = ["mock"]
 # supports_stream = true
 # supports_json_mode = true
+# supports_function_calling = true
+# Set this only when the configured provider/base URL supports strict function schemas.
+# function_calling_strict = false
 #
 # [[llm.clients]]
 # name = "openai"
@@ -44,7 +55,7 @@ manual_wait_poll_seconds = 0.5
 # api_key_env = "OPENAI_API_KEY"
 # default_model = "gpt-4.1-mini"
 # available_models = ["gpt-4.1-mini", "gpt-4.1"]
-# timeout_seconds = 60
+# timeout_seconds = 180
 # supports_stream = true
 # supports_json_mode = true
 
@@ -55,7 +66,7 @@ client_id = ""
 client_id_env = "MS_GRAPH_CLIENT_ID"
 tenant_id = "consumers"
 scopes = ["User.Read", "Mail.Read", "offline_access"]
-token_store_path = "./data/secrets/outlook_token.json"
+token_store_path = "./data/runtime/secrets/outlook_token.json"
 sync_folder = "Inbox"
 download_attachment_content = false
 startup_sync_enabled = true
@@ -73,9 +84,22 @@ password_env = "MAIL_IMAP_PASSWORD"
 use_ssl = true
 
 [embedding]
-provider = "local_bge"
-model_name = "BAAI/bge-m3"
+# All document content stays local: FastEmbed generates vectors locally and
+# sqlite-vec persists/searches them inside the local SQLite database.
+enabled = true
+provider = "fastembed"
+index_provider = "sqlite_vec"
+model_name = "BAAI/bge-small-zh-v1.5"
+dimensions = 512
 device = "auto"
-cache_dir = "./data/models"
+cache_dir = "./data/runtime/models"
 batch_size = 16
 normalize_embeddings = true
+query_prefix = "为这个句子生成表示以用于检索相关文章："
+default_retrieval_mode = "hybrid"
+# Use POST /knowledge/semantic-index/sync for existing content. Enabling this
+# makes future imports synchronously embed their new non-secret chunks.
+auto_index_on_import = false
+# Avoid any network access while serving queries. The first model download must
+# be requested explicitly through semantic-index sync.
+local_files_only = true

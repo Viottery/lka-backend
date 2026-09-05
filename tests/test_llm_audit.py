@@ -21,7 +21,7 @@ from app.core.llm.errors import (
     LLMRateLimitError,
 )
 from app.core.llm.openai_compatible import OpenAICompatibleLLMClient
-from app.core.llm.models import LLMMessage, LLMRequest
+from app.core.llm.models import LLMMessage, LLMRequest, LLMToolDefinition
 
 
 @pytest.mark.parametrize(
@@ -214,9 +214,10 @@ def test_openai_compatible_success_response_preserves_headers_usage_and_finish_r
         ),
         stream=False,
     )
-    content, usage, finish_reason = client._message_content(payload)
+    content, tool_calls, usage, finish_reason = client._message_content(payload)
 
     assert content == "ok"
+    assert tool_calls == []
     assert finish_reason == "stop"
     assert usage["prompt_tokens"] == 11
     assert usage["completion_tokens"] == 3
@@ -326,6 +327,58 @@ def test_openai_compatible_stream_parses_chat_completion_delta_chunks(monkeypatc
         "completion_tokens": 2,
         "total_tokens": 5,
     }
+
+
+def test_openai_compatible_streams_and_aggregates_function_call_arguments(monkeypatch):
+    def fake_urlopen(request, timeout):
+        payload = json.loads(request.data.decode("utf-8"))
+        assert payload["tools"][0]["function"]["name"] == "lookup"
+        assert payload["tools"][0]["function"]["strict"] is True
+        assert payload["tool_choice"] == "auto"
+        return _fake_stream_response(
+            [
+                'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"lookup","arguments":"{\\"query\\":\\""}}]}}]}\n\n',
+                'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"hello\\"}"}}]},"finish_reason":"tool_calls"}]}\n\n',
+                "data: [DONE]\n\n",
+            ]
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    client = OpenAICompatibleLLMClient(
+        name="test-client",
+        provider_name="openai-compatible",
+        base_url="https://example.invalid/v1",
+        api_key="test-key",
+        default_model="test-model",
+        supports_function_calling=True,
+        function_calling_strict=True,
+    )
+
+    async def collect():
+        return [
+            event
+            async for event in client.stream(
+                LLMRequest(
+                    messages=[LLMMessage(role="user", content="hello")],
+                    prompt_summary="function-call-stream",
+                    tools=[
+                        LLMToolDefinition(
+                            name="lookup",
+                            description="Lookup evidence.",
+                            parameters={"type": "object", "properties": {}},
+                            strict=True,
+                        )
+                    ],
+                    tool_choice="auto",
+                )
+            )
+        ]
+
+    events = asyncio.run(collect())
+    assert events[-1].metadata["finish_reason"] == "tool_calls"
+    assert events[-1].metadata["tool_calls"] == [
+        {"id": "call_1", "name": "lookup", "arguments": {"query": "hello"}, "raw_arguments": '{"query":"hello"}'}
+    ]
 
 
 def test_openai_compatible_stream_emits_failed_event_for_provider_error_chunk(monkeypatch):

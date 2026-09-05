@@ -366,6 +366,19 @@ def _run_direct_operation(
         payload = response.model_dump(mode="json")
         fixture_index.setdefault("workspaces", []).append(payload)
         return {"operation": operation, "output": payload}
+    if operation == "knowledge_search":
+        result = runtime.search_knowledge(
+            query=str(params.get("query") or ""),
+            limit=int(params.get("limit") or 10),
+            source_types=params.get("source_types") if isinstance(params.get("source_types"), list) else None,
+        )
+        payload = result.model_dump(mode="json")
+        return {"operation": operation, "output": payload}
+    if operation == "knowledge_load_chunks":
+        chunk_ids = params.get("chunk_ids") if isinstance(params.get("chunk_ids"), list) else []
+        chunk_ids = _resolve_eval_placeholders(chunk_ids, fixture_index=fixture_index, previous_results=[])
+        result = runtime.load_knowledge_chunks(chunk_ids=[str(item) for item in chunk_ids])
+        return {"operation": operation, "output": result.model_dump(mode="json")}
     if operation == "matter_create":
         matter = runtime.create_matter(
             payload=MatterCreateInput.model_validate(params.get("matter") or {})
@@ -490,6 +503,16 @@ def _resolve_eval_placeholders(
             if isinstance(output, dict) and isinstance(output.get("next_offset"), int):
                 return output["next_offset"]
         return 0
+    if value.startswith("$knowledge_document:"):
+        title = value.split(":", 1)[1]
+        knowledge = fixture_index.get("knowledge", {})
+        documents = knowledge.get("documents_by_title", {}) if isinstance(knowledge, dict) else {}
+        return str(documents.get(title) or "")
+    if value.startswith("$knowledge_chunks:"):
+        title = value.split(":", 1)[1]
+        knowledge = fixture_index.get("knowledge", {})
+        chunks = knowledge.get("chunks_by_title", {}) if isinstance(knowledge, dict) else {}
+        return list(chunks.get(title) or [])
     return value
 
 

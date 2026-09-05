@@ -30,8 +30,17 @@ class AgentSession(BaseModel):
     title: str
     status: str
     metadata: dict[str, Any] = Field(default_factory=dict)
+    workspace: "SessionWorkspace | None" = None
     created_at: str
     updated_at: str
+
+
+class SessionWorkspace(BaseModel):
+    """A backend-local directory selected for one Agent session."""
+
+    path: str
+    platform: Literal["linux", "windows", "macos"]
+    backend_path: str
 
 
 class AgentSessionMessage(BaseModel):
@@ -211,6 +220,36 @@ class SessionService:
         finally:
             conn.close()
         return self._session_from_row(row) if row else None
+
+    def set_workspace(
+        self,
+        *,
+        session_id: str,
+        workspace: SessionWorkspace,
+    ) -> AgentSession:
+        session = self.get_session_or_none(session_id=session_id)
+        if session is None:
+            raise KeyError(f"Session not found: {session_id}")
+        metadata = dict(session.metadata)
+        metadata["workspace"] = workspace.model_dump(mode="json")
+        now = _now_iso()
+        conn = self._conn_factory()
+        try:
+            conn.execute(
+                """
+                UPDATE agent_sessions
+                SET metadata = ?, updated_at = ?
+                WHERE session_id = ?
+                """,
+                (json.dumps(metadata, ensure_ascii=False), now, session_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        updated = self.get_session_or_none(session_id=session_id)
+        if updated is None:
+            raise RuntimeError(f"Failed to update session workspace: {session_id}")
+        return updated
 
     def append_message(
         self,
@@ -490,11 +529,19 @@ class SessionService:
         return "New Session"
 
     def _session_from_row(self, row: sqlite3.Row) -> AgentSession:
+        metadata = self._json_dict(row["metadata"])
+        workspace_value = metadata.get("workspace")
+        workspace = (
+            SessionWorkspace.model_validate(workspace_value)
+            if isinstance(workspace_value, dict)
+            else None
+        )
         return AgentSession(
             session_id=row["session_id"],
             title=row["title"],
             status=row["status"],
-            metadata=self._json_dict(row["metadata"]),
+            metadata=metadata,
+            workspace=workspace,
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )

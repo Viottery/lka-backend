@@ -1,0 +1,16 @@
+{
+  "benchmark_id": "public_multihop_v1",
+  "sampling_seed": 20260829,
+  "datasets": [
+    {"dataset": "multihop-rag", "split": "sampled", "path": "multihop_rag_600.jsonl", "license": "ODC-BY", "task_family": "multi-hop-rag", "expected_route": "knowledge"},
+    {"dataset": "hotpotqa", "split": "validation", "path": "hotpotqa_200.jsonl", "license": "CC BY-SA 4.0", "task_family": "multi-hop-qa", "expected_route": "knowledge"},
+    {"dataset": "2wikimultihopqa", "split": "validation", "path": "2wikimultihopqa_200.jsonl", "license": "Apache-2.0", "task_family": "multi-hop-qa", "expected_route": "knowledge"},
+    {"dataset": "musique", "split": "dev", "path": "musique_200.jsonl", "license": "upstream dataset license", "task_family": "compositional-multi-hop", "expected_route": "knowledge"}
+  ],
+  "metric_groups": {
+    "retrieval": ["knowledge_search_recall", "knowledge_search_precision", "knowledge_evidence_recall"],
+    "answer": ["answer_quality", "knowledge_answer_fact_accuracy"],
+    "agent": ["selected_package_match", "required_tool_called", "tool_success_rate", "run_log_completeness_rate"],
+    "performance": ["wall_time_ms", "llm_call_count", "reported_token_total"]
+  }
+}

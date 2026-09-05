@@ -6,6 +6,7 @@ from collections.abc import Callable
 from typing import Any
 
 from app.domains.mail import MailMatterDraft, MailService
+from app.domains.mail_knowledge import MailKnowledgeMirror
 from app.core.tools import ToolContext, ToolInvocation, ToolPackageSpec, ToolResult, ToolSpec
 
 
@@ -19,8 +20,8 @@ MAIL_PACKAGE = ToolPackageSpec(
         "Use this package when the user asks about mailbox contents, mail notifications, or mail-derived facts.",
     ],
     decision_hints=[
-        "Search candidate messages before loading full message records.",
-        "Load full messages for relevant message ids before writing the final answer.",
+        "Use mail.search for locally indexed mail evidence; each result includes bounded relevant body text and provenance.",
+        "Do not request complete message bodies in bulk. Use the returned evidence snippets unless exact source text is essential.",
         "Synchronize mail first only when the user asks to sync, asks for the latest mailbox state, or local mail may be stale.",
         "This package reads and syncs mail evidence; use another registered persistence package for tasks, events, or matters.",
     ],
@@ -32,16 +33,17 @@ MAIL_PACKAGE = ToolPackageSpec(
 
 
 class SearchMailTool:
-    def __init__(self, mail_service: MailService) -> None:
-        self.mail_service = mail_service
+    def __init__(self, mail_knowledge_mirror: MailKnowledgeMirror) -> None:
+        self.mail_knowledge_mirror = mail_knowledge_mirror
 
     spec = ToolSpec(
         name="mail.search",
         package="mail",
         type="local_tool",
         description=(
-            "Search local persisted mail with SQLite FTS and return candidate message ids. "
-            "Use an empty query string to match all local mail, ordered by newest first."
+            "Search locally indexed mail evidence through the knowledge retrieval layer. "
+            "Returns mail cards with bounded relevant body excerpts and stable provenance; it never returns complete bodies in bulk. "
+            "Use an empty query with order_by=source_time_desc to inspect the newest local mail."
         ),
         risk="low",
         requires_confirmation=False,
@@ -63,15 +65,34 @@ class SearchMailTool:
                     "minimum": 1,
                     "description": "Maximum number of candidate messages to return.",
                 },
+                "mode": {
+                    "type": "string",
+                    "enum": ["keyword", "semantic", "hybrid"],
+                    "description": "Retrieval mode for content queries. source_time_desc uses local time ordering.",
+                },
+                "order_by": {
+                    "type": "string",
+                    "enum": ["relevance", "source_time_desc"],
+                    "description": "Use source_time_desc with an empty query for newest-first mail.",
+                },
+                "max_snippet_chars": {
+                    "type": "integer",
+                    "minimum": 80,
+                    "maximum": 1200,
+                    "description": "Per-message evidence excerpt budget.",
+                },
             },
         },
         output_schema={"query": "string", "messages": "array"},
     )
 
     def invoke(self, *, invocation: ToolInvocation, context: ToolContext) -> ToolResult:
-        result = self.mail_service.search_messages(
+        result = self.mail_knowledge_mirror.search(
             query=str(invocation.input.get("query") or ""),
             limit=int(invocation.input.get("limit") or 10),
+            mode=str(invocation.input.get("mode") or "") or None,
+            order_by=str(invocation.input.get("order_by") or "relevance"),
+            max_snippet_chars=int(invocation.input.get("max_snippet_chars") or 420),
         )
         return ToolResult(
             invocation_id=invocation.invocation_id,
@@ -89,7 +110,11 @@ class LoadMailMessagesTool:
         name="mail.load_messages",
         package="mail",
         type="local_tool",
-        description="Load complete local mail records, including full body text and attachment metadata.",
+        description=(
+            "Load bounded source text for up to three already identified mail messages. "
+            "Use only when mail.search evidence is insufficient for an exact question; do not use "
+            "for bulk mail review."
+        ),
         risk="low",
         requires_confirmation=False,
         read_only=True,
@@ -98,20 +123,38 @@ class LoadMailMessagesTool:
             "type": "object",
             "required": ["message_ids"],
             "properties": {
-                "message_ids": {"type": "array", "items": {"type": "string"}},
+                "message_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "maxItems": 3,
+                },
+                "max_chars_per_message": {
+                    "type": "integer",
+                    "minimum": 80,
+                    "maximum": 12000,
+                },
             },
         },
         output_schema={"messages": "array"},
     )
 
     def invoke(self, *, invocation: ToolInvocation, context: ToolContext) -> ToolResult:
-        message_ids = [str(message_id) for message_id in invocation.input.get("message_ids", [])]
+        message_ids = [str(message_id) for message_id in invocation.input.get("message_ids", [])][:3]
+        max_chars = int(invocation.input.get("max_chars_per_message") or 12000)
         messages = self.mail_service.load_messages(message_ids)
+        output_messages = []
+        for message in messages:
+            payload = message.model_dump(mode="json")
+            body_text = str(payload.get("body_text") or "")
+            payload["body_text"] = body_text[:max_chars]
+            payload["body_truncated"] = len(body_text) > max_chars
+            output_messages.append(payload)
         return ToolResult(
             invocation_id=invocation.invocation_id,
             tool_name=self.spec.name,
             status="completed",
-            output={"messages": [message.model_dump(mode="json") for message in messages]},
+            output={"messages": output_messages},
         )
 
 

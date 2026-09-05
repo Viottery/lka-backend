@@ -56,7 +56,9 @@ Urgent track 的阶段目标：
 - [x] 在每次 Agent turn 的 context window 中注入当前时间；`runtime.now` 暂不作为 Agent 可见工具注册。
 - [ ] 将邮件纳入本地持久化存储管理，补齐邮件整理、检索和概括工具。
 - [ ] 将 TaskContext / MatterContext / trace 查询进一步接入 session，让前端会话切换能恢复完整运行上下文。
-- [ ] 接入本地 `BAAI/bge-m3` embedding provider，并兼容 Windows / Linux 模型缓存路径。
+- [x] 接入可替换的本地 embedding / semantic-index 接口；默认实现为
+  FastEmbed `BAAI/bge-small-zh-v1.5` 和 sqlite-vec，兼容 Windows / Linux 模型缓存路径，
+  并保留后续 BGE-M3 / FAISS provider 替换空间。
 - [ ] 设计 harness skill evolution 路径：允许 Agent 在受控权限下从数据库 schema、历史 run log
   和工具结果中归纳可复用遍历 / 批处理策略，沉淀为可审计 skill proposal，而不是直接绕过
   Tool Registry 任意访问数据库。
@@ -125,14 +127,15 @@ Urgent track 的阶段目标：
   协议校验，没有声明时只检查完整 JSON 对象形状。Agent Loop 会把 rejection 作为 observation
   反馈给 LLM，让模型修正参数后继续。
 - 同一 session 中由 Tool Package metadata 标记为可缓存的工具结果会作为
-  `cached_tool_observations` 注入后续 turn；追问应优先复用相关缓存或把缓存作为已有
-  observation，而不是重复调用等价工具。
+  `cached_tool_observations` 供后续 decision 使用；缓存不直接进入 route/context prompt，且所有
+  observation 必须受聚合 prompt 预算约束，避免完整工具结果重复注入。
 - 每个 session 已新增本地 context window，默认预算 `65536` token；窗口未满时保留近期
   user / agent 问答，满后由独立 `context_summarize` LLM 调用重写前文摘要，并只保留最近
   两条消息原文。完整运行过程仍保存在本地 run log，后续再接入可检索历史 trace。
 - 远程邮件同步归 runtime 管理，不建立邮件专属 Agent。启动自检和后台轮询只更新本地邮件
   知识源；当用户要求最新邮箱状态或本地缓存可能过期时，Main Agent Brain 可以选择
-  `mail.sync`，同步后仍通过 `mail.search` / `mail.load_messages` 获取证据并回答。
+  `mail.sync`，同步后通过知识库适配的 `mail.search` 获取受限证据并回答；
+  `mail.load_messages` 仅用于少量精确原文查阅。
 - 事务管理独立于邮件。`MatterService` 保存任务、事件、待办和提醒候选项；邮件、trace、
   文件和后续日历对象都只能作为 `source_link` 关联到 matter。Agent 从邮件归纳事务时，
   必须通过通用 loop 先读取证据，再选择 `matter` tools 写入或更新。
@@ -769,7 +772,7 @@ Urgent track 的阶段目标：
 
 当前阶段完成后，下一阶段可以继续做：
 
-- [ ] 真正的 retrieval / embedding / vector store 接入。
+- [x] `knowledge` 的本地 embedding、sqlite-vec semantic index 与 FTS hybrid retrieval 接入。
 - [ ] 更强的 intent parser。
 - [ ] 更细粒度的 capability registry。
 - [ ] Native skill 拆分与扩展。

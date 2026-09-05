@@ -249,11 +249,11 @@ Main Agent Brain 的 Tool Registry。
 `filesystem` Tool Package 只处理模型主动要求读写某个明确文本文件的场景。读取工具默认返回
 受限片段并携带 full-file sha256；编辑工具使用 `expected_sha256` 和唯一
 `old_text -> new_text` 替换，避免基于过期上下文覆盖用户修改。`filesystem` 路径字段中的
-相对路径按第一个 configured workspace root 解析，并支持 `$workspace_root` 等 workspace root
+相对路径按当前 session workspace（未设置时为第一个 configured workspace root）解析，并支持 `$workspace_root` 等 workspace root
 变量。目录 listing、文本搜索和命令执行由 `bash` Tool Package 承担。
 
 `bash` Tool Package 支持同步命令、后台终端、多轮 stdin 交互、输出查询、活跃终端查询、
-Ctrl-C 和终止。`bash.run` 默认在第一个 configured workspace root 下执行；相对 `cwd`
+Ctrl-C 和终止。`bash.run` 默认在当前 session workspace（未设置时为第一个 configured workspace root）下执行；相对 `cwd`
 会按该 root 解析，命令环境中注入 `workspace_root`、`WORKSPACE_ROOT`、`LKA_WORKSPACE_ROOT`
 和 `LKA_WORKSPACE_ROOTS`。`bash.run` 会按具体命令使用保守只读白名单动态判定
 `read_only`；白名单外、写入、信号和 stdin 交互都按非只读操作进入 safety review。

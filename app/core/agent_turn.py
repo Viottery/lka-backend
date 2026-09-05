@@ -53,6 +53,8 @@ from app.core.llm import (
     LLMResponseParseError,
     LLMResponseMode,
     LLMService,
+    LLMToolCall,
+    LLMToolDefinition,
     LLMTimeoutError,
     TextLLMClient,
 )
@@ -68,6 +70,12 @@ from app.core.tools import (
 )
 
 
+DEFAULT_MAX_DECISION_STEPS = 10
+DECISION_OBSERVATION_MAX_STRING_CHARS = 4_000
+DECISION_OBSERVATION_MAX_LIST_ITEMS = 20
+LLM_OBSERVATION_MAX_TOTAL_CHARS = 16_000
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -76,6 +84,12 @@ def _stable_id(prefix: str, *parts: str | None) -> str:
     text = "|".join(part or "" for part in parts)
     digest = sha1(text.encode("utf-8")).hexdigest()[:12]
     return f"{prefix}_{digest}"
+
+
+def _session_workspace_path(session: AgentSession) -> str | None:
+    """Return the already backend-validated session workspace, if configured."""
+
+    return session.workspace.backend_path if session.workspace is not None else None
 
 
 _turn_llm_client_name: ContextVar[str | None] = ContextVar(
@@ -185,6 +199,10 @@ class AgentTurnResult(BaseModel):
     trace_id: str
     answer: str
     selected_package: str | None = None
+    initial_package: str | None = None
+    expanded_packages: list[str] = Field(default_factory=list)
+    used_packages: list[str] = Field(default_factory=list)
+    active_package: str | None = None
     package_catalog: list[dict[str, Any]] = Field(default_factory=list)
     session_context_window: dict[str, Any] = Field(default_factory=dict)
     expanded_tools: list[dict[str, Any]] = Field(default_factory=list)
@@ -206,6 +224,7 @@ class AgentTurnLoop:
         tool_executor: ToolExecutor,
         llm_client: TextLLMClient | LLMService | None,
         log_dir: Path,
+        max_decision_steps: int = DEFAULT_MAX_DECISION_STEPS,
         run_manager: InMemoryAgentRunManager | None = None,
         safety_review_mode: SafetyReviewMode | str = SafetyReviewMode.SKIP,
         safety_manual_wait_poll_seconds: float = 0.5,
@@ -217,7 +236,7 @@ class AgentTurnLoop:
         self.run_manager = run_manager
         self.llm_max_attempts = 2
         self.default_rate_limit_wait_seconds = 1.0
-        self.max_decision_steps = 6
+        self.max_decision_steps = max(1, int(max_decision_steps))
         self.decision_format_max_attempts = 2
         self.llm_generation_token_budget: int | None = None
         self.session_context_token_budget = 65_536
@@ -393,6 +412,7 @@ class AgentTurnLoop:
             session_id=session.session_id,
             trace_id=trace_id,
             context_id=trace_id,
+            workspace_root=_session_workspace_path(session),
         )
         self.session_service.append_message(
             session_id=session.session_id,
@@ -406,6 +426,8 @@ class AgentTurnLoop:
         )
         context_window_payload = context_window.model_dump(mode="json")
         context_window_payload["current_time"] = current_time_payload()
+        if session.workspace is not None:
+            context_window_payload["workspace"] = session.workspace.model_dump(mode="json")
         cached_tool_observations = self._cached_tool_observations_from_session(
             session_id=session.session_id,
         )
@@ -527,12 +549,19 @@ class AgentTurnLoop:
                 llm_events=llm_events,
             ),
         )
+        expanded_packages = self._packages_from_expanded_tools(expanded_tools)
+        used_packages = self._packages_from_tool_events(tool_events)
+        active_package = used_packages[-1] if used_packages else None
         result = AgentTurnResult(
             run_id=run_id,
             session_id=session.session_id,
             trace_id=trace_id,
             answer=answer,
             selected_package=selected_package if isinstance(selected_package, str) else None,
+            initial_package=selected_package if isinstance(selected_package, str) else None,
+            expanded_packages=expanded_packages,
+            used_packages=used_packages,
+            active_package=active_package,
             package_catalog=package_catalog,
             session_context_window=context_window_payload,
             expanded_tools=expanded_tools,
@@ -552,6 +581,10 @@ class AgentTurnLoop:
                 "run_id": result.run_id,
                 "trace_id": trace_id,
                 "selected_package": result.selected_package,
+                "initial_package": result.initial_package,
+                "expanded_packages": result.expanded_packages,
+                "used_packages": result.used_packages,
+                "active_package": result.active_package,
                 "log_path": result.log_path,
                 "context_window": {
                     "token_budget": updated_context_window.token_budget,
@@ -596,7 +629,7 @@ class AgentTurnLoop:
         system_prompt = (
             "You are the Main Agent Brain for Local Knowledge Agent OS. Choose at most one "
             "tool package for the current turn. Do not choose concrete tools yet. Return only "
-            "null when the provided session context window, including cached local resources, "
+            "null when the provided session context window "
             "is sufficient to answer without another tool call. Use only package names present "
             "in package_catalog, and use each package description and routing_hints as the "
             "source of truth. Return only strict JSON: "
@@ -606,7 +639,7 @@ class AgentTurnLoop:
         user_prompt = json.dumps(
             {
                 "user_input": user_input,
-                "session_context_window": context_window,
+                "session_context_window": self._context_window_for_llm(context_window),
                 "package_catalog": package_catalog,
             },
             ensure_ascii=False,
@@ -763,6 +796,7 @@ class AgentTurnLoop:
         selected_package: str,
     ) -> str | None:
         observations: list[dict[str, Any]] = []
+        successful_call_fingerprints: set[str] = set()
         observations.extend(self._cached_tool_observations_from_context_window(context_window))
         package_catalog = [
             package.model_dump(mode="json")
@@ -784,7 +818,6 @@ class AgentTurnLoop:
                 expanded_tools=expanded_tools,
                 observations=observations,
                 llm_events=llm_events,
-                selected_package=selected_package,
             )
             if decision is None:
                 return None
@@ -852,7 +885,7 @@ class AgentTurnLoop:
                 )
                 return answer
 
-            if action == "invalid_plain_text_decision":
+            if action in {"invalid_plain_text_decision", "invalid_empty_decision"}:
                 if observations:
                     return self._answer_with_llm(
                         user_input=user_input,
@@ -974,6 +1007,46 @@ class AgentTurnLoop:
                 )
                 continue
 
+            call_fingerprint = self._tool_call_fingerprint(
+                tool_name=tool_name,
+                tool_input=tool_input,
+            )
+            operation = decision.get("operation")
+            repeat_successful_call = bool(
+                operation.get("repeat_successful_call")
+                if isinstance(operation, dict)
+                else False
+            )
+            if call_fingerprint in successful_call_fingerprints and not repeat_successful_call:
+                reason = (
+                    "Blocked an identical tool call after a successful result in this turn. "
+                    "Existing evidence is available for the answer stage."
+                )
+                self._append_progress(
+                    progress_events,
+                    type="tool_duplicate_blocked",
+                    stage="decision",
+                    tool_name=tool_name,
+                    status="blocked",
+                    message=f"Skipped duplicate successful call to `{tool_name}`.",
+                    metadata={"tool_input": tool_input, "reason": reason},
+                )
+                self._record_decision(
+                    decision_events,
+                    source="local",
+                    action="final_answer",
+                    reason=reason,
+                    step_index=step_index + 1,
+                )
+                return self._answer_with_llm(
+                    user_input=user_input,
+                    route=route,
+                    context_window=context_window,
+                    observations=observations,
+                    final_decision={"action": "final_answer", "reason": reason},
+                    llm_events=llm_events,
+                )
+
             tool_result = self._execute_tool(
                 tool_name=tool_name,
                 tool_input=tool_input,
@@ -984,7 +1057,7 @@ class AgentTurnLoop:
             )
             feedback = self._check_tool_result(
                 user_input=user_input,
-                selected_package=selected_package,
+                tool_package=self._package_for_tool(tool_name),
                 decision=decision,
                 tool_result=tool_result,
                 llm_events=llm_events,
@@ -1001,13 +1074,15 @@ class AgentTurnLoop:
                 metadata=feedback,
             )
             observations.append(
-                {
-                    "tool_name": tool_name,
-                    "input": tool_input,
-                    "result": tool_result.model_dump(mode="json"),
-                    "feedback": feedback,
-                }
+                self._observation_for_decision_prompt(
+                    tool_name=tool_name,
+                    tool_input=tool_input,
+                    tool_result=tool_result,
+                    feedback=feedback,
+                )
             )
+            if tool_result.status == "completed":
+                successful_call_fingerprints.add(call_fingerprint)
 
         if observations:
             return self._answer_with_llm(
@@ -1023,6 +1098,16 @@ class AgentTurnLoop:
             )
         return None
 
+    @staticmethod
+    def _tool_call_fingerprint(*, tool_name: str, tool_input: dict[str, Any]) -> str:
+        return json.dumps(
+            {"tool_name": tool_name, "tool_input": tool_input},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+
     def _decide_next_action(
         self,
         *,
@@ -1034,17 +1119,43 @@ class AgentTurnLoop:
         expanded_tools: list[dict[str, Any]],
         observations: list[dict[str, Any]],
         llm_events: list[AgentTurnLLMEvent],
-        selected_package: str,
     ) -> dict[str, Any] | None:
+        prompt_observations = self._observations_within_prompt_budget(observations)
+        native_tools, native_tool_actions = self._native_decision_tools(
+            package_catalog=package_catalog,
+            expanded_tools=expanded_tools,
+        )
+        if native_tools and self._supports_function_calling():
+            native_decision = self._decide_next_action_with_native_tools(
+                user_input=user_input,
+                route=route,
+                context_window=context_window,
+                package_catalog=package_catalog,
+                expanded_package_names=expanded_package_names,
+                expanded_tools=expanded_tools,
+                observations=prompt_observations,
+                completed_tool_calls=self._completed_tool_call_summaries(observations),
+                tools=native_tools,
+                actions=native_tool_actions,
+                llm_events=llm_events,
+            )
+            if native_decision is not None:
+                return native_decision
         base_system_prompt = (
             "You are the Main Agent Brain for Local Knowledge Agent OS. Choose the next "
             "single action for this agent turn. You may call one available tool, expand a "
             "package, request confirmation, or enter the final answer stage. "
-            f"The initially expanded package is {selected_package}. Use package_catalog, "
-            "package decision_hints, expanded_tools, tool descriptions, input_schema, "
+            "Use expanded_package_names as the authoritative set of currently available "
+            "packages. Use package_catalog, package decision_hints, expanded_tools, tool descriptions, input_schema, "
             "side_effects, risk, observations, and session context as the source of truth. "
-            "Use tools when more local evidence, deterministic context, or persistence is "
-            "needed. Reuse cached observations when they are relevant. When observations and "
+            "Use tools only when more local evidence, deterministic context, or persistence is "
+            "needed. Reuse cached observations when they are relevant. Before every tool call, "
+            "check completed_tool_calls and observations: if a completed result already supplies "
+            "the requested evidence, you must choose final_answer. Never repeat the same tool "
+            "with identical input after it succeeded in this turn merely to increase confidence. "
+            "Only when the user explicitly requested repeated execution may you repeat it; then "
+            "set operation.repeat_successful_call=true and state that user requirement in reason. "
+            "When observations and "
             "session context are sufficient to answer the user, return operation.type "
             "final_answer with a concise reason, then stop; do not write final natural "
             "language prose in this decision stage. If the currently expanded tools are insufficient, "
@@ -1057,7 +1168,7 @@ class AgentTurnLoop:
             "envelope: "
             '{"operation":{"type":"tool_call|expand_package|final_answer|request_confirmation|no_op",'
             '"package_name":null,"tool_name":"<expanded tool name or null>","tool_input":{},'
-            '"final_answer":null,"reason":"...","confidence":"low|medium|high"},'
+            '"repeat_successful_call":false,"final_answer":null,"reason":"...","confidence":"low|medium|high"},'
             '"assistant_message":"short user-visible progress text"}. '
             "The operation object is the only executable control channel and must come first. "
             "assistant_message is display-only progress text; it never selects tools and never "
@@ -1073,20 +1184,21 @@ class AgentTurnLoop:
             if decision_retry is not None:
                 system_prompt = (
                     f"{base_system_prompt} The previous decision output was rejected because "
-                    "it was plain text instead of strict JSON. You must now correct that "
-                    "specific output. Return only the JSON envelope. If the rejected text "
+                    f"{decision_retry['error']}. You must now correct that specific output. "
+                    "Return only the JSON envelope. If the rejected text "
                     "said you would read, load, fetch, or inspect details, produce a "
                     "tool_call JSON operation using the available tools and stable resource "
                     "identifiers from observations. Do not repeat the rejected plain text."
                 )
             prompt_payload = {
                 "user_input": user_input,
-                "session_context_window": context_window,
-                "route": route,
+                "session_context_window": self._context_window_for_llm(context_window),
+                "route_context": self._route_context(route),
                 "package_catalog": package_catalog,
                 "expanded_package_names": expanded_package_names,
                 "expanded_tools": expanded_tools,
-                "observations": observations,
+                "observations": prompt_observations,
+                "completed_tool_calls": self._completed_tool_call_summaries(observations),
             }
             if decision_retry is not None:
                 prompt_payload["decision_retry"] = decision_retry
@@ -1117,7 +1229,7 @@ class AgentTurnLoop:
                     user_input=user_input,
                     route=route,
                     expanded_tools=expanded_tools,
-                    observations=observations,
+                    observations=prompt_observations,
                     llm_events=llm_events,
                 )
                 if repaired is not None:
@@ -1129,7 +1241,27 @@ class AgentTurnLoop:
                 }
             answer = response.content.strip()
             if not answer:
-                return None
+                if format_attempt < self.decision_format_max_attempts:
+                    decision_retry = {
+                        "error": "previous_decision_output_was_empty",
+                        "invalid_output": "",
+                        "required_response": (
+                            "Return strict JSON with operation first. Do not return an empty "
+                            "response. Use tool_call if more evidence is needed; use "
+                            "final_answer only to enter the separate answer stage when "
+                            "observations are sufficient."
+                        ),
+                    }
+                    continue
+                return {
+                    "action": "invalid_empty_decision",
+                    "operation": {
+                        "type": "invalid",
+                        "reason": "Decision output was empty after the format retry.",
+                    },
+                    "reason": "Rejected empty decision output.",
+                    "_raw_output": response.content,
+                }
             if format_attempt < self.decision_format_max_attempts:
                 decision_retry = {
                     "error": "previous_decision_output_was_plain_text_not_json",
@@ -1152,6 +1284,190 @@ class AgentTurnLoop:
                 "_raw_output": response.content,
             }
         return None
+
+    def _supports_function_calling(self) -> bool:
+        supports = getattr(self.llm_client, "supports_function_calling", None)
+        if callable(supports):
+            return bool(supports(client_name=_turn_llm_client_name.get()))
+        return bool(supports)
+
+    def _native_decision_tools(
+        self,
+        *,
+        package_catalog: list[dict[str, Any]],
+        expanded_tools: list[dict[str, Any]],
+    ) -> tuple[list[LLMToolDefinition], dict[str, dict[str, Any]]]:
+        definitions: list[LLMToolDefinition] = []
+        actions: dict[str, dict[str, Any]] = {}
+        for index, tool in enumerate(expanded_tools):
+            tool_name = tool.get("name")
+            if not isinstance(tool_name, str) or not tool_name:
+                continue
+            function_name = f"tool_{index}_{tool_name.replace('.', '_').replace('-', '_')}"
+            definitions.append(
+                LLMToolDefinition(
+                    name=function_name,
+                    description=str(tool.get("description") or tool_name),
+                    parameters=self._json_schema_from_tool_schema(tool.get("input_schema")),
+                    strict=True,
+                )
+            )
+            actions[function_name] = {"action": "call_tool", "tool_name": tool_name}
+
+        package_names = [
+            package.get("name")
+            for package in package_catalog
+            if isinstance(package.get("name"), str) and package.get("name")
+        ]
+        if package_names:
+            function_name = "agent_expand_package"
+            definitions.append(
+                LLMToolDefinition(
+                    name=function_name,
+                    description="Expand one registered tool package so its tools become available.",
+                    strict=True,
+                    parameters={
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["package_name"],
+                        "properties": {"package_name": {"type": "string", "enum": package_names}},
+                    },
+                )
+            )
+            actions[function_name] = {"action": "expand_package"}
+        return definitions, actions
+
+    def _decide_next_action_with_native_tools(
+        self,
+        *,
+        user_input: str,
+        route: dict[str, Any],
+        context_window: dict[str, Any],
+        package_catalog: list[dict[str, Any]],
+        expanded_package_names: list[str],
+        expanded_tools: list[dict[str, Any]],
+        observations: list[dict[str, Any]],
+        completed_tool_calls: list[dict[str, Any]],
+        tools: list[LLMToolDefinition],
+        actions: dict[str, dict[str, Any]],
+        llm_events: list[AgentTurnLLMEvent],
+    ) -> dict[str, Any] | None:
+        system_prompt = (
+            "You are the Main Agent Brain for Local Knowledge Agent OS. Choose the next "
+            "single action. Call exactly one provided function only when a tool or package "
+            "expansion is needed. When observations and session context are sufficient, do not "
+            "call a function; return a short plain-text reason that the separate answer stage "
+            "can now run. Never repeat a completed successful tool call with identical input "
+            "unless the user explicitly requested it. Follow function schemas exactly."
+        )
+        user_prompt = json.dumps(
+            {
+                "user_input": user_input,
+                "session_context_window": self._context_window_for_llm(context_window),
+                "route_context": self._route_context(route),
+                "package_catalog": package_catalog,
+                "expanded_package_names": expanded_package_names,
+                "expanded_tools": expanded_tools,
+                "observations": observations,
+                "completed_tool_calls": completed_tool_calls,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        response = self._complete_text_with_retry(
+            stage="decision",
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            prompt_summary=f"agent_turn_native_decision observations={len(observations)}",
+            max_output_tokens=self.llm_generation_token_budget,
+            llm_events=llm_events,
+            tools=tools,
+            tool_choice="auto",
+        )
+        if response is None:
+            return None
+        if not response.tool_calls:
+            return {
+                "action": "final_answer",
+                "answer": None,
+                "assistant_message": response.content.strip() or None,
+                "operation": {"type": "final_answer", "reason": "Native tool selection completed."},
+                "reason": "Provider selected no further tool call.",
+                "_raw_output": response.content,
+            }
+        if len(response.tool_calls) != 1:
+            return {
+                "action": "malformed_tool_call",
+                "reason": "Provider returned more than one tool call for a single-action step.",
+                "_raw_output": response.content,
+            }
+        call = response.tool_calls[0]
+        action = actions.get(call.name)
+        if action is None or call.arguments is None:
+            return {
+                "action": "malformed_tool_call",
+                "reason": "Provider returned an unknown function or invalid function arguments.",
+                "_raw_output": response.content,
+            }
+        if action["action"] == "call_tool":
+            return {
+                "action": "call_tool",
+                "tool_name": action["tool_name"],
+                "tool_input": call.arguments,
+                "operation": {"type": "tool_call", "tool_name": action["tool_name"], "tool_input": call.arguments},
+                "reason": "Provider-native function call.",
+                "_raw_output": response.content,
+            }
+        package_name = call.arguments.get("package_name")
+        return {
+            "action": "expand_package",
+            "package_name": package_name,
+            "operation": {"type": "expand_package", "package_name": package_name},
+            "reason": "Provider-native function call.",
+            "_raw_output": response.content,
+        }
+
+    def _json_schema_from_tool_schema(self, schema: Any) -> dict[str, Any]:
+        if not isinstance(schema, dict):
+            return {"type": "object", "additionalProperties": False, "properties": {}}
+        if schema.get("type") == "object" and isinstance(schema.get("properties"), dict):
+            source = schema
+        else:
+            source = {"type": "object", "properties": schema}
+        properties = source.get("properties")
+        normalized_properties = {
+            key: self._json_schema_value(value)
+            for key, value in properties.items()
+            if isinstance(key, str)
+        }
+        required = source.get("required")
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": normalized_properties,
+            "required": [key for key in required if isinstance(key, str)] if isinstance(required, list) else [],
+        }
+
+    def _json_schema_value(self, value: Any) -> dict[str, Any]:
+        if isinstance(value, str):
+            return {"type": value}
+        if not isinstance(value, dict):
+            return {}
+        result = {key: item for key, item in value.items() if key not in {"allowed_values", "properties", "items", "required"}}
+        if isinstance(value.get("allowed_values"), list):
+            result["enum"] = value["allowed_values"]
+        if isinstance(value.get("properties"), dict):
+            result["properties"] = {
+                key: self._json_schema_value(item)
+                for key, item in value["properties"].items()
+                if isinstance(key, str)
+            }
+            result["additionalProperties"] = False
+        if isinstance(value.get("required"), list):
+            result["required"] = [key for key in value["required"] if isinstance(key, str)]
+        if isinstance(value.get("items"), dict):
+            result["items"] = self._json_schema_value(value["items"])
+        return result
 
     def _record_route_decision(
         self,
@@ -1352,7 +1668,7 @@ class AgentTurnLoop:
         user_prompt = json.dumps(
             {
                 "user_input": user_input,
-                "route": route,
+                "route_context": self._route_context(route),
                 "expanded_tools": expanded_tools,
                 "observations": observations,
                 "malformed_output": raw_output,
@@ -1377,7 +1693,7 @@ class AgentTurnLoop:
             parsed,
             raw_output=response.content,
         )
-        if normalized.get("action") not in {"call_tool", "expand_package"}:
+        if normalized.get("action") not in {"call_tool", "expand_package", "final_answer"}:
             return None
         normalized["_raw_output"] = raw_output
         normalized["_repair_output"] = response.content
@@ -1398,6 +1714,38 @@ class AgentTurnLoop:
             tool.model_dump(mode="json")
             for tool in self.tool_executor.registry.list_tools(package=package_name)
         ]
+
+    def _route_context(self, route: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: route.get(key)
+            for key in ("reason", "search_query")
+            if route.get(key) is not None
+        }
+
+    def _package_for_tool(self, tool_name: str) -> str | None:
+        tool = self.tool_executor.registry.get_tool_or_none(tool_name)
+        if tool is None:
+            return None
+        return tool.spec.package
+
+    def _packages_from_expanded_tools(self, expanded_tools: list[dict[str, Any]]) -> list[str]:
+        packages: list[str] = []
+        for tool in expanded_tools:
+            package = tool.get("package")
+            if isinstance(package, str) and package not in packages:
+                packages.append(package)
+        return packages
+
+    def _packages_from_tool_events(
+        self,
+        tool_events: list[AgentTurnToolEvent],
+    ) -> list[str]:
+        packages: list[str] = []
+        for event in tool_events:
+            package = self._package_for_tool(event.tool_name)
+            if package and package not in packages:
+                packages.append(package)
+        return packages
 
     def _cached_tool_observations_from_session(
         self,
@@ -1437,21 +1785,21 @@ class AgentTurnLoop:
                     continue
                 seen_fingerprints.add(fingerprint)
                 cached_observations.append(
-                    {
-                        "tool_name": tool_name,
-                        "input": tool_event.get("input")
+                    self._cached_observation_for_decision_prompt(
+                        tool_name=tool_name,
+                        tool_input=tool_event.get("input")
                         if isinstance(tool_event.get("input"), dict)
                         else {},
-                        "result": result,
-                        "feedback": tool_event.get("feedback")
+                        result=result,
+                        feedback=tool_event.get("feedback")
                         if isinstance(tool_event.get("feedback"), dict)
                         else {},
-                        "_cache": {
+                        cache_info={
                             "source": "session_tool_result",
                             "trace_id": session_message.payload.get("trace_id"),
                             "log_path": session_message.payload.get("log_path"),
                         },
-                    }
+                    )
                 )
                 if len(cached_observations) >= limit:
                     return list(reversed(cached_observations))
@@ -1486,8 +1834,9 @@ class AgentTurnLoop:
                 "input": observation.get("input")
                 if isinstance(observation.get("input"), dict)
                 else {},
-                "result": result,
             }
+            compacted_result, compacted = self._compact_for_decision_prompt(result)
+            observation_payload["result"] = compacted_result
             feedback = observation.get("feedback")
             if isinstance(feedback, dict):
                 observation_payload["feedback"] = feedback
@@ -1497,8 +1846,145 @@ class AgentTurnLoop:
                     "source": "session_tool_result",
                     **cache_info,
                 }
+            if compacted or observation.get("_prompt_compacted"):
+                observation_payload["_prompt_compacted"] = True
             observations.append(observation_payload)
         return observations
+
+    def _observation_for_decision_prompt(
+        self,
+        *,
+        tool_name: str,
+        tool_input: dict[str, Any],
+        tool_result: ToolResult,
+        feedback: dict[str, Any],
+    ) -> dict[str, Any]:
+        result_payload = tool_result.model_dump(mode="json")
+        compacted_result, compacted = self._compact_for_decision_prompt(result_payload)
+        observation = {
+            "tool_name": tool_name,
+            "input": tool_input,
+            "result": compacted_result,
+            "feedback": feedback,
+        }
+        if compacted:
+            observation["_prompt_compacted"] = True
+        return observation
+
+    def _cached_observation_for_decision_prompt(
+        self,
+        *,
+        tool_name: str,
+        tool_input: dict[str, Any],
+        result: dict[str, Any],
+        feedback: dict[str, Any],
+        cache_info: dict[str, Any],
+    ) -> dict[str, Any]:
+        compacted_result, compacted = self._compact_for_decision_prompt(result)
+        observation = {
+            "tool_name": tool_name,
+            "input": tool_input,
+            "result": compacted_result,
+            "feedback": feedback,
+            "_cache": cache_info,
+        }
+        if compacted:
+            observation["_prompt_compacted"] = True
+        return observation
+
+    def _compact_for_decision_prompt(self, value: Any) -> tuple[Any, bool]:
+        if isinstance(value, str):
+            if len(value) <= DECISION_OBSERVATION_MAX_STRING_CHARS:
+                return value, False
+            keep = DECISION_OBSERVATION_MAX_STRING_CHARS // 2
+            omitted = len(value) - (keep * 2)
+            return (
+                value[:keep]
+                + f"\n...[truncated {omitted} chars for decision prompt]...\n"
+                + value[-keep:],
+                True,
+            )
+        if isinstance(value, list):
+            compacted_items: list[Any] = []
+            changed = False
+            for item in value[:DECISION_OBSERVATION_MAX_LIST_ITEMS]:
+                compacted_item, item_changed = self._compact_for_decision_prompt(item)
+                compacted_items.append(compacted_item)
+                changed = changed or item_changed
+            if len(value) > DECISION_OBSERVATION_MAX_LIST_ITEMS:
+                changed = True
+            return compacted_items, changed
+        if isinstance(value, dict):
+            compacted_dict: dict[str, Any] = {}
+            changed = False
+            for key, item in value.items():
+                compacted_item, item_changed = self._compact_for_decision_prompt(item)
+                compacted_dict[key] = compacted_item
+                changed = changed or item_changed
+            return compacted_dict, changed
+        return value, False
+
+    def _observations_within_prompt_budget(
+        self,
+        observations: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Keep recent actionable observations without allowing aggregate prompt growth."""
+
+        kept_reversed: list[dict[str, Any]] = []
+        remaining = LLM_OBSERVATION_MAX_TOTAL_CHARS
+        omitted = 0
+        for observation in reversed(observations):
+            compacted, compacted_changed = self._compact_for_decision_prompt(observation)
+            serialized = json.dumps(compacted, ensure_ascii=False, separators=(",", ":"))
+            if len(serialized) <= remaining:
+                if compacted_changed and isinstance(compacted, dict):
+                    compacted["_prompt_compacted"] = True
+                kept_reversed.append(compacted)
+                remaining -= len(serialized)
+                continue
+            omitted += 1
+        bounded = list(reversed(kept_reversed))
+        if omitted:
+            bounded.insert(
+                0,
+                {
+                    "_prompt_compacted": True,
+                    "summary": (
+                        f"{omitted} earlier tool observations were omitted from this LLM prompt "
+                        "to preserve the context budget. Full results remain in the run log."
+                    ),
+                },
+            )
+        return bounded
+
+    @staticmethod
+    def _completed_tool_call_summaries(observations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        summaries: list[dict[str, Any]] = []
+        for observation in observations:
+            tool_name = observation.get("tool_name")
+            tool_input = observation.get("input")
+            result = observation.get("result")
+            if not isinstance(tool_name, str) or not isinstance(tool_input, dict):
+                continue
+            if not isinstance(result, dict) or result.get("status") != "completed":
+                continue
+            summaries.append(
+                {
+                    "tool_name": tool_name,
+                    "tool_input": tool_input,
+                    "evidence_available": True,
+                    "replay_policy": "do_not_repeat_same_input_in_current_turn",
+                }
+            )
+        return summaries
+
+    @staticmethod
+    def _context_window_for_llm(context_window: dict[str, Any]) -> dict[str, Any]:
+        """Cached tool evidence is supplied separately as budgeted observations."""
+
+        sanitized = dict(context_window)
+        sanitized.pop("cached_tool_observations", None)
+        return sanitized
 
     def _execute_tool(
         self,
@@ -1927,7 +2413,7 @@ class AgentTurnLoop:
         self,
         *,
         user_input: str,
-        selected_package: str,
+        tool_package: str | None,
         decision: dict[str, Any],
         tool_result: ToolResult,
         llm_events: list[AgentTurnLLMEvent],
@@ -1954,7 +2440,7 @@ class AgentTurnLoop:
         user_prompt = json.dumps(
             {
                 "user_input": user_input,
-                "selected_package": selected_package,
+                "tool_package": tool_package,
                 "decision": decision,
                 "tool_result": tool_result.model_dump(mode="json"),
                 "tool_feedback": local_feedback,
@@ -2029,12 +2515,13 @@ class AgentTurnLoop:
             "Base the answer on evidence from observations and session context. Mention "
             "uncertainty when evidence is incomplete. Do not wrap the answer in JSON."
         )
+        prompt_observations = self._observations_within_prompt_budget(observations)
         user_prompt = json.dumps(
             {
                 "user_input": user_input,
-                "route": route,
-                "session_context_window": context_window,
-                "observations": observations,
+                "route_context": self._route_context(route),
+                "session_context_window": self._context_window_for_llm(context_window),
+                "observations": prompt_observations,
                 "answer_stage_decision": answer_decision,
             },
             ensure_ascii=False,
@@ -2044,7 +2531,7 @@ class AgentTurnLoop:
             stage="answer",
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            prompt_summary=f"agent_turn_answer observations={len(observations)}",
+            prompt_summary=f"agent_turn_answer observations={len(prompt_observations)}",
             max_output_tokens=None,
             llm_events=llm_events,
         )
@@ -2088,8 +2575,8 @@ class AgentTurnLoop:
         user_prompt = json.dumps(
             {
                 "user_input": user_input,
-                "route": route,
-                "session_context_window": context_window,
+                "route_context": self._route_context(route),
+                "session_context_window": self._context_window_for_llm(context_window),
             },
             ensure_ascii=False,
             indent=2,
@@ -2141,6 +2628,8 @@ class AgentTurnLoop:
         prompt_summary: str,
         max_output_tokens: int | None,
         llm_call_id: str,
+        tools: list[LLMToolDefinition] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
     ) -> LLMResponse:
         if self.llm_client is None:
             raise LLMClientError("No LLM client is configured.")
@@ -2160,6 +2649,8 @@ class AgentTurnLoop:
                 temperature=0.0,
                 max_output_tokens=max_output_tokens,
                 require_json=self._llm_stage_requires_json(stage),
+                tools=tools or [],
+                tool_choice=tool_choice,
                 metadata={"stage": stage},
             )
             snapshot = ""
@@ -2239,7 +2730,18 @@ class AgentTurnLoop:
             provider_request_id=stream_metadata.get("provider_request_id"),
             usage=stream_metadata.get("usage") or {},
             metadata={"streamed": True, "content_role": content_role},
+            tool_calls=self._tool_calls_from_stream_metadata(stream_metadata),
         )
+
+    @staticmethod
+    def _tool_calls_from_stream_metadata(metadata: dict[str, Any]) -> list[LLMToolCall]:
+        raw_calls = metadata.get("tool_calls")
+        if not isinstance(raw_calls, list):
+            return []
+        try:
+            return [LLMToolCall.model_validate(call) for call in raw_calls]
+        except (TypeError, ValueError):
+            return []
 
     def _summarize_context_window(
         self,
@@ -2297,6 +2799,8 @@ class AgentTurnLoop:
         prompt_summary: str,
         max_output_tokens: int | None,
         llm_events: list[AgentTurnLLMEvent],
+        tools: list[LLMToolDefinition] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
     ) -> LLMResponse | None:
         if self.llm_client is None:
             return None
@@ -2341,6 +2845,8 @@ class AgentTurnLoop:
                         max_output_tokens=max_output_tokens,
                         stage=stage,
                         llm_call_id=llm_call_id,
+                        tools=tools,
+                        tool_choice=tool_choice,
                     )
                 else:
                     response = self._complete_text_once(
@@ -2349,6 +2855,8 @@ class AgentTurnLoop:
                         prompt_summary=prompt_summary,
                         max_output_tokens=max_output_tokens,
                         stage=stage,
+                        tools=tools,
+                        tool_choice=tool_choice,
                     )
             except LLMRateLimitError as exc:
                 duration_ms = self._duration_ms(perf_start)
@@ -2477,22 +2985,28 @@ class AgentTurnLoop:
         prompt_summary: str,
         max_output_tokens: int | None,
         stage: str,
+        tools: list[LLMToolDefinition] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
     ) -> LLMResponse:
         if self.llm_client is None:
             raise LLMClientError("No LLM client is configured.")
+        request_kwargs: dict[str, Any] = {
+            "system_prompt": system_prompt,
+            "user_prompt": user_prompt,
+            "prompt_summary": prompt_summary,
+            "temperature": 0.0,
+            "max_output_tokens": max_output_tokens,
+            "client_name": _turn_llm_client_name.get(),
+            "model": _turn_llm_model.get(),
+            "response_mode": _turn_llm_response_mode.get(),
+            "require_json": self._llm_stage_requires_json(stage),
+            "metadata": {"stage": stage},
+        }
+        if tools is not None:
+            request_kwargs["tools"] = tools
+            request_kwargs["tool_choice"] = tool_choice
         try:
-            result = self.llm_client.complete_text(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                prompt_summary=prompt_summary,
-                temperature=0.0,
-                max_output_tokens=max_output_tokens,
-                client_name=_turn_llm_client_name.get(),
-                model=_turn_llm_model.get(),
-                response_mode=_turn_llm_response_mode.get(),
-                require_json=self._llm_stage_requires_json(stage),
-                metadata={"stage": stage},
-            )
+            result = self.llm_client.complete_text(**request_kwargs)
         except TypeError:
             result = self.llm_client.complete_text(
                 system_prompt=system_prompt,
@@ -2856,6 +3370,10 @@ class AgentTurnLoop:
             payload={
                 "answer_length": len(result.answer),
                 "selected_package": result.selected_package,
+                "initial_package": result.initial_package,
+                "expanded_packages": result.expanded_packages,
+                "used_packages": result.used_packages,
+                "active_package": result.active_package,
                 "tool_event_count": len(result.tool_events),
                 "llm_event_count": len(result.llm_events),
                 "log_path": result.log_path,
@@ -2868,6 +3386,10 @@ class AgentTurnLoop:
                 "trace_id": result.trace_id,
                 "answer": result.answer,
                 "selected_package": result.selected_package,
+                "initial_package": result.initial_package,
+                "expanded_packages": result.expanded_packages,
+                "used_packages": result.used_packages,
+                "active_package": result.active_package,
             },
             log_path=result.log_path,
         )
@@ -2919,7 +3441,11 @@ class AgentTurnLoop:
             f"- session_id: `{result.session_id}`",
             f"- run_id: `{result.run_id}`",
             f"- trace_id: `{result.trace_id}`",
+            f"- initial_package: `{result.initial_package}`",
             f"- selected_package: `{result.selected_package}`",
+            f"- expanded_packages: `{', '.join(result.expanded_packages) or 'none'}`",
+            f"- used_packages: `{', '.join(result.used_packages) or 'none'}`",
+            f"- active_package: `{result.active_package}`",
             "",
             "## User Input",
             "",

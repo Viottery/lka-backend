@@ -1,3 +1,5 @@
+from typing import Literal
+
 from fastapi import APIRouter, HTTPException, Query, Request
 
 from app.api.schemas import (
@@ -30,8 +32,17 @@ def search_mail(
     request: Request,
     q: str = Query(default=""),
     limit: int = Query(default=10, ge=1, le=100),
+    mode: Literal["keyword", "semantic", "hybrid"] | None = None,
+    order_by: Literal["relevance", "source_time_desc"] = "relevance",
+    max_snippet_chars: int = 420,
 ) -> MailSearchResponse:
-    result = request.app.state.runtime.search_mail(query=q, limit=limit)
+    result = request.app.state.runtime.search_mail(
+        query=q,
+        limit=limit,
+        mode=mode,
+        order_by=order_by,
+        max_snippet_chars=max_snippet_chars,
+    )
     return MailSearchResponse(**result.model_dump())
 
 

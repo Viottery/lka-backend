@@ -18,10 +18,13 @@ class Settings(BaseSettings):
     version: str = Field(default="0.1.0", alias="LKA_VERSION")
     host: str = Field(default="127.0.0.1", alias="LKA_HOST")
     port: int = Field(default=8765, alias="LKA_PORT")
-    data_dir: Path = Field(default=Path("./data"), alias="LKA_DATA_DIR")
+    data_dir: Path = Field(default=Path("./data/runtime"), alias="LKA_DATA_DIR")
     platform: str = Field(default="auto", alias="LKA_PLATFORM")
     default_shell: str = Field(default="auto", alias="LKA_DEFAULT_SHELL")
     workspace_roots: str = Field(default="", alias="LKA_WORKSPACE_ROOTS")
+    wsl_windows_mount_root: Path = Field(
+        default=Path("/mnt"), alias="LKA_WSL_WINDOWS_MOUNT_ROOT"
+    )
     cors_origins: str = Field(
         default=(
             "http://127.0.0.1:8780;"

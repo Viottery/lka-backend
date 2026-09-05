@@ -82,7 +82,7 @@ Local Knowledge Agent OS 当前已经从“邮件问答 Demo”推进到一个�
 | 严格 JSON-only LLM 输出拒收 | 未强制 |
 | 工具结果分页/压缩 | 未完成 |
 | Agent 主动检索历史运行日志 | 未完成 |
-| embedding / semantic search | 未完成 |
+| embedding / semantic search | 已实现 FastEmbed + sqlite-vec V1；无索引时保守降级关键词检索 |
 | 自动邮件触发 LLM 处理 | 未完成 |
 | skill 形成与沉淀 | 未完成 |
 | planner / brain 多 agent 分层 | 延后 |
@@ -633,8 +633,10 @@ step 3:
 当前最大决策步数：
 
 ```text
-max_decision_steps = 6
+max_decision_steps = 10
 ```
+
+该值可通过 `config/local.toml` 的 `[agent].max_decision_steps` 调整。
 
 如果没有得到 final answer，系统会返回当前能形成的回答或错误状态。
 
@@ -781,7 +783,7 @@ MAIL_PACKAGE = ToolPackageSpec(
 - 旧的 `mail.persist_matters` 类还在代码中，但 runtime 不注册它。
 - 当前 Agent 可见邮件工具只有：
   - `mail.search`
-  - `mail.load_messages`
+  - `mail.load_messages`（仅精确查阅，最多三封）
   - `mail.sync`
 
 ### 11.2 mail.search
@@ -790,16 +792,18 @@ MAIL_PACKAGE = ToolPackageSpec(
 
 职责：
 
-- 搜索本地已持久化邮件。
-- 使用 SQLite FTS。
-- 返回候选邮件摘要和 `message_id`。
+- 搜索本地知识库中 `source_type=mail_message` 的邮件证据。
+- 复用知识库关键词、语义和混合检索，以及隐私过滤和 chunk 截断。
+- 返回邮件元数据、受预算约束的正文证据片段和稳定溯源。
 
 输入：
 
 ```json
 {
   "query": "NTUSO audition",
-  "limit": 8
+  "limit": 8,
+  "mode": "hybrid",
+  "order_by": "relevance"
 }
 ```
 
@@ -814,7 +818,10 @@ MAIL_PACKAGE = ToolPackageSpec(
       "subject": "...",
       "sender": "...",
       "received_at": "...",
-      "snippet": "..."
+      "snippet": "...",
+      "document_id": "...",
+      "chunk_id": "...",
+      "source_ref": "mail_message:..."
     }
   ]
 }
@@ -822,8 +829,9 @@ MAIL_PACKAGE = ToolPackageSpec(
 
 业务含义：
 
-- 这是候选检索，不等于 LLM 已经读过完整邮件。
-- 如果用户需要具体要求、完整内容、时间、链接，LLM 应继续调用 `mail.load_messages`。
+- 常规任务直接使用检索结果中的正文证据，不再把“候选元数据”和正文批量加载拆成两步。
+- 空 query 加 `order_by=source_time_desc` 用于最新邮件列表。
+- 仅在用户明确要求原文或精确引文且证据片段不足时才调用 `mail.load_messages`。
 
 ### 11.3 mail.load_messages
 
@@ -831,8 +839,8 @@ MAIL_PACKAGE = ToolPackageSpec(
 
 职责：
 
-- 根据 `message_ids` 加载完整邮件记录。
-- 返回完整正文和附件元数据。
+- 根据已知 `message_ids` 查阅少量邮件原文。
+- 最多三封；Agent 后续 prompt 仍受通用 observation 总预算保护。
 
 输入：
 
@@ -1489,14 +1497,9 @@ AgentTurnLoop.run
   -> LLM operation=tool_call(mail.search)
        input: {"query": "NTUSO audition", "limit": 8}
   -> ToolExecutor 校验 input
-  -> SearchMailTool 调 MailService.search_messages
-  -> 返回候选邮件，例如 "Fw: NTUSO Audition"
+  -> SearchMailTool 调 MailKnowledgeMirror.search -> KnowledgeService.search
+  -> 返回带正文证据片段和来源的邮件卡，例如 "Fw: NTUSO Audition"
   -> 工具反馈：找到了相关邮件
-  -> LLM operation=tool_call(mail.load_messages)
-       input: {"message_ids": ["..."]}
-  -> LoadMailMessagesTool 调 MailService.load_messages
-  -> 返回完整正文
-  -> 工具反馈：成功加载完整内容
   -> LLM operation=final_answer
        final_answer: 总结 audition 要求、准备材料、建议
   -> verify final answer
@@ -1518,7 +1521,6 @@ AgentTurnLoop.run
 ```text
 route -> mail
 mail.search("ICA student pass")
-mail.load_messages([...])
 final_answer
 ```
 

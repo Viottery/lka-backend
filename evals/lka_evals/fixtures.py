@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from app.domains.mail import MailAccountInput, MailMessageInput
+from app.domains.knowledge import KnowledgeDocumentInput
 from app.domains.matters import MatterCreateInput
 
 
@@ -32,6 +33,7 @@ def apply_setup(runtime: Any, setup: dict[str, Any] | None) -> dict[str, Any]:
         "matters": {"matter_ids": []},
         "filesystem": {},
         "workspaces": [],
+        "knowledge": {"documents_by_title": {}, "chunks_by_title": {}},
     }
     mail_fixtures = setup.get("mail_fixtures")
     if isinstance(mail_fixtures, list):
@@ -42,6 +44,18 @@ def apply_setup(runtime: Any, setup: dict[str, Any] | None) -> dict[str, Any]:
     inline_mail = setup.get("mail")
     if isinstance(inline_mail, dict):
         _import_mail_payload(runtime, inline_mail, fixture_index)
+
+    knowledge_fixtures = setup.get("knowledge_fixtures")
+    if isinstance(knowledge_fixtures, list):
+        for fixture_name in knowledge_fixtures:
+            if isinstance(fixture_name, str):
+                _import_knowledge_fixture(runtime, fixture_name, fixture_index)
+
+    inline_knowledge = setup.get("knowledge")
+    if isinstance(inline_knowledge, list):
+        for payload in inline_knowledge:
+            if isinstance(payload, dict):
+                _import_knowledge_payload(runtime, payload, fixture_index)
 
     matters = setup.get("matters")
     if isinstance(matters, list):
@@ -145,6 +159,28 @@ def _import_mail_payload(runtime: Any, payload: dict[str, Any], fixture_index: d
             "subject": message.subject,
             "received_at": message.received_at,
         }
+
+
+def _import_knowledge_fixture(runtime: Any, fixture_name: str, fixture_index: dict[str, Any]) -> None:
+    relative_path = fixture_name if fixture_name.endswith(".json") else f"knowledge/{fixture_name}.json"
+    _import_knowledge_payload(runtime, load_fixture(relative_path), fixture_index)
+
+
+def _import_knowledge_payload(runtime: Any, payload: dict[str, Any], fixture_index: dict[str, Any]) -> None:
+    documents = payload.get("documents")
+    if not isinstance(documents, list):
+        raise ValueError("Knowledge fixture requires documents list.")
+    for document_payload in documents:
+        if not isinstance(document_payload, dict):
+            continue
+        imported = runtime.import_knowledge_document(
+            payload=KnowledgeDocumentInput.model_validate(document_payload)
+        )
+        title = str(document_payload.get("title") or "")
+        fixture_index["knowledge"]["documents_by_title"][title] = imported.document_id
+        fixture_index["knowledge"]["chunks_by_title"][title] = list(
+            runtime.load_knowledge_document(document_id=imported.document_id).chunk_ids
+        )
 
 
 def _stable_id(prefix: str, *parts: str | None) -> str:

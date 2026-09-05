@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import tomllib
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -40,9 +41,11 @@ class LLMClientConfig(BaseModel):
     api_key_env: str = "OPENAI_API_KEY"
     default_model: str = "gpt-4.1-mini"
     available_models: list[str] = Field(default_factory=list)
-    timeout_seconds: int = 60
+    timeout_seconds: int = 180
     supports_stream: bool = True
     supports_json_mode: bool = False
+    supports_function_calling: bool = False
+    function_calling_strict: bool = False
 
     def resolved_api_key(self) -> str | None:
         return _resolved_env_value(self.api_key_env) if self.api_key_env else None
@@ -53,7 +56,7 @@ class LLMProviderConfig(BaseModel):
     base_url: str = "https://api.openai.com/v1"
     api_key_env: str = "OPENAI_API_KEY"
     model: str = "gpt-4.1-mini"
-    timeout_seconds: int = 60
+    timeout_seconds: int = 180
     default_client: str | None = None
     fallback_client: str | None = None
     default_response_mode: str = "json"
@@ -95,6 +98,11 @@ class LLMProviderConfig(BaseModel):
 class SafetyReviewConfig(BaseModel):
     tool_review_mode: str = "skip"
     manual_wait_poll_seconds: float = 0.5
+
+
+class AgentConfig(BaseModel):
+    max_decision_steps: int = 10
+    orchestrator: Literal["legacy", "langgraph"] = "legacy"
 
 
 class OutlookMailConfig(BaseModel):
@@ -147,17 +155,25 @@ class MailProviderConfig(BaseModel):
 
 
 class EmbeddingConfig(BaseModel):
-    provider: str = "local_bge"
-    model_name: str = "BAAI/bge-m3"
+    enabled: bool = True
+    provider: str = "fastembed"
+    index_provider: str = "sqlite_vec"
+    model_name: str = "BAAI/bge-small-zh-v1.5"
+    dimensions: int = 512
     device: str = "auto"
     cache_dir: Path = Path("./data/models")
     batch_size: int = 16
     normalize_embeddings: bool = True
+    query_prefix: str = "为这个句子生成表示以用于检索相关文章："
+    default_retrieval_mode: str = "hybrid"
+    auto_index_on_import: bool = False
+    local_files_only: bool = True
 
 
 class LocalAppConfig(BaseModel):
     llm: LLMProviderConfig = Field(default_factory=LLMProviderConfig)
     safety: SafetyReviewConfig = Field(default_factory=SafetyReviewConfig)
+    agent: AgentConfig = Field(default_factory=AgentConfig)
     mail: MailProviderConfig = Field(default_factory=MailProviderConfig)
     embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
 

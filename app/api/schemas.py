@@ -17,6 +17,15 @@ from app.domains.mail import (
     MailMessageInput,
     MailSearchResult,
 )
+from app.domains.knowledge import (
+    KnowledgeChunkLoadResult,
+    KnowledgeDocumentInput,
+    KnowledgeDocumentRecord,
+    KnowledgeImportResult,
+    KnowledgeSemanticSyncResult,
+    KnowledgeSearchResult,
+)
+from app.domains.mail_knowledge import MailKnowledgeMirrorResult
 from app.domains.matters import (
     MatterCreateInput,
     MatterList,
@@ -37,6 +46,7 @@ from app.core.sessions import (
     AgentSessionList,
     AgentSessionMessage,
     SessionRole,
+    SessionWorkspace,
 )
 from app.core.safety import SafetyReviewDecision, SafetyReviewRecord
 from app.core.tools import ToolInvocation, ToolResult
@@ -132,6 +142,16 @@ class SessionCreateResponse(AgentSessionDetail):
     pass
 
 
+class SessionWorkspaceUpdateRequest(BaseModel):
+    path: str = Field(min_length=1)
+    platform: str
+
+
+class SessionWorkspaceResponse(BaseModel):
+    session_id: str
+    workspace: SessionWorkspace
+
+
 class SessionListResponse(AgentSessionList):
     sessions: list[AgentSession]
 
@@ -160,6 +180,47 @@ class MailImportResponse(MailImportResult):
 
 
 class MailSearchResponse(MailSearchResult):
+    pass
+
+
+class KnowledgeImportRequest(KnowledgeDocumentInput):
+    pass
+
+
+class KnowledgeImportResponse(KnowledgeImportResult):
+    pass
+
+
+class KnowledgeSearchResponse(KnowledgeSearchResult):
+    pass
+
+
+class KnowledgeSemanticSyncResponse(KnowledgeSemanticSyncResult):
+    pass
+
+
+class KnowledgeSemanticSyncRequest(BaseModel):
+    allow_model_download: bool = False
+
+
+class MailKnowledgeMirrorSyncRequest(BaseModel):
+    account_id: str | None = None
+
+
+class MailKnowledgeMirrorSyncResponse(MailKnowledgeMirrorResult):
+    pass
+
+
+class KnowledgeChunkLoadRequest(BaseModel):
+    chunk_ids: list[str]
+    max_chars_per_chunk: int = Field(default=420, ge=1, le=1200)
+
+
+class KnowledgeChunkLoadResponse(KnowledgeChunkLoadResult):
+    pass
+
+
+class KnowledgeDocumentResponse(KnowledgeDocumentRecord):
     pass
 
 
@@ -217,6 +278,7 @@ __all__ = [
     "MailAccountInput",
     "MailAttachmentInput",
     "MailMessageInput",
+    "KnowledgeDocumentInput",
     "MatterCreateInput",
     "MatterSourceLinkInput",
     "MatterUpdateInput",

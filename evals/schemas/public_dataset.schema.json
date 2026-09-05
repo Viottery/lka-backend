@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Normalized Public Retrieval Dataset",
+  "type": "object",
+  "required": ["kind"],
+  "properties": {
+    "kind": {"enum": ["document", "query"]},
+    "document_id": {"type": "string"},
+    "title": {"type": "string"},
+    "text": {"type": "string"},
+    "query_id": {"type": "string"},
+    "question": {"type": "string"},
+    "answer": {"type": "string"},
+    "supporting_document_ids": {"type": "array", "items": {"type": "string"}},
+    "supporting_titles": {"type": "array", "items": {"type": "string"}},
+    "hop_count": {"type": "integer", "minimum": 1},
+    "forbidden_document_ids": {"type": "array", "items": {"type": "string"}},
+    "dataset": {"type": "string"}
+    ,"question_type": {"type": "string"}
+    ,"split": {"type": "string"}
+  }
+}

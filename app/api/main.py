@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.routes.agent import router as agent_router
 from app.api.routes.capabilities import router as capabilities_router
 from app.api.routes.health import router as health_router
+from app.api.routes.knowledge import router as knowledge_router
 from app.api.routes.mail import router as mail_router
 from app.api.routes.matters import router as matters_router
 from app.api.routes.runtime_debug import router as runtime_debug_router
@@ -46,6 +47,7 @@ def create_app() -> FastAPI:
     app.include_router(runtime_debug_router)
     app.include_router(agent_router)
     app.include_router(sessions_router)
+    app.include_router(knowledge_router)
     app.include_router(mail_router)
     app.include_router(matters_router)
 

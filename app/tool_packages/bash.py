@@ -90,13 +90,22 @@ BASH_PACKAGE = ToolPackageSpec(
 @dataclass(frozen=True)
 class BashAccessPolicy:
     roots: list[Path]
+    allow_session_root_override: bool = False
 
     @classmethod
     def from_workspace_roots(cls, roots: list[Path] | None) -> "BashAccessPolicy":
         configured = [root.expanduser().resolve(strict=False) for root in roots or []]
         if not configured:
             configured = [Path.cwd().resolve(strict=False)]
-        return cls(roots=configured)
+        return cls(roots=configured, allow_session_root_override=not bool(roots))
+
+    def for_session_workspace(self, workspace_root: str | None) -> "BashAccessPolicy":
+        if not workspace_root:
+            return self
+        root = Path(workspace_root).expanduser().resolve(strict=False)
+        if not self.allow_session_root_override and not self._is_allowed(root):
+            raise PermissionError("session workspace is outside allowed workspace roots")
+        return BashAccessPolicy(roots=[root])
 
     def resolve_cwd(self, cwd_value: str | None) -> Path:
         if cwd_value and cwd_value.strip():
@@ -370,21 +379,24 @@ class BashRunTool:
         return is_read_only_command(str(tool_input.get("command") or ""))
 
     def invoke(self, *, invocation: ToolInvocation, context: ToolContext) -> ToolResult:
-        _ = context
         command = str(invocation.input.get("command") or "")
         mode = str(invocation.input.get("mode") or "sync")
         read_only = self.is_read_only_invocation(invocation.input)
         try:
             if not command.strip():
                 raise ValueError("command is required.")
-            cwd = self.policy.resolve_cwd(invocation.input.get("cwd"))
+            policy = self.policy.for_session_workspace(context.workspace_root)
+            cwd = policy.resolve_cwd(invocation.input.get("cwd"))
             if mode == "background":
-                payload = self._run_background(command=command, cwd=cwd, read_only=read_only)
+                payload = self._run_background(
+                    command=command, cwd=cwd, read_only=read_only, policy=policy
+                )
             else:
                 payload = self._run_sync(
                     command=command,
                     cwd=cwd,
                     read_only=read_only,
+                    policy=policy,
                     timeout_seconds=int(
                         invocation.input.get("timeout_seconds")
                         or DEFAULT_SYNC_TIMEOUT_SECONDS
@@ -414,6 +426,7 @@ class BashRunTool:
         command: str,
         cwd: Path,
         read_only: bool,
+        policy: BashAccessPolicy,
         timeout_seconds: int,
         max_output_bytes: int,
     ) -> dict[str, Any]:
@@ -424,7 +437,7 @@ class BashRunTool:
             completed = subprocess.run(
                 ["/bin/bash", "-lc", command],
                 cwd=cwd,
-                env=self._env(),
+                env=self._env(policy),
                 capture_output=True,
                 timeout=timeout,
                 check=False,
@@ -443,7 +456,7 @@ class BashRunTool:
             "mode": "sync",
             "command": command,
             "cwd": cwd.as_posix(),
-            "workspace_root": self.policy.default_root.as_posix(),
+            "workspace_root": policy.default_root.as_posix(),
             "read_only": read_only,
             "status": "timed_out" if timed_out else "exited",
             "running": False,
@@ -462,19 +475,20 @@ class BashRunTool:
         command: str,
         cwd: Path,
         read_only: bool,
+        policy: BashAccessPolicy,
     ) -> dict[str, Any]:
         session = self.session_manager.start(
             command=command,
             cwd=cwd,
-            workspace_root=self.policy.default_root,
+            workspace_root=policy.default_root,
             read_only=read_only,
-            env=self._env(),
+            env=self._env(policy),
         )
         return {
             "mode": "background",
             "command": command,
             "cwd": cwd.as_posix(),
-            "workspace_root": self.policy.default_root.as_posix(),
+            "workspace_root": policy.default_root.as_posix(),
             "read_only": read_only,
             "status": "running",
             "running": True,
@@ -487,9 +501,9 @@ class BashRunTool:
             "next_offset": 0,
         }
 
-    def _env(self) -> dict[str, str]:
+    def _env(self, policy: BashAccessPolicy) -> dict[str, str]:
         env = dict(os.environ)
-        env.update(self.policy.env())
+        env.update(policy.env())
         return env
 
 

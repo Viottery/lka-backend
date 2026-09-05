@@ -9,10 +9,98 @@ from app.api.routes.agent import run_agent_turn
 from app.api.routes.mail import import_mail
 from app.api.routes.sessions import get_session
 from app.api.schemas import AgentTurnRequest, MailImportRequest
+from app.core.agent_graph import AgentGraphRunner
+from app.core.agent_turn import LLM_OBSERVATION_MAX_TOTAL_CHARS
 from app.core.config import get_settings
 from app.core.llm import LLMRateLimitError, LLMResponse, LLMStreamEvent
 from app.core.tools import ToolContext, ToolExecutor, ToolRegistry, ToolResult, ToolSpec
+from app.domains.mail import MailAccountInput, MailMessageInput
 from app.domains.matters import MatterCreateInput
+
+
+def test_agent_turn_uses_configured_max_decision_steps(tmp_path, monkeypatch):
+    config_path = tmp_path / "local.toml"
+    config_path.write_text("[agent]\nmax_decision_steps = 12\n", encoding="utf-8")
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(config_path))
+    get_settings.cache_clear()
+
+    app = create_app()
+
+    assert app.state.runtime.agent_turn_loop.max_decision_steps == 12
+    assert app.state.runtime.agent_turn_runner is app.state.runtime.agent_turn_loop
+
+
+def test_agent_turn_can_run_through_langgraph_orchestrator(tmp_path, monkeypatch):
+    config_path = tmp_path / "local.toml"
+    config_path.write_text(
+        '[agent]\norchestrator = "langgraph"\nmax_decision_steps = 10\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(config_path))
+    get_settings.cache_clear()
+
+    app = create_app()
+    runner = app.state.runtime.agent_turn_runner
+
+    assert isinstance(runner, AgentGraphRunner)
+
+    response = run_agent_turn(
+        AgentTurnRequest(
+            session_id="session_langgraph_scaffold",
+            user_input="Answer directly without using a tool.",
+        ),
+        SimpleNamespace(app=app),
+    )
+
+    assert response.run_id.startswith("agent_run_")
+    assert response.session_id == "session_langgraph_scaffold"
+    assert response.answer
+    assert app.state.runtime.agent_run_manager.get_run(response.run_id).status.value == "completed"
+
+    snapshot = runner.graph.get_state(
+        {"configurable": {"thread_id": response.run_id}}
+    )
+    assert snapshot.values["phase"] == "completed"
+    assert snapshot.values["result_summary"]["run_id"] == response.run_id
+    assert "tool_events" not in snapshot.values
+
+
+def test_agent_turn_prefers_provider_native_function_calls_when_supported(tmp_path, monkeypatch):
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
+    get_settings.cache_clear()
+    app = create_app()
+    app.state.runtime.import_mail(
+        account=MailAccountInput(provider="local_json", email_address="user@example.com"),
+        messages=[
+            MailMessageInput(
+                external_id="native_function_call_001",
+                folder="Inbox",
+                subject="Native function calling evidence",
+                sender="sender@example.com",
+                to=["user@example.com"],
+                received_at="2026-08-05T09:30:00Z",
+                body_text="Native tool call test body.",
+            )
+        ],
+    )
+    fake_llm = _NativeFunctionCallingLLM()
+    app.state.runtime.agent_turn_loop.llm_client = fake_llm
+
+    response = run_agent_turn(
+        AgentTurnRequest(
+            session_id="session_native_function_call",
+            user_input="查询 native function calling evidence",
+        ),
+        SimpleNamespace(app=app),
+    )
+
+    assert response.answer == "Native function call completed."
+    assert [event.tool_name for event in response.tool_events] == ["mail.search"]
+    assert "tool_0_mail_search" in fake_llm.function_names
+    assert any("Call exactly one provided function" in prompt for prompt in fake_llm.system_prompts)
 
 
 def test_agent_turn_expands_mail_package_and_records_log(tmp_path, monkeypatch):
@@ -62,6 +150,10 @@ def test_agent_turn_expands_mail_package_and_records_log(tmp_path, monkeypatch):
     assert response.session_id == "session_agent_turn_ntuso"
     assert response.run_id.startswith("agent_run_")
     assert response.selected_package == "mail"
+    assert response.initial_package == "mail"
+    assert response.expanded_packages == ["mail"]
+    assert response.used_packages == ["mail"]
+    assert response.active_package == "mail"
     assert [event.tool_name for event in response.tool_events] == [
         "mail.search",
         "mail.load_messages",
@@ -94,6 +186,10 @@ def test_agent_turn_expands_mail_package_and_records_log(tmp_path, monkeypatch):
     assert run.trace_id == response.trace_id
     assert run.log_path == response.log_path
     assert run.result_snapshot["selected_package"] == "mail"
+    assert run.result_snapshot["initial_package"] == "mail"
+    assert run.result_snapshot["expanded_packages"] == ["mail"]
+    assert run.result_snapshot["used_packages"] == ["mail"]
+    assert run.result_snapshot["active_package"] == "mail"
     run_events = app.state.runtime.agent_run_manager.list_events(response.run_id)
     assert [event.sequence for event in run_events] == list(range(1, len(run_events) + 1))
     assert run_events[0].type == "run_started"
@@ -106,6 +202,10 @@ def test_agent_turn_expands_mail_package_and_records_log(tmp_path, monkeypatch):
     assert "## Package Catalog" in log_text
     assert "## Progress Events" in log_text
     assert "## Verification Warnings" in log_text
+    assert "- initial_package: `mail`" in log_text
+    assert "- expanded_packages: `mail`" in log_text
+    assert "- used_packages: `mail`" in log_text
+    assert "- active_package: `mail`" in log_text
     assert "mail.search" in log_text
     assert "mail.load_messages" in log_text
     assert full_body_sentinel in log_text
@@ -114,6 +214,10 @@ def test_agent_turn_expands_mail_package_and_records_log(tmp_path, monkeypatch):
     assert [message.role for message in session.messages] == ["user", "agent"]
     assert session.messages[1].payload["trace_id"] == response.trace_id
     assert session.messages[1].payload["selected_package"] == "mail"
+    assert session.messages[1].payload["initial_package"] == "mail"
+    assert session.messages[1].payload["expanded_packages"] == ["mail"]
+    assert session.messages[1].payload["used_packages"] == ["mail"]
+    assert session.messages[1].payload["active_package"] == "mail"
 
 
 def test_agent_turn_retries_rate_limited_llm_and_logs_failure(tmp_path, monkeypatch):
@@ -427,12 +531,95 @@ def test_agent_turn_reuses_cached_loaded_mail_for_follow_up(tmp_path, monkeypatc
     assert second.tool_events == []
     assert second.answer == "第二轮回答：我复用了缓存邮件正文。"
     assert fake_llm.second_route_context is not None
-    assert "cached_tool_observations" in fake_llm.second_route_context
+    assert "cached_tool_observations" not in fake_llm.second_route_context
     assert full_body_sentinel in json.dumps(
         fake_llm.second_decision_observations,
         ensure_ascii=False,
     )
     assert second.decision_events[1].action == "final_answer"
+
+
+def test_agent_turn_compacts_long_observations_without_truncating_tool_log(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
+    get_settings.cache_clear()
+
+    app = create_app()
+    request = SimpleNamespace(app=app)
+    omitted_sentinel = "OMITTED_MIDDLE_SENTINEL"
+    body_text = "HEAD-" + ("A" * 5_000) + omitted_sentinel + ("B" * 5_000) + "-TAIL"
+    import_mail(
+        MailImportRequest(
+            account={
+                "provider": "local_json",
+                "email_address": "user@example.com",
+            },
+            messages=[
+                {
+                    "external_id": "agent_turn_long_observation_001",
+                    "folder": "Inbox",
+                    "subject": "Long mail body",
+                    "sender": "long@example.com",
+                    "to": ["user@example.com"],
+                    "received_at": "2026-08-05T09:30:00Z",
+                    "body_text": body_text,
+                },
+            ],
+        ),
+        request,
+    )
+    fake_llm = _LongObservationCompactionLLM()
+    app.state.runtime.agent_turn_loop.llm_client = fake_llm
+
+    response = run_agent_turn(
+        AgentTurnRequest(
+            session_id="session_long_observation_compaction",
+            user_input="读取 Long mail body 邮件。",
+        ),
+        request,
+    )
+
+    assert response.answer == "长邮件已读取。"
+    full_body = response.tool_events[-1].result["output"]["messages"][0]["body_text"]
+    assert omitted_sentinel in full_body
+    assert fake_llm.final_decision_observations
+    compacted_observation_json = json.dumps(
+        fake_llm.final_decision_observations[-1],
+        ensure_ascii=False,
+    )
+    assert omitted_sentinel not in compacted_observation_json
+    assert "truncated" in compacted_observation_json
+    assert fake_llm.answer_observations
+    answer_observation_json = json.dumps(fake_llm.answer_observations, ensure_ascii=False)
+    assert omitted_sentinel not in answer_observation_json
+    assert "truncated" in answer_observation_json
+
+
+def test_agent_turn_enforces_aggregate_observation_prompt_budget(tmp_path, monkeypatch):
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
+    get_settings.cache_clear()
+
+    loop = create_app().state.runtime.agent_turn_loop
+    observations = [
+        {
+            "tool_name": "example.read",
+            "input": {"index": index},
+            "result": {"output": f"EARLY_{index}_" + ("x" * 4_000)},
+        }
+        for index in range(8)
+    ]
+
+    bounded = loop._observations_within_prompt_budget(observations)
+    serialized = json.dumps(bounded, ensure_ascii=False, separators=(",", ":"))
+
+    assert len(serialized) <= LLM_OBSERVATION_MAX_TOTAL_CHARS + 400
+    assert "EARLY_0_" not in serialized
+    assert "EARLY_7_" in serialized
+    assert any(item.get("_prompt_compacted") for item in bounded)
 
 
 def test_agent_turn_recovers_mail_route_from_malformed_llm_json(tmp_path, monkeypatch):
@@ -648,6 +835,50 @@ def test_agent_turn_does_not_final_plain_text_progress_after_mail_search(
     )
 
 
+def test_agent_turn_retries_empty_decision_after_tool_observation(tmp_path, monkeypatch):
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
+    get_settings.cache_clear()
+
+    app = create_app()
+    request = SimpleNamespace(app=app)
+    import_mail(
+        MailImportRequest(
+            account={"provider": "local_json", "email_address": "user@example.com"},
+            messages=[
+                {
+                    "external_id": "agent_turn_empty_decision_001",
+                    "subject": "Mail for empty decision retry",
+                    "sender": "sender@example.com",
+                    "to": ["user@example.com"],
+                    "body_text": "The empty response retry must preserve this evidence.",
+                }
+            ],
+        ),
+        request,
+    )
+    app.state.runtime.agent_turn_loop.llm_client = _EmptyDecisionThenWorkingLLM()
+
+    response = run_agent_turn(
+        AgentTurnRequest(
+            session_id="session_empty_decision_retry",
+            user_input="查看最新邮件",
+        ),
+        request,
+    )
+
+    assert [event.tool_name for event in response.tool_events] == ["mail.search"]
+    assert response.answer == "已基于检索到的邮件完成回答。"
+    retry_events = [
+        event
+        for event in response.llm_events
+        if event.stage == "decision" and "format_attempt=2" in event.prompt_summary
+    ]
+    assert len(retry_events) == 1
+    assert "previous_decision_output_was_empty" in retry_events[0].user_prompt
+    assert not any(event.action == "invalid_empty_decision" for event in response.decision_events)
+
+
 def test_agent_turn_accepts_operation_envelope_decisions(tmp_path, monkeypatch):
     monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
@@ -784,6 +1015,42 @@ def test_agent_turn_does_not_recover_malformed_tool_call_as_answer(tmp_path, mon
     assert "损坏 JSON" in response.answer
 
 
+def test_agent_turn_blocks_repeated_successful_tool_call_and_answers(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
+    get_settings.cache_clear()
+
+    app = create_app()
+    request = SimpleNamespace(app=app)
+    fake_llm = _RepeatedSuccessfulToolLLM()
+    app.state.runtime.agent_turn_loop.llm_client = fake_llm
+
+    response = run_agent_turn(
+        AgentTurnRequest(
+            session_id="session_repeat_successful_tool",
+            user_input="查询 NTUSO 邮件",
+        ),
+        request,
+    )
+
+    assert response.answer == "已根据第一次检索结果完成回答。"
+    assert [event.tool_name for event in response.tool_events] == ["mail.search"]
+    assert [event.action for event in response.decision_events] == [
+        "select_package",
+        "call_tool",
+        "call_tool",
+        "final_answer",
+    ]
+    assert response.decision_events[-1].source == "local"
+    assert "Blocked an identical tool call" in (response.decision_events[-1].reason or "")
+    assert "tool_duplicate_blocked" in [event.type for event in response.progress_events]
+    assert fake_llm.completed_tool_calls
+    assert fake_llm.completed_tool_calls[-1]["tool_name"] == "mail.search"
+
+
 def test_agent_turn_can_expand_matter_package_after_mail_observation(tmp_path, monkeypatch):
     monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
@@ -836,6 +1103,11 @@ def test_agent_turn_can_expand_matter_package_after_mail_observation(tmp_path, m
         "matter.create_many",
     ]
     assert "matter.create_many" in [tool["name"] for tool in response.expanded_tools]
+    assert response.selected_package == "mail"
+    assert response.initial_package == "mail"
+    assert response.expanded_packages == ["mail", "matter"]
+    assert response.used_packages == ["mail", "matter"]
+    assert response.active_package == "matter"
     assert response.tool_events[-1].feedback["source"] == "local"
     assert response.tool_events[-1].result["output"]["matters_created"] == 1
     progress_types = [event.type for event in response.progress_events]
@@ -843,6 +1115,18 @@ def test_agent_turn_can_expand_matter_package_after_mail_observation(tmp_path, m
     assert "tool_feedback" in progress_types
     assert response.progress_events[-1].type == "final_answer"
     assert response.verification_warnings == []
+    assert fake_llm.decision_payloads
+    assert all("selected_package" not in payload for payload in fake_llm.decision_payloads)
+    assert all("route" not in payload for payload in fake_llm.decision_payloads)
+    assert all(
+        "initially expanded package" not in system_prompt
+        for system_prompt in fake_llm.decision_system_prompts
+    )
+    assert all(
+        '"selected_package"' not in event.user_prompt
+        for event in response.llm_events
+        if event.stage != "route"
+    )
 
     matters = app.state.runtime.list_matters(limit=10)
     assert len(matters.matters) == 1
@@ -886,6 +1170,9 @@ def test_agent_turn_feeds_tool_input_validation_errors_back_to_llm(
     assert response.tool_events[1].feedback["source"] == "local"
     assert response.tool_events[1].result["output"]["matters_created"] == 1
     assert response.answer == "已创建 NTUSO audition 准备事项。"
+    assert fake_llm.tool_check_payloads
+    assert all("selected_package" not in payload for payload in fake_llm.tool_check_payloads)
+    assert {payload["tool_package"] for payload in fake_llm.tool_check_payloads} == {"matter"}
 
 
 def test_agent_turn_uses_local_feedback_for_valid_tool_result(
@@ -1486,6 +1773,89 @@ class _MailCacheReuseLLM:
         )
 
 
+class _LongObservationCompactionLLM:
+    def __init__(self) -> None:
+        self.final_decision_observations: list[dict] = []
+        self.answer_observations: list[dict] = []
+
+    def complete_text(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        prompt_summary: str,
+        temperature: float = 0.0,
+        max_output_tokens: int | None = None,
+    ) -> LLMResponse:
+        if "Choose at most one tool package" in system_prompt:
+            content = json.dumps(
+                {
+                    "selected_package": "mail",
+                    "reason": "Use mail for long observation test.",
+                    "search_query": "Long mail body",
+                }
+            )
+        elif "Tool Result Checker" in system_prompt:
+            content = _tool_check_content()
+        elif "Choose the next single action" in system_prompt:
+            payload = json.loads(user_prompt)
+            observations = payload["observations"]
+            if not observations:
+                content = json.dumps(
+                    {
+                        "operation": {
+                            "type": "tool_call",
+                            "tool_name": "mail.search",
+                            "tool_input": {"query": "Long mail body", "limit": 5},
+                            "final_answer": None,
+                            "reason": "Search long mail.",
+                            "confidence": "high",
+                        },
+                        "assistant_message": "检索长邮件。",
+                    }
+                )
+            elif observations[-1]["tool_name"] == "mail.search":
+                messages = observations[-1]["result"]["output"]["messages"]
+                content = json.dumps(
+                    {
+                        "operation": {
+                            "type": "tool_call",
+                            "tool_name": "mail.load_messages",
+                            "tool_input": {"message_ids": [messages[0]["message_id"]]},
+                            "final_answer": None,
+                            "reason": "Load long mail.",
+                            "confidence": "high",
+                        },
+                        "assistant_message": "加载长邮件正文。",
+                    }
+                )
+            else:
+                self.final_decision_observations = observations
+                content = json.dumps(
+                    {
+                        "operation": {
+                            "type": "final_answer",
+                            "final_answer": None,
+                            "reason": "Long mail body has been loaded.",
+                            "confidence": "high",
+                        },
+                        "assistant_message": "准备回答。",
+                    }
+                )
+        elif "Final Answer Writer" in system_prompt:
+            payload = json.loads(user_prompt)
+            self.answer_observations = payload["observations"]
+            content = "长邮件已读取。"
+        else:
+            content = "Unexpected prompt."
+        return LLMResponse(
+            provider="fake_long_observation_compaction_llm",
+            status="completed",
+            content=content,
+            prompt_summary=prompt_summary,
+        )
+
+
 class _MalformedRouteLLM:
     def complete_text(
         self,
@@ -1698,6 +2068,171 @@ class _PlainTextProgressAfterSearchLLM:
         )
 
 
+class _EmptyDecisionThenWorkingLLM:
+    def complete_text(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        prompt_summary: str,
+        temperature: float = 0.0,
+        max_output_tokens: int | None = None,
+    ) -> LLMResponse:
+        if "Choose at most one tool package" in system_prompt:
+            content = json.dumps(
+                {
+                    "selected_package": "mail",
+                    "reason": "Use mail to inspect the latest local messages.",
+                    "search_query": "",
+                }
+            )
+        elif "Tool Result Checker" in system_prompt:
+            content = _tool_check_content()
+        elif "Choose the next single action" in system_prompt:
+            payload = json.loads(user_prompt)
+            observations = payload["observations"]
+            if not observations:
+                content = json.dumps(
+                    {
+                        "operation": {
+                            "type": "tool_call",
+                            "tool_name": "mail.search",
+                            "tool_input": {"query": "", "limit": 5},
+                            "final_answer": None,
+                            "reason": "Search the newest local mail first.",
+                        },
+                        "assistant_message": "正在读取最新邮件。",
+                    }
+                )
+            elif payload.get("decision_retry"):
+                content = json.dumps(
+                    {
+                        "operation": {
+                            "type": "final_answer",
+                            "final_answer": None,
+                            "reason": "The mail search result is sufficient for this test.",
+                        },
+                        "assistant_message": "已获取邮件结果。",
+                    }
+                )
+            else:
+                content = ""
+        elif "Final Answer Writer" in system_prompt:
+            content = "已基于检索到的邮件完成回答。"
+        else:
+            content = "Unexpected prompt."
+        return LLMResponse(
+            provider="fake_empty_decision_then_working_llm",
+            status="completed",
+            content=content,
+            prompt_summary=prompt_summary,
+        )
+
+
+class _NativeFunctionCallingLLM:
+    supports_function_calling = True
+
+    def __init__(self) -> None:
+        self.function_names: list[str] = []
+        self.system_prompts: list[str] = []
+        self._native_decisions = 0
+
+    def complete_text(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        prompt_summary: str,
+        tools=None,
+        **kwargs,
+    ) -> LLMResponse:
+        self.system_prompts.append(system_prompt)
+        if "Choose at most one tool package" in system_prompt:
+            content = json.dumps(
+                {"selected_package": "mail", "reason": "Search local evidence.", "search_query": "native"}
+            )
+            tool_calls = []
+        elif tools:
+            self.function_names.extend(tool.name for tool in tools if tool.name.startswith("tool_"))
+            if self._native_decisions == 0:
+                self._native_decisions += 1
+                content = ""
+                tool_calls = [
+                    {
+                        "id": "call_native_search",
+                        "name": "tool_0_mail_search",
+                        "arguments": {"query": "native", "limit": 5},
+                        "raw_arguments": '{"query":"native","limit":5}',
+                    }
+                ]
+            else:
+                content = "Evidence is sufficient."
+                tool_calls = []
+        elif "Final Answer Writer" in system_prompt:
+            content = "Native function call completed."
+            tool_calls = []
+        else:
+            content = _tool_check_content() if "Tool Result Checker" in system_prompt else "Unexpected prompt."
+            tool_calls = []
+        return LLMResponse(
+            provider="fake_native_function_llm",
+            status="completed",
+            content=content,
+            prompt_summary=prompt_summary,
+            tool_calls=tool_calls,
+        )
+
+
+class _RepeatedSuccessfulToolLLM:
+    def __init__(self) -> None:
+        self.completed_tool_calls: list[dict] = []
+
+    def complete_text(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        prompt_summary: str,
+        temperature: float = 0.0,
+        max_output_tokens: int | None = None,
+    ) -> LLMResponse:
+        if "Choose at most one tool package" in system_prompt:
+            content = json.dumps(
+                {"selected_package": "mail", "reason": "Search local mail.", "search_query": "NTUSO"}
+            )
+        elif "Tool Result Checker" in system_prompt:
+            content = _tool_check_content()
+        elif "Choose the next single action" in system_prompt:
+            payload = json.loads(user_prompt)
+            completed = payload.get("completed_tool_calls", [])
+            if completed:
+                self.completed_tool_calls = completed
+            content = json.dumps(
+                {
+                    "operation": {
+                        "type": "tool_call",
+                        "tool_name": "mail.search",
+                        "tool_input": {"query": "NTUSO", "limit": 8},
+                        "repeat_successful_call": False,
+                        "final_answer": None,
+                        "reason": "Search mail.",
+                        "confidence": "high",
+                    },
+                    "assistant_message": "检索邮件。",
+                }
+            )
+        elif "Final Answer Writer" in system_prompt:
+            content = "已根据第一次检索结果完成回答。"
+        else:
+            content = "Unexpected prompt."
+        return LLMResponse(
+            provider="fake_repeat_successful_tool_llm",
+            status="completed",
+            content=content,
+            prompt_summary=prompt_summary,
+        )
+
+
 class _EnvelopeDecisionLLM:
     def complete_text(
         self,
@@ -1858,6 +2393,11 @@ class _MalformedToolCallDecisionLLM:
 
 
 class _CrossPackageMatterLLM:
+    def __init__(self) -> None:
+        self.decision_payloads: list[dict] = []
+        self.decision_system_prompts: list[str] = []
+        self.tool_check_payloads: list[dict] = []
+
     def complete_text(
         self,
         *,
@@ -1876,9 +2416,12 @@ class _CrossPackageMatterLLM:
                 }
             )
         elif "Tool Result Checker" in system_prompt:
+            self.tool_check_payloads.append(json.loads(user_prompt))
             content = _tool_check_content()
         elif "Choose the next single action" in system_prompt:
             payload = json.loads(user_prompt)
+            self.decision_payloads.append(payload)
+            self.decision_system_prompts.append(system_prompt)
             observations = payload["observations"]
             expanded_package_names = payload["expanded_package_names"]
             if not observations:
@@ -2003,6 +2546,9 @@ class _CrossPackageMatterLLM:
 
 
 class _InvalidMatterInputThenRepairLLM:
+    def __init__(self) -> None:
+        self.tool_check_payloads: list[dict] = []
+
     def complete_text(
         self,
         *,
@@ -2022,6 +2568,7 @@ class _InvalidMatterInputThenRepairLLM:
             )
         elif "Tool Result Checker" in system_prompt:
             payload = json.loads(user_prompt)
+            self.tool_check_payloads.append(payload)
             status = payload["tool_result"]["status"]
             content = json.dumps(
                 {

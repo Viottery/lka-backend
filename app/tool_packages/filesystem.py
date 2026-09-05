@@ -47,13 +47,22 @@ FILESYSTEM_PACKAGE = ToolPackageSpec(
 @dataclass(frozen=True)
 class FileAccessPolicy:
     roots: list[Path]
+    allow_session_root_override: bool = False
 
     @classmethod
     def from_workspace_roots(cls, roots: list[Path] | None) -> "FileAccessPolicy":
         configured = [root.expanduser().resolve(strict=False) for root in roots or []]
         if not configured:
             configured = [Path.cwd().resolve(strict=False)]
-        return cls(roots=configured)
+        return cls(roots=configured, allow_session_root_override=not bool(roots))
+
+    def for_session_workspace(self, workspace_root: str | None) -> "FileAccessPolicy":
+        if not workspace_root:
+            return self
+        root = Path(workspace_root).expanduser().resolve(strict=False)
+        if not self.allow_session_root_override and not self._is_allowed(root):
+            raise PermissionError("session workspace is outside allowed workspace roots")
+        return FileAccessPolicy(roots=[root])
 
     def resolve(self, path_value: str) -> Path:
         if not path_value.strip():
@@ -133,9 +142,9 @@ class ReadFileTool:
     )
 
     def invoke(self, *, invocation: ToolInvocation, context: ToolContext) -> ToolResult:
-        _ = context
         try:
-            resolved = self.policy.resolve(str(invocation.input.get("path") or ""))
+            policy = self.policy.for_session_workspace(context.workspace_root)
+            resolved = policy.resolve(str(invocation.input.get("path") or ""))
             payload = read_file_slice(
                 path=resolved,
                 requested_path=str(invocation.input.get("path") or ""),
@@ -206,9 +215,9 @@ class EditFileTool:
     )
 
     def invoke(self, *, invocation: ToolInvocation, context: ToolContext) -> ToolResult:
-        _ = context
         try:
-            resolved = self.policy.resolve(str(invocation.input.get("path") or ""))
+            policy = self.policy.for_session_workspace(context.workspace_root)
+            resolved = policy.resolve(str(invocation.input.get("path") or ""))
             payload = edit_file(
                 path=resolved,
                 requested_path=str(invocation.input.get("path") or ""),

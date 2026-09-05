@@ -320,6 +320,95 @@ def init_db(db_path: Path) -> None:
                 PRIMARY KEY(matter_id, source_type, source_id),
                 FOREIGN KEY(matter_id) REFERENCES matters(matter_id)
             );
+
+            CREATE TABLE IF NOT EXISTS knowledge_sources (
+                source_id TEXT PRIMARY KEY,
+                source_type TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                uri TEXT,
+                metadata TEXT NOT NULL,
+                status TEXT NOT NULL,
+                sensitivity TEXT NOT NULL,
+                remote_policy TEXT NOT NULL,
+                access_scope TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS knowledge_documents (
+                document_id TEXT PRIMARY KEY,
+                source_id TEXT NOT NULL,
+                source_type TEXT NOT NULL,
+                title TEXT NOT NULL,
+                uri TEXT,
+                checksum TEXT NOT NULL,
+                mime_type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                sensitivity TEXT NOT NULL,
+                remote_policy TEXT NOT NULL,
+                source_ref TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                indexed_at TEXT NOT NULL,
+                metadata TEXT NOT NULL,
+                FOREIGN KEY(source_id) REFERENCES knowledge_sources(source_id),
+                UNIQUE(source_id, uri, checksum)
+            );
+
+            CREATE TABLE IF NOT EXISTS knowledge_chunks (
+                chunk_id TEXT PRIMARY KEY,
+                document_id TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                char_count INTEGER NOT NULL,
+                token_estimate INTEGER NOT NULL,
+                source_ref TEXT NOT NULL,
+                sensitivity TEXT NOT NULL,
+                remote_policy TEXT NOT NULL,
+                metadata TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(document_id) REFERENCES knowledge_documents(document_id),
+                UNIQUE(document_id, chunk_index)
+            );
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_chunks_fts USING fts5(
+                chunk_id UNINDEXED,
+                document_id UNINDEXED,
+                title,
+                text,
+                source_type
+            );
+
+            CREATE TABLE IF NOT EXISTS knowledge_access_audit (
+                audit_id TEXT PRIMARY KEY,
+                query_id TEXT NOT NULL,
+                tool_name TEXT,
+                document_id TEXT,
+                chunk_id TEXT,
+                action TEXT NOT NULL,
+                result_count INTEGER NOT NULL DEFAULT 0,
+                policy_decision TEXT NOT NULL,
+                remote_data_sent INTEGER NOT NULL DEFAULT 0,
+                metadata TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS knowledge_embedding_records (
+                vector_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                index_key TEXT NOT NULL,
+                chunk_id TEXT NOT NULL,
+                chunk_checksum TEXT NOT NULL,
+                provider_name TEXT NOT NULL,
+                model_name TEXT NOT NULL,
+                dimensions INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(index_key, chunk_id),
+                FOREIGN KEY(chunk_id) REFERENCES knowledge_chunks(chunk_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_knowledge_embedding_records_index
+                ON knowledge_embedding_records(index_key, chunk_id);
             """
         )
         conn.commit()

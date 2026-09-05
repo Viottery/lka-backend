@@ -76,4 +76,6 @@ def _build_openai_compatible_client(config: LLMClientConfig) -> AsyncLLMClient:
         timeout_seconds=config.timeout_seconds,
         supports_stream=config.supports_stream,
         supports_json_mode=config.supports_json_mode,
+        supports_function_calling=config.supports_function_calling,
+        function_calling_strict=config.function_calling_strict,
     )

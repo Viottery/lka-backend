@@ -59,6 +59,10 @@ class MailSearchResultItem(BaseModel):
     folder: str
     received_at: str | None = None
     snippet: str
+    document_id: str | None = None
+    chunk_id: str | None = None
+    source_ref: str | None = None
+    excerpt_truncated: bool = False
 
 
 class MailSearchResult(BaseModel):
@@ -76,6 +80,13 @@ class MailMessageRecord(BaseModel):
     received_at: str | None = None
     body_text: str
     attachments: list[MailAttachmentInput] = Field(default_factory=list)
+
+
+class MailMirrorRecord(MailMessageRecord):
+    """A persisted message with the stable identifiers needed by a mirror."""
+
+    account_id: str
+    external_id: str
 
 
 class MailMatter(BaseModel):
@@ -293,6 +304,36 @@ class MailService:
             ],
         )
 
+    def get_message_summaries(self, message_ids: list[str]) -> dict[str, MailSearchResultItem]:
+        """Return mail card metadata without loading message bodies."""
+
+        if not message_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in message_ids)
+        conn = self._conn_factory()
+        try:
+            rows = conn.execute(
+                f"""
+                SELECT message_id, subject, sender, folder, received_at
+                FROM mail_messages
+                WHERE message_id IN ({placeholders})
+                """,
+                message_ids,
+            ).fetchall()
+        finally:
+            conn.close()
+        return {
+            str(row["message_id"]): MailSearchResultItem(
+                message_id=str(row["message_id"]),
+                subject=str(row["subject"] or ""),
+                sender=str(row["sender"] or ""),
+                folder=str(row["folder"] or ""),
+                received_at=str(row["received_at"] or ""),
+                snippet="",
+            )
+            for row in rows
+        }
+
     def list_matters(self, *, limit: int = 50) -> MailMatterList:
         conn = self._conn_factory()
         try:
@@ -382,6 +423,88 @@ class MailService:
             for row in rows
         }
         return [records_by_id[message_id] for message_id in message_ids if message_id in records_by_id]
+
+    def list_messages_for_mirror(
+        self,
+        *,
+        account_id: str | None = None,
+        external_ids: list[str] | None = None,
+    ) -> list[MailMirrorRecord]:
+        """Return persisted messages selected for projection into local knowledge."""
+
+        clauses: list[str] = []
+        params: list[str] = []
+        if account_id:
+            clauses.append("m.account_id = ?")
+            params.append(account_id)
+        if external_ids is not None:
+            if not external_ids:
+                return []
+            placeholders = ", ".join("?" for _ in external_ids)
+            clauses.append(f"m.external_id IN ({placeholders})")
+            params.extend(external_ids)
+        where_clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        conn = self._conn_factory()
+        try:
+            rows = conn.execute(
+                f"""
+                SELECT m.message_id, m.account_id, m.external_id, m.subject, m.sender, m.folder,
+                    m.recipients, m.cc, m.received_at, m.body_text
+                FROM mail_messages m
+                {where_clause}
+                ORDER BY m.received_at DESC, m.updated_at DESC
+                """,
+                params,
+            ).fetchall()
+            message_ids = [str(row["message_id"]) for row in rows]
+            attachments_by_message = self._attachments_by_message(conn, message_ids)
+        finally:
+            conn.close()
+        return [
+            MailMirrorRecord(
+                message_id=row["message_id"],
+                account_id=row["account_id"],
+                external_id=row["external_id"],
+                subject=row["subject"],
+                sender=row["sender"],
+                folder=row["folder"],
+                recipients=self._json_list(row["recipients"]),
+                cc=self._json_list(row["cc"]),
+                received_at=row["received_at"],
+                body_text=row["body_text"],
+                attachments=attachments_by_message.get(row["message_id"], []),
+            )
+            for row in rows
+        ]
+
+    def _attachments_by_message(
+        self,
+        conn: sqlite3.Connection,
+        message_ids: list[str],
+    ) -> dict[str, list[MailAttachmentInput]]:
+        if not message_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in message_ids)
+        attachment_rows = conn.execute(
+            f"""
+            SELECT message_id, external_id, name, content_type, size
+            FROM mail_attachments
+            WHERE message_id IN ({placeholders})
+            ORDER BY created_at ASC
+            """,
+            message_ids,
+        ).fetchall()
+        attachments_by_message: dict[str, list[MailAttachmentInput]] = {}
+        for row in attachment_rows:
+            attachments_by_message.setdefault(row["message_id"], []).append(
+                MailAttachmentInput(
+                    external_id=row["external_id"],
+                    name=row["name"],
+                    content_type=row["content_type"],
+                    size=row["size"],
+                )
+            )
+        return attachments_by_message
 
     def draft_matters_locally(self, messages: list[MailMessageRecord]) -> list[MailMatterDraft]:
         return [
