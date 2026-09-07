@@ -92,6 +92,18 @@ class InMemorySafetyReviewStore:
             self._condition.notify_all()
             return record
 
+    def restore(self, record: SafetyReviewRecord) -> SafetyReviewRecord:
+        """Rehydrate a durable review without changing its decision state."""
+
+        with self._condition:
+            existing = self._reviews.get(record.review_id)
+            if existing is not None:
+                return existing
+            self._reviews[record.review_id] = record
+            self._run_reviews.setdefault(record.run_id, []).append(record.review_id)
+            self._condition.notify_all()
+        return record
+
     def get(self, review_id: str) -> SafetyReviewRecord | None:
         with self._condition:
             return self._reviews.get(review_id)

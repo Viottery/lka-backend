@@ -4,7 +4,7 @@ import time
 from collections.abc import AsyncIterator
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.api.schemas import (
     AgentTurnRequest,
@@ -13,6 +13,7 @@ from app.api.schemas import (
     SafetyReviewListResponse,
     SafetyReviewResponse,
 )
+from app.core.agent_graph import AgentTurnWaitingForConfirmation
 from app.core.agent_runs import AgentRunEvent, AgentRunStatus
 from app.core.llm import LLMResponseMode
 
@@ -23,15 +24,25 @@ router = APIRouter(prefix="/agent", tags=["agent"])
 async def run_agent_turn_endpoint(
     payload: AgentTurnRequest,
     request: Request,
-) -> AgentTurnResponse:
+) -> AgentTurnResponse | JSONResponse:
     llm_options = payload.llm
-    result = await request.app.state.runtime.run_agent_turn_async(
-        session_id=payload.session_id,
-        user_input=payload.user_input,
-        llm_client_name=llm_options.client_name if llm_options else None,
-        llm_model=llm_options.model if llm_options else None,
-        llm_response_mode=llm_options.response_mode if llm_options else LLMResponseMode.TEXT,
-    )
+    try:
+        result = await request.app.state.runtime.run_agent_turn_async(
+            session_id=payload.session_id,
+            user_input=payload.user_input,
+            llm_client_name=llm_options.client_name if llm_options else None,
+            llm_model=llm_options.model if llm_options else None,
+            llm_response_mode=llm_options.response_mode if llm_options else LLMResponseMode.TEXT,
+        )
+    except AgentTurnWaitingForConfirmation as exc:
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "waiting_confirmation",
+                "run_id": exc.run_id,
+                "review_id": exc.review_id,
+            },
+        )
     return AgentTurnResponse(**result.model_dump())
 
 
@@ -109,12 +120,18 @@ async def decide_agent_safety_review(
     run_manager = request.app.state.runtime.agent_run_manager
     if run_manager.get_safety_review(review_id) is None:
         raise HTTPException(status_code=404, detail="Safety review not found.")
-    review = run_manager.decide_safety_review(
+    review, transitioned = run_manager.decide_safety_review_with_transition(
         review_id=review_id,
         decision=payload.decision,
         decided_by=payload.decided_by,
         reason=payload.reason,
     )
+    runtime = request.app.state.runtime
+    if transitioned and review.status.value in {"approved", "rejected"}:
+        resume = getattr(runtime, "resume_agent_run_async", None)
+        if callable(resume):
+            task = asyncio.create_task(resume(review.run_id))
+            task.add_done_callback(_consume_task_exception)
     return SafetyReviewResponse(**review.model_dump(mode="python"))
 
 
@@ -154,15 +171,14 @@ async def _agent_turn_event_stream(
                 yield _sse_event_frame(event)
 
             run = run_manager.get_run(run_id)
-            if run and run.status in {
-                AgentRunStatus.COMPLETED,
-                AgentRunStatus.FAILED,
-                AgentRunStatus.CANCELLED,
-            }:
-                if task.done():
-                    break
-
-            if task.done() and not events:
+            if task.done() and run and run.status == AgentRunStatus.WAITING_CONFIRMATION:
+                await asyncio.sleep(0.05)
+                continue
+            # A completed graph task has no further producer.  Emit the batch
+            # fetched above, then close even when a failure left the durable run
+            # status unchanged; otherwise SSE can spin forever after a worker
+            # exception has already been consumed by the task callback.
+            if task.done():
                 break
 
             if time.monotonic() - last_sent_at >= 15:
@@ -248,5 +264,5 @@ async def _is_client_disconnected(request: Request) -> bool:
 def _consume_task_exception(task: asyncio.Task) -> None:
     try:
         task.result()
-    except Exception:
+    except Exception:  # noqa: BLE001 - task errors are persisted on the Agent run.
         return

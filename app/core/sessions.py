@@ -5,18 +5,17 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from hashlib import sha1
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-
 SessionRole = Literal["user", "agent", "system", "tool"]
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _stable_id(prefix: str, *parts: str | None) -> str:
@@ -30,7 +29,7 @@ class AgentSession(BaseModel):
     title: str
     status: str
     metadata: dict[str, Any] = Field(default_factory=dict)
-    workspace: "SessionWorkspace | None" = None
+    workspace: SessionWorkspace | None = None
     created_at: str
     updated_at: str
 
@@ -258,17 +257,18 @@ class SessionService:
         role: SessionRole,
         content: str,
         payload: dict[str, Any] | None = None,
+        message_id: str | None = None,
     ) -> AgentSessionMessage:
         self.ensure_session(session_id=session_id)
         now = _now_iso()
-        message_id = _stable_id("session_msg", session_id, role, content, now)
+        message_id = message_id or _stable_id("session_msg", session_id, role, content, now)
         payload = payload or {}
 
         conn = self._conn_factory()
         try:
             conn.execute(
                 """
-                INSERT INTO agent_session_messages(
+                INSERT OR IGNORE INTO agent_session_messages(
                     message_id, session_id, role, content, payload, created_at
                 )
                 VALUES(?, ?, ?, ?, ?, ?)
@@ -349,6 +349,7 @@ class SessionService:
         user_input: str,
         agent_answer: str,
         trace_id: str,
+        effect_id: str | None = None,
         token_budget: int | None = None,
         context_summarizer: Callable[
             [str, list[SessionRecentMessage], list[SessionRecentMessage], int],
@@ -356,6 +357,16 @@ class SessionService:
         ]
         | None = None,
     ) -> AgentSessionContextWindow:
+        if effect_id is not None:
+            conn = self._conn_factory()
+            try:
+                existing = conn.execute(
+                    "SELECT 1 FROM agent_session_effects WHERE effect_id = ?", (effect_id,)
+                ).fetchone()
+            finally:
+                conn.close()
+            if existing is not None:
+                return self.get_context_window(session_id=session_id, token_budget=token_budget)
         window = self.get_context_window(
             session_id=session_id,
             token_budget=token_budget,
@@ -390,10 +401,12 @@ class SessionService:
             token_estimate=token_estimate,
             updated_at=now,
         )
-        self._upsert_context_window(updated)
+        self._upsert_context_window(updated, effect_id=effect_id)
         return updated
 
-    def _upsert_context_window(self, window: AgentSessionContextWindow) -> None:
+    def _upsert_context_window(
+        self, window: AgentSessionContextWindow, *, effect_id: str | None = None
+    ) -> None:
         conn = self._conn_factory()
         try:
             conn.execute(
@@ -421,6 +434,15 @@ class SessionService:
                     window.updated_at,
                 ),
             )
+            if effect_id is not None:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO agent_session_effects(
+                        effect_id, session_id, effect_type, created_at
+                    ) VALUES (?, ?, 'context_exchange', ?)
+                    """,
+                    (effect_id, window.session_id, window.updated_at),
+                )
             conn.commit()
         finally:
             conn.close()
@@ -443,10 +465,9 @@ class SessionService:
         kept = messages[-2:] if len(messages) > 2 else list(messages)
         messages_to_summarize = messages[:-2] if len(messages) > 2 else []
         if context_summarizer is not None and messages_to_summarize:
-            current_summary = (
-                context_summarizer(summary, messages_to_summarize, kept, token_budget)
-                or self._summarize_messages_locally(summary, messages_to_summarize)
-            )
+            current_summary = context_summarizer(
+                summary, messages_to_summarize, kept, token_budget
+            ) or self._summarize_messages_locally(summary, messages_to_summarize)
         else:
             current_summary = self._summarize_messages_locally(summary, messages_to_summarize)
         current_summary = self._trim_summary_for_budget(
@@ -516,9 +537,7 @@ class SessionService:
         if not isinstance(payload, list):
             return []
         return [
-            SessionRecentMessage.model_validate(item)
-            for item in payload
-            if isinstance(item, dict)
+            SessionRecentMessage.model_validate(item) for item in payload if isinstance(item, dict)
         ]
 
     def _default_title(self, *, title: str | None, initial_message: str | None) -> str:

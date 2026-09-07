@@ -7,6 +7,8 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from app.api.main import create_app
 from app.api.routes.agent import (
     decide_agent_safety_review,
@@ -14,9 +16,10 @@ from app.api.routes.agent import (
     list_agent_run_safety_reviews,
 )
 from app.api.schemas import SafetyReviewDecisionRequest
+from app.core.agent_graph import AgentTurnWaitingForConfirmation
 from app.core.config import get_settings
 from app.core.llm import LLMResponse
-from app.core.safety import SafetyReviewDecision, SafetyReviewMode
+from app.core.safety import SafetyReviewDecision, SafetyReviewMode, SafetyReviewRequest
 from app.core.tools import ToolContext
 
 
@@ -124,6 +127,104 @@ def test_manual_review_api_approves_waiting_agent_run(tmp_path, monkeypatch):
     run = app.state.runtime.agent_run_manager.get_run(review.run_id)
     assert run is not None
     assert run.status == "completed"
+
+
+def test_langgraph_manual_review_api_resumes_waiting_run(tmp_path, monkeypatch):
+    config_path = tmp_path / "local.toml"
+    config_path.write_text('[agent]\norchestrator = "langgraph"\n', encoding="utf-8")
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(config_path))
+    get_settings.cache_clear()
+    app = create_app()
+    runtime = app.state.runtime
+    runtime.agent_turn_loop.safety_review_mode = SafetyReviewMode.MANUAL
+    runtime.agent_turn_loop.llm_client = _CreateMatterLLM()
+    run = runtime.create_agent_run(
+        session_id="session_langgraph_safety_manual",
+        user_input="创建一个需要人工确认的本地事务",
+    )
+    request = SimpleNamespace(app=app)
+
+    async def run_review_flow() -> None:
+        with pytest.raises(AgentTurnWaitingForConfirmation):
+            await runtime.run_agent_turn_async(
+                session_id=run.session_id,
+                user_input=run.user_input,
+                existing_run_id=run.run_id,
+            )
+
+        [review] = runtime.agent_run_manager.list_safety_reviews(run.run_id)
+        assert review.status.value == "pending"
+        decided = await decide_agent_safety_review(
+            review.review_id,
+            SafetyReviewDecisionRequest(
+                decision=SafetyReviewDecision.APPROVE,
+                reason="User approved the LangGraph tool call.",
+            ),
+            request,
+        )
+        assert decided.status == "approved"
+
+        for _ in range(100):
+            resumed = runtime.agent_run_manager.get_run(run.run_id)
+            if resumed is not None and resumed.status.value == "completed":
+                return
+            await asyncio.sleep(0.01)
+        raise AssertionError("LangGraph run did not resume after manual approval.")
+
+    try:
+        asyncio.run(run_review_flow())
+        completed = runtime.agent_run_manager.get_run(run.run_id)
+        assert completed is not None
+        assert completed.status.value == "completed"
+        assert [event.type for event in runtime.agent_run_manager.list_events(run.run_id)].count(
+            "run_started"
+        ) == 1
+        assert len(runtime.agent_run_manager.list_safety_reviews(run.run_id)) == 1
+    finally:
+        runtime.stop()
+
+
+def test_safety_review_decision_api_rehydrates_run_after_runtime_restart(tmp_path, monkeypatch):
+    first_app = _app(tmp_path, monkeypatch)
+    first_manager = first_app.state.runtime.agent_run_manager
+    run = first_manager.create_run(
+        session_id="session_review_restart",
+        user_input="approve after restart",
+        trace_id="trace_review_restart",
+    )
+    review = first_manager.create_safety_review(
+        SafetyReviewRequest(
+            review_id="review_restart_api",
+            run_id=run.run_id,
+            session_id=run.session_id,
+            trace_id=run.trace_id,
+            invocation_id="invocation_restart_api",
+            tool_name="filesystem.edit_file",
+            mode=SafetyReviewMode.MANUAL,
+            reason="Write requires confirmation.",
+            created_at=run.created_at,
+        )
+    )
+    first_app.state.runtime.stop()
+
+    get_settings.cache_clear()
+    second_app = create_app()
+    request = SimpleNamespace(app=second_app)
+    response = asyncio.run(
+        decide_agent_safety_review(
+            review.review_id,
+            SafetyReviewDecisionRequest(
+                decision=SafetyReviewDecision.APPROVE,
+                reason="Approved after restart.",
+            ),
+            request,
+        )
+    )
+
+    assert response.status == "approved"
+    assert second_app.state.runtime.agent_run_manager.get_run(run.run_id) is not None
+    second_app.state.runtime.stop()
 
 
 def _wait_for_review(run_manager):

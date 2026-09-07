@@ -12,9 +12,11 @@ from app.api.schemas import (
     CapabilityItem,
     WorkspaceIndexResponse,
 )
+from app.core.agent_checkpoints import create_sqlite_checkpoint_runtime
 from app.core.agent_graph import AgentGraphRunner
 from app.core.agent_runner import AgentTurnRunner
 from app.core.agent_runs import AgentRunRecord, InMemoryAgentRunManager
+from app.core.agent_storage import SqliteAgentRunStore
 from app.core.agent_turn import AgentTurnLoop, AgentTurnResult
 from app.core.config import Settings
 from app.core.context import ContextAssembler
@@ -221,7 +223,10 @@ class LocalKnowledgeAgentRuntime:
             BashTerminateSessionTool(self.bash_session_manager)
         )
         self.tool_executor = ToolExecutor(self.tool_registry)
-        self.agent_run_manager = InMemoryAgentRunManager()
+        self.agent_run_store = SqliteAgentRunStore(self.db_path)
+        self.agent_run_manager = InMemoryAgentRunManager(
+            durable_store=self.agent_run_store
+        )
         self.agent_llm_client = build_text_llm_client(self.local_app_config.llm)
         self.agent_turn_loop = AgentTurnLoop(
             session_service=self.session_service,
@@ -234,10 +239,22 @@ class LocalKnowledgeAgentRuntime:
             safety_manual_wait_poll_seconds=(
                 self.local_app_config.safety.manual_wait_poll_seconds
             ),
+            tool_invocation_store=self.agent_run_store,
         )
         self.agent_turn_runner: AgentTurnRunner = self.agent_turn_loop
         if self.local_app_config.agent.orchestrator == "langgraph":
-            self.agent_turn_runner = AgentGraphRunner(self.agent_turn_loop)
+            checkpointer = None
+            checkpoint_runtime = None
+            if self.local_app_config.agent.checkpoint_backend == "sqlite":
+                checkpoint_runtime = create_sqlite_checkpoint_runtime(
+                    self.settings.data_dir / "agent_checkpoints.sqlite3"
+                )
+            self.agent_turn_runner = AgentGraphRunner(
+                self.agent_turn_loop,
+                checkpointer=checkpointer,
+                checkpoint_runtime=checkpoint_runtime,
+                artifact_store=self.agent_run_store,
+            )
         self.debug_loop = RuntimeLoop(
             context_assembler=ContextAssembler(),
             retrieval_provider=LocalDebugRetrievalProvider(
@@ -266,6 +283,10 @@ class LocalKnowledgeAgentRuntime:
         if self._mail_sync_thread and self._mail_sync_thread.is_alive():
             self._mail_sync_thread.join(timeout=5)
         self._mail_sync_thread = None
+        close_runner = getattr(self.agent_turn_runner, "close", None)
+        if callable(close_runner):
+            close_runner()
+        self.agent_run_manager.close()
 
     def _run_startup_mail_sync(self) -> None:
         config = self.local_app_config.mail.outlook
@@ -319,7 +340,7 @@ class LocalKnowledgeAgentRuntime:
                 "error_type": type(exc).__name__,
                 "error": str(exc),
             }
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - persist unexpected provider failures for diagnostics.
             self.last_mail_sync_result = {
                 "provider": "outlook",
                 "status": "failed",
@@ -499,6 +520,24 @@ class LocalKnowledgeAgentRuntime:
             llm_response_mode=llm_response_mode,
             existing_run_id=existing_run_id,
         )
+
+    def resume_agent_run(self, run_id: str) -> AgentTurnResult:
+        """Resume an incomplete LangGraph run from its latest checkpoint."""
+
+        if not isinstance(self.agent_turn_runner, AgentGraphRunner):
+            raise RuntimeError(  # noqa: TRY004 - this is runtime mode, not an argument type.
+                "Agent run recovery requires the LangGraph orchestrator."
+            )
+        return self.agent_turn_runner.resume(run_id)
+
+    async def resume_agent_run_async(self, run_id: str) -> AgentTurnResult:
+        """Asynchronously resume an incomplete LangGraph run."""
+
+        if not isinstance(self.agent_turn_runner, AgentGraphRunner):
+            raise RuntimeError(  # noqa: TRY004 - this is runtime mode, not an argument type.
+                "Agent run recovery requires the LangGraph orchestrator."
+            )
+        return await self.agent_turn_runner.resume_async(run_id)
 
     def create_agent_run(
         self,

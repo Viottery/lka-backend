@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-import json
 import asyncio
 import inspect
+import json
 import queue
 import threading
 import time
 from contextvars import ContextVar
+from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
-from datetime import datetime, timezone
 from hashlib import sha1
 from pathlib import Path
 from typing import Any
@@ -22,6 +22,39 @@ from app.core.agent_runs import (
     AgentRunRecord,
     InMemoryAgentRunManager,
 )
+from app.core.agent_storage import SqliteAgentRunStore
+from app.core.agent_tool_graph import AgentToolLifecycleGraph
+from app.core.llm import (
+    LLMAuthenticationError,
+    LLMClientError,
+    LLMMessage,
+    LLMNetworkError,
+    LLMProviderHTTPError,
+    LLMProviderStreamError,
+    LLMRateLimitError,
+    LLMRequest,
+    LLMResponse,
+    LLMResponseMode,
+    LLMResponseParseError,
+    LLMService,
+    LLMTimeoutError,
+    LLMToolCall,
+    LLMToolDefinition,
+    TextLLMClient,
+)
+from app.core.llm.audit import (
+    LLMCallRecord,
+    build_stream_error_call_record,
+    classify_openai_sdk_exception,
+    classify_provider_error,
+    prompt_metadata,
+    stable_llm_call_id,
+    usage_token_counts,
+)
+from app.core.llm.audit import (
+    now_iso as llm_audit_now_iso,
+)
+from app.core.runtime_context import current_time_payload
 from app.core.safety import (
     SafetyReviewDecision,
     SafetyReviewMode,
@@ -30,45 +63,13 @@ from app.core.safety import (
     SafetyReviewStatus,
     stable_safety_review_id,
 )
-from app.core.llm.audit import (
-    LLMCallRecord,
-    build_stream_error_call_record,
-    classify_openai_sdk_exception,
-    classify_provider_error,
-    now_iso as llm_audit_now_iso,
-    prompt_metadata,
-    stable_llm_call_id,
-    usage_token_counts,
-)
-from app.core.llm import (
-    LLMAuthenticationError,
-    LLMClientError,
-    LLMMessage,
-    LLMNetworkError,
-    LLMProviderHTTPError,
-    LLMProviderStreamError,
-    LLMRequest,
-    LLMRateLimitError,
-    LLMResponse,
-    LLMResponseParseError,
-    LLMResponseMode,
-    LLMService,
-    LLMToolCall,
-    LLMToolDefinition,
-    LLMTimeoutError,
-    TextLLMClient,
-)
-from app.core.runtime_context import current_time_payload
-from app.core.sessions import SessionService
-from app.core.sessions import AgentSession
-from app.core.sessions import SessionRecentMessage
+from app.core.sessions import AgentSession, SessionRecentMessage, SessionService
 from app.core.tools import (
     ToolContext,
     ToolExecutor,
     ToolResult,
     effective_tool_read_only,
 )
-
 
 DEFAULT_MAX_DECISION_STEPS = 10
 DECISION_OBSERVATION_MAX_STRING_CHARS = 4_000
@@ -77,7 +78,7 @@ LLM_OBSERVATION_MAX_TOTAL_CHARS = 16_000
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _stable_id(prefix: str, *parts: str | None) -> str:
@@ -214,6 +215,35 @@ class AgentTurnResult(BaseModel):
     log_path: str | None = None
 
 
+class AgentTurnWorkingSet(BaseModel):
+    """Durable-reference-friendly state shared by external ReAct graph nodes.
+
+    Large prompt inputs, LLM audit records and raw tool output remain in artifacts
+    and the local run log.  This model intentionally carries only the data needed
+    to resume the next control-flow decision.
+    """
+
+    run_id: str
+    session_id: str
+    trace_id: str
+    user_input: str
+    context_artifact_ref: dict[str, Any] = Field(default_factory=dict)
+    route: dict[str, Any] = Field(default_factory=dict)
+    initial_package: str | None = None
+    active_package: str | None = None
+    expanded_packages: list[str] = Field(default_factory=list)
+    used_packages: list[str] = Field(default_factory=list)
+    step_index: int = 0
+    pending_decision: dict[str, Any] = Field(default_factory=dict)
+    pending_invocation_id: str | None = None
+    pending_tool_name: str | None = None
+    pending_tool_input: dict[str, Any] = Field(default_factory=dict)
+    pending_review_id: str | None = None
+    observation_artifact_refs: list[dict[str, Any]] = Field(default_factory=list)
+    terminal_answer: str | None = None
+    terminal_reason: str | None = None
+
+
 class AgentTurnLoop:
     """Small first Main Agent Brain slice for routing to packages and calling tools."""
 
@@ -228,6 +258,7 @@ class AgentTurnLoop:
         run_manager: InMemoryAgentRunManager | None = None,
         safety_review_mode: SafetyReviewMode | str = SafetyReviewMode.SKIP,
         safety_manual_wait_poll_seconds: float = 0.5,
+        tool_invocation_store: SqliteAgentRunStore | None = None,
     ) -> None:
         self.session_service = session_service
         self.tool_executor = tool_executor
@@ -242,6 +273,7 @@ class AgentTurnLoop:
         self.session_context_token_budget = 65_536
         self.safety_review_mode = self._normalize_safety_review_mode(safety_review_mode)
         self.safety_manual_wait_poll_seconds = safety_manual_wait_poll_seconds
+        self.tool_invocation_store = tool_invocation_store
 
     def _normalize_safety_review_mode(
         self,
@@ -354,7 +386,7 @@ class AgentTurnLoop:
                         ),
                     )
                 )
-            except BaseException as exc:
+            except BaseException as exc:  # noqa: BLE001 - propagate worker cancellation/errors.
                 result_queue.put((False, exc))
 
         thread = threading.Thread(target=target, name="lka-agent-turn", daemon=True)
@@ -541,12 +573,14 @@ class AgentTurnLoop:
             agent_answer=answer,
             trace_id=trace_id,
             token_budget=self.session_context_token_budget,
-            context_summarizer=lambda summary, messages, recent_messages, token_budget: self._summarize_context_window(
-                summary=summary,
-                messages_to_summarize=messages,
-                retained_recent_messages=recent_messages,
-                token_budget=token_budget,
-                llm_events=llm_events,
+            context_summarizer=lambda summary, messages, recent_messages, token_budget: (
+                self._summarize_context_window(
+                    summary=summary,
+                    messages_to_summarize=messages,
+                    retained_recent_messages=recent_messages,
+                    token_budget=token_budget,
+                    llm_events=llm_events,
+                )
             ),
         )
         expanded_packages = self._packages_from_expanded_tools(expanded_tools)
@@ -591,16 +625,11 @@ class AgentTurnLoop:
                     "token_estimate": updated_context_window.token_estimate,
                     "recent_message_count": len(updated_context_window.recent_messages),
                 },
-                "decision_events": [
-                    event.model_dump(mode="json") for event in decision_events
-                ],
+                "decision_events": [event.model_dump(mode="json") for event in decision_events],
                 "tool_events": [event.model_dump(mode="json") for event in tool_events],
-                "progress_events": [
-                    event.model_dump(mode="json") for event in progress_events
-                ],
+                "progress_events": [event.model_dump(mode="json") for event in progress_events],
                 "verification_warnings": [
-                    warning.model_dump(mode="json")
-                    for warning in verification_warnings
+                    warning.model_dump(mode="json") for warning in verification_warnings
                 ],
             },
         )
@@ -804,9 +833,7 @@ class AgentTurnLoop:
         ]
         expanded_package_names = {selected_package}
         allowed_tool_names = {
-            str(tool.get("name"))
-            for tool in expanded_tools
-            if isinstance(tool.get("name"), str)
+            str(tool.get("name")) for tool in expanded_tools if isinstance(tool.get("name"), str)
         }
         for step_index in range(1, self.max_decision_steps + 1):
             decision = self._decide_next_action(
@@ -952,9 +979,7 @@ class AgentTurnLoop:
                 expanded_tools.extend(new_tools)
                 expanded_package_names.add(package_name)
                 new_tool_names = [
-                    str(tool.get("name"))
-                    for tool in new_tools
-                    if isinstance(tool.get("name"), str)
+                    str(tool.get("name")) for tool in new_tools if isinstance(tool.get("name"), str)
                 ]
                 allowed_tool_names.update(new_tool_names)
                 observations.append(
@@ -972,8 +997,7 @@ class AgentTurnLoop:
                     package_name=package_name,
                     status="completed",
                     message=(
-                        f"Expanded `{package_name}` package with "
-                        f"{len(new_tool_names)} tools."
+                        f"Expanded `{package_name}` package with {len(new_tool_names)} tools."
                     ),
                     metadata={"expanded_tools": new_tool_names},
                 )
@@ -984,9 +1008,7 @@ class AgentTurnLoop:
 
             tool_name = str(decision.get("tool_name") or "")
             tool_input = (
-                decision.get("tool_input")
-                if isinstance(decision.get("tool_input"), dict)
-                else {}
+                decision.get("tool_input") if isinstance(decision.get("tool_input"), dict) else {}
             )
             if tool_name not in allowed_tool_names:
                 observations.append(
@@ -1013,9 +1035,7 @@ class AgentTurnLoop:
             )
             operation = decision.get("operation")
             repeat_successful_call = bool(
-                operation.get("repeat_successful_call")
-                if isinstance(operation, dict)
-                else False
+                operation.get("repeat_successful_call") if isinstance(operation, dict) else False
             )
             if call_fingerprint in successful_call_fingerprints and not repeat_successful_call:
                 reason = (
@@ -1054,6 +1074,7 @@ class AgentTurnLoop:
                 tool_events=tool_events,
                 progress_events=progress_events,
                 llm_events=llm_events,
+                step_index=step_index,
             )
             feedback = self._check_tool_result(
                 user_input=user_input,
@@ -1082,6 +1103,15 @@ class AgentTurnLoop:
                 )
             )
             if tool_result.status == "completed":
+                if self._completed_tool_call_changes_state(
+                    tool_name=tool_name,
+                    tool_input=tool_input,
+                ):
+                    # A write can invalidate an earlier read with identical
+                    # arguments.  Preserve the duplicate guard for repeated
+                    # reads/writes, while allowing deterministic read-back
+                    # verification after a successful state change.
+                    successful_call_fingerprints.clear()
                 successful_call_fingerprints.add(call_fingerprint)
 
         if observations:
@@ -1107,6 +1137,15 @@ class AgentTurnLoop:
             separators=(",", ":"),
             default=str,
         )
+
+    def _completed_tool_call_changes_state(
+        self,
+        *,
+        tool_name: str,
+        tool_input: dict[str, Any],
+    ) -> bool:
+        tool = self.tool_executor.registry.get_tool_or_none(tool_name)
+        return tool is not None and effective_tool_read_only(tool, tool_input) is not True
 
     def _decide_next_action(
         self,
@@ -1414,7 +1453,11 @@ class AgentTurnLoop:
                 "action": "call_tool",
                 "tool_name": action["tool_name"],
                 "tool_input": call.arguments,
-                "operation": {"type": "tool_call", "tool_name": action["tool_name"], "tool_input": call.arguments},
+                "operation": {
+                    "type": "tool_call",
+                    "tool_name": action["tool_name"],
+                    "tool_input": call.arguments,
+                },
                 "reason": "Provider-native function call.",
                 "_raw_output": response.content,
             }
@@ -1445,7 +1488,9 @@ class AgentTurnLoop:
             "type": "object",
             "additionalProperties": False,
             "properties": normalized_properties,
-            "required": [key for key in required if isinstance(key, str)] if isinstance(required, list) else [],
+            "required": [key for key in required if isinstance(key, str)]
+            if isinstance(required, list)
+            else [],
         }
 
     def _json_schema_value(self, value: Any) -> dict[str, Any]:
@@ -1453,7 +1498,11 @@ class AgentTurnLoop:
             return {"type": value}
         if not isinstance(value, dict):
             return {}
-        result = {key: item for key, item in value.items() if key not in {"allowed_values", "properties", "items", "required"}}
+        result = {
+            key: item
+            for key, item in value.items()
+            if key not in {"allowed_values", "properties", "items", "required"}
+        }
         if isinstance(value.get("allowed_values"), list):
             result["enum"] = value["allowed_values"]
         if isinstance(value.get("properties"), dict):
@@ -1482,9 +1531,7 @@ class AgentTurnLoop:
             decision_events,
             source=source,
             action="select_package",
-            selected_package=selected_package
-            if isinstance(selected_package, str)
-            else None,
+            selected_package=selected_package if isinstance(selected_package, str) else None,
             reason=route.get("reason") if isinstance(route.get("reason"), str) else None,
             raw_output=raw_output,
         )
@@ -1656,11 +1703,11 @@ class AgentTurnLoop:
             return None
         system_prompt = (
             "You repair one malformed Main Agent Brain decision. Return only strict JSON "
-            "using the operation-first envelope: {\"operation\":{\"type\":"
-            "\"tool_call|expand_package|final_answer|request_confirmation|no_op\","
-            "\"package_name\":null,\"tool_name\":null,\"tool_input\":{},"
-            "\"final_answer\":null,\"reason\":\"...\","
-            "\"confidence\":\"low|medium|high\"},\"assistant_message\":\"...\"}. "
+            'using the operation-first envelope: {"operation":{"type":'
+            '"tool_call|expand_package|final_answer|request_confirmation|no_op",'
+            '"package_name":null,"tool_name":null,"tool_input":{},'
+            '"final_answer":null,"reason":"...",'
+            '"confidence":"low|medium|high"},"assistant_message":"..."}. '
             "Preserve a tool call only when the "
             "malformed output clearly includes the tool name and complete tool input. Do not "
             "invent missing required tool arguments."
@@ -1698,15 +1745,13 @@ class AgentTurnLoop:
         normalized["_raw_output"] = raw_output
         normalized["_repair_output"] = response.content
         normalized["reason"] = (
-            normalized.get("reason")
-            or "Repaired malformed tool-call decision output."
+            normalized.get("reason") or "Repaired malformed tool-call decision output."
         )
         return normalized
 
     def _package_exists(self, package_name: str) -> bool:
         return any(
-            package.name == package_name
-            for package in self.tool_executor.registry.list_packages()
+            package.name == package_name for package in self.tool_executor.registry.list_packages()
         )
 
     def _tool_payloads_for_package(self, package_name: str) -> list[dict[str, Any]]:
@@ -1717,9 +1762,7 @@ class AgentTurnLoop:
 
     def _route_context(self, route: dict[str, Any]) -> dict[str, Any]:
         return {
-            key: route.get(key)
-            for key in ("reason", "search_query")
-            if route.get(key) is not None
+            key: route.get(key) for key in ("reason", "search_query") if route.get(key) is not None
         }
 
     def _package_for_tool(self, tool_name: str) -> str | None:
@@ -1995,56 +2038,51 @@ class AgentTurnLoop:
         tool_events: list[AgentTurnToolEvent],
         progress_events: list[AgentTurnProgressEvent] | None = None,
         llm_events: list[AgentTurnLLMEvent] | None = None,
+        step_index: int = 0,
     ) -> ToolResult:
         selected_at = _now_iso()
-        invocation_id = _stable_id("tool_invocation", context.trace_id, tool_name, selected_at)
-        review_result, approved_review = self._review_tool_call_before_execute(
+        run_id = _turn_run_id.get() or context.trace_id or "standalone"
+        invocation_id = _stable_id(
+            "tool_invocation",
+            run_id,
+            str(step_index),
+            tool_name,
+            self._tool_call_fingerprint(tool_name=tool_name, tool_input=tool_input),
+        )
+        lifecycle_graph = AgentToolLifecycleGraph(
+            tool_executor=self.tool_executor,
+            review_tool_call=lambda invocation_id, name, input_value, tool_context: (
+                self._review_tool_call_before_execute(
+                    invocation_id=invocation_id,
+                    tool_name=name,
+                    tool_input=input_value,
+                    context=tool_context,
+                    progress_events=progress_events,
+                    llm_events=llm_events,
+                )
+            ),
+            append_progress=lambda event_type, status, message, metadata: (
+                self._append_progress(
+                    progress_events,
+                    type=event_type,
+                    stage="tool_execute",
+                    tool_name=tool_name,
+                    status=status,
+                    message=message,
+                    metadata=metadata,
+                )
+                if progress_events is not None
+                else None
+            ),
+            raise_if_cancel_requested=self._raise_if_cancel_requested,
+            artifact_store=self.tool_invocation_store,
+        )
+        result = lifecycle_graph.run(
             invocation_id=invocation_id,
+            run_id=_turn_run_id.get(),
             tool_name=tool_name,
             tool_input=tool_input,
             context=context,
-            progress_events=progress_events,
-            llm_events=llm_events,
-        )
-        if review_result is not None:
-            tool_events.append(
-                AgentTurnToolEvent(
-                    tool_name=tool_name,
-                    selected_at=selected_at,
-                    completed_at=_now_iso(),
-                    input=tool_input,
-                    result=review_result.model_dump(mode="json"),
-                    feedback=self._local_tool_feedback(
-                        tool_name=tool_name,
-                        result=review_result,
-                    ),
-                )
-            )
-            return review_result
-        if progress_events is not None:
-            self._append_progress(
-                progress_events,
-                type="tool_started",
-                stage="tool_execute",
-                tool_name=tool_name,
-                status="running",
-                message=f"Calling `{tool_name}`.",
-                metadata={"input": tool_input},
-            )
-        self._raise_if_cancel_requested()
-        execution_context = context
-        if approved_review is not None:
-            execution_context = context.model_copy(
-                update={
-                    "safety_review_approved": True,
-                    "safety_review_id": approved_review.review_id,
-                }
-            )
-        result = self.tool_executor.execute(
-            invocation_id=invocation_id,
-            tool_name=tool_name,
-            tool_input=tool_input,
-            context=execution_context,
         )
         tool_events.append(
             AgentTurnToolEvent(
@@ -2056,16 +2094,148 @@ class AgentTurnLoop:
                 feedback=self._local_tool_feedback(tool_name=tool_name, result=result),
             )
         )
-        if progress_events is not None:
-            self._append_progress(
+        return result
+
+    def prepare_graph_safety_review(
+        self,
+        *,
+        invocation_id: str,
+        tool_name: str,
+        tool_input: dict[str, Any],
+        context: ToolContext,
+        progress_events: list[AgentTurnProgressEvent],
+        llm_events: list[AgentTurnLLMEvent],
+    ) -> tuple[ToolResult | None, SafetyReviewRecord | None]:
+        """Create or resolve one review without blocking a LangGraph worker.
+
+        Legacy turns retain their Condition-based waiting behaviour.  Graph turns
+        call this method at a checkpointed safety node and use an interrupt for a
+        pending manual decision instead.
+        """
+        tool = self.tool_executor.registry.get_tool_or_none(tool_name)
+        if tool is None:
+            return None, None
+        read_only = effective_tool_read_only(tool, tool_input)
+        if read_only is True:
+            return None, None
+        run_manager = _turn_run_manager.get()
+        run_id = _turn_run_id.get()
+        if run_manager is None or run_id is None:
+            return (
+                ToolResult(
+                    invocation_id=invocation_id,
+                    tool_name=tool_name,
+                    status="rejected",
+                    error="Safety review is required but no Agent run is active.",
+                ),
+                None,
+            )
+        review_id = stable_safety_review_id(run_id, invocation_id, tool_name)
+        review = run_manager.get_safety_review(review_id)
+        if review is None:
+            review = run_manager.create_safety_review(
+                SafetyReviewRequest(
+                    review_id=review_id,
+                    run_id=run_id,
+                    session_id=context.session_id,
+                    trace_id=context.trace_id or "",
+                    invocation_id=invocation_id,
+                    tool_name=tool_name,
+                    tool_input=tool_input,
+                    tool_risk=tool.spec.risk,
+                    side_effects=tool.spec.side_effects,
+                    read_only=read_only,
+                    mode=self.safety_review_mode,
+                    reason=self._safety_review_reason(read_only=read_only),
+                    created_at=_now_iso(),
+                )
+            )
+            self._append_safety_review_progress(
+                progress_events=progress_events,
+                review=review,
+                status="required",
+                message=f"Safety review required for `{tool_name}`.",
+            )
+            self._append_run_event(
+                type="safety_review_required",
+                message=f"Safety review required for `{tool_name}`.",
+                stage="safety_review",
+                payload={"review": review.model_dump(mode="json")},
+            )
+        if review.status == SafetyReviewStatus.PENDING:
+            if self.safety_review_mode == SafetyReviewMode.SKIP:
+                review = run_manager.decide_safety_review(
+                    review_id=review.review_id,
+                    decision=SafetyReviewDecision.APPROVE,
+                    decided_by="system.skip",
+                    reason="Safety review mode is skip; review recorded and automatically approved.",
+                )
+            elif self.safety_review_mode == SafetyReviewMode.LLM:
+                review = self._decide_safety_review_with_llm(review, llm_events=llm_events)
+            else:
+                return None, review
+        self._append_safety_review_progress(
+            progress_events=progress_events,
+            review=review,
+            status=review.status.value,
+            message=f"Safety review {review.status.value} for `{tool_name}`.",
+        )
+        if review.status == SafetyReviewStatus.APPROVED:
+            return None, review
+        return (
+            self._safety_rejected_tool_result(
+                invocation_id=invocation_id,
+                tool_name=tool_name,
+                review=review,
+            ),
+            None,
+        )
+
+    def execute_graph_tool(
+        self,
+        *,
+        invocation_id: str,
+        tool_name: str,
+        tool_input: dict[str, Any],
+        context: ToolContext,
+        approved_review: SafetyReviewRecord | None,
+        tool_events: list[AgentTurnToolEvent],
+        progress_events: list[AgentTurnProgressEvent],
+    ) -> ToolResult:
+        """Use the project tool lifecycle graph after graph-level safety approval."""
+        selected_at = _now_iso()
+        lifecycle_graph = AgentToolLifecycleGraph(
+            tool_executor=self.tool_executor,
+            review_tool_call=lambda *_args: (None, approved_review),
+            append_progress=lambda event_type, status, message, metadata: self._append_progress(
                 progress_events,
-                type="tool_completed",
+                type=event_type,
                 stage="tool_execute",
                 tool_name=tool_name,
-                status=result.status,
-                message=self._tool_progress_message(tool_name=tool_name, result=result),
-                metadata={"result": result.model_dump(mode="json")},
+                status=status,
+                message=message,
+                metadata=metadata,
+            ),
+            raise_if_cancel_requested=self._raise_if_cancel_requested,
+            artifact_store=self.tool_invocation_store,
+        )
+        result = lifecycle_graph.run(
+            invocation_id=invocation_id,
+            run_id=_turn_run_id.get(),
+            tool_name=tool_name,
+            tool_input=tool_input,
+            context=context,
+        )
+        tool_events.append(
+            AgentTurnToolEvent(
+                tool_name=tool_name,
+                selected_at=selected_at,
+                completed_at=_now_iso(),
+                input=tool_input,
+                result=result.model_dump(mode="json"),
+                feedback=self._local_tool_feedback(tool_name=tool_name, result=result),
             )
+        )
         return result
 
     def _review_tool_call_before_execute(
@@ -2168,7 +2338,6 @@ class AgentTurnLoop:
                 None,
             )
 
-        run_manager.mark_waiting_confirmation(run_id, confirmation_id=review.review_id)
         decided = run_manager.safety_reviews.wait_for_decision(
             review.review_id,
             timeout_seconds=self.safety_manual_wait_poll_seconds,
@@ -2251,7 +2420,7 @@ class AgentTurnLoop:
         system_prompt = (
             "You are a safety reviewer for local agent tool calls. Decide whether this "
             "single non-read-only operation may proceed. Return only strict JSON: "
-            "{\"approve\":true|false,\"reason\":\"...\"}. Approve only when the "
+            '{"approve":true|false,"reason":"..."}. Approve only when the '
             "operation is clearly requested by the user, scoped, and consistent with the "
             "tool metadata. Reject ambiguous, destructive, broad, or unsupported operations."
         )
@@ -2268,11 +2437,7 @@ class AgentTurnLoop:
             max_output_tokens=512,
             llm_events=llm_events if llm_events is not None else [],
         )
-        parsed = (
-            self._parse_json_object(response.content)
-            if response is not None
-            else None
-        )
+        parsed = self._parse_json_object(response.content) if response is not None else None
         approve = bool(parsed.get("approve")) if isinstance(parsed, dict) else False
         reason = (
             str(parsed.get("reason"))
@@ -2281,9 +2446,7 @@ class AgentTurnLoop:
         )
         decided = run_manager.decide_safety_review(
             review_id=review.review_id,
-            decision=SafetyReviewDecision.APPROVE
-            if approve
-            else SafetyReviewDecision.REJECT,
+            decision=SafetyReviewDecision.APPROVE if approve else SafetyReviewDecision.REJECT,
             decided_by="llm",
             reason=reason,
         )
@@ -2359,9 +2522,7 @@ class AgentTurnLoop:
         tool_events: list[AgentTurnToolEvent],
     ) -> list[AgentTurnVerificationWarning]:
         successful_tools = {
-            event.tool_name
-            for event in tool_events
-            if event.result.get("status") == "completed"
+            event.tool_name for event in tool_events if event.result.get("status") == "completed"
         }
         warnings: list[AgentTurnVerificationWarning] = []
         _ = (answer, successful_tools)
@@ -2434,8 +2595,8 @@ class AgentTurnLoop:
             "execution status from domain record status: ToolResult.status=completed means "
             "the tool ran, not that a business object is done. If tool_feedback.domain_summary "
             "is present, use it as the authoritative structured summary for business records. "
-            "Return only strict JSON: {\"status\":"
-            "\"accepted|needs_retry|failed\",\"message\":\"...\",\"remaining_work\":\"...\"}."
+            'Return only strict JSON: {"status":'
+            '"accepted|needs_retry|failed","message":"...","remaining_work":"..."}.'
         )
         user_prompt = json.dumps(
             {
@@ -2478,9 +2639,7 @@ class AgentTurnLoop:
             status = "failed"
         message = parsed.get("message") if isinstance(parsed.get("message"), str) else None
         remaining_work = (
-            parsed.get("remaining_work")
-            if isinstance(parsed.get("remaining_work"), str)
-            else None
+            parsed.get("remaining_work") if isinstance(parsed.get("remaining_work"), str) else None
         )
         feedback = {
             "source": "llm",
@@ -2759,7 +2918,7 @@ class AgentTurnLoop:
             "Summarize older conversation history for future turns. Preserve user goals, "
             "preferences, constraints, unresolved tasks, important facts, and references to "
             "trace ids when useful. Do not include tool execution logs, raw prompts, or verbose "
-            "transcripts. Return only strict JSON: {\"summary\":\"...\"}"
+            'transcripts. Return only strict JSON: {"summary":"..."}'
         )
         user_prompt = json.dumps(
             {
@@ -3213,7 +3372,9 @@ class AgentTurnLoop:
         metadata: dict[str, Any] | None = None,
     ) -> LLMCallRecord:
         record_metadata = {}
-        record_metadata.update(prompt_metadata(system_prompt=system_prompt, user_prompt=user_prompt))
+        record_metadata.update(
+            prompt_metadata(system_prompt=system_prompt, user_prompt=user_prompt)
+        )
         if metadata:
             record_metadata.update(metadata)
         run_context = self._current_run_context()
@@ -3331,8 +3492,8 @@ class AgentTurnLoop:
         try:
             retry_at = parsedate_to_datetime(retry_after)
             if retry_at.tzinfo is None:
-                retry_at = retry_at.replace(tzinfo=timezone.utc)
-            delta = retry_at - datetime.now(timezone.utc)
+                retry_at = retry_at.replace(tzinfo=UTC)
+            delta = retry_at - datetime.now(UTC)
             return max(delta.total_seconds(), 0.0)
         except (TypeError, ValueError):
             return self.default_rate_limit_wait_seconds
@@ -3465,9 +3626,7 @@ class AgentTurnLoop:
             "",
             "## Decision Events",
             "",
-            self._json_block(
-                [event.model_dump(mode="json") for event in result.decision_events]
-            ),
+            self._json_block([event.model_dump(mode="json") for event in result.decision_events]),
             "",
             "## Tool Events",
             "",
@@ -3475,17 +3634,12 @@ class AgentTurnLoop:
             "",
             "## Progress Events",
             "",
-            self._json_block(
-                [event.model_dump(mode="json") for event in result.progress_events]
-            ),
+            self._json_block([event.model_dump(mode="json") for event in result.progress_events]),
             "",
             "## Verification Warnings",
             "",
             self._json_block(
-                [
-                    warning.model_dump(mode="json")
-                    for warning in result.verification_warnings
-                ]
+                [warning.model_dump(mode="json") for warning in result.verification_warnings]
             ),
             "",
             "## LLM Events",
@@ -3519,7 +3673,9 @@ class AgentTurnLoop:
                 return {}
 
     def _json_block(self, value: Any) -> str:
-        return "```json\n" + json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n```"
+        return (
+            "```json\n" + json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n```"
+        )
 
     def _text_block(self, value: str) -> str:
         return "```text\n" + value + "\n```"

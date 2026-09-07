@@ -2,24 +2,27 @@
 
 from __future__ import annotations
 
+import queue
 import threading
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
 from hashlib import sha1
 from typing import Any
 
 from pydantic import BaseModel, Field
 
+from app.core.agent_storage import SqliteAgentRunStore
 from app.core.safety import (
     InMemorySafetyReviewStore,
     SafetyReviewDecision,
+    SafetyReviewMode,
     SafetyReviewRecord,
     SafetyReviewRequest,
 )
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _stable_id(prefix: str, *parts: str | None) -> str:
@@ -73,14 +76,27 @@ class AgentRunEvent(BaseModel):
 
 
 class InMemoryAgentRunManager:
-    """Thread-safe local run store for the single-process MVP runtime."""
+    """Thread-safe hot cache with optional durable SQLite backing for Agent runs."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, durable_store: SqliteAgentRunStore | None = None) -> None:
         self._lock = threading.RLock()
         self._runs: dict[str, AgentRunRecord] = {}
         self._events: dict[str, list[AgentRunEvent]] = {}
         self._cancel_requests: dict[str, str | None] = {}
         self.safety_reviews = InMemorySafetyReviewStore()
+        self.durable_store = durable_store
+        self._pending_delta_events: queue.Queue[AgentRunEvent | None] | None = None
+        self._event_writer: threading.Thread | None = None
+        self._event_writer_error: BaseException | None = None
+        self._closed = False
+        if durable_store is not None:
+            self._pending_delta_events = queue.Queue()
+            self._event_writer = threading.Thread(
+                target=self._write_delta_events,
+                name="lka-agent-event-writer",
+                daemon=True,
+            )
+            self._event_writer.start()
 
     def create_run(
         self,
@@ -107,6 +123,21 @@ class InMemoryAgentRunManager:
         with self._lock:
             self._runs[run_id] = record
             self._events[run_id] = []
+            self._persist_run(record)
+        return record
+
+    def restore_run(self, record: AgentRunRecord) -> AgentRunRecord:
+        """Restore a checkpointed run identity into the process-local event manager."""
+
+        with self._lock:
+            existing = self._runs.get(record.run_id)
+            if existing is not None:
+                return existing
+            self._runs[record.run_id] = record
+            self._events[record.run_id] = self._load_events(record.run_id)
+            self._restore_reviews(record.run_id)
+            self._restore_cancel_request(record)
+            self._persist_run(record)
         return record
 
     def mark_running(self, run_id: str) -> AgentRunRecord:
@@ -132,12 +163,31 @@ class InMemoryAgentRunManager:
         return self._update_run(run_id, status=AgentRunStatus.RUNNING)
 
     def create_safety_review(self, request: SafetyReviewRequest) -> SafetyReviewRecord:
-        return self.safety_reviews.create(request)
+        with self._lock:
+            existing = self.safety_reviews.get(request.review_id)
+            if request.mode == SafetyReviewMode.MANUAL and (
+                existing is None or existing.status.value == "pending"
+            ):
+                # Publish the run's paused state before the pending review
+                # becomes observable to API/SSE readers.
+                self.mark_waiting_confirmation(request.run_id, confirmation_id=request.review_id)
+            review = self.safety_reviews.create(request)
+            self._persist_review(review)
+            return review
 
     def get_safety_review(self, review_id: str) -> SafetyReviewRecord | None:
-        return self.safety_reviews.get(review_id)
+        review = self.safety_reviews.get(review_id)
+        if review is not None or self.durable_store is None:
+            return review
+        payload = self.durable_store.load_review(review_id)
+        if payload is None:
+            return None
+        restored = SafetyReviewRecord.model_validate(payload)
+        self.get_run(restored.run_id)
+        return self.safety_reviews.restore(restored)
 
     def list_safety_reviews(self, run_id: str) -> list[SafetyReviewRecord]:
+        self._restore_reviews(run_id)
         return self.safety_reviews.list_for_run(run_id)
 
     def decide_safety_review(
@@ -155,6 +205,7 @@ class InMemoryAgentRunManager:
             reason=reason,
             decided_at=_now_iso(),
         )
+        self._persist_review(review)
         self.append_event(
             review.run_id,
             "safety_review_decided",
@@ -166,16 +217,48 @@ class InMemoryAgentRunManager:
             self.resume_running(review.run_id)
         return review
 
+    def decide_safety_review_with_transition(
+        self,
+        *,
+        review_id: str,
+        decision: SafetyReviewDecision,
+        decided_by: str,
+        reason: str | None,
+    ) -> tuple[SafetyReviewRecord, bool]:
+        """Decide once and report whether this call changed pending state.
+
+        The transition flag is the control-plane idempotency key for graph
+        resume: retries can return the durable decision but must not resume the
+        same graph thread again.
+        """
+        with self._lock:
+            current = self.get_safety_review(review_id)
+            if current is None:
+                raise KeyError(f"Safety review not found: {review_id}")
+            if current.status.value != "pending":
+                return current, False
+            return (
+                self.decide_safety_review(
+                    review_id=review_id,
+                    decision=decision,
+                    decided_by=decided_by,
+                    reason=reason,
+                ),
+                True,
+            )
+
     def attach_safety_review_llm_output(
         self,
         *,
         review_id: str,
         llm_output: str | None,
     ) -> SafetyReviewRecord:
-        return self.safety_reviews.attach_llm_output(
+        review = self.safety_reviews.attach_llm_output(
             review_id=review_id,
             llm_output=llm_output,
         )
+        self._persist_review(review)
+        return review
 
     def mark_cancelled(
         self,
@@ -243,11 +326,21 @@ class InMemoryAgentRunManager:
                 created_at=_now_iso(),
             )
             self._events[run_id].append(event)
+            if type == "llm_delta":
+                self._queue_delta_event(event)
+            else:
+                self._persist_event(event)
             return event
 
     def get_run(self, run_id: str) -> AgentRunRecord | None:
         with self._lock:
-            return self._runs.get(run_id)
+            current = self._runs.get(run_id)
+            if current is not None or self.durable_store is None:
+                return current
+            payload = self.durable_store.load_run(run_id)
+            if payload is None:
+                return None
+            return self.restore_run(AgentRunRecord.model_validate(payload))
 
     def list_events(
         self,
@@ -256,9 +349,7 @@ class InMemoryAgentRunManager:
     ) -> list[AgentRunEvent]:
         with self._lock:
             return [
-                event
-                for event in self._events.get(run_id, [])
-                if event.sequence > after_sequence
+                event for event in self._events.get(run_id, []) if event.sequence > after_sequence
             ]
 
     def request_cancel(self, run_id: str, reason: str | None = None) -> None:
@@ -266,6 +357,18 @@ class InMemoryAgentRunManager:
             if run_id not in self._runs:
                 raise KeyError(f"Agent run not found: {run_id}")
             self._cancel_requests[run_id] = reason
+            current = self._runs[run_id]
+            metadata = dict(current.metadata)
+            metadata.update(
+                {
+                    "cancel_requested": True,
+                    "cancel_reason": reason,
+                    "cancel_requested_at": _now_iso(),
+                }
+            )
+            updated = current.model_copy(update={"metadata": metadata})
+            self._runs[run_id] = updated
+            self._persist_run(updated)
             self.append_event(
                 run_id,
                 "run_cancel_requested",
@@ -307,4 +410,86 @@ class InMemoryAgentRunManager:
                 payload["metadata"] = metadata
             updated = current.model_copy(update={"status": status, **payload})
             self._runs[run_id] = updated
+            self._persist_run(updated)
             return updated
+
+    def _persist_run(self, record: AgentRunRecord) -> None:
+        if self.durable_store is not None:
+            self.durable_store.save_run(record.model_dump(mode="json"), updated_at=_now_iso())
+
+    def _persist_event(self, event: AgentRunEvent) -> None:
+        if self.durable_store is not None:
+            self.durable_store.save_event(event.model_dump(mode="json"))
+
+    def _queue_delta_event(self, event: AgentRunEvent) -> None:
+        if self._pending_delta_events is None:
+            return
+        self._pending_delta_events.put(event)
+
+    def _write_delta_events(self) -> None:
+        if self._pending_delta_events is None or self.durable_store is None:
+            return
+        while True:
+            first = self._pending_delta_events.get()
+            if first is None:
+                self._pending_delta_events.task_done()
+                return
+            batch = [first]
+            while len(batch) < 64:
+                try:
+                    next_event = self._pending_delta_events.get_nowait()
+                except queue.Empty:
+                    break
+                if next_event is None:
+                    self._pending_delta_events.task_done()
+                    self._pending_delta_events.put(None)
+                    break
+                batch.append(next_event)
+            try:
+                self.durable_store.save_events([event.model_dump(mode="json") for event in batch])
+            except BaseException as exc:  # noqa: BLE001 - surfaced by flush/close callers.
+                self._event_writer_error = exc
+            finally:
+                for _ in batch:
+                    self._pending_delta_events.task_done()
+
+    def flush_events(self) -> None:
+        if self._pending_delta_events is None:
+            return
+        self._pending_delta_events.join()
+        if self._event_writer_error is not None:
+            raise RuntimeError("Agent event persistence failed.") from self._event_writer_error
+
+    def close(self) -> None:
+        """Flush pending token events before shutting down the local runtime."""
+
+        if self._pending_delta_events is None or self._closed:
+            return
+        self.flush_events()
+        self._closed = True
+        self._pending_delta_events.put(None)
+        if self._event_writer is not None:
+            self._event_writer.join(timeout=2)
+
+    def _restore_cancel_request(self, record: AgentRunRecord) -> None:
+        if record.metadata.get("cancel_requested") is True:
+            reason = record.metadata.get("cancel_reason")
+            self._cancel_requests[record.run_id] = reason if isinstance(reason, str) else None
+
+    def _persist_review(self, review: SafetyReviewRecord) -> None:
+        if self.durable_store is not None:
+            self.durable_store.save_review(review.model_dump(mode="json"), updated_at=_now_iso())
+
+    def _load_events(self, run_id: str) -> list[AgentRunEvent]:
+        if self.durable_store is None:
+            return []
+        return [
+            AgentRunEvent.model_validate(payload)
+            for payload in self.durable_store.list_events(run_id)
+        ]
+
+    def _restore_reviews(self, run_id: str) -> None:
+        if self.durable_store is None:
+            return
+        for payload in self.durable_store.list_reviews(run_id):
+            self.safety_reviews.restore(SafetyReviewRecord.model_validate(payload))

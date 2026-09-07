@@ -5,7 +5,6 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-
 CURRENT_TRACE_COLUMNS = {
     "trace_id",
     "session_id",
@@ -196,6 +195,14 @@ def init_db(db_path: Path) -> None:
                 recent_messages TEXT NOT NULL,
                 token_estimate INTEGER NOT NULL,
                 updated_at TEXT NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES agent_sessions(session_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS agent_session_effects (
+                effect_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                effect_type TEXT NOT NULL,
+                created_at TEXT NOT NULL,
                 FOREIGN KEY(session_id) REFERENCES agent_sessions(session_id)
             );
 
@@ -409,6 +416,70 @@ def init_db(db_path: Path) -> None:
 
             CREATE INDEX IF NOT EXISTS idx_knowledge_embedding_records_index
                 ON knowledge_embedding_records(index_key, chunk_id);
+
+            CREATE TABLE IF NOT EXISTS agent_runs (
+                run_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                record_payload TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_agent_runs_session_created
+                ON agent_runs(session_id, created_at);
+
+            CREATE TABLE IF NOT EXISTS agent_run_events (
+                run_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                event_payload TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(run_id, sequence),
+                FOREIGN KEY(run_id) REFERENCES agent_runs(run_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS agent_safety_reviews (
+                review_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                review_payload TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(run_id) REFERENCES agent_runs(run_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_agent_safety_reviews_run
+                ON agent_safety_reviews(run_id, created_at);
+
+            CREATE TABLE IF NOT EXISTS agent_run_artifacts (
+                artifact_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(run_id) REFERENCES agent_runs(run_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_agent_run_artifacts_run_kind
+                ON agent_run_artifacts(run_id, kind, created_at);
+
+            CREATE TABLE IF NOT EXISTS agent_tool_invocations (
+                invocation_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                input_hash TEXT NOT NULL,
+                status TEXT NOT NULL,
+                result_payload TEXT,
+                claimed_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(run_id) REFERENCES agent_runs(run_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_agent_tool_invocations_run
+                ON agent_tool_invocations(run_id, claimed_at);
             """
         )
         conn.commit()

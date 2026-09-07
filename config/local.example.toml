@@ -32,6 +32,9 @@ manual_wait_poll_seconds = 0.5
 # Orchestration backend. Keep legacy during migration; langgraph enables the
 # checkpointed graph runner while preserving the existing Agent semantics.
 orchestrator = "legacy"
+# Graph mode uses a separate local SQLite checkpoint database by default.
+# Use memory only for disposable tests that do not need restart recovery.
+checkpoint_backend = "sqlite"
 # Maximum decision-loop steps after the initial route. Raise for longer workflows
 # such as sync -> search -> load -> dedupe -> create/update -> verify -> answer.
 max_decision_steps = 10

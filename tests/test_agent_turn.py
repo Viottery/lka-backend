@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from app.api.main import create_app
 from app.api.routes.agent import run_agent_turn
@@ -12,7 +15,7 @@ from app.api.schemas import AgentTurnRequest, MailImportRequest
 from app.core.agent_graph import AgentGraphRunner
 from app.core.agent_turn import LLM_OBSERVATION_MAX_TOTAL_CHARS
 from app.core.config import get_settings
-from app.core.llm import LLMRateLimitError, LLMResponse, LLMStreamEvent
+from app.core.llm import LLMRateLimitError, LLMResponse, LLMResponseMode, LLMStreamEvent
 from app.core.tools import ToolContext, ToolExecutor, ToolRegistry, ToolResult, ToolSpec
 from app.domains.mail import MailAccountInput, MailMessageInput
 from app.domains.matters import MatterCreateInput
@@ -59,12 +62,189 @@ def test_agent_turn_can_run_through_langgraph_orchestrator(tmp_path, monkeypatch
     assert response.answer
     assert app.state.runtime.agent_run_manager.get_run(response.run_id).status.value == "completed"
 
-    snapshot = runner.graph.get_state(
-        {"configurable": {"thread_id": response.run_id}}
-    )
-    assert snapshot.values["phase"] == "completed"
+    snapshot = runner.get_state(response.run_id)
+    assert snapshot.values["phase"] == "finalized"
+    assert snapshot.values["status"] == "completed"
+    assert snapshot.values["graph_thread_id"] == response.run_id
+    assert snapshot.values["checkpoint_schema_version"] == 1
     assert snapshot.values["result_summary"]["run_id"] == response.run_id
+    assert snapshot.values["result_artifact_ref"]["kind"] == "agent_turn_result"
+    assert (
+        app.state.runtime.agent_run_store.load_artifact(
+            snapshot.values["result_artifact_ref"]["artifact_id"]
+        )
+        is not None
+    )
     assert "tool_events" not in snapshot.values
+
+    checkpoint_phases = {
+        item.values.get("phase")
+        for item in runner.get_state_history(response.run_id)
+    }
+    assert {
+        "created",
+        "initialized",
+        "context_prepared",
+        "routed",
+        "answered",
+        "verified",
+        "finalized",
+    }.issubset(checkpoint_phases)
+
+
+def test_langgraph_checkpoint_records_failed_turn_status(tmp_path, monkeypatch):
+    config_path = tmp_path / "local.toml"
+    config_path.write_text('[agent]\norchestrator = "langgraph"\n', encoding="utf-8")
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(config_path))
+    get_settings.cache_clear()
+
+    app = create_app()
+    runner = app.state.runtime.agent_turn_runner
+    assert isinstance(runner, AgentGraphRunner)
+    run = runner.create_run_for_turn(
+        session_id="session_langgraph_failure",
+        user_input="fail in test",
+    )
+
+    def fail_prepare_context(**kwargs):
+        raise RuntimeError("graph failure sentinel")
+
+    monkeypatch.setattr(runner.turn_loop.session_service, "append_message", fail_prepare_context)
+
+    with pytest.raises(RuntimeError, match="graph failure sentinel"):
+        runner.run(
+            session_id=run.session_id,
+            user_input=run.user_input,
+            existing_run_id=run.run_id,
+        )
+
+    snapshot = runner.get_state(run.run_id)
+    assert snapshot.values["phase"] == "initialized"
+    assert app.state.runtime.agent_run_manager.get_run(run.run_id).status.value == "failed"
+
+
+def test_langgraph_resumes_incomplete_sqlite_checkpoint_after_runtime_restart(
+    tmp_path,
+    monkeypatch,
+):
+    config_path = tmp_path / "local.toml"
+    config_path.write_text(
+        '[agent]\norchestrator = "langgraph"\ncheckpoint_backend = "sqlite"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(config_path))
+    get_settings.cache_clear()
+
+    first_app = create_app()
+    first_runner = first_app.state.runtime.agent_turn_runner
+    assert isinstance(first_runner, AgentGraphRunner)
+    first_runner.interrupt_after = ["initialize_run"]
+    run = first_runner.create_run_for_turn(
+        session_id="session_langgraph_restart",
+        user_input="Answer directly after checkpoint recovery.",
+    )
+    asyncio.run(
+        first_runner._invoke(
+            run_id=run.run_id,
+            session_id=run.session_id,
+            user_input=run.user_input,
+            llm_client_name=None,
+            llm_model=None,
+            llm_response_mode=LLMResponseMode.TEXT,
+        )
+    )
+
+    paused = first_runner.get_state(run.run_id)
+    assert paused.values["phase"] == "initialized"
+    assert paused.next == ("prepare_context",)
+    first_app.state.runtime.stop()
+
+    get_settings.cache_clear()
+    second_app = create_app()
+    second_runner = second_app.state.runtime.agent_turn_runner
+    assert isinstance(second_runner, AgentGraphRunner)
+    recovered_run = second_app.state.runtime.agent_run_manager.get_run(run.run_id)
+    assert recovered_run is not None
+    assert recovered_run.status.value == "running"
+
+    result = second_app.state.runtime.resume_agent_run(run.run_id)
+
+    assert result.run_id == run.run_id
+    assert result.session_id == run.session_id
+    restored = second_runner.get_state(run.run_id)
+    assert restored.values["phase"] == "finalized"
+    assert restored.values["status"] == "completed"
+    assert restored.next == ()
+    assert second_app.state.runtime.agent_run_manager.get_run(run.run_id).status.value == (
+        "completed"
+    )
+    second_app.state.runtime.stop()
+
+
+def test_langgraph_restores_completed_result_after_runtime_restart(tmp_path, monkeypatch):
+    config_path = tmp_path / "local.toml"
+    config_path.write_text(
+        '[agent]\norchestrator = "langgraph"\ncheckpoint_backend = "sqlite"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(config_path))
+    get_settings.cache_clear()
+
+    first_app = create_app()
+    completed = first_app.state.runtime.run_agent_turn(
+        session_id="session_langgraph_completed_restart",
+        user_input="Answer directly before restarting.",
+    )
+    first_app.state.runtime.stop()
+
+    get_settings.cache_clear()
+    second_app = create_app()
+    try:
+        restored = second_app.state.runtime.resume_agent_run(completed.run_id)
+
+        assert restored.run_id == completed.run_id
+        assert restored.session_id == completed.session_id
+        assert restored.answer == completed.answer
+        assert restored.log_path == completed.log_path
+        assert second_app.state.runtime.agent_run_manager.get_run(completed.run_id).status.value == (
+            "completed"
+        )
+    finally:
+        second_app.state.runtime.stop()
+
+
+def test_langgraph_can_pause_at_a_real_react_node(tmp_path, monkeypatch):
+    config_path = tmp_path / "local.toml"
+    config_path.write_text('[agent]\norchestrator = "langgraph"\n', encoding="utf-8")
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(config_path))
+    get_settings.cache_clear()
+
+    app = create_app()
+    runner = app.state.runtime.agent_turn_runner
+    assert isinstance(runner, AgentGraphRunner)
+    runner.interrupt_after = ["prepare_context"]
+    run = runner.create_run_for_turn(
+        session_id="session_langgraph_unsafe_replay",
+        user_input="Answer directly.",
+    )
+    asyncio.run(
+        runner._invoke(
+            run_id=run.run_id,
+            session_id=run.session_id,
+            user_input=run.user_input,
+            llm_client_name=None,
+            llm_model=None,
+            llm_response_mode=LLMResponseMode.TEXT,
+        )
+    )
+
+    paused = runner.get_state(run.run_id)
+    assert paused.values["phase"] == "context_prepared"
+    assert paused.next == ("route_package",)
 
 
 def test_agent_turn_prefers_provider_native_function_calls_when_supported(tmp_path, monkeypatch):
@@ -1051,6 +1231,41 @@ def test_agent_turn_blocks_repeated_successful_tool_call_and_answers(
     assert fake_llm.completed_tool_calls[-1]["tool_name"] == "mail.search"
 
 
+@pytest.mark.parametrize("orchestrator", ["legacy", "langgraph"])
+def test_agent_turn_allows_readback_after_successful_state_change(
+    tmp_path,
+    monkeypatch,
+    orchestrator,
+):
+    config_path = tmp_path / "local.toml"
+    config_path.write_text(
+        f'[agent]\norchestrator = "{orchestrator}"\n',
+        encoding="utf-8",
+    )
+    notes_path = tmp_path / "notes.md"
+    notes_path.write_text("Status: red\n", encoding="utf-8")
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(config_path))
+    monkeypatch.setenv("LKA_WORKSPACE_ROOTS", str(tmp_path))
+    get_settings.cache_clear()
+
+    app = create_app()
+    app.state.runtime.agent_turn_loop.llm_client = _ReadEditReadLLM(notes_path)
+
+    response = app.state.runtime.run_agent_turn(
+        session_id=f"session_readback_{orchestrator}",
+        user_input="Change the status and verify it.",
+    )
+
+    assert [event.tool_name for event in response.tool_events] == [
+        "filesystem.read_file",
+        "filesystem.edit_file",
+        "filesystem.read_file",
+    ]
+    assert "Status: green" in response.tool_events[-1].result["output"]["content"]
+    assert "tool_duplicate_blocked" not in [event.type for event in response.progress_events]
+
+
 def test_agent_turn_can_expand_matter_package_after_mail_observation(tmp_path, monkeypatch):
     monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
@@ -1378,6 +1593,11 @@ class _RateLimitedThenWorkingLLM:
         prompt_summary: str,
         temperature: float = 0.0,
         max_output_tokens: int | None = None,
+        client_name: str | None = None,
+        model: str | None = None,
+        response_mode: LLMResponseMode = LLMResponseMode.TEXT,
+        require_json: bool = False,
+        metadata: dict | None = None,
     ) -> LLMResponse:
         self.calls += 1
         self.max_output_tokens_seen.append(max_output_tokens)
@@ -2227,6 +2447,73 @@ class _RepeatedSuccessfulToolLLM:
             content = "Unexpected prompt."
         return LLMResponse(
             provider="fake_repeat_successful_tool_llm",
+            status="completed",
+            content=content,
+            prompt_summary=prompt_summary,
+        )
+
+
+class _ReadEditReadLLM:
+    def __init__(self, notes_path: Path) -> None:
+        self.notes_path = str(notes_path)
+
+    def complete_text(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        prompt_summary: str,
+        temperature: float = 0.0,
+        max_output_tokens: int | None = None,
+    ) -> LLMResponse:
+        if "Choose at most one tool package" in system_prompt:
+            content = json.dumps(
+                {"selected_package": "filesystem", "reason": "Update and verify a local file."}
+            )
+        elif "Tool Result Checker" in system_prompt:
+            content = _tool_check_content()
+        elif "Choose the next single action" in system_prompt:
+            observations = json.loads(user_prompt).get("observations", [])
+            completed = [
+                item
+                for item in observations
+                if isinstance(item, dict) and isinstance(item.get("tool_name"), str)
+            ]
+            if len(completed) == 0:
+                operation = {
+                    "type": "tool_call",
+                    "tool_name": "filesystem.read_file",
+                    "tool_input": {"path": self.notes_path},
+                    "reason": "Read the current state.",
+                }
+            elif len(completed) == 1:
+                sha256 = completed[0]["result"]["output"]["sha256"]
+                operation = {
+                    "type": "tool_call",
+                    "tool_name": "filesystem.edit_file",
+                    "tool_input": {
+                        "path": self.notes_path,
+                        "expected_sha256": sha256,
+                        "edits": [{"old_text": "Status: red", "new_text": "Status: green"}],
+                    },
+                    "reason": "Apply the requested update.",
+                }
+            elif len(completed) == 2:
+                operation = {
+                    "type": "tool_call",
+                    "tool_name": "filesystem.read_file",
+                    "tool_input": {"path": self.notes_path},
+                    "reason": "Verify the update.",
+                }
+            else:
+                operation = {"type": "final_answer", "reason": "Read-back verification completed."}
+            content = json.dumps({"operation": operation})
+        elif "Final Answer Writer" in system_prompt:
+            content = "The status is now green."
+        else:
+            content = "Unexpected prompt."
+        return LLMResponse(
+            provider="fake_read_edit_read_llm",
             status="completed",
             content=content,
             prompt_summary=prompt_summary,

@@ -103,6 +103,7 @@ class SafetyReviewConfig(BaseModel):
 class AgentConfig(BaseModel):
     max_decision_steps: int = 10
     orchestrator: Literal["legacy", "langgraph"] = "legacy"
+    checkpoint_backend: Literal["memory", "sqlite"] = "sqlite"
 
 
 class OutlookMailConfig(BaseModel):

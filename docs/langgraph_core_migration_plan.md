@@ -12,27 +12,76 @@ replacement for domain services, tool definitions, provider adapters, or policy.
 
 ## Current Implementation Status
 
-Status as of 2026-09-05:
+Status as of 2026-09-07:
 
 - [x] Created a pre-migration Git/worktree snapshot outside the repository.
 - [x] Added a runtime-facing `AgentTurnRunner` protocol.
 - [x] Added LangGraph as a locked local dependency and implemented an
-  `AgentGraphRunner` with an in-memory checkpointer.
+  `AgentGraphRunner` with a configurable in-memory or SQLite checkpointer.
 - [x] Added `agent.orchestrator = "legacy" | "langgraph"`; legacy remains the default.
+- [x] Split the initial scaffold into explicit `initialize_run`, `prepare_context`,
+  `route_package`, `expand_package`, `decide_next_operation`,
+  `validate_operation`, `safety_gate`, `execute_tool`, `build_observation`,
+  `answer`, `verify_answer` and `finalize_run` nodes.
 - [x] Verified basic synchronous and SSE tool-call runs through graph mode while
   preserving the existing result and event contracts.
-- [x] Kept full tool results out of graph checkpoints; the initial checkpoint stores
-  only request data and a bounded terminal summary.
-- [ ] Split the current bridge node (`execute_turn`) into context, route, decision,
-  validation, safety, execution, observation, answer and finalization nodes.
-- [ ] Replace the in-memory checkpointer and run/review stores with reviewed durable
-  SQLite implementations.
-- [ ] Replace blocking manual-review waiting with LangGraph interrupt/resume.
+- [x] Kept full tool results, LLM events and prompt observations out of graph
+  checkpoints; graph state keeps project-owned immutable artifact references.
+- [x] Added local SQLite graph persistence in LangGraph mode and an explicit runtime
+  recovery path for an incomplete run after a backend restart.
+- [x] Added a nested project-owned LangGraph tool lifecycle
+  (`safety_gate` -> `execute_tool` -> `build_observation`) and durable tool claims.
+- [x] Added project-owned durable SQLite persistence for runs, run events, safety
+  reviews, large result artifacts and tool invocation claims.
+- [x] Added deterministic tool invocation IDs and durable claims: a completed tool
+  result is reused, while an invocation left executing after a crash is treated as
+  uncertain and is never replayed automatically.
+- [x] Replaced graph-mode blocking manual review with LangGraph `interrupt`/resume;
+  the decision API resumes only on the first pending-to-terminal transition.
+- [x] Restored completed results from the durable result artifact after a runtime
+  restart, not only incomplete checkpointed runs.
 
-The current graph runner is a migration scaffold: LangGraph owns invocation and
-checkpointing, but `execute_turn` still delegates Agent semantics and the internal
-decision loop to `AgentTurnLoop`. It must not be treated as completion of the core
-loop migration.
+The migration scope is complete: LangGraph owns the outer ReAct control flow,
+checkpointing, interrupts and recovery. Project-owned `AgentTurnLoop` methods still
+implement routing, decisions, prompts, observations and answers, while the existing
+`ToolRegistry`, `ToolExecutor`, safety policy and domain packages remain authoritative.
+The legacy loop is retained only as an explicit compatibility orchestrator, not as a
+bridge node called by graph mode.
+
+### Current Status And Checkpoint Semantics
+
+The current graph stores two related but separate values:
+
+- `status` is the public run lifecycle and uses the existing values `queued`,
+  `running`, `waiting_confirmation`, `completed`, `failed` and `cancelled`.
+- `phase` is the internal graph position. A successful tool turn progresses through
+  context preparation, package routing/expansion, decision/validation, safety,
+  execution, observation, answer, verification and finalization nodes.
+
+The current checkpoint design is intentionally bounded:
+
+- one `graph_thread_id` per `run_id`; conversation `session_id` is not reused as the
+  graph thread;
+- `checkpoint_schema_version = 1` is stored in graph state;
+- `checkpoint_backend = "sqlite"` is the graph-mode default and stores snapshots in
+  `data/runtime/agent_checkpoints.sqlite3`; `memory` remains available for disposable
+  tests;
+- SQLite persistence uses a short-lived synchronous `SqliteSaver` inside a dedicated
+  worker thread. This keeps project synchronous services and nested provider streams
+  off the FastAPI event loop while avoiding cross-loop SQLite connections;
+- the checkpointer writes after the initial input and each graph node;
+- checkpoint state contains request/run identity, status, phase, a compact working
+  set and immutable references to project-owned runtime/result artifacts;
+- complete prompts, raw mail bodies and full tool events are excluded;
+- the full `AgentTurnResult` is persisted as a project-owned artifact and can be
+  reconstructed after the process-local result cache is lost.
+
+Recovery is explicit through `Runtime.resume_agent_run(run_id)` (or its async
+equivalent). It restores the durable run record and resumes the latest interrupted
+node; a completed run instead returns the persisted result artifact. Startup does not
+automatically resume every incomplete run. Tool invocations use durable claims, and
+session/finalization effects use stable IDs, so graph replay neither repeats completed
+tool side effects nor duplicates user/agent session messages or lifecycle events.
 
 ## 2. Scope And Non-goals
 
@@ -272,15 +321,16 @@ tool rejection, malformed model output and normal final answers.
 
 ### Phase 3: Durable Run And Manual Review
 
-1. Add reviewed SQLite tables/repositories and a SQLite checkpointer.
-2. Implement the `interrupt`/resume protocol without blocking a worker thread.
-3. Change safety-review API handlers to operate on durable repositories and resume
-   the graph by `run_id`.
-4. Add restart tests: start manual review, stop runtime, recreate runtime, approve or
-   reject, then confirm exactly one correct continuation occurs.
+1. [x] Add reviewed SQLite tables/repositories for runs, events, reviews, artifacts
+   and tool invocation claims.
+2. [x] Implement the `interrupt`/resume protocol without blocking a worker thread.
+3. [x] Change safety-review API handlers to resume the graph by `run_id` only for the
+   first pending-to-terminal review transition.
+4. [x] Add recovery tests for interrupted, approved manual-review and completed runs.
 
 Acceptance: manual review survives SSE disconnect and backend restart; no
-side-effecting tool runs twice.
+side-effecting tool runs twice. Completed by the targeted LangGraph recovery and
+safety-review tests.
 
 ### Phase 4: Streaming, Cancellation And Observability
 
