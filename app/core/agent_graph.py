@@ -93,6 +93,7 @@ class AgentGraphRunner:
             ("decide_next_operation", self._decide),
             ("validate_operation", self._validate),
             ("safety_gate", self._safety),
+            ("manual_review_interrupt", self._manual_review_interrupt),
             ("execute_tool", self._execute),
             ("build_observation", self._observe),
             ("answer", self._answer),
@@ -121,8 +122,13 @@ class AgentGraphRunner:
         builder.add_conditional_edges(
             "safety_gate",
             self._after_safety,
-            {"execute": "execute_tool", "observe": "build_observation"},
+            {
+                "interrupt": "manual_review_interrupt",
+                "execute": "execute_tool",
+                "observe": "build_observation",
+            },
         )
+        builder.add_edge("manual_review_interrupt", "safety_gate")
         builder.add_edge("execute_tool", "build_observation")
         builder.add_edge("build_observation", "decide_next_operation")
         builder.add_edge("answer", "verify_answer")
@@ -636,8 +642,6 @@ class AgentGraphRunner:
         data["llm_events"] = self._dump(llm)
         if review is not None and review.status == SafetyReviewStatus.PENDING:
             ws.pending_review_id = review.review_id
-            self._save_data(s["run_id"], data)
-            interrupt({"review_id": review.review_id, "tool_name": name, "run_id": s["run_id"]})
             return self._save(s, ws, data, "waiting_confirmation", "waiting_confirmation")
         if rejected is not None:
             data["pending_tool_result"] = rejected.model_dump(mode="json")
@@ -656,6 +660,22 @@ class AgentGraphRunner:
             return self._save(s, ws, data, "safety_rejected")
         data["approved_review"] = review.model_dump(mode="json") if review else None
         return self._save(s, ws, data, "safety_approved")
+
+    def _manual_review_interrupt(self, s: AgentGraphState) -> AgentGraphState:
+        """Pause only after the review and its initial progress are checkpointed."""
+
+        ws = self._ws(s)
+        review_id = ws.pending_review_id
+        if not review_id:
+            raise RuntimeError("Manual review interrupt is missing review_id.")
+        interrupt(
+            {
+                "review_id": review_id,
+                "tool_name": ws.pending_tool_name,
+                "run_id": s["run_id"],
+            }
+        )
+        return {"phase": "review_resumed"}
 
     def _execute(self, s: AgentGraphState) -> AgentGraphState:
         ws, data = self._data(s)
@@ -867,23 +887,29 @@ class AgentGraphRunner:
                     "log_path": result.log_path,
                 },
             )
+        # The completed state is a recovery promise: persist the terminal
+        # result before publishing it.  If the process dies after this point,
+        # ``_take_result`` can reload the artifact even before LangGraph has
+        # committed the final node checkpoint.
+        ref = self._store_result(result)
+        completed_snapshot = {
+            "session_id": result.session_id,
+            "trace_id": result.trace_id,
+            "answer": result.answer,
+            "selected_package": result.selected_package,
+            "initial_package": result.initial_package,
+            "expanded_packages": result.expanded_packages,
+            "used_packages": result.used_packages,
+            "active_package": result.active_package,
+            "result_artifact_ref": ref,
+        }
         self.turn_loop.run_manager.complete_run(
             ws.run_id,
-            result_snapshot={
-                "session_id": result.session_id,
-                "trace_id": result.trace_id,
-                "answer": result.answer,
-                "selected_package": result.selected_package,
-                "initial_package": result.initial_package,
-                "expanded_packages": result.expanded_packages,
-                "used_packages": result.used_packages,
-                "active_package": result.active_package,
-            },
+            result_snapshot=completed_snapshot,
             log_path=result.log_path,
         )
         with self._lock:
             self._results[ws.run_id] = result
-        ref = self._store_result(result)
         return {
             "phase": "finalized",
             "status": "completed",
@@ -915,7 +941,10 @@ class AgentGraphRunner:
         }.get(s["phase"], "decide")
 
     def _after_safety(self, s: AgentGraphState) -> str:
-        return "observe" if s["phase"] == "safety_rejected" else "execute"
+        return {
+            "waiting_confirmation": "interrupt",
+            "safety_rejected": "observe",
+        }.get(s["phase"], "execute")
 
     def _ws(self, s: AgentGraphState) -> AgentTurnWorkingSet:
         return AgentTurnWorkingSet.model_validate(s["working_set"])
@@ -1038,6 +1067,11 @@ class AgentGraphRunner:
 
         state = self.get_state(run_id)
         ref = state.values.get("result_artifact_ref")
+        if not isinstance(ref, dict):
+            run = self._run(run_id)
+            snapshot = run.result_snapshot or {}
+            candidate = snapshot.get("result_artifact_ref")
+            ref = candidate if isinstance(candidate, dict) else None
         if not isinstance(ref, dict):
             return None
         if isinstance(ref.get("payload"), dict):

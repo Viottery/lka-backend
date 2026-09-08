@@ -40,6 +40,14 @@ Status as of 2026-09-07:
   the decision API resumes only on the first pending-to-terminal transition.
 - [x] Restored completed results from the durable result artifact after a runtime
   restart, not only incomplete checkpointed runs.
+- [x] Persisted the final result artifact before publishing `completed`, with an
+  artifact-reference fallback for the final-checkpoint crash window.
+- [x] Split manual-review state persistence from the interrupt node so the initial
+  review progress is part of the resumable checkpoint.
+- [x] Added sequence-based SSE reconnect, event/status queries and explicit
+  cancellation; transport disconnects no longer cancel an active run.
+- [x] Kept live token snapshots for SSE compatibility while persisting only deltas
+  and rebuilding snapshots during durable replay.
 
 The migration scope is complete: LangGraph owns the outer ReAct control flow,
 checkpointing, interrupts and recovery. Project-owned `AgentTurnLoop` methods still

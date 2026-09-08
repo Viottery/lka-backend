@@ -76,7 +76,7 @@ class SqliteAgentRunStore:
                     (
                         event["run_id"],
                         event["sequence"],
-                        _json_dump(event),
+                        _json_dump(self._event_for_storage(event)),
                         event["created_at"],
                     )
                     for event in events
@@ -90,6 +90,26 @@ class SqliteAgentRunStore:
                 (run_id,),
             ).fetchall()
         return [_json_load(row["event_payload"]) for row in rows]
+
+    @staticmethod
+    def _event_for_storage(event: dict[str, Any]) -> dict[str, Any]:
+        """Store token deltas once, not every growing prefix snapshot.
+
+        Live SSE events retain ``content_snapshot`` for compatibility.  Durable
+        readers reconstruct it from ordered deltas when rehydrating a run.
+        """
+
+        if event.get("type") != "llm_delta":
+            return event
+        payload = event.get("payload")
+        if not isinstance(payload, dict) or "content_snapshot" not in payload:
+            return event
+        stored = dict(event)
+        stored_payload = dict(payload)
+        stored_payload.pop("content_snapshot", None)
+        stored_payload["content_snapshot_omitted"] = True
+        stored["payload"] = stored_payload
+        return stored
 
     def save_review(self, review: dict[str, Any], *, updated_at: str) -> None:
         with connect(self.db_path) as conn:

@@ -200,6 +200,52 @@ def test_agent_run_manager_persists_cancel_request_and_flushes_token_events(tmp_
     second.close()
 
 
+def test_agent_run_manager_rebuilds_stream_snapshot_from_compact_delta_storage(tmp_path):
+    store = SqliteAgentRunStore(tmp_path / "lka.sqlite3")
+    first = InMemoryAgentRunManager(durable_store=store)
+    run = first.create_run(
+        session_id="session_compact_delta",
+        user_input="compact token storage",
+        trace_id="trace_compact_delta",
+    )
+    first.append_event(
+        run.run_id,
+        "llm_delta",
+        "first",
+        stage="answer",
+        payload={
+            "llm_call_id": "call_compact_delta",
+            "delta": "first",
+            "content_snapshot": "first",
+        },
+    )
+    first.append_event(
+        run.run_id,
+        "llm_delta",
+        " second",
+        stage="answer",
+        payload={
+            "llm_call_id": "call_compact_delta",
+            "delta": " second",
+            "content_snapshot": "first second",
+        },
+    )
+    first.close()
+
+    stored = store.list_events(run.run_id)
+    assert all("content_snapshot" not in event["payload"] for event in stored)
+    assert all(event["payload"]["content_snapshot_omitted"] is True for event in stored)
+
+    second = InMemoryAgentRunManager(durable_store=store)
+    restored = second.get_run(run.run_id)
+    assert restored is not None
+    assert [event.payload["content_snapshot"] for event in second.list_events(run.run_id)] == [
+        "first",
+        "first second",
+    ]
+    second.close()
+
+
 def test_sqlite_run_store_claims_tool_invocation_without_replaying_effect(tmp_path):
     store = SqliteAgentRunStore(tmp_path / "lka.sqlite3")
     first_claim = store.claim_tool_invocation(

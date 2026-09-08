@@ -6,7 +6,13 @@ from types import SimpleNamespace
 import pytest
 
 from app.api.main import create_app
-from app.api.routes.agent import _sse_event_frame, stream_agent_turn
+from app.api.routes.agent import (
+    _sse_event_frame,
+    cancel_agent_run,
+    list_agent_run_events,
+    reconnect_agent_turn_stream,
+    stream_agent_turn,
+)
 from app.api.schemas import AgentTurnRequest
 from app.core.agent_runs import AgentRunEvent
 from app.core.config import get_settings
@@ -252,6 +258,73 @@ def test_agent_turn_stream_endpoint_is_registered_without_changing_turn(tmp_path
 
     assert "/agent/turn" in openapi
     assert "/agent/turn/stream" in openapi
+    assert "/agent/runs/{run_id}" in openapi
+    assert "/agent/runs/{run_id}/events" in openapi
+    assert "/agent/runs/{run_id}/stream" in openapi
+    assert "/agent/runs/{run_id}/cancel" in openapi
+
+
+def test_agent_turn_stream_reconnects_from_sequence_and_cancel_is_explicit(tmp_path, monkeypatch):
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
+    get_settings.cache_clear()
+    app = create_app()
+    app.state.runtime.agent_turn_loop.llm_client = _StreamingAnswerLLM()
+    request = SimpleNamespace(app=app, is_disconnected=_is_never_disconnected)
+
+    response = _run_async(
+        stream_agent_turn(
+            AgentTurnRequest(session_id="session_reconnect", user_input="直接回答。"),
+            request,
+        )
+    )
+    frames = _parse_sse(_run_async(_consume_stream_response(response)))
+    run_id = frames[0]["data"]["run_id"]
+    reconnect_after = frames[2]["data"]["sequence"]
+    replay = _run_async(reconnect_agent_turn_stream(run_id, request, reconnect_after))
+    replay_frames = _parse_sse(_run_async(_consume_stream_response(replay)))
+
+    assert replay_frames
+    assert [frame["data"]["sequence"] for frame in replay_frames] == list(
+        range(reconnect_after + 1, frames[-1]["data"]["sequence"] + 1)
+    )
+
+    queued = app.state.runtime.create_agent_run(
+        session_id="session_cancel", user_input="cancel this run"
+    )
+    cancelled = _run_async(cancel_agent_run(queued.run_id, request))
+    assert cancelled.run_id == queued.run_id
+    assert app.state.runtime.agent_run_manager.is_cancel_requested(queued.run_id) is True
+
+
+def test_agent_run_event_query_and_sse_hide_raw_tool_result_payload(tmp_path, monkeypatch):
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
+    get_settings.cache_clear()
+    app = create_app()
+    request = SimpleNamespace(app=app, is_disconnected=_is_never_disconnected)
+    run = app.state.runtime.create_agent_run(
+        session_id="session_public_events", user_input="public event test"
+    )
+    app.state.runtime.agent_run_manager.append_event(
+        run.run_id,
+        "tool_completed",
+        "Tool completed.",
+        stage="tool_execute",
+        payload={
+            "tool_name": "mail.load_messages",
+            "status": "completed",
+            "metadata": {"result": {"body_text": "PRIVATE_TOOL_RESULT_SENTINEL"}},
+        },
+    )
+
+    queried = _run_async(list_agent_run_events(run.run_id, request))
+    assert queried.events[0].payload == {
+        "tool_name": "mail.load_messages",
+        "status": "completed",
+    }
+    [frame] = _parse_sse(_sse_event_frame(queried.events[0]))
+    assert "PRIVATE_TOOL_RESULT_SENTINEL" not in json.dumps(frame, ensure_ascii=False)
 
 
 def test_final_answer_sse_frame_uses_full_answer_from_metadata():

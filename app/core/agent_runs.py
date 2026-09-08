@@ -483,10 +483,26 @@ class InMemoryAgentRunManager:
     def _load_events(self, run_id: str) -> list[AgentRunEvent]:
         if self.durable_store is None:
             return []
-        return [
+        events = [
             AgentRunEvent.model_validate(payload)
             for payload in self.durable_store.list_events(run_id)
         ]
+        snapshots: dict[str, str] = {}
+        for event in events:
+            if event.type != "llm_delta":
+                continue
+            payload = event.payload
+            if isinstance(payload.get("content_snapshot"), str):
+                continue
+            delta = payload.get("delta")
+            if not isinstance(delta, str):
+                continue
+            call_id = payload.get("llm_call_id")
+            key = str(call_id) if isinstance(call_id, str) else f"stage:{event.stage or ''}"
+            snapshot = snapshots.get(key, "") + delta
+            snapshots[key] = snapshot
+            payload["content_snapshot"] = snapshot
+        return events
 
     def _restore_reviews(self, run_id: str) -> None:
         if self.durable_store is None:

@@ -463,8 +463,8 @@ POST /agent/turn
 ```
 
 `llm` 是可选字段；不传时使用会话 / 配置默认值。`model` 是运行时可切换选项，不应由
-后端代码写死。`/agent/turn` 返回完整结果；`POST /agent/turn/stream` 提供用户可见的 SSE
-token-delta 输出。
+后端代码写死。`/agent/turn` 返回用户可见结果和脱敏审计摘要；`POST /agent/turn/stream`
+提供用户可见的 SSE token-delta 输出。
 每次 LLM 调用都会在响应的 `llm_events` 中带上 `llm_call_id`、provider / model、
 response mode、耗时、usage、finish reason、provider request id、rate-limit headers、
 错误分类和 retry 判断等审计字段。完整 prompt / output 仍只写入本地 markdown run log；
@@ -483,16 +483,15 @@ response mode、耗时、usage、finish reason、provider request id、rate-limi
   "expanded_packages": ["mail", "matter"],
   "used_packages": ["mail", "matter"],
   "active_package": "matter",
-  "package_catalog": [],
-  "expanded_tools": [],
-  "decision_events": [],
-  "tool_events": [],
+  "tool_events": [{"tool_name": "mail.search", "status": "completed"}],
   "progress_events": [],
   "verification_warnings": [],
-  "llm_events": [],
-  "log_path": "data/agent_logs/agent_turn_xxx.md"
+  "llm_events": [{"llm_call_id": "llm_call_xxx", "stage": "answer", "status": "completed"}]
 }
 ```
+
+完整 session context、decision raw output、工具输入/原始输出、LLM 完整 prompt / output、
+audit record 和本地日志路径均不属于正常 HTTP 响应；它们只保留在本地 run log 与受控审计存储。
 
 ### 设计说明
 
@@ -547,8 +546,8 @@ response mode、耗时、usage、finish reason、provider request id、rate-limi
   `ToolResult.output`；未声明时只检查 `ToolResult` 是完整 JSON 对象形状。只有工具执行
   失败、被拒绝、输出协议不匹配或本地无法确认时，才记录 `tool_result_check` LLM 事件。
 - 长工具结果会在进入后续 LLM prompt 的 `observations` 前做通用压缩，并用
-  `_prompt_compacted=true` 标记。完整工具结果仍保留在 `tool_events`、session payload 和
-  本地 markdown run log 中。
+  `_prompt_compacted=true` 标记。完整工具结果仍保留在内部 `tool_events`、session payload 和
+  本地 markdown run log 中；正常 API 和 transport event 仅暴露摘要。
 - 每轮 decision prompt 还会包含 `completed_tool_calls`，以简洁形式列出当前 turn 已成功的
   调用和其输入。模型在已有结果覆盖请求时必须进入 `final_answer`，不得仅为增加置信度而重放
   相同工具和输入；如用户明确要求重复执行，模型必须在 operation 中显式设置
@@ -826,6 +825,19 @@ final_answer
 
 当审查模式为 `manual` 时，stream 会在 `safety_review_required` 后保持打开；
 前端应调用 `POST /agent/safety-reviews/{review_id}/decision` 提交用户决策。
+
+SSE 连接本身不是运行的所有者：短暂断开不会取消 run。客户端可以按 sequence 重连或查询
+持久化事件：
+
+```http
+GET /agent/runs/{run_id}
+GET /agent/runs/{run_id}/events?after_sequence=42
+GET /agent/runs/{run_id}/stream?after_sequence=42
+POST /agent/runs/{run_id}/cancel
+```
+
+`cancel` 记录协作式取消请求；正在执行的 provider 调用会在下一个可取消边界停止。重连的
+`llm_delta` 保持 `content_snapshot` 字段兼容性，但 SQLite 只保存 delta 并在回放时重建快照。
 
 `POST /agent/turn/stream` 默认以 `llm.response_mode=stream` 运行。所有 Agent runtime
 中的 LLM stage 都可以发送 provider token delta，包括 route、decision、decision_repair、

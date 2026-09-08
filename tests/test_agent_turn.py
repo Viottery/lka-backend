@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.api.main import create_app
-from app.api.routes.agent import run_agent_turn
+from app.api.routes.agent import run_agent_turn, run_agent_turn_endpoint
 from app.api.routes.mail import import_mail
 from app.api.routes.sessions import get_session
 from app.api.schemas import AgentTurnRequest, MailImportRequest
@@ -90,6 +90,67 @@ def test_agent_turn_can_run_through_langgraph_orchestrator(tmp_path, monkeypatch
         "verified",
         "finalized",
     }.issubset(checkpoint_phases)
+
+
+def test_agent_turn_http_response_excludes_local_prompt_context_and_tool_audit(tmp_path, monkeypatch):
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
+    get_settings.cache_clear()
+    app = create_app()
+    request = SimpleNamespace(app=app)
+
+    response = asyncio.run(
+        run_agent_turn_endpoint(
+            AgentTurnRequest(
+                session_id="session_public_agent_response",
+                user_input="PRIVATE_USER_PROMPT_SENTINEL",
+            ),
+            request,
+        )
+    )
+    payload = response.model_dump(mode="json")
+
+    assert "session_context_window" not in payload
+    assert "expanded_tools" not in payload
+    assert "decision_events" not in payload
+    assert "log_path" not in payload
+    for event in payload["llm_events"]:
+        assert "system_prompt" not in event
+        assert "user_prompt" not in event
+        assert "output" not in event
+        assert "audit_record" not in event
+    for event in payload["tool_events"]:
+        assert set(event) == {"tool_name", "selected_at", "completed_at", "status"}
+
+
+def test_langgraph_completed_run_recovers_from_result_artifact_before_final_checkpoint(
+    tmp_path, monkeypatch
+):
+    config_path = tmp_path / "local.toml"
+    config_path.write_text('[agent]\norchestrator = "langgraph"\n', encoding="utf-8")
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(config_path))
+    get_settings.cache_clear()
+    app = create_app()
+    runner = app.state.runtime.agent_turn_runner
+    assert isinstance(runner, AgentGraphRunner)
+
+    result = app.state.runtime.run_agent_turn(
+        session_id="session_completed_artifact_fallback",
+        user_input="Answer directly.",
+    )
+    run = app.state.runtime.agent_run_manager.get_run(result.run_id)
+    assert run is not None
+    assert run.result_snapshot is not None
+    assert "result_artifact_ref" in run.result_snapshot
+
+    monkeypatch.setattr(runner, "get_state", lambda _run_id: SimpleNamespace(values={}))
+    with runner._lock:
+        runner._results.clear()
+    recovered = runner.resume(result.run_id)
+
+    assert recovered.answer == result.answer
+    assert recovered.run_id == result.run_id
 
 
 def test_langgraph_checkpoint_records_failed_turn_status(tmp_path, monkeypatch):

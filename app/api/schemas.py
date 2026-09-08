@@ -4,10 +4,37 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from app.core.agent_turn import AgentTurnResult
+from app.core.agent_runs import AgentRunEvent, AgentRunRecord, AgentRunStatus
+from app.core.agent_turn import (
+    AgentTurnLLMEvent,
+    AgentTurnProgressEvent,
+    AgentTurnResult,
+    AgentTurnToolEvent,
+    AgentTurnVerificationWarning,
+)
 from app.core.context import SessionContext, TaskContext
 from app.core.events import EventRecord
 from app.core.llm import LLMResponse, LLMResponseMode
+from app.core.retrieval import RetrievalResult
+from app.core.safety import SafetyReviewDecision, SafetyReviewRecord
+from app.core.sessions import (
+    AgentSession,
+    AgentSessionDetail,
+    AgentSessionList,
+    AgentSessionMessage,
+    SessionRole,
+    SessionWorkspace,
+)
+from app.core.tools import ToolInvocation, ToolResult
+from app.core.tracing import TraceRecord
+from app.domains.knowledge import (
+    KnowledgeChunkLoadResult,
+    KnowledgeDocumentInput,
+    KnowledgeDocumentRecord,
+    KnowledgeImportResult,
+    KnowledgeSearchResult,
+    KnowledgeSemanticSyncResult,
+)
 from app.domains.mail import (
     MailAccountInput,
     MailAttachmentInput,
@@ -16,14 +43,6 @@ from app.domains.mail import (
     MailMatterList,
     MailMessageInput,
     MailSearchResult,
-)
-from app.domains.knowledge import (
-    KnowledgeChunkLoadResult,
-    KnowledgeDocumentInput,
-    KnowledgeDocumentRecord,
-    KnowledgeImportResult,
-    KnowledgeSemanticSyncResult,
-    KnowledgeSearchResult,
 )
 from app.domains.mail_knowledge import MailKnowledgeMirrorResult
 from app.domains.matters import (
@@ -39,18 +58,6 @@ from app.integrations.outlook import (
     OutlookAuthStartResult,
     OutlookSyncResult,
 )
-from app.core.retrieval import RetrievalResult
-from app.core.sessions import (
-    AgentSession,
-    AgentSessionDetail,
-    AgentSessionList,
-    AgentSessionMessage,
-    SessionRole,
-    SessionWorkspace,
-)
-from app.core.safety import SafetyReviewDecision, SafetyReviewRecord
-from app.core.tools import ToolInvocation, ToolResult
-from app.core.tracing import TraceRecord
 
 
 class HealthResponse(BaseModel):
@@ -114,8 +121,161 @@ class AgentTurnRequest(BaseModel):
     llm: AgentTurnLLMOptions | None = None
 
 
-class AgentTurnResponse(AgentTurnResult):
-    pass
+class AgentTurnLLMEventSummary(BaseModel):
+    """Public, prompt-free audit summary for one LLM invocation."""
+
+    llm_call_id: str | None = None
+    stage: str
+    client_name: str | None = None
+    provider: str
+    model: str | None = None
+    response_mode: str | None = None
+    status: str
+    started_at: str | None = None
+    completed_at: str | None = None
+    failed_at: str | None = None
+    duration_ms: int | None = None
+    attempt: int = 1
+    http_status: int | None = None
+    provider_request_id: str | None = None
+    provider_error_type: str | None = None
+    provider_error_code: str | None = None
+    error_category: str | None = None
+    is_retriable: bool | None = None
+    finish_reason: str | None = None
+    input_token_count: int | None = None
+    output_token_count: int | None = None
+    total_token_count: int | None = None
+    content_length: int | None = None
+    partial: bool = False
+
+    @classmethod
+    def from_event(cls, event: AgentTurnLLMEvent) -> AgentTurnLLMEventSummary:
+        return cls(
+            **event.model_dump(
+                include=set(cls.model_fields),
+                mode="python",
+            )
+        )
+
+
+class AgentTurnToolEventSummary(BaseModel):
+    tool_name: str
+    selected_at: str
+    completed_at: str
+    status: str | None = None
+
+    @classmethod
+    def from_event(cls, event: AgentTurnToolEvent) -> AgentTurnToolEventSummary:
+        status = event.result.get("status") if isinstance(event.result, dict) else None
+        return cls(
+            tool_name=event.tool_name,
+            selected_at=event.selected_at,
+            completed_at=event.completed_at,
+            status=status if isinstance(status, str) else None,
+        )
+
+
+class AgentTurnProgressEventSummary(BaseModel):
+    event_index: int
+    created_at: str
+    type: str
+    message: str
+    stage: str | None = None
+    tool_name: str | None = None
+    package_name: str | None = None
+    status: str | None = None
+
+    @classmethod
+    def from_event(
+        cls, event: AgentTurnProgressEvent
+    ) -> AgentTurnProgressEventSummary:
+        return cls(**event.model_dump(include=set(cls.model_fields), mode="python"))
+
+
+class AgentTurnVerificationWarningSummary(BaseModel):
+    code: str
+    message: str
+    severity: str
+
+    @classmethod
+    def from_warning(
+        cls, warning: AgentTurnVerificationWarning
+    ) -> AgentTurnVerificationWarningSummary:
+        return cls(**warning.model_dump(include=set(cls.model_fields), mode="python"))
+
+
+class AgentTurnResponse(BaseModel):
+    """Public Agent turn result.
+
+    Full prompts, session context and raw tool output are local audit data.  They
+    remain in ``AgentTurnResult`` and the local run log, but must never cross
+    the normal HTTP response boundary.
+    """
+
+    run_id: str
+    session_id: str
+    trace_id: str
+    answer: str
+    selected_package: str | None = None
+    initial_package: str | None = None
+    expanded_packages: list[str] = Field(default_factory=list)
+    used_packages: list[str] = Field(default_factory=list)
+    active_package: str | None = None
+    tool_events: list[AgentTurnToolEventSummary] = Field(default_factory=list)
+    progress_events: list[AgentTurnProgressEventSummary] = Field(default_factory=list)
+    verification_warnings: list[AgentTurnVerificationWarningSummary] = Field(default_factory=list)
+    llm_events: list[AgentTurnLLMEventSummary] = Field(default_factory=list)
+
+    @classmethod
+    def from_result(cls, result: AgentTurnResult) -> AgentTurnResponse:
+        return cls(
+            run_id=result.run_id,
+            session_id=result.session_id,
+            trace_id=result.trace_id,
+            answer=result.answer,
+            selected_package=result.selected_package,
+            initial_package=result.initial_package,
+            expanded_packages=result.expanded_packages,
+            used_packages=result.used_packages,
+            active_package=result.active_package,
+            tool_events=[AgentTurnToolEventSummary.from_event(event) for event in result.tool_events],
+            progress_events=[
+                AgentTurnProgressEventSummary.from_event(event)
+                for event in result.progress_events
+            ],
+            verification_warnings=[
+                AgentTurnVerificationWarningSummary.from_warning(warning)
+                for warning in result.verification_warnings
+            ],
+            llm_events=[AgentTurnLLMEventSummary.from_event(event) for event in result.llm_events],
+        )
+
+
+class AgentRunResponse(BaseModel):
+    run_id: str
+    session_id: str
+    trace_id: str
+    parent_run_id: str | None = None
+    status: AgentRunStatus
+    created_at: str
+    started_at: str | None = None
+    completed_at: str | None = None
+    failed_at: str | None = None
+    cancelled_at: str | None = None
+    waiting_since: str | None = None
+    error_type: str | None = None
+    error: str | None = None
+    result_snapshot: dict[str, Any] | None = None
+
+    @classmethod
+    def from_record(cls, record: AgentRunRecord) -> AgentRunResponse:
+        return cls(**record.model_dump(include=set(cls.model_fields), mode="python"))
+
+
+class AgentRunEventsResponse(BaseModel):
+    run_id: str
+    events: list[AgentRunEvent] = Field(default_factory=list)
 
 
 class SafetyReviewResponse(SafetyReviewRecord):
@@ -275,10 +435,10 @@ class MatterLinkSourceRequest(MatterSourceLinkInput):
 
 
 __all__ = [
+    "KnowledgeDocumentInput",
     "MailAccountInput",
     "MailAttachmentInput",
     "MailMessageInput",
-    "KnowledgeDocumentInput",
     "MatterCreateInput",
     "MatterSourceLinkInput",
     "MatterUpdateInput",

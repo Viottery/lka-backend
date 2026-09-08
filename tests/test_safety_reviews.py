@@ -155,6 +155,16 @@ def test_langgraph_manual_review_api_resumes_waiting_run(tmp_path, monkeypatch):
 
         [review] = runtime.agent_run_manager.list_safety_reviews(run.run_id)
         assert review.status.value == "pending"
+        runner = runtime.agent_turn_runner
+        state = runner.get_state(run.run_id)
+        runtime_data = runtime.agent_run_store.load_artifact(
+            state.values["runtime_artifact_ref"]["artifact_id"]
+        )
+        assert runtime_data is not None
+        assert any(
+            event["type"] == "safety_review" and event["status"] == "required"
+            for event in runtime_data["progress_events"]
+        )
         decided = await decide_agent_safety_review(
             review.review_id,
             SafetyReviewDecisionRequest(
