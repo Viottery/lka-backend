@@ -1,3 +1,4 @@
+from app.api.schemas import AgentRunResponse
 from app.core.agent_runs import AgentRunStatus, InMemoryAgentRunManager
 from app.core.agent_storage import SqliteAgentRunStore
 from app.core.agent_tool_graph import AgentToolLifecycleGraph
@@ -66,6 +67,44 @@ def test_agent_run_manager_records_failure_and_cancel_request():
     assert failed.status == AgentRunStatus.FAILED
     assert failed.error_type == "RuntimeError"
     assert failed.error == "boom"
+
+
+def test_agent_run_manager_cancel_run_immediately_sets_terminal_status():
+    manager = InMemoryAgentRunManager()
+    run = manager.create_run(
+        session_id="session_cancel_terminal",
+        user_input="cancel terminal run",
+        trace_id="trace_cancel_terminal",
+    )
+
+    cancelled = manager.cancel_run(run.run_id, reason="user cancelled")
+
+    assert cancelled.status == AgentRunStatus.CANCELLED
+    assert manager.is_cancel_requested(run.run_id) is True
+    assert [event.type for event in manager.list_events(run.run_id)] == [
+        "run_cancel_requested",
+        "run_cancelled",
+    ]
+
+
+def test_public_agent_run_response_hides_internal_result_snapshot():
+    manager = InMemoryAgentRunManager()
+    run = manager.create_run(
+        session_id="session_public_run", user_input="public run", trace_id="trace_public_run"
+    )
+    manager.complete_run(
+        run.run_id,
+        result_snapshot={
+            "answer": "done",
+            "result_artifact_ref": {"artifact_id": "internal_artifact"},
+        },
+    )
+
+    response = AgentRunResponse.from_record(manager.get_run(run.run_id))
+
+    assert response.has_result is True
+    assert "result_snapshot" not in response.model_dump()
+    assert "internal_artifact" not in response.model_dump_json()
 
 
 def test_manual_safety_review_pauses_run_before_review_is_visible():

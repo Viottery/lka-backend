@@ -3574,14 +3574,7 @@ class AgentTurnLoop:
         run_id = _turn_run_id.get()
         if run_manager is None or run_id is None:
             return
-        run_manager.append_event(
-            run_id,
-            "run_cancelled",
-            reason or "Agent run cancelled.",
-            stage="run",
-            payload={"reason": reason},
-        )
-        run_manager.mark_cancelled(run_id, reason=reason)
+        run_manager.cancel_run(run_id, reason=reason)
 
     def _raise_if_cancel_requested(self) -> None:
         run_manager = _turn_run_manager.get()

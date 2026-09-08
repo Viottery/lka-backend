@@ -266,11 +266,12 @@ class AgentRunResponse(BaseModel):
     waiting_since: str | None = None
     error_type: str | None = None
     error: str | None = None
-    result_snapshot: dict[str, Any] | None = None
+    has_result: bool = False
 
     @classmethod
     def from_record(cls, record: AgentRunRecord) -> AgentRunResponse:
-        return cls(**record.model_dump(include=set(cls.model_fields), mode="python"))
+        payload = record.model_dump(include=set(cls.model_fields) - {"has_result"}, mode="python")
+        return cls(**payload, has_result=record.result_snapshot is not None)
 
 
 class AgentRunEventsResponse(BaseModel):

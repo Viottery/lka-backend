@@ -128,7 +128,9 @@ GET  /agent/runs/{run_id}/stream?after_sequence=N
 POST /agent/runs/{run_id}/cancel
 ```
 
-`cancel` 是 durable cooperative cancellation request；节点边界会检查并停止后续 LLM/tool 操作。
+`cancel` 会立即发布 cancelled run 状态并写入 durable cancellation request；节点边界会检查并停止
+后续 LLM/tool/finalize 操作。已经进入 provider 的请求无法保证被强制中止，但其迟到结果不会让
+run 回到 completed。
 manual review 的审批 API 仅在 review 从 `pending` 首次转换到 `approved/rejected` 时调度 resume。
 
 ### 3.6 API 隐私边界与 delta 存储
@@ -192,6 +194,31 @@ git diff --check
 ```
 
 结果：178 个测试通过；ruff、py_compile 和 `git diff --check` 通过。
+
+## 6.1 本地部署测试配置
+
+默认 orchestrator 继续保持 `legacy`，这是兼容发布策略，不表示 LangGraph 未完成。进行本地
+部署测试时，在未提交的 `config/local.toml` 中显式启用：
+
+```toml
+[agent]
+orchestrator = "langgraph"
+checkpoint_backend = "sqlite"
+max_decision_steps = 10
+```
+
+首轮验收应至少覆盖：
+
+1. 无工具回答、只读工具、跨 package 工具和写工具 manual review；
+2. 浏览器/SSE 断连后按 `run_id` 和 `after_sequence` 重连；
+3. `POST /agent/runs/{run_id}/cancel` 在 route、decision、answer 前取消，以及 provider
+   调用期间取消后的终态保持；
+4. 重启后恢复 waiting manual review、incomplete checkpoint 和 completed result artifact；
+5. 检查 `/agent/turn`、run status、event query 不含完整 prompt、session context、原始 tool
+   result 或 artifact reference。
+
+当前代码已满足进入上述**受控本地部署测试**的条件；是否将默认 orchestrator 从 `legacy`
+切换为 `langgraph` 应在该验收完成后作为单独发布决策处理。
 
 ## 7. Git 记录
 

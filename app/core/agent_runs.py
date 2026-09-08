@@ -273,6 +273,30 @@ class InMemoryAgentRunManager:
             error=reason,
         )
 
+    def cancel_run(self, run_id: str, reason: str | None = None) -> AgentRunRecord:
+        """Durably terminate a run while an in-flight provider call winds down."""
+
+        with self._lock:
+            current = self._runs.get(run_id)
+            if current is None:
+                raise KeyError(f"Agent run not found: {run_id}")
+            if current.status in {
+                AgentRunStatus.COMPLETED,
+                AgentRunStatus.FAILED,
+                AgentRunStatus.CANCELLED,
+            }:
+                return current
+            self.request_cancel(run_id, reason)
+            if not any(event.type == "run_cancelled" for event in self._events[run_id]):
+                self.append_event(
+                    run_id,
+                    "run_cancelled",
+                    reason or "Agent run cancelled.",
+                    stage="run",
+                    payload={"reason": reason},
+                )
+            return self.mark_cancelled(run_id, reason)
+
     def complete_run(
         self,
         run_id: str,
@@ -356,8 +380,14 @@ class InMemoryAgentRunManager:
         with self._lock:
             if run_id not in self._runs:
                 raise KeyError(f"Agent run not found: {run_id}")
-            self._cancel_requests[run_id] = reason
             current = self._runs[run_id]
+            if current.status in {
+                AgentRunStatus.COMPLETED,
+                AgentRunStatus.FAILED,
+                AgentRunStatus.CANCELLED,
+            } or run_id in self._cancel_requests:
+                return
+            self._cancel_requests[run_id] = reason
             metadata = dict(current.metadata)
             metadata.update(
                 {

@@ -294,6 +294,7 @@ def test_agent_turn_stream_reconnects_from_sequence_and_cancel_is_explicit(tmp_p
     )
     cancelled = _run_async(cancel_agent_run(queued.run_id, request))
     assert cancelled.run_id == queued.run_id
+    assert cancelled.status == "cancelled"
     assert app.state.runtime.agent_run_manager.is_cancel_requested(queued.run_id) is True
 
 

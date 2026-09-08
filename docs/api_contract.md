@@ -836,8 +836,10 @@ GET /agent/runs/{run_id}/stream?after_sequence=42
 POST /agent/runs/{run_id}/cancel
 ```
 
-`cancel` 记录协作式取消请求；正在执行的 provider 调用会在下一个可取消边界停止。重连的
-`llm_delta` 保持 `content_snapshot` 字段兼容性，但 SQLite 只保存 delta 并在回放时重建快照。
+`cancel` 会立即把 run 标记为 `cancelled` 并记录 durable cancellation request；正在执行的
+provider 调用无法保证被强制中止，但其后续 graph node、工具和 finalize 副作用会在下一个节点
+边界被阻止。重连的 `llm_delta` 保持 `content_snapshot` 字段兼容性，但 SQLite 只保存 delta 并在
+回放时重建快照。
 
 `POST /agent/turn/stream` 默认以 `llm.response_mode=stream` 运行。所有 Agent runtime
 中的 LLM stage 都可以发送 provider token delta，包括 route、decision、decision_repair、

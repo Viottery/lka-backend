@@ -352,6 +352,7 @@ class AgentGraphRunner:
             _turn_llm_client_name.reset(tokens[0])
 
     def _initialize_run(self, s: AgentGraphState) -> AgentGraphState:
+        self.turn_loop._raise_if_cancel_requested()
         run = self._run(s["run_id"])
         if run.status.value == "queued":
             self.turn_loop.run_manager.mark_running(run.run_id)
@@ -373,6 +374,7 @@ class AgentGraphRunner:
         }
 
     def _prepare_context(self, s: AgentGraphState) -> AgentGraphState:
+        self.turn_loop._raise_if_cancel_requested()
         run = self._run(s["run_id"])
         session = self.turn_loop.session_service.ensure_session(
             session_id=run.session_id,
@@ -427,6 +429,7 @@ class AgentGraphRunner:
         }
 
     def _route_package(self, s: AgentGraphState) -> AgentGraphState:
+        self.turn_loop._raise_if_cancel_requested()
         ws, data = self._data(s)
         llm = self._models(data["llm_events"], AgentTurnLLMEvent)
         decisions = self._models(data["decision_events"], AgentTurnDecisionEvent)
@@ -458,6 +461,7 @@ class AgentGraphRunner:
         return self._save(s, ws, data, "routed")
 
     def _expand_package(self, s: AgentGraphState) -> AgentGraphState:
+        self.turn_loop._raise_if_cancel_requested()
         ws, data = self._data(s)
         requested_package = ws.pending_decision.get("package_name")
         package = requested_package or ws.initial_package
@@ -516,6 +520,7 @@ class AgentGraphRunner:
         return self._save(s, ws, data, "package_expanded")
 
     def _decide(self, s: AgentGraphState) -> AgentGraphState:
+        self.turn_loop._raise_if_cancel_requested()
         ws, data = self._data(s)
         if ws.step_index >= self.turn_loop.max_decision_steps:
             ws.terminal_reason = "Step limit reached after loading evidence."
@@ -553,7 +558,7 @@ class AgentGraphRunner:
             else None,
             operation=x.get("operation") if isinstance(x.get("operation"), dict) else {},
             raw_output=x.get("_raw_output") if isinstance(x.get("_raw_output"), str) else None,
-            step_index=ws.step_index + 1,
+            step_index=ws.step_index,
         )
         data["decision_events"] = self._dump(events)
         assistant_message = x.get("assistant_message")
@@ -569,12 +574,13 @@ class AgentGraphRunner:
                     x.get("package_name") if isinstance(x.get("package_name"), str) else None
                 ),
                 message=self.turn_loop._short_text(assistant_message),
-                metadata={"action": x.get("action"), "step_index": ws.step_index + 1},
+                metadata={"action": x.get("action"), "step_index": ws.step_index},
             )
             data["progress_events"] = self._dump(progress)
         return self._save(s, ws, data, "decision_made")
 
     def _validate(self, s: AgentGraphState) -> AgentGraphState:
+        self.turn_loop._raise_if_cancel_requested()
         ws, data = self._data(s)
         x = ws.pending_decision
         action = str(x.get("action") or "")
@@ -622,6 +628,7 @@ class AgentGraphRunner:
         return self._save(s, ws, data, "operation_valid")
 
     def _safety(self, s: AgentGraphState) -> AgentGraphState:
+        self.turn_loop._raise_if_cancel_requested()
         ws, data = self._data(s)
         name = ws.pending_tool_name
         tool_input = dict(ws.pending_tool_input)
@@ -664,6 +671,7 @@ class AgentGraphRunner:
     def _manual_review_interrupt(self, s: AgentGraphState) -> AgentGraphState:
         """Pause only after the review and its initial progress are checkpointed."""
 
+        self.turn_loop._raise_if_cancel_requested()
         ws = self._ws(s)
         review_id = ws.pending_review_id
         if not review_id:
@@ -678,6 +686,7 @@ class AgentGraphRunner:
         return {"phase": "review_resumed"}
 
     def _execute(self, s: AgentGraphState) -> AgentGraphState:
+        self.turn_loop._raise_if_cancel_requested()
         ws, data = self._data(s)
         name = ws.pending_tool_name
         if not name:
@@ -704,6 +713,7 @@ class AgentGraphRunner:
         return self._save(s, ws, data, "tool_executed")
 
     def _observe(self, s: AgentGraphState) -> AgentGraphState:
+        self.turn_loop._raise_if_cancel_requested()
         ws, data = self._data(s)
         x = ws.pending_decision
         name = ws.pending_tool_name
@@ -748,6 +758,7 @@ class AgentGraphRunner:
         return self._save(s, ws, data, "observation_ready")
 
     def _answer(self, s: AgentGraphState) -> AgentGraphState:
+        self.turn_loop._raise_if_cancel_requested()
         ws, data = self._data(s)
         llm = self._models(data["llm_events"], AgentTurnLLMEvent)
         answer = (
@@ -785,6 +796,7 @@ class AgentGraphRunner:
         return self._save(s, ws, data, "answered")
 
     def _verify(self, s: AgentGraphState) -> AgentGraphState:
+        self.turn_loop._raise_if_cancel_requested()
         ws, data = self._data(s)
         warnings = self.turn_loop._verify_final_answer(
             answer=ws.terminal_answer or "",
@@ -805,6 +817,7 @@ class AgentGraphRunner:
         return self._save(s, ws, data, "verified")
 
     def _finalize(self, s: AgentGraphState) -> AgentGraphState:
+        self.turn_loop._raise_if_cancel_requested()
         ws, data = self._data(s)
         answer = ws.terminal_answer or ""
         updated = self.turn_loop.session_service.record_context_exchange(

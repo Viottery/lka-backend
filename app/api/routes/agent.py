@@ -140,7 +140,7 @@ async def cancel_agent_run(run_id: str, request: Request) -> AgentRunResponse:
         AgentRunStatus.FAILED,
         AgentRunStatus.CANCELLED,
     }:
-        run_manager.request_cancel(run_id, reason="api_cancelled")
+        run_manager.cancel_run(run_id, reason="api_cancelled")
     return AgentRunResponse.from_record(run_manager.get_run(run_id) or run)
 
 

@@ -13,6 +13,7 @@ from app.api.routes.mail import import_mail
 from app.api.routes.sessions import get_session
 from app.api.schemas import AgentTurnRequest, MailImportRequest
 from app.core.agent_graph import AgentGraphRunner
+from app.core.agent_runs import AgentRunCancelled
 from app.core.agent_turn import LLM_OBSERVATION_MAX_TOTAL_CHARS
 from app.core.config import get_settings
 from app.core.llm import LLMRateLimitError, LLMResponse, LLMResponseMode, LLMStreamEvent
@@ -151,6 +152,59 @@ def test_langgraph_completed_run_recovers_from_result_artifact_before_final_chec
 
     assert recovered.answer == result.answer
     assert recovered.run_id == result.run_id
+
+
+def test_langgraph_cancelled_run_stops_before_context_or_llm(tmp_path, monkeypatch):
+    config_path = tmp_path / "local.toml"
+    config_path.write_text('[agent]\norchestrator = "langgraph"\n', encoding="utf-8")
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(config_path))
+    get_settings.cache_clear()
+    app = create_app()
+    run = app.state.runtime.create_agent_run(
+        session_id="session_cancelled_graph", user_input="do not start"
+    )
+    app.state.runtime.agent_run_manager.cancel_run(run.run_id, reason="test cancellation")
+
+    with pytest.raises(AgentRunCancelled, match="test cancellation"):
+        app.state.runtime.run_agent_turn(
+            session_id=run.session_id,
+            user_input=run.user_input,
+            existing_run_id=run.run_id,
+        )
+
+    cancelled = app.state.runtime.agent_run_manager.get_run(run.run_id)
+    assert cancelled is not None
+    assert cancelled.status.value == "cancelled"
+    assert app.state.runtime.session_service.get_session(session_id=run.session_id).messages == []
+
+
+def test_langgraph_decision_event_step_matches_working_set_step(tmp_path, monkeypatch):
+    config_path = tmp_path / "local.toml"
+    config_path.write_text('[agent]\norchestrator = "langgraph"\n', encoding="utf-8")
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(config_path))
+    get_settings.cache_clear()
+    app = create_app()
+    loop = app.state.runtime.agent_turn_loop
+    monkeypatch.setattr(
+        loop,
+        "_route",
+        lambda **_kwargs: {"selected_package": "mail", "reason": "test route"},
+    )
+    monkeypatch.setattr(
+        loop,
+        "_decide_next_action",
+        lambda **_kwargs: {"action": "final_answer", "reason": "test completion"},
+    )
+
+    result = app.state.runtime.run_agent_turn(
+        session_id="session_step_alignment", user_input="finish directly"
+    )
+
+    assert result.decision_events[-1].step_index == 1
+    snapshot = app.state.runtime.agent_turn_runner.get_state(result.run_id)
+    assert snapshot.values["working_set"]["step_index"] == 1
 
 
 def test_langgraph_checkpoint_records_failed_turn_status(tmp_path, monkeypatch):
