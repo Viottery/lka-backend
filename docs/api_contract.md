@@ -277,10 +277,12 @@ GET /knowledge/search?q=红石&limit=10&source_type=local_document&mode=hybrid
   "requested_mode": "hybrid",
   "applied_mode": "hybrid",
   "retrieval_warning": null,
+  "rerank_applied": false,
   "results": [
     {
       "chunk_id": "knowledge_chunk_xxx",
       "document_id": "knowledge_doc_xxx",
+      "source_id": "knowledge_source_xxx",
       "title": "Minecraft Wiki",
       "source_type": "local_document",
       "uri": "data/knowledge_samples/zh.minecraft.wiki_w_Minecraft_Wiki.md",
@@ -292,6 +294,7 @@ GET /knowledge/search?q=红石&limit=10&source_type=local_document&mode=hybrid
       "policy_decision": "allowed",
       "retrieval_channels": ["keyword", "semantic"],
       "retrieval_score": 0.0328,
+      "rerank_score": null,
       "untrusted_data": true
     }
   ],
@@ -302,6 +305,9 @@ GET /knowledge/search?q=红石&limit=10&source_type=local_document&mode=hybrid
 `mode` 可选值为 `keyword`、`semantic` 和 `hybrid`。后端通过可替换的 retrieval
 接口选择实现；当语义索引尚未同步时，`semantic` / `hybrid` 会保守回退到关键词检索，并在
 `retrieval_warning` 中明确返回原因。
+当前默认配置采用 `keyword`；只有经本地数据集验证的模型与索引准备就绪后，
+才建议把默认值切换到 `hybrid`。`rerank_applied`、`rerank_score` 与
+`retrieval_warning` 是兼容扩展；本地重排未启用或不可用时保持融合排序。
 
 ### 4.3 Rebuild Mail Knowledge Mirror
 
@@ -387,8 +393,11 @@ privacy-filtered 的文本视图。
 
 ### 设计说明
 
-- `knowledge.search`、`knowledge.load_chunks`、`knowledge.load_document` 都是 Agent 可见
+- `knowledge.list_sources`、`knowledge.search`、`knowledge.load_chunks`、
+  `knowledge.load_document` 都是 Agent 可见
   只读工具。
+- `knowledge.list_sources` 返回当前 Agent scope 中可见的来源 id、类型、名称和文档数；
+  `knowledge.search` 可选 `source_ids`，与子 Agent 服务端授权范围取交集。
 - `knowledge.search` 只返回 Top-K 最小片段，不返回整篇文档。
 - 关键词、语义和 hybrid 融合策略不是 Agent core 或工具协议中的硬编码；它们由本地
   retrieval implementation 和配置决定。
@@ -465,6 +474,8 @@ POST /agent/turn
 `llm` 是可选字段；不传时使用会话 / 配置默认值。`model` 是运行时可切换选项，不应由
 后端代码写死。`/agent/turn` 返回用户可见结果和脱敏审计摘要；`POST /agent/turn/stream`
 提供用户可见的 SSE token-delta 输出。
+请求可选带 `safety_review_mode`（`skip`、`llm`、`manual`）。后端取请求与本地配置中
+更严格的模式，因此前端可以提高审查级别，但不能绕过后端配置；省略时使用本地配置。
 每次 LLM 调用都会在响应的 `llm_events` 中带上 `llm_call_id`、provider / model、
 response mode、耗时、usage、finish reason、provider request id、rate-limit headers、
 错误分类和 retry 判断等审计字段。完整 prompt / output 仍只写入本地 markdown run log；
@@ -834,12 +845,21 @@ GET /agent/runs/{run_id}
 GET /agent/runs/{run_id}/events?after_sequence=42
 GET /agent/runs/{run_id}/stream?after_sequence=42
 POST /agent/runs/{run_id}/cancel
+POST /agent/runs/{run_id}/resume
 ```
 
 `cancel` 会立即把 run 标记为 `cancelled` 并记录 durable cancellation request；正在执行的
 provider 调用无法保证被强制中止，但其后续 graph node、工具和 finalize 副作用会在下一个节点
 边界被阻止。重连的 `llm_delta` 保持 `content_snapshot` 字段兼容性，但 SQLite 只保存 delta 并在
-回放时重建快照。
+回放时重建快照。完成前会先 flush token delta，之后才发布 `run_completed`。
+
+服务重启后，处于 `running` 状态且保留 LangGraph SQLite checkpoint 的 run 可由
+`POST /agent/runs/{run_id}/resume` 显式恢复。`waiting_confirmation` run 必须继续通过对应的
+safety-review decision 恢复；终态 run 和 legacy orchestrator run 返回 `409`。同一进程内的重复
+resume 请求会合并为同一个恢复任务。
+
+安全审查 API 与 SSE 的 `safety_review_*` 事件只返回公开摘要（review ID、工具、风险、状态、
+理由及时间）。原始 `tool_input` 和审查 LLM 输出属于本地审计材料，不会进入普通 HTTP/SSE 响应。
 
 `POST /agent/turn/stream` 默认以 `llm.response_mode=stream` 运行。所有 Agent runtime
 中的 LLM stage 都可以发送 provider token delta，包括 route、decision、decision_repair、
@@ -1294,3 +1314,99 @@ POST /mail/outlook/sync
 - 当前后端实现是轻量骨架，因此部分返回值是规则化输出而非真实 agent 结果。
 - 这份契约保留了未来完整系统需要的字段，便于逐步替换实现。
 - 如果某个字段暂时未被使用，应优先保留而不是删除，避免前后端接口反复抖动。
+
+## 19. Multi-Agent Run Snapshot And Controls
+
+### Enablement
+
+Multi-Agent planning is opt-in. Copy `config/local.example.toml` to
+`config/local.toml` and set:
+
+```toml
+[agent]
+orchestrator = "langgraph"
+checkpoint_backend = "sqlite"
+multi_agent_planning_enabled = true
+
+[safety]
+tool_review_mode = "manual"
+```
+
+Restart the backend after changing local configuration. `orchestrator = "langgraph"`
+is required when Multi-Agent planning is enabled. Use `tool_review_mode = "manual"`
+to queue non-read-only tool calls for user approval; `skip` and `llm` are alternative
+review policies, not substitutes for the execution-time Tool Executor checks.
+
+```http
+GET /agent/runs/{run_id}/snapshot
+```
+
+读取 parent run 的多 Agent 只读快照。计划存在时，服务端会重新校验并返回 Plan；计划尚未
+创建时，`plan` 为 `null`。`children` 递归列出 child run 的 ID、step / attempt、run 状态、计划
+step 状态和已持久化的 TaskResult 摘要。结果可包含 artifact ID 和 EvidenceRef；不会返回完整
+artifact 内容、Agent metadata、ContextSnapshot 或上下文 prompt。
+
+```http
+GET /agent/runs/{parent_run_id}/stream?after_sequence=42
+```
+
+沿用 parent run 的持久化事件流，包含 scheduler 写入 parent event log 的 `subtask_created`、
+`subtask_started`、`subtask_waiting_confirmation`、`subtask_retry_scheduled`、
+`subtask_completed`、`subtask_failed` 和 plan progress 事件。`after_sequence` 是 parent run
+自身的事件游标，SSE `id` 使用 `{parent_run_id}:{sequence}`；断线后用最后收到的 sequence 重连。
+此流提供 scheduler 进度，不合并 child 内部完整的 LLM 或工具事件；需要查看某个 child 的事件时，
+使用对应的 `/agent/runs/{child_run_id}/events` 或 `/stream`。
+
+```http
+POST /agent/runs/{parent_run_id}/children/{child_run_id}/cancel
+```
+
+只取消由该 parent 直接拥有且仍处于 queued、running、waiting_confirmation 或 waiting_user 状态的 child；所有权由
+scheduler 再次校验。取消后 scheduler 会恢复 parent 编排，以记录取消结果并处理依赖步骤。其他 parent
+的 child、未知 child 或不匹配的 parent 返回 `404` / `409`。
+
+```http
+POST /agent/runs/{parent_run_id}/children/{child_run_id}/retry
+```
+
+手动重试 parent 直接拥有的最新失败或超时 child attempt。scheduler 校验 parent/child
+归属、attempt 是否最新、step 是否处于失败状态，以及是否已有该 step 的活动 attempt；无效状态
+返回 `409`，不匹配或不存在的 child 返回 `404`。重试完成后响应 parent 的只读 run snapshot，
+并继续 parent scheduler。对同一旧 attempt 重复请求不会再次创建 attempt；scheduler 会按当前
+child/plan 状态拒绝不再有效的重试请求。
+
+```http
+POST /agent/runs/{child_run_id}/resume
+```
+
+沿用通用 run 恢复接口，仅恢复有 LangGraph checkpoint 且状态为 `running` 的 run。等待安全审批的
+child 必须先通过 safety-review 队列决定；决定后系统恢复该 child，并在其终态时继续 parent scheduler。
+child 恢复与 scheduler 使用同一个 runtime graph runner 和 per-run execution lease；若 child 正被
+scheduler 执行，checkpoint 恢复会等待该执行结束，不会并行重放同一 child graph。相同 run 的 HTTP
+resume 请求在同一进程内也会合并。该 lease 是进程内同步，不提供多 worker / 多进程互斥。
+可重试的 child failure 由 scheduler 按本地 `max_retries` 配置自动重试；
+自动重试耗尽后，可使用上面的手动重试 endpoint 重跑最新失败 attempt；不可重试或仍失败的 step
+留在失败状态，需后续由 Planner 重新规划。
+
+```http
+POST /agent/runs/{run_id}/continue
+Content-Type: application/json
+
+{
+  "command_id": "client-generated-idempotency-key",
+  "answer": "Use the last quarter."
+}
+```
+
+只接受 `waiting_user` 状态的非终态 run 和非空回答。成功后响应包含 `run_id`、`command_id`、
+`question_id`、当前状态、`replayed` 与 `resume_scheduled`；不会回显回答。回答与 command ID 保存在
+本地 SQLite continuation journal，run metadata 只保留 command ID 引用；`multi_agent_user_answer_received`
+事件不包含回答。重复提交相同 command ID 和相同回答幂等；同一 ID 配不同回答返回 `409`。不同 ID 在
+同一问题已被回答后也返回 `409`。回答不进入 Safety Review 队列。
+
+`GET /agent/runs/{run_id}` 和 `/snapshot` 在 run 处于 `waiting_user` 时会返回 allowlisted
+`pending_user_question`（question ID、patch ID、面向用户的问题和时间），不会返回 metadata 或回答。
+若 runtime continuation hook 尚未接入，回答仍会原子保存并将 run 置为 `running`，但响应明确给出
+`resume_scheduled: false`；这不代表 graph 已恢复。相同命令重放可在 hook 可用后重新调度。
+
+取消与超时在 scheduler / 工具检查边界生效；已经进入的同步写工具不能被强制终止，可能完成当前副作用后才观察到取消。

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from app.core.llm.audit import LLMCallRecord
 from app.core.llm.client import AsyncLLMClient, LLMClient, TextLLMClient
 from app.core.llm.errors import (
     LLMAuthenticationError,
@@ -16,6 +17,7 @@ from app.core.llm.errors import (
 from app.core.llm.mock import MockLLMClient
 from app.core.llm.models import (
     LLMMessage,
+    LLMReasoningEffort,
     LLMRequest,
     LLMResponse,
     LLMResponseMode,
@@ -23,7 +25,6 @@ from app.core.llm.models import (
     LLMToolCall,
     LLMToolDefinition,
 )
-from app.core.llm.audit import LLMCallRecord
 from app.core.llm.registry import LLMClientRegistry, build_llm_registry
 from app.core.llm.service import LLMService
 from app.core.local_config import LLMProviderConfig
@@ -54,6 +55,7 @@ __all__ = [
     "LLMClientRegistry",
     "LLMCallRecord",
     "LLMMessage",
+    "LLMReasoningEffort",
     "LLMNetworkError",
     "LLMProviderHTTPError",
     "LLMProviderStreamError",

@@ -298,7 +298,8 @@ POST /agent/turn
 
 启动同步行为由 `config/local.toml` 中 Outlook 配置控制：
 
-- `enabled`
+- `enabled`：Outlook 同步总开关；关闭后 startup、background、HTTP API 和 `mail.sync`
+  均不会访问远程 Outlook provider。
 - `startup_sync_enabled`
 - `background_sync_enabled`
 - `sync_interval_seconds`

@@ -1,0 +1,16 @@
+{
+  "dataset_sha256": "d7f99b9d8e7427c58fae1f092f01711a144b70fb6d7f43344030a5165575331f",
+  "sample_seed": 20260929,
+  "sample_limit": 100,
+  "top_k": 10,
+  "cases": [
+    {"query_id": "multihoprag_0069", "category": "annotation_review", "status": "needs_manual_review", "focus_document_ids": ["multihoprag_doc_74b85c3b91ec"]},
+    {"query_id": "multihoprag_0150", "category": "fusion_cutoff", "status": "observed", "focus_document_ids": ["multihoprag_doc_0663c4a3bc8a"]},
+    {"query_id": "multihoprag_0318", "category": "rewrite_length_gate", "status": "observed", "focus_document_ids": []},
+    {"query_id": "multihoprag_0360", "category": "entity_split", "status": "observed", "focus_document_ids": []},
+    {"query_id": "multihoprag_0374", "category": "rewrite_length_gate", "status": "observed", "focus_document_ids": []},
+    {"query_id": "multihoprag_0417", "category": "annotation_review", "status": "needs_manual_review", "focus_document_ids": ["multihoprag_doc_fb361f1af19c", "multihoprag_doc_3f2f9bd81464"]},
+    {"query_id": "multihoprag_0432", "category": "candidate_miss", "status": "observed", "focus_document_ids": ["multihoprag_doc_c4a5a36992ca", "multihoprag_doc_ba272f4666af"]},
+    {"query_id": "multihoprag_0474", "category": "annotation_review", "status": "needs_manual_review", "focus_document_ids": ["multihoprag_doc_a868252b79c4"]}
+  ]
+}

@@ -49,6 +49,9 @@ class SearchMailTool:
         requires_confirmation=False,
         read_only=True,
         side_effects=["read_local_db"],
+        scope_uses_sources=True,
+        scope_uses_accounts=True,
+        scope_filtering_required=True,
         input_schema={
             "type": "object",
             "required": ["query"],
@@ -87,12 +90,24 @@ class SearchMailTool:
     )
 
     def invoke(self, *, invocation: ToolInvocation, context: ToolContext) -> ToolResult:
+        scope = context.tool_view
+        if scope is not None and scope.child_run_id is not None and (
+            not scope.allowed_source_ids or not scope.allowed_account_ids
+        ):
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=self.spec.name,
+                status="rejected",
+                error="Child mail search requires explicit source and account grants.",
+            )
         result = self.mail_knowledge_mirror.search(
             query=str(invocation.input.get("query") or ""),
             limit=int(invocation.input.get("limit") or 10),
             mode=str(invocation.input.get("mode") or "") or None,
             order_by=str(invocation.input.get("order_by") or "relevance"),
             max_snippet_chars=int(invocation.input.get("max_snippet_chars") or 420),
+            source_ids=list(scope.allowed_source_ids) if scope and scope.allowed_source_ids else None,
+            account_ids=list(scope.allowed_account_ids) if scope and scope.allowed_account_ids else None,
         )
         return ToolResult(
             invocation_id=invocation.invocation_id,
@@ -119,6 +134,9 @@ class LoadMailMessagesTool:
         requires_confirmation=False,
         read_only=True,
         side_effects=["read_local_db"],
+        scope_uses_sources=True,
+        scope_uses_accounts=True,
+        scope_filtering_required=True,
         input_schema={
             "type": "object",
             "required": ["message_ids"],
@@ -140,9 +158,28 @@ class LoadMailMessagesTool:
     )
 
     def invoke(self, *, invocation: ToolInvocation, context: ToolContext) -> ToolResult:
+        scope = context.tool_view
+        if scope is not None and scope.child_run_id is not None and (
+            not scope.allowed_source_ids or not scope.allowed_account_ids
+        ):
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=self.spec.name,
+                status="rejected",
+                error="Child mail loading requires explicit source and account grants.",
+            )
         message_ids = [str(message_id) for message_id in invocation.input.get("message_ids", [])][:3]
         max_chars = int(invocation.input.get("max_chars_per_message") or 12000)
-        messages = self.mail_service.load_messages(message_ids)
+        messages = self.mail_service.load_messages(
+            message_ids,
+            account_ids=list(scope.allowed_account_ids) if scope and scope.allowed_account_ids else None,
+        )
+        if scope is not None and scope.child_run_id is not None:
+            permitted_sources = set(scope.allowed_source_ids)
+            messages = [
+                message for message in messages
+                if MailKnowledgeMirror.source_id_for_account(message.account_id) in permitted_sources
+            ]
         output_messages = []
         for message in messages:
             payload = message.model_dump(mode="json")
@@ -171,6 +208,7 @@ class PersistMailMattersTool:
         requires_confirmation=False,
         read_only=False,
         side_effects=["write_local_db"],
+        scope_uses_accounts=True,
         input_schema={
             "type": "object",
             "required": ["drafts"],
@@ -218,6 +256,7 @@ class SyncMailTool:
         requires_confirmation=False,
         read_only=False,
         side_effects=["read_remote_mail", "write_local_db"],
+        scope_uses_accounts=True,
         input_schema={
             "type": "object",
             "properties": {

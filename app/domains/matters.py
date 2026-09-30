@@ -11,6 +11,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from app.domains.mail_knowledge import MailKnowledgeMirror
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -99,7 +101,18 @@ class MatterService:
     def __init__(self, conn_factory: Callable[[], sqlite3.Connection]) -> None:
         self._conn_factory = conn_factory
 
-    def create_matter(self, payload: MatterCreateInput) -> MatterRecord:
+    def create_matter(
+        self, payload: MatterCreateInput, *,
+        source_ids: tuple[str, ...] | None = None,
+        account_ids: tuple[str, ...] | None = None,
+        allow_unattributed: bool = True,
+    ) -> MatterRecord:
+        if (
+            (source_ids is not None or account_ids is not None)
+            and not payload.source_links
+            and not allow_unattributed
+        ):
+            raise PermissionError("Unlinked matters are outside the child source/account scope.")
         now = _now_iso()
         title = payload.title.strip() or "Untitled matter"
         summary = payload.summary.strip() or title
@@ -116,6 +129,13 @@ class MatterService:
         )
         conn = self._conn_factory()
         try:
+            if source_ids is not None or account_ids is not None:
+                conn.execute("BEGIN IMMEDIATE")
+                self.validate_source_links_scope(
+                    source_links=payload.source_links, source_ids=source_ids,
+                    account_ids=account_ids, allow_unattributed=allow_unattributed,
+                    conn=conn,
+                )
             conn.execute(
                 """
                 INSERT INTO matters(
@@ -177,17 +197,101 @@ class MatterService:
             conn.close()
         return self._record_from_row(row, source_links=source_links)
 
+    def _matter_in_scope(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        matter_id: str,
+        source_ids: tuple[str, ...] | None,
+        account_ids: tuple[str, ...] | None,
+        allow_unattributed: bool,
+    ) -> bool:
+        if source_ids is None and account_ids is None:
+            return True
+        links = conn.execute(
+            "SELECT source_type, source_id FROM matter_source_links WHERE matter_id = ?",
+            (matter_id,),
+        ).fetchall()
+        if not links:
+            return allow_unattributed
+        sources = set(source_ids or ())
+        accounts = set(account_ids or ())
+        for link in links:
+            source_type = str(link["source_type"]).strip().lower()
+            source_id = str(link["source_id"]).strip()
+            if source_type == "mail_message":
+                owner = conn.execute(
+                    "SELECT account_id FROM mail_messages WHERE message_id = ?",
+                    (source_id,),
+                ).fetchone()
+                if owner is None:
+                    return False
+                if (
+                    source_ids is not None
+                    and MailKnowledgeMirror.source_id_for_account(owner["account_id"]) not in sources
+                ):
+                    return False
+                if account_ids is not None and owner["account_id"] not in accounts:
+                    return False
+            else:
+                return False
+        return True
+
+    def validate_source_links_scope(
+        self,
+        *,
+        source_links: list[MatterSourceLinkInput],
+        source_ids: tuple[str, ...] | None,
+        account_ids: tuple[str, ...] | None,
+        allow_unattributed: bool,
+        conn: sqlite3.Connection | None = None,
+    ) -> None:
+        sources = set(source_ids or ())
+        accounts = set(account_ids or ())
+        owns_connection = conn is None
+        if conn is None:
+            conn = self._conn_factory()
+        try:
+            for link in source_links:
+                kind = link.source_type.strip().lower()
+                source_id = link.source_id.strip()
+                if kind == "mail_message":
+                    owner = conn.execute(
+                        "SELECT account_id FROM mail_messages WHERE message_id = ?",
+                        (source_id,),
+                    ).fetchone()
+                    if owner is None:
+                        raise PermissionError("Matter source ownership cannot be verified for this child run.")
+                    if (
+                        source_ids is not None
+                        and MailKnowledgeMirror.source_id_for_account(owner["account_id"]) not in sources
+                    ):
+                        raise PermissionError("Matter source link is outside the child source scope.")
+                    if account_ids is not None and owner["account_id"] not in accounts:
+                        raise PermissionError("Matter source link is outside the child account scope.")
+                else:
+                    raise PermissionError("Matter source type cannot be verified for this child scope.")
+        finally:
+            if owns_connection:
+                conn.close()
+
     def list_matters(
         self,
         *,
         limit: int = 50,
         status: str | None = None,
+        source_ids: tuple[str, ...] | None = None,
+        account_ids: tuple[str, ...] | None = None,
+        allow_unattributed: bool = True,
     ) -> MatterList:
         conn = self._conn_factory()
         try:
+            if source_ids is not None or account_ids is not None:
+                conn.execute("BEGIN")
+            limit_sql = "LIMIT ?" if source_ids is None and account_ids is None else ""
             if status:
                 rows = conn.execute(
-                    """
+                    f"""
                     SELECT matter_id, title, summary, status, priority, due_at,
                            tags, metadata, created_at, updated_at
                     FROM matters
@@ -196,13 +300,15 @@ class MatterService:
                         due_at IS NULL,
                         due_at ASC,
                         updated_at DESC
-                    LIMIT ?
+                    {limit_sql}
                     """,
-                    (self._normalized_status(status), limit),
+                    (self._normalized_status(status), limit)
+                    if limit_sql
+                    else (self._normalized_status(status),),
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    """
+                    f"""
                     SELECT matter_id, title, summary, status, priority, due_at,
                            tags, metadata, created_at, updated_at
                     FROM matters
@@ -210,10 +316,17 @@ class MatterService:
                         due_at IS NULL,
                         due_at ASC,
                         updated_at DESC
-                    LIMIT ?
+                    {limit_sql}
                     """,
-                    (limit,),
+                    (limit,) if limit_sql else (),
                 ).fetchall()
+            rows = [
+                row for row in rows
+                if self._matter_in_scope(
+                    conn, matter_id=row["matter_id"], source_ids=source_ids,
+                    account_ids=account_ids, allow_unattributed=allow_unattributed,
+                )
+            ][:limit]
             links_by_matter = self._load_source_links_for_rows(conn, rows)
         finally:
             conn.close()
@@ -227,13 +340,21 @@ class MatterService:
             ]
         )
 
-    def search_matters(self, *, query: str, limit: int = 10) -> MatterSearchResult:
+    def search_matters(
+        self, *, query: str, limit: int = 10,
+        source_ids: tuple[str, ...] | None = None,
+        account_ids: tuple[str, ...] | None = None,
+        allow_unattributed: bool = True,
+    ) -> MatterSearchResult:
         normalized_query = query.strip()
         conn = self._conn_factory()
         try:
+            if source_ids is not None or account_ids is not None:
+                conn.execute("BEGIN")
+            limit_sql = "LIMIT ?" if source_ids is None and account_ids is None else ""
             if normalized_query:
                 rows = conn.execute(
-                    """
+                    f"""
                     SELECT
                         m.matter_id,
                         m.title,
@@ -247,13 +368,15 @@ class MatterService:
                     JOIN matters m ON m.matter_id = matters_fts.matter_id
                     WHERE matters_fts MATCH ?
                     ORDER BY rank
-                    LIMIT ?
+                    {limit_sql}
                     """,
-                    (self._fts_query(normalized_query), limit),
+                    (self._fts_query(normalized_query), limit)
+                    if limit_sql
+                    else (self._fts_query(normalized_query),),
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    """
+                    f"""
                     SELECT matter_id, title, summary, status, priority, due_at, tags,
                            summary AS snippet
                     FROM matters
@@ -261,10 +384,17 @@ class MatterService:
                         due_at IS NULL,
                         due_at ASC,
                         updated_at DESC
-                    LIMIT ?
+                    {limit_sql}
                     """,
-                    (limit,),
+                    (limit,) if limit_sql else (),
                 ).fetchall()
+            rows = [
+                row for row in rows
+                if self._matter_in_scope(
+                    conn, matter_id=row["matter_id"], source_ids=source_ids,
+                    account_ids=account_ids, allow_unattributed=allow_unattributed,
+                )
+            ][:limit]
         finally:
             conn.close()
 
@@ -290,6 +420,9 @@ class MatterService:
         *,
         matter_id: str,
         payload: MatterUpdateInput,
+        source_ids: tuple[str, ...] | None = None,
+        account_ids: tuple[str, ...] | None = None,
+        allow_unattributed: bool = True,
     ) -> MatterRecord:
         current = self.get_matter(matter_id=matter_id)
         title = payload.title.strip() if payload.title is not None else current.title
@@ -318,6 +451,13 @@ class MatterService:
         now = _now_iso()
         conn = self._conn_factory()
         try:
+            if source_ids is not None or account_ids is not None:
+                conn.execute("BEGIN IMMEDIATE")
+                if not self._matter_in_scope(
+                    conn, matter_id=matter_id, source_ids=source_ids,
+                    account_ids=account_ids, allow_unattributed=allow_unattributed,
+                ):
+                    raise PermissionError("Matter is outside the child source/account scope.")
             conn.execute(
                 """
                 UPDATE matters
@@ -341,18 +481,44 @@ class MatterService:
             conn.commit()
         finally:
             conn.close()
-        return self.get_matter(matter_id=matter_id)
+        updated = self.get_matter(matter_id=matter_id)
+        if source_ids is not None or account_ids is not None:
+            conn = self._conn_factory()
+            try:
+                if not self._matter_in_scope(
+                    conn, matter_id=matter_id, source_ids=source_ids,
+                    account_ids=account_ids, allow_unattributed=allow_unattributed,
+                ):
+                    raise PermissionError("Matter is outside the child source/account scope.")
+            finally:
+                conn.close()
+        return updated
 
     def link_source(
         self,
         *,
         matter_id: str,
         source_link: MatterSourceLinkInput,
+        source_ids: tuple[str, ...] | None = None,
+        account_ids: tuple[str, ...] | None = None,
+        allow_unattributed: bool = True,
     ) -> MatterRecord:
         self.get_matter(matter_id=matter_id)
         now = _now_iso()
         conn = self._conn_factory()
         try:
+            if source_ids is not None or account_ids is not None:
+                conn.execute("BEGIN IMMEDIATE")
+                self.validate_source_links_scope(
+                    source_links=[source_link], source_ids=source_ids,
+                    account_ids=account_ids, allow_unattributed=allow_unattributed,
+                    conn=conn,
+                )
+                if not self._matter_in_scope(
+                    conn, matter_id=matter_id, source_ids=source_ids,
+                    account_ids=account_ids, allow_unattributed=allow_unattributed,
+                ):
+                    raise PermissionError("Matter is outside the child source/account scope.")
             conn.execute(
                 """
                 INSERT INTO matter_source_links(
@@ -373,7 +539,18 @@ class MatterService:
             conn.commit()
         finally:
             conn.close()
-        return self.get_matter(matter_id=matter_id)
+        linked = self.get_matter(matter_id=matter_id)
+        if source_ids is not None or account_ids is not None:
+            conn = self._conn_factory()
+            try:
+                if not self._matter_in_scope(
+                    conn, matter_id=matter_id, source_ids=source_ids,
+                    account_ids=account_ids, allow_unattributed=allow_unattributed,
+                ):
+                    raise PermissionError("Matter is outside the child source/account scope.")
+            finally:
+                conn.close()
+        return linked
 
     def _upsert_fts(
         self,

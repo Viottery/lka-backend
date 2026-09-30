@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 from evals.lka_evals.log_parser import REQUIRED_LOG_SECTIONS
+from evals.lka_evals.rag_grounding import evaluate_grounding
 from evals.lka_evals.subject import EvalRunArtifact
 
 
@@ -57,6 +58,8 @@ def evaluate_case(case: dict[str, Any], artifact: EvalRunArtifact) -> list[Metri
         metrics.append(_knowledge_loaded_evidence(artifact, expected.get("knowledge_required_chunk_titles")))
     if "knowledge_answer_contains_all" in expected:
         metrics.append(_knowledge_answer_contains(artifact, expected.get("knowledge_answer_contains_all")))
+    if "knowledge_grounding" in expected:
+        metrics.append(_knowledge_grounding(artifact, expected.get("knowledge_grounding")))
     if "answer_exact" in expected or "answer_f1" in expected:
         metrics.append(_answer_quality(artifact, expected))
     if "tool_output_contains_all" in expected:
@@ -384,6 +387,50 @@ def _knowledge_answer_contains(artifact: EvalRunArtifact, expected: Any) -> Metr
     missing = [term for term in terms if term.casefold() not in answer]
     score = (len(terms) - len(missing)) / len(terms) if terms else 1.0
     return MetricResult("knowledge_answer_fact_accuracy", score, not missing, {"missing_terms": missing, "checked_terms": terms})
+
+
+def _knowledge_grounding(artifact: EvalRunArtifact, expected: Any) -> MetricResult:
+    options = expected if isinstance(expected, dict) else {}
+    refs: set[str] = set()
+    for event in artifact.result.get("tool_events", []):
+        if not isinstance(event, dict) or event.get("tool_name") not in {
+            "knowledge.search", "knowledge.load_chunks", "knowledge.load_document"
+        }:
+            continue
+        result = event.get("result")
+        if not isinstance(result, dict) or result.get("status") != "completed":
+            continue
+        output = result.get("output")
+        if not isinstance(output, dict):
+            continue
+        records = output.get("results", output.get("chunks", [output]))
+        for item in records if isinstance(records, list) else []:
+            if isinstance(item, dict) and item.get("policy_decision") in {"allowed", "redacted"}:
+                ref = item.get("source_ref")
+                if isinstance(ref, str):
+                    refs.add(ref)
+    # Explicit permitted refs can narrow a case's evidence oracle; they must
+    # never grant refs that were not actually observed in successful tool output.
+    explicit = options.get("permitted_source_refs")
+    if isinstance(explicit, list):
+        refs.intersection_update(str(ref) for ref in explicit)
+    sufficient = bool(options.get("evidence_sufficient", True))
+    check = evaluate_grounding(
+        str(artifact.result.get("answer") or ""),
+        permitted_source_refs=refs,
+        evidence_sufficient=sufficient,
+        claim_oracle=(
+            [claim for claim in options["claims"] if isinstance(claim, dict)]
+            if isinstance(options.get("claims"), list) else []
+        ),
+    )
+    passed = not check.unsupported_claims and check.expected_abstention and (
+        check.citation_validity if sufficient else check.unsupported_citation_count == 0
+    )
+    return MetricResult(
+        "knowledge_grounding", float(passed), passed, check.to_dict(),
+        weight=2.0,
+    )
 
 
 def _answer_quality(artifact: EvalRunArtifact, expected: dict[str, Any]) -> MetricResult:

@@ -1,0 +1,24 @@
+{"id":"P01","split":"dev","task":"package","request":"查找上周王琳发来的合同邮件。","context":"尚无本轮邮件证据。","expected":"mail"}
+{"id":"P02","split":"dev","task":"package","request":"在已导入的员工手册里查报销规则。","context":"会话里没有报销规则原文。","expected":"knowledge"}
+{"id":"P03","split":"dev","task":"package","request":"查一下我已经记录的待办有哪些。","context":"当前会话没有事项清单。","expected":"matter"}
+{"id":"P04","split":"dev","task":"package","request":"读取 docs/api_contract.md 这个文件的前五十行。","context":"用户给了明确文件路径。","expected":"filesystem"}
+{"id":"P05","split":"dev","task":"package","request":"列出当前项目根目录的文件。","context":"用户要求目录列表。","expected":"bash"}
+{"id":"P06","split":"dev","task":"package","request":"把刚才的两个步骤改成一句话。","context":"刚才的步骤是核对材料和发送确认。","expected":"none"}
+{"id":"P07","split":"dev","task":"package","request":"今天收件箱有什么新邮件？","context":"昨日曾查过邮箱，本轮还没有今天的邮件。","expected":"mail"}
+{"id":"P08","split":"dev","task":"package","request":"在已索引的事故复盘里找回滚原因。","context":"尚无事故复盘内容。","expected":"knowledge"}
+{"id":"P09","split":"dev","task":"package","request":"查找下周到期的提醒事项。","context":"已保存事项在本地事项库中。","expected":"matter"}
+{"id":"P10","split":"dev","task":"package","request":"定点修改 config/local.example.toml 里的端口注释。","context":"用户给了明确文件路径。","expected":"filesystem"}
+{"id":"P11","split":"dev","task":"package","request":"运行项目里的 pytest 测试。","context":"用户要求执行命令。","expected":"bash"}
+{"id":"P12","split":"dev","task":"package","request":"翻译成英文：会议提前半小时。","context":"原文已在当前请求中完整提供。","expected":"none"}
+{"id":"P13","split":"holdout","task":"package","request":"同步收件箱并看看刚到的客户邮件。","context":"尚未执行本轮同步。","expected":"mail"}
+{"id":"P14","split":"holdout","task":"package","request":"在已导入的会议纪要中查上月决定。","context":"会话中没有纪要原文。","expected":"knowledge"}
+{"id":"P15","split":"holdout","task":"package","request":"查询我已经保存的采购事务状态。","context":"事务状态未在当前会话展示。","expected":"matter"}
+{"id":"P16","split":"holdout","task":"package","request":"打开 README.md 看安装命令。","context":"请求指定了文件路径。","expected":"filesystem"}
+{"id":"P17","split":"holdout","task":"package","request":"在仓库里用 rg 搜索函数名。","context":"需要命令行搜索代码。","expected":"bash"}
+{"id":"P18","split":"holdout","task":"package","request":"12 加 7 等于多少？","context":"数字都在当前请求里。","expected":"none"}
+{"id":"P19","split":"holdout","task":"package","request":"找到采购邮件，并据此整理待办。","context":"首先需要邮件证据，之后再考虑事项写入。","expected":"mail"}
+{"id":"P20","split":"holdout","task":"package","request":"从已导入的网页快照里找 API 限流说明。","context":"尚未读取网页快照。","expected":"knowledge"}
+{"id":"P21","split":"holdout","task":"package","request":"查一下已保存事项中哪些还在等待中。","context":"本轮尚无事项记录。","expected":"matter"}
+{"id":"P22","split":"holdout","task":"package","request":"读取明确路径 docs/project_overview.md 的标题。","context":"用户指定本地文件。","expected":"filesystem"}
+{"id":"P23","split":"holdout","task":"package","request":"运行 git status 查看工作区状态。","context":"用户要求命令输出。","expected":"bash"}
+{"id":"P24","split":"holdout","task":"package","request":"根据刚才确认的结论写一个简短标题。","context":"已确认结论：缓存命中率提高，错误率下降。","expected":"none"}

@@ -5,10 +5,14 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from collections.abc import Callable
-from datetime import datetime, timezone
+import time
+from collections import OrderedDict
+from collections.abc import Callable, Sequence
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from datetime import UTC, datetime
 from hashlib import sha256
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
+from threading import Lock
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -17,11 +21,12 @@ from app.domains.knowledge_retrieval import (
     CallableCandidateRetriever,
     ConfigurableKnowledgeRetriever,
     EmbeddingProvider,
+    Reranker,
     RetrievalCandidate,
+    RetrievalSelection,
     SemanticCandidateRetriever,
     SemanticIndex,
 )
-
 
 KnowledgeSensitivity = Literal["public", "personal", "sensitive", "secret"]
 KnowledgeRemotePolicy = Literal["allow", "redact", "confirm", "deny"]
@@ -29,6 +34,7 @@ KnowledgeRemotePolicy = Literal["allow", "redact", "confirm", "deny"]
 DEFAULT_CHUNK_CHARS = 1800
 MAX_CHUNK_CHARS = 6000
 DEFAULT_SNIPPET_CHARS = 420
+_QUERY_SEARCH_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="knowledge-query")
 MAX_SNIPPET_CHARS = 1200
 MAX_LOAD_CHUNKS = 20
 MAX_LOAD_DOCUMENT_CHARS = 12000
@@ -36,14 +42,14 @@ SECRET_PLACEHOLDER = "[REDACTED SECRET-LIKE CONTENT]"
 
 SECRET_PATTERNS = [
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
-    re.compile(r"\b(?:api[_-]?key|token|secret|password)\s*[:=]\s*['\"]?[^'\"\s]{8,}", re.I),
-    re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{16,}", re.I),
+    re.compile(r"\b(?:api[_-]?key|token|secret|password)\s*[:=]\s*['\"]?[^'\"\s]{8,}", re.IGNORECASE),
+    re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{16,}", re.IGNORECASE),
     re.compile(r"\b(?:sk|rk|pk)-[A-Za-z0-9_-]{20,}\b"),
 ]
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _stable_id(prefix: str, *parts: str | None) -> str:
@@ -89,6 +95,7 @@ class KnowledgeImportResult(BaseModel):
 class KnowledgeSearchItem(BaseModel):
     chunk_id: str
     document_id: str
+    source_id: str | None = None
     title: str
     source_type: str
     uri: str | None = None
@@ -100,6 +107,7 @@ class KnowledgeSearchItem(BaseModel):
     policy_decision: str
     retrieval_channels: list[str] = Field(default_factory=list)
     retrieval_score: float | None = None
+    rerank_score: float | None = None
     untrusted_data: bool = True
 
 
@@ -111,11 +119,21 @@ class KnowledgeSearchResult(BaseModel):
     requested_mode: str = "keyword"
     applied_mode: str = "keyword"
     retrieval_warning: str | None = None
+    rerank_applied: bool = False
+
+
+class KnowledgeSourceRecord(BaseModel):
+    source_id: str
+    source_type: str
+    display_name: str
+    uri: str | None = None
+    document_count: int
 
 
 class KnowledgeChunkRecord(BaseModel):
     chunk_id: str
     document_id: str
+    source_id: str | None = None
     title: str
     source_type: str
     uri: str | None = None
@@ -178,6 +196,8 @@ class KnowledgeService:
         semantic_index: SemanticIndex | None = None,
         default_retrieval_mode: str = "hybrid",
         auto_index_on_import: bool = False,
+        reranker: Reranker | None = None,
+        workspace_roots: tuple[Path, ...] = (),
     ) -> None:
         self._conn_factory = conn_factory
         self.privacy_gateway = PrivacyGateway()
@@ -185,6 +205,144 @@ class KnowledgeService:
         self._semantic_index = semantic_index
         self._default_retrieval_mode = default_retrieval_mode
         self._auto_index_on_import = auto_index_on_import
+        self._reranker = reranker
+        self._workspace_roots = tuple(root.resolve(strict=False) for root in workspace_roots)
+        self._candidate_cache: OrderedDict[tuple[Any, ...], tuple[float, RetrievalSelection]] = OrderedDict()
+        self._cache_lock = Lock()
+        self._cache_ttl_seconds = 30.0
+        self._cache_capacity = 128
+
+    def _retrieval_version(self) -> tuple[Any, ...]:
+        conn = self._conn_factory()
+        try:
+            return tuple(
+                tuple(conn.execute(f"SELECT COUNT(*), MAX(updated_at) FROM {table}").fetchone())
+                for table in ("knowledge_sources", "knowledge_documents", "knowledge_embedding_records")
+            )
+        finally:
+            conn.close()
+
+    def _clear_candidate_cache(self) -> None:
+        with self._cache_lock:
+            self._candidate_cache.clear()
+
+    def _cached_selection(self, key: tuple[Any, ...]) -> RetrievalSelection | None:
+        with self._cache_lock:
+            entry = self._candidate_cache.get(key)
+            if entry is None:
+                return None
+            created_at, selection = entry
+            if time.monotonic() - created_at > self._cache_ttl_seconds:
+                del self._candidate_cache[key]
+                return None
+            self._candidate_cache.move_to_end(key)
+            return selection
+
+    def _store_selection(self, key: tuple[Any, ...], selection: RetrievalSelection) -> None:
+        with self._cache_lock:
+            self._candidate_cache[key] = (time.monotonic(), selection)
+            self._candidate_cache.move_to_end(key)
+            while len(self._candidate_cache) > self._cache_capacity:
+                self._candidate_cache.popitem(last=False)
+
+    def list_authorized_source_ids(
+        self, *, workspace_path: str | None = None, session_id: str | None = None
+    ) -> tuple[str, ...]:
+        """Return active sources whose persisted access scope allows this context.
+
+        An empty source access_scope is global within this single-user local backend.
+        A malformed or explicit scope fails closed.
+        """
+        conn = self._conn_factory()
+        try:
+            rows = conn.execute(
+                "SELECT source_id, access_scope FROM knowledge_sources WHERE status = 'active' ORDER BY source_id"
+            ).fetchall()
+        finally:
+            conn.close()
+        return tuple(
+            str(row["source_id"]) for row in rows
+            if self._source_access_allowed(
+                row["access_scope"], workspace_path=workspace_path, session_id=session_id
+            )
+        )
+
+    @staticmethod
+    def _source_access_allowed(
+        raw_scope: str, *, workspace_path: str | None, session_id: str | None
+    ) -> bool:
+        try:
+            scope = json.loads(raw_scope)
+        except (TypeError, ValueError):
+            return False
+        if not isinstance(scope, dict):
+            return False
+        if set(scope) - {"workspace_paths", "session_ids"}:
+            return False
+        workspace_paths = scope.get("workspace_paths")
+        if workspace_paths is not None:
+            if not isinstance(workspace_paths, list) or not all(isinstance(x, str) for x in workspace_paths):
+                return False
+            if not workspace_path or not any(
+                KnowledgeService._workspace_paths_overlap(workspace_path, root)
+                for root in workspace_paths
+            ):
+                return False
+        session_ids = scope.get("session_ids")
+        if session_ids is not None:
+            if not isinstance(session_ids, list) or not all(isinstance(x, str) for x in session_ids):
+                return False
+            if session_id not in session_ids:
+                return False
+        return True
+
+    @staticmethod
+    def _workspace_paths_overlap(left: str, right: str) -> bool:
+        def normalize(path: str):
+            if re.match(r"^[A-Za-z]:[\\/]", path) or path.startswith("\\\\"):
+                return PureWindowsPath(path.casefold())
+            return Path(path).resolve(strict=False)
+
+        a, b = normalize(left), normalize(right)
+        if type(a) is not type(b):
+            return False
+        return a == b or a in b.parents or b in a.parents
+
+    def list_sources(
+        self,
+        *,
+        source_ids: list[str] | None = None,
+        source_types: list[str] | None = None,
+        limit: int = 100,
+    ) -> list[KnowledgeSourceRecord]:
+        clauses = ["s.status = 'active'"]
+        params: list[Any] = []
+        for column, values in (("s.source_id", source_ids), ("s.source_type", source_types)):
+            if values is not None:
+                clauses.append(
+                    f"{column} IN ({', '.join('?' for _ in values)})" if values else "0"
+                )
+                params.extend(values)
+        source_clause = " AND ".join(clauses)
+        conn = self._conn_factory()
+        try:
+            rows = conn.execute(
+                f"""
+                SELECT s.source_id, s.source_type, s.display_name, s.uri,
+                       COUNT(d.document_id) AS document_count
+                FROM knowledge_sources s
+                LEFT JOIN knowledge_documents d ON d.source_id = s.source_id
+                    AND d.status = 'active'
+                WHERE {source_clause}
+                GROUP BY s.source_id
+                ORDER BY s.source_type, s.display_name, s.source_id
+                LIMIT ?
+                """,
+                [*params, min(max(1, limit), 200)],
+            ).fetchall()
+        finally:
+            conn.close()
+        return [KnowledgeSourceRecord.model_validate(dict(row)) for row in rows]
 
     def import_text_document(self, payload: KnowledgeDocumentInput) -> KnowledgeImportResult:
         source = payload.source
@@ -343,6 +501,8 @@ class KnowledgeService:
         finally:
             conn.close()
 
+        if committed:
+            self._clear_candidate_cache()
         if committed and removed_chunk_ids and self._semantic_index is not None:
             self._semantic_index.remove(removed_chunk_ids)
         if self._auto_index_on_import:
@@ -370,7 +530,12 @@ class KnowledgeService:
         remote_policy: KnowledgeRemotePolicy = "redact",
         metadata: dict[str, Any] | None = None,
     ) -> KnowledgeImportResult:
-        text = path.read_text(encoding="utf-8")
+        resolved = path.resolve(strict=True)
+        roots = [root for root in self._workspace_roots if root == resolved or root in resolved.parents]
+        if self._workspace_roots and not roots:
+            raise ValueError("file is outside configured workspace roots")
+        text = resolved.read_text(encoding="utf-8")
+        access_scope = {"workspace_paths": [str(max(roots, key=lambda root: len(root.parts)))]} if roots else {}
         return self.import_text_document(
             KnowledgeDocumentInput(
                 source=KnowledgeSourceInput(
@@ -378,6 +543,7 @@ class KnowledgeService:
                     display_name=path.name,
                     uri=path.as_posix(),
                     metadata=metadata or {},
+                    access_scope=access_scope,
                     sensitivity=sensitivity,
                     remote_policy=remote_policy,
                 ),
@@ -391,6 +557,34 @@ class KnowledgeService:
             )
         )
 
+    def prune_workspace_documents(self, *, source_uri: str, keep_uris: set[str]) -> int:
+        """Remove stale documents only from one explicit workspace source."""
+        source_id = _stable_id("knowledge_source", "workspace_file", source_uri)
+        removed_chunk_ids: list[str] = []
+        conn = self._conn_factory()
+        try:
+            rows = conn.execute(
+                "SELECT document_id, uri FROM knowledge_documents "
+                "WHERE source_id = ? AND source_type = 'workspace_file'",
+                (source_id,),
+            ).fetchall()
+            removed = 0
+            for row in rows:
+                if row["uri"] in keep_uris:
+                    continue
+                document_id = str(row["document_id"])
+                removed_chunk_ids.extend(self._delete_document_chunks(conn, document_id))
+                conn.execute("DELETE FROM knowledge_documents WHERE document_id = ?", (document_id,))
+                removed += 1
+            conn.commit()
+        finally:
+            conn.close()
+        if removed:
+            self._clear_candidate_cache()
+        if removed_chunk_ids and self._semantic_index is not None:
+            self._semantic_index.remove(removed_chunk_ids)
+        return removed
+
     def search(
         self,
         *,
@@ -402,43 +596,91 @@ class KnowledgeService:
         mode: str | None = None,
         sort_by: Literal["relevance", "source_time_desc"] = "relevance",
         distinct_documents: bool = False,
+        source_ids: list[str] | None = None,
+        account_ids: list[str] | None = None,
+        cache_namespace: str | None = None,
+        keyword_candidate_k: int | None = None,
+        semantic_candidate_k: int | None = None,
+        max_chunks_per_document: int | None = None,
+        _apply_rerank: bool = True,
     ) -> KnowledgeSearchResult:
+        limit = min(max(1, limit), 100)
+        candidate_limits = {
+            "keyword": min(400, max(limit, keyword_candidate_k or limit * 4)),
+            "semantic": min(400, max(limit, semantic_candidate_k or limit * 4)),
+        }
+        if max_chunks_per_document is not None and max_chunks_per_document < 1:
+            raise ValueError("max_chunks_per_document must be positive")
         query_id = _stable_id("knowledge_query", query, _now_iso())
         requested_mode = mode or self._default_retrieval_mode
+        if any(values is not None and not values for values in (source_types, source_ids, account_ids)):
+            self._audit(
+                query_id=query_id, tool_name=tool_name, action="search",
+                result_count=0, policy_decision="filtered",
+                metadata={"requested_mode": requested_mode, "empty_scope": True},
+            )
+            return KnowledgeSearchResult(
+                query=query, query_id=query_id, results=[], requested_mode=requested_mode,
+                applied_mode="none", retrieval_warning="empty source scope",
+            )
         keyword_retriever = CallableCandidateRetriever(
             channel="keyword",
             callback=lambda candidate_query, candidate_limit: self._keyword_candidates(
                 query=candidate_query,
                 limit=candidate_limit,
                 source_types=source_types,
+                source_ids=source_ids,
+                account_ids=account_ids,
                 sort_by=sort_by,
             ),
         )
         retrievers = [keyword_retriever]
         if self._embedding_provider is not None and self._semantic_index is not None:
-            retrievers.append(
-                SemanticCandidateRetriever(
-                    provider=self._embedding_provider,
-                    index=self._semantic_index,
-                )
+            semantic_retriever = SemanticCandidateRetriever(
+                provider=self._embedding_provider,
+                index=self._semantic_index,
             )
-        selection = ConfigurableKnowledgeRetriever(retrievers=retrievers).retrieve(
-            query=query,
-            limit=max(limit * 4, limit),
-            mode=requested_mode,
+            if source_types or source_ids or account_ids:
+                retrievers.append(
+                    CallableCandidateRetriever(
+                        channel="semantic",
+                        callback=lambda candidate_query, candidate_limit: self._scoped_semantic_candidates(
+                            query=candidate_query,
+                            limit=candidate_limit,
+                            source_types=source_types,
+                            source_ids=source_ids,
+                            account_ids=account_ids,
+                        ),
+                    )
+                )
+            else:
+                retrievers.append(semantic_retriever)
+        cache_key = (
+            cache_namespace, sha256(query.encode("utf-8")).hexdigest(),
+            requested_mode, limit, sort_by,
+            tuple(sorted(source_types or ())), tuple(sorted(source_ids or ())),
+            tuple(sorted(account_ids or ())), tuple(sorted(candidate_limits.items())),
+            self._retrieval_version(),
         )
+        selection = self._cached_selection(cache_key)
+        if selection is None:
+            selection = ConfigurableKnowledgeRetriever(retrievers=retrievers).retrieve(
+                query=query,
+                limit=min(400, max(candidate_limits.values())),
+                mode=requested_mode,
+                candidate_limits=candidate_limits,
+            )
+            self._store_selection(cache_key, selection)
         rows = self._rows_for_chunk_ids(
             chunk_ids=[candidate.chunk_id for candidate in selection.candidates],
             source_types=source_types,
+            source_ids=source_ids,
+            account_ids=account_ids,
         )
         candidates_by_id = {candidate.chunk_id: candidate for candidate in selection.candidates}
         results: list[KnowledgeSearchItem] = []
         filtered_count = 0
-        seen_document_ids: set[str] = set()
         for row in rows:
-            document_id = str(row["document_id"])
-            if distinct_documents and document_id in seen_document_ids:
-                continue
             candidate = candidates_by_id[str(row["chunk_id"])]
             decision = self.privacy_gateway.decide(
                 sensitivity=row["sensitivity"],
@@ -452,6 +694,7 @@ class KnowledgeService:
                 KnowledgeSearchItem(
                     chunk_id=row["chunk_id"],
                     document_id=row["document_id"],
+                    source_id=row["source_id"],
                     title=row["title"],
                     source_type=row["source_type"],
                     uri=row["uri"],
@@ -465,9 +708,40 @@ class KnowledgeService:
                     retrieval_score=candidate.score,
                 )
             )
-            seen_document_ids.add(document_id)
-            if len(results) >= limit:
-                break
+        rerank_applied = False
+        rerank_warning: str | None = None
+        if _apply_rerank and self._reranker is not None and results:
+            try:
+                rerank_count = min(len(results), self._reranker.max_candidates)
+                scores = self._reranker.score(
+                    query,
+                    [f"{item.title}\n{item.snippet}" for item in results[:rerank_count]],
+                )
+                if len(scores) != rerank_count:
+                    raise ValueError("reranker returned the wrong number of scores")
+                for item, score in zip(results[:rerank_count], scores, strict=True):
+                    item.rerank_score = float(score)
+                results[:rerank_count] = sorted(
+                    results[:rerank_count],
+                    key=lambda item: (-float(item.rerank_score), -float(item.retrieval_score or 0), item.chunk_id),
+                )
+                rerank_applied = True
+            except Exception as exc:  # noqa: BLE001 - optional model failures must fall back
+                rerank_warning = f"local reranker unavailable: {type(exc).__name__}"
+                for item in results:
+                    item.rerank_score = None
+        if distinct_documents or max_chunks_per_document is not None:
+            deduplicated: list[KnowledgeSearchItem] = []
+            document_counts: dict[str, int] = {}
+            per_document = 1 if distinct_documents else max_chunks_per_document
+            for item in results:
+                count = document_counts.get(item.document_id, 0)
+                if per_document is not None and count >= per_document:
+                    continue
+                deduplicated.append(item)
+                document_counts[item.document_id] = count + 1
+            results = deduplicated
+        results = results[:limit]
         self._audit(
             query_id=query_id,
             tool_name=tool_name,
@@ -480,8 +754,12 @@ class KnowledgeService:
                 "requested_mode": selection.requested_mode,
                 "applied_mode": selection.applied_mode,
                 "retrieval_warning": selection.warning,
+                "rerank_applied": rerank_applied,
+                "rerank_warning": rerank_warning,
                 "sort_by": sort_by,
                 "distinct_documents": distinct_documents,
+                "candidate_limits": candidate_limits,
+                "max_chunks_per_document": max_chunks_per_document,
             },
         )
         return KnowledgeSearchResult(
@@ -491,8 +769,172 @@ class KnowledgeService:
             filtered_count=filtered_count,
             requested_mode=selection.requested_mode,
             applied_mode=selection.applied_mode,
-            retrieval_warning=selection.warning,
+            retrieval_warning="; ".join(part for part in (selection.warning, rerank_warning) if part) or None,
+            rerank_applied=rerank_applied,
         )
+
+    def search_queries(
+        self,
+        *,
+        query: str,
+        rewritten_queries: Sequence[str],
+        limit: int = 10,
+        source_types: list[str] | None = None,
+        source_ids: list[str] | None = None,
+        account_ids: list[str] | None = None,
+        cache_namespace: str | None = None,
+        mode: str | None = None,
+        max_snippet_chars: int = DEFAULT_SNIPPET_CHARS,
+        tool_name: str | None = None,
+        keyword_candidate_k: int | None = None,
+        semantic_candidate_k: int | None = None,
+        max_chunks_per_document: int | None = None,
+        max_parallel_searches: int = 4,
+        max_total_candidates: int = 240,
+    ) -> tuple[KnowledgeSearchResult, list[dict[str, Any]]]:
+        """Search bounded queries concurrently, then fuse in stable input order."""
+        limit = min(max(1, limit), 100)
+        queries = [query, *rewritten_queries]
+        if len(queries) > 17:
+            raise ValueError("too many search queries")
+        if not 1 <= max_parallel_searches <= 8:
+            raise ValueError("max_parallel_searches must be between 1 and 8")
+        if not 30 <= max_total_candidates <= 800:
+            raise ValueError("max_total_candidates must be between 30 and 800")
+        requested_mode = mode or self._default_retrieval_mode
+        channel_count = 2 if requested_mode == "hybrid" else 1
+        if len(queries) * channel_count > max_total_candidates:
+            raise ValueError("candidate budget is too small for the query/channel count")
+        per_query_limit = min(
+            100, max(30, limit, keyword_candidate_k or 0, semantic_candidate_k or 0),
+            max(1, max_total_candidates // (len(queries) * channel_count)),
+        )
+        search_kwargs = {
+            "limit": per_query_limit,
+            "source_types": source_types,
+            "source_ids": source_ids,
+            "account_ids": account_ids,
+            "cache_namespace": cache_namespace,
+            "mode": mode,
+            "max_snippet_chars": max_snippet_chars,
+            "tool_name": tool_name,
+            # search() otherwise expands a result limit to limit*4 candidates.
+            # Pin each channel to its share of the total cross-query budget.
+            "keyword_candidate_k": per_query_limit,
+            "semantic_candidate_k": per_query_limit,
+            "max_chunks_per_document": max_chunks_per_document,
+            "_apply_rerank": False,
+        }
+        parallel_count = min(max_parallel_searches, len(queries))
+        in_flight: dict[Future[KnowledgeSearchResult], int] = {}
+        search_results: list[KnowledgeSearchResult | None] = [None] * len(queries)
+        next_index = 0
+        while next_index < parallel_count:
+            future = _QUERY_SEARCH_EXECUTOR.submit(
+                self.search, query=queries[next_index], **search_kwargs,
+            )
+            in_flight[future] = next_index
+            next_index += 1
+        try:
+            while in_flight:
+                completed, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+                for future in completed:
+                    index = in_flight.pop(future)
+                    search_results[index] = future.result()
+                while next_index < len(queries) and len(in_flight) < parallel_count:
+                    future = _QUERY_SEARCH_EXECUTOR.submit(
+                        self.search, query=queries[next_index], **search_kwargs,
+                    )
+                    in_flight[future] = next_index
+                    next_index += 1
+        except Exception:
+            for future in in_flight:
+                future.cancel()
+            raise
+        traces: list[dict[str, Any]] = []
+        results_by_chunk: dict[str, KnowledgeSearchItem] = {}
+        ranks_by_chunk: dict[str, list[int]] = {}
+        filtered_count = 0
+        applied_modes: list[str] = []
+        warnings: list[str] = []
+        for search_query, result in zip(queries, search_results, strict=True):
+            if result is None:
+                raise RuntimeError("parallel search result is missing")
+            traces.append({"query": search_query, "hit_count": len(result.results), "query_id": result.query_id})
+            filtered_count += result.filtered_count
+            applied_modes.append(result.applied_mode)
+            if result.retrieval_warning:
+                warnings.append(result.retrieval_warning)
+            new_unique_hits = 0
+            for rank, item in enumerate(result.results, start=1):
+                existing = results_by_chunk.get(item.chunk_id)
+                if existing is None:
+                    results_by_chunk[item.chunk_id] = item
+                    ranks_by_chunk[item.chunk_id] = []
+                    new_unique_hits += 1
+                else:
+                    existing.retrieval_channels = sorted(
+                        set(existing.retrieval_channels) | set(item.retrieval_channels)
+                    )
+                ranks_by_chunk[item.chunk_id].append(rank)
+            traces[-1]["new_unique_hits"] = new_unique_hits
+
+        fusion_scores = {
+            chunk_id: sum(1.0 / (60 + rank) for rank in ranks)
+            for chunk_id, ranks in ranks_by_chunk.items()
+        }
+        fused = list(results_by_chunk.values())
+        for item in fused:
+            item.retrieval_score = fusion_scores[item.chunk_id]
+        fused.sort(
+            key=lambda item: (
+                -fusion_scores[item.chunk_id],
+                item.chunk_id,
+            )
+        )
+        rerank_applied = False
+        rerank_warning = None
+        if self._reranker is not None and fused:
+            try:
+                rerank_count = min(len(fused), self._reranker.max_candidates)
+                scores = self._reranker.score(
+                    query,
+                    [f"{item.title}\n{item.snippet}" for item in fused[:rerank_count]],
+                )
+                if len(scores) != rerank_count:
+                    raise ValueError("reranker returned the wrong number of scores")
+                for item, score in zip(fused[:rerank_count], scores, strict=True):
+                    item.rerank_score = float(score)
+                fused[:rerank_count] = sorted(
+                    fused[:rerank_count],
+                    key=lambda item: (-float(item.rerank_score), item.chunk_id),
+                )
+                rerank_applied = True
+            except Exception as exc:  # noqa: BLE001 - optional model failures must fall back
+                rerank_warning = f"local reranker unavailable: {type(exc).__name__}"
+                for item in fused:
+                    item.rerank_score = None
+        document_counts: dict[str, int] = {}
+        final_results: list[KnowledgeSearchItem] = []
+        for item in fused:
+            count = document_counts.get(item.document_id, 0)
+            if max_chunks_per_document is not None and count >= max_chunks_per_document:
+                continue
+            final_results.append(item)
+            document_counts[item.document_id] = count + 1
+            if len(final_results) >= limit:
+                break
+        combined_warning = "; ".join(dict.fromkeys([*warnings, *([rerank_warning] if rerank_warning else [])])) or None
+        return KnowledgeSearchResult(
+            query=query,
+            query_id=traces[0]["query_id"],
+            results=final_results,
+            filtered_count=filtered_count,
+            requested_mode=mode or self._default_retrieval_mode,
+            applied_mode=next((applied for applied in applied_modes if applied != "none"), "none"),
+            retrieval_warning=combined_warning,
+            rerank_applied=rerank_applied,
+        ), traces
 
     def sync_semantic_index(
         self,
@@ -519,7 +961,9 @@ class KnowledgeService:
                 SELECT c.chunk_id, c.text
                 FROM knowledge_chunks c
                 JOIN knowledge_documents d ON d.document_id = c.document_id
+                JOIN knowledge_sources s ON s.source_id = d.source_id
                 WHERE d.status = 'active'
+                  AND s.status = 'active'
                   AND c.sensitivity != 'secret'
                   AND c.remote_policy != 'deny'
                   {where_clause}
@@ -532,7 +976,9 @@ class KnowledgeService:
                 SELECT c.chunk_id
                 FROM knowledge_chunks c
                 JOIN knowledge_documents d ON d.document_id = c.document_id
+                JOIN knowledge_sources s ON s.source_id = d.source_id
                 WHERE d.status = 'active'
+                  AND s.status = 'active'
                   AND c.sensitivity != 'secret'
                   AND c.remote_policy != 'deny'
                 """
@@ -555,6 +1001,7 @@ class KnowledgeService:
             str(row["chunk_id"]) for row in active_rows
         )
         status = self._semantic_index.status()
+        self._clear_candidate_cache()
         return KnowledgeSemanticSyncResult(
             enabled=True,
             index_key=status.index_key,
@@ -572,25 +1019,32 @@ class KnowledgeService:
         chunk_ids: list[str],
         max_chars_per_chunk: int = DEFAULT_SNIPPET_CHARS,
         tool_name: str | None = None,
+        source_ids: list[str] | None = None,
+        account_ids: list[str] | None = None,
     ) -> KnowledgeChunkLoadResult:
         query_id = _stable_id("knowledge_load", ",".join(chunk_ids), _now_iso())
         if not chunk_ids:
             return KnowledgeChunkLoadResult(query_id=query_id, chunks=[])
         limited_ids = chunk_ids[:MAX_LOAD_CHUNKS]
         placeholders = ", ".join("?" for _ in limited_ids)
+        scope_clause, scope_params = self._source_filter_sql(
+            source_types=None, source_ids=source_ids, account_ids=account_ids,
+        )
         conn = self._conn_factory()
         try:
             rows = conn.execute(
                 f"""
                 SELECT
-                    c.chunk_id, c.document_id, d.title, d.source_type, d.uri,
+                    c.chunk_id, c.document_id, d.source_id, d.title, d.source_type, d.uri,
                     c.chunk_index, c.text, c.char_count, c.token_estimate,
                     c.source_ref, c.sensitivity, c.remote_policy
                 FROM knowledge_chunks c
                 JOIN knowledge_documents d ON d.document_id = c.document_id
-                WHERE c.chunk_id IN ({placeholders})
+                JOIN knowledge_sources s ON s.source_id = d.source_id
+                WHERE c.chunk_id IN ({placeholders}) AND d.status = 'active'
+                  {scope_clause}
                 """,
-                limited_ids,
+                [*limited_ids, *scope_params],
             ).fetchall()
         finally:
             conn.close()
@@ -613,6 +1067,7 @@ class KnowledgeService:
                 KnowledgeChunkRecord(
                     chunk_id=row["chunk_id"],
                     document_id=row["document_id"],
+                    source_id=row["source_id"],
                     title=row["title"],
                     source_type=row["source_type"],
                     uri=row["uri"],
@@ -647,18 +1102,24 @@ class KnowledgeService:
         include_text: bool = False,
         max_chars: int = MAX_LOAD_DOCUMENT_CHARS,
         tool_name: str | None = None,
+        source_ids: list[str] | None = None,
+        account_ids: list[str] | None = None,
     ) -> KnowledgeDocumentRecord:
         conn = self._conn_factory()
+        scope_clause, scope_params = self._source_filter_sql(
+            source_types=None, source_ids=source_ids, account_ids=account_ids,
+        )
         try:
             row = conn.execute(
-                """
+                f"""
                 SELECT
-                    document_id, source_id, source_type, title, uri, checksum,
-                    mime_type, status, sensitivity, remote_policy, source_ref, metadata
-                FROM knowledge_documents
-                WHERE document_id = ?
+                    d.document_id, d.source_id, d.source_type, d.title, d.uri, d.checksum,
+                    d.mime_type, d.status, d.sensitivity, d.remote_policy, d.source_ref, d.metadata
+                FROM knowledge_documents d
+                JOIN knowledge_sources s ON s.source_id = d.source_id
+                WHERE d.document_id = ? AND d.status = 'active' {scope_clause}
                 """,
-                (document_id,),
+                [document_id, *scope_params],
             ).fetchone()
             if row is None:
                 raise ValueError(f"knowledge document not found: {document_id}")
@@ -734,16 +1195,17 @@ class KnowledgeService:
         query: str,
         limit: int,
         source_types: list[str] | None,
+        source_ids: list[str] | None,
+        account_ids: list[str] | None,
         max_candidates: int,
         sort_by: Literal["relevance", "source_time_desc"],
     ) -> list[sqlite3.Row]:
         normalized_query = query.strip()
-        source_params: list[Any] = []
-        source_clause = ""
-        if source_types:
-            placeholders = ", ".join("?" for _ in source_types)
-            source_clause = f"AND d.source_type IN ({placeholders})"
-            source_params.extend(source_types)
+        source_clause, source_params = self._source_filter_sql(
+            source_types=source_types,
+            source_ids=source_ids,
+            account_ids=account_ids,
+        )
         conn = self._conn_factory()
         try:
             if normalized_query and sort_by == "relevance":
@@ -757,8 +1219,9 @@ class KnowledgeService:
                     FROM knowledge_chunks_fts
                     JOIN knowledge_chunks c ON c.chunk_id = knowledge_chunks_fts.chunk_id
                     JOIN knowledge_documents d ON d.document_id = c.document_id
-                    WHERE knowledge_chunks_fts MATCH ? {source_clause}
-                    ORDER BY rank
+                    JOIN knowledge_sources s ON s.source_id = d.source_id
+                    WHERE knowledge_chunks_fts MATCH ? AND d.status = 'active' {source_clause}
+                    ORDER BY rank, c.chunk_id
                     LIMIT ?
                     """,
                     [self._fts_query(normalized_query), *source_params, max_candidates],
@@ -783,13 +1246,14 @@ class KnowledgeService:
                     FROM knowledge_chunks_fts
                     JOIN knowledge_chunks c ON c.chunk_id = knowledge_chunks_fts.chunk_id
                     JOIN knowledge_documents d ON d.document_id = c.document_id
-                    WHERE knowledge_chunks_fts MATCH ? {source_clause}
+                    JOIN knowledge_sources s ON s.source_id = d.source_id
+                    WHERE knowledge_chunks_fts MATCH ? AND d.status = 'active' {source_clause}
                     ORDER BY COALESCE(
                         json_extract(d.metadata, '$.source_time'),
                         json_extract(d.metadata, '$.received_at'),
                         d.updated_at
                     ) DESC,
-                        c.chunk_index ASC
+                        c.chunk_index ASC, c.chunk_id ASC
                     LIMIT ?
                     """,
                     [self._fts_query(normalized_query), *source_params, max_candidates],
@@ -813,13 +1277,14 @@ class KnowledgeService:
                         c.sensitivity, c.remote_policy
                     FROM knowledge_chunks c
                     JOIN knowledge_documents d ON d.document_id = c.document_id
+                    JOIN knowledge_sources s ON s.source_id = d.source_id
                     WHERE d.status = 'active' {source_clause}
                     ORDER BY COALESCE(
                         json_extract(d.metadata, '$.source_time'),
                         json_extract(d.metadata, '$.received_at'),
                         d.updated_at
                     ) DESC,
-                        c.chunk_index ASC
+                        c.chunk_index ASC, c.chunk_id ASC
                     LIMIT ?
                     """,
                     [*source_params, max_candidates],
@@ -834,12 +1299,16 @@ class KnowledgeService:
         query: str,
         limit: int,
         source_types: list[str] | None,
+        source_ids: list[str] | None,
+        account_ids: list[str] | None,
         sort_by: Literal["relevance", "source_time_desc"],
     ) -> list[RetrievalCandidate]:
         rows = self._search_rows(
             query=query,
             limit=limit,
             source_types=source_types,
+            source_ids=source_ids,
+            account_ids=account_ids,
             max_candidates=limit,
             sort_by=sort_by,
         )
@@ -858,25 +1327,28 @@ class KnowledgeService:
         *,
         chunk_ids: list[str],
         source_types: list[str] | None,
+        source_ids: list[str] | None = None,
+        account_ids: list[str] | None = None,
     ) -> list[sqlite3.Row]:
         if not chunk_ids:
             return []
-        source_clause = ""
-        source_params: list[Any] = []
-        if source_types:
-            source_clause = f"AND d.source_type IN ({', '.join('?' for _ in source_types)})"
-            source_params.extend(source_types)
+        source_clause, source_params = self._source_filter_sql(
+            source_types=source_types,
+            source_ids=source_ids,
+            account_ids=account_ids,
+        )
         placeholders = ", ".join("?" for _ in chunk_ids)
         conn = self._conn_factory()
         try:
             rows = conn.execute(
                 f"""
                 SELECT
-                    c.chunk_id, c.document_id, d.title, d.source_type, d.uri,
+                    c.chunk_id, c.document_id, d.source_id, d.title, d.source_type, d.uri,
                     c.chunk_index, c.text AS snippet, c.source_ref,
                     c.sensitivity, c.remote_policy
                 FROM knowledge_chunks c
                 JOIN knowledge_documents d ON d.document_id = c.document_id
+                JOIN knowledge_sources s ON s.source_id = d.source_id
                 WHERE c.chunk_id IN ({placeholders})
                   AND d.status = 'active' {source_clause}
                 """,
@@ -886,6 +1358,84 @@ class KnowledgeService:
             conn.close()
         by_id = {str(row["chunk_id"]): row for row in rows}
         return [by_id[chunk_id] for chunk_id in chunk_ids if chunk_id in by_id]
+
+    @staticmethod
+    def _source_filter_sql(
+        *,
+        source_types: list[str] | None,
+        source_ids: list[str] | None,
+        account_ids: list[str] | None,
+    ) -> tuple[str, list[Any]]:
+        clauses = ["AND s.status = 'active'"]
+        params: list[Any] = []
+        for column, values in (("d.source_type", source_types), ("d.source_id", source_ids)):
+            if values is not None:
+                if not values:
+                    return "AND 0", []
+                clauses.append(f"AND {column} IN ({', '.join('?' for _ in values)})")
+                params.extend(values)
+        if account_ids is not None:
+            if not account_ids:
+                return "AND 0", []
+            account_expr = (
+                "COALESCE(json_extract(d.metadata, '$.account_id'), "
+                "json_extract(d.metadata, '$.mail_account_id'), "
+                "json_extract(s.metadata, '$.account_id'))"
+            )
+            clauses.append(
+                f"AND ({account_expr} IS NULL OR {account_expr} IN ("
+                + ", ".join("?" for _ in account_ids) + "))"
+            )
+            params.extend(account_ids)
+        return " ".join(clauses), params
+
+    def _scoped_semantic_candidates(
+        self,
+        *,
+        query: str,
+        limit: int,
+        source_types: list[str] | None,
+        source_ids: list[str] | None,
+        account_ids: list[str] | None,
+    ) -> list[RetrievalCandidate]:
+        # sqlite-vec KNN is global. Grow the bounded search window until enough
+        # scoped hits survive, without allowing out-of-scope text into results.
+        if self._semantic_index is None or self._embedding_provider is None or not query.strip():
+            return []
+        status = self._semantic_index.status()
+        if not status.available:
+            return []
+        indexed = status.indexed_chunks
+        window = min(max(limit, 1), indexed, 2048)
+        vector = self._embedding_provider.embed_query(query) if window else []
+        scoped_search = getattr(self._semantic_index, "search_scoped", None)
+        if callable(scoped_search) and vector:
+            hits = scoped_search(
+                vector, limit, source_types=source_types,
+                source_ids=source_ids, account_ids=account_ids,
+            )
+            return [
+                RetrievalCandidate(chunk_id=hit.chunk_id, rank=i + 1, score=hit.score, channel="semantic")
+                for i, hit in enumerate(hits)
+            ]
+        while window:
+            hits = self._semantic_index.search(vector, window)
+            allowed = {
+                row["chunk_id"] for row in self._rows_for_chunk_ids(
+                    chunk_ids=[hit.chunk_id for hit in hits],
+                    source_types=source_types,
+                    source_ids=source_ids,
+                    account_ids=account_ids,
+                )
+            }
+            scoped = [hit for hit in hits if hit.chunk_id in allowed]
+            if len(scoped) >= limit or window >= min(indexed, 2048):
+                return [
+                    RetrievalCandidate(chunk_id=hit.chunk_id, rank=i + 1, score=hit.score, channel="semantic")
+                    for i, hit in enumerate(scoped[:limit])
+                ]
+            window = min(window * 2, indexed, 2048)
+        return []
 
     def _append_substring_matches(
         self,
@@ -915,13 +1465,14 @@ class KnowledgeService:
                 c.sensitivity, c.remote_policy
             FROM knowledge_chunks c
             JOIN knowledge_documents d ON d.document_id = c.document_id
+            JOIN knowledge_sources s ON s.source_id = d.source_id
             WHERE d.status = 'active' {source_clause} AND ({match_clause})
             ORDER BY COALESCE(
                 json_extract(d.metadata, '$.source_time'),
                 json_extract(d.metadata, '$.received_at'),
                 d.updated_at
             ) DESC,
-                c.chunk_index ASC
+                c.chunk_index ASC, c.chunk_id ASC
             LIMIT ?
             """,
             [*source_params, *match_params, limit],

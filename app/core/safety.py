@@ -73,6 +73,14 @@ class SafetyReviewRejected(RuntimeError):
         self.review = review
 
 
+class SafetyReviewQueueConflict(ValueError):
+    """Raised when a review cannot be decided in the current queue state."""
+
+    def __init__(self, message: str, *, head_review_id: str | None = None) -> None:
+        super().__init__(message)
+        self.head_review_id = head_review_id
+
+
 class InMemorySafetyReviewStore:
     """Thread-safe local safety review store for current in-memory Agent runs."""
 
@@ -97,10 +105,14 @@ class InMemorySafetyReviewStore:
 
         with self._condition:
             existing = self._reviews.get(record.review_id)
-            if existing is not None:
+            if existing is not None and not (
+                existing.status == SafetyReviewStatus.PENDING
+                and record.status != SafetyReviewStatus.PENDING
+            ):
                 return existing
             self._reviews[record.review_id] = record
-            self._run_reviews.setdefault(record.run_id, []).append(record.review_id)
+            if record.review_id not in self._run_reviews.setdefault(record.run_id, []):
+                self._run_reviews[record.run_id].append(record.review_id)
             self._condition.notify_all()
         return record
 
@@ -115,6 +127,15 @@ class InMemorySafetyReviewStore:
                 for review_id in self._run_reviews.get(run_id, [])
                 if review_id in self._reviews
             ]
+
+    def list_pending(self) -> list[SafetyReviewRecord]:
+        with self._condition:
+            return sorted(
+                (review for review in self._reviews.values()
+                 if review.mode == SafetyReviewMode.MANUAL
+                 and review.status == SafetyReviewStatus.PENDING),
+                key=lambda review: (review.created_at, review.review_id),
+            )
 
     def attach_llm_output(
         self,

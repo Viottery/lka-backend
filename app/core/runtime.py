@@ -2,25 +2,54 @@
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 import threading
 from hashlib import sha1
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Literal
+from uuid import uuid4
 
 from app.api.schemas import (
     CapabilityItem,
     WorkspaceIndexResponse,
 )
 from app.core.agent_checkpoints import create_sqlite_checkpoint_runtime
+from app.core.agent_executors import AgentDefinition, AgentExecutorRegistry, MockWorkflowExecutor
 from app.core.agent_graph import AgentGraphRunner
 from app.core.agent_runner import AgentTurnRunner
-from app.core.agent_runs import AgentRunRecord, InMemoryAgentRunManager
+from app.core.agent_runs import AgentRunRecord, AgentRunStatus, InMemoryAgentRunManager
 from app.core.agent_storage import SqliteAgentRunStore
 from app.core.agent_turn import AgentTurnLoop, AgentTurnResult
+from app.core.child_agent import ChildAgentExecutor
+from app.core.codex_app_server import CodexAppServerClient
+from app.core.codex_expert import (
+    CodexAppServerExpertExecutor,
+    staged_file_change_approval_guard,
+)
+from app.core.codex_trace import CodexTraceEvent, CodexTraceJournal
+from app.core.codex_transport import CodexSubprocessTransport
+from app.core.codex_workspace import CodexWorkspaceFactory
 from app.core.config import Settings
 from app.core.context import ContextAssembler
+from app.core.context_driver import ContextViews, EvidenceCandidate
 from app.core.llm import LLMResponseMode, MockLLMClient, build_text_llm_client
+from app.core.safety import SafetyReviewMode
+from app.core.multi_agent import (
+    GENERAL_AGENT_ID,
+    ContextSnapshot,
+    EvidenceRef,
+    ForkPolicy,
+    RuntimeBudget,
+    ScopeGrant,
+    SideEffectLevel,
+    TaskResult,
+)
+from app.core.multi_agent_scheduler import (
+    MultiAgentScheduler,
+    MultiAgentScheduleResult,
+    SchedulerContext,
+)
 from app.core.retrieval import LocalDebugRetrievalProvider
 from app.core.runtime_loop import RuntimeDebugRun, RuntimeLoop
 from app.core.sessions import (
@@ -59,10 +88,13 @@ from app.domains.matters import (
     MatterSourceLinkInput,
     MatterUpdateInput,
 )
+from app.domains.workspace_knowledge import WorkspaceKnowledgeIndexer
+from app.integrations.local_reranker import FastEmbedCrossEncoderReranker
 from app.integrations.local_semantic import build_local_semantic_components
 from app.integrations.outlook import (
     OutlookAuthCompleteResult,
     OutlookAuthStartResult,
+    OutlookConfigError,
     OutlookService,
     OutlookServiceError,
     OutlookSyncResult,
@@ -88,6 +120,7 @@ from app.tool_packages.filesystem import (
 )
 from app.tool_packages.knowledge import (
     KNOWLEDGE_PACKAGE,
+    ListKnowledgeSourcesTool,
     LoadKnowledgeChunksTool,
     LoadKnowledgeDocumentTool,
     SearchKnowledgeTool,
@@ -136,6 +169,14 @@ class LocalKnowledgeAgentRuntime:
         self.db_path = get_db_path(settings.data_dir)
         init_db(self.db_path)
         self.local_app_config = settings.load_local_config()
+        if (
+            self.local_app_config.agent.multi_agent_planning_enabled
+            and self.local_app_config.agent.orchestrator != "langgraph"
+        ):
+            raise ValueError(
+                "Multi-Agent scheduling requires agent.orchestrator = 'langgraph' "
+                "so parent runs can checkpoint and resume around child approvals."
+            )
         self.platform = detect_platform(settings.platform)
         self.path_resolver = PathResolver(
             self.platform,
@@ -160,12 +201,29 @@ class LocalKnowledgeAgentRuntime:
             normalize_embeddings=embedding_config.normalize_embeddings,
             local_files_only=embedding_config.local_files_only,
         )
+        reranker_config = self.local_app_config.reranker
+        reranker = (
+            FastEmbedCrossEncoderReranker(
+                model_name=reranker_config.model_name,
+                cache_dir=str(reranker_config.cache_dir),
+                batch_size=reranker_config.batch_size,
+                max_candidates=reranker_config.max_candidates,
+                max_query_chars=reranker_config.max_query_chars,
+                max_candidate_chars=reranker_config.max_candidate_chars,
+                max_concurrent_inferences=reranker_config.max_concurrent_inferences,
+                queue_timeout_ms=reranker_config.queue_timeout_ms,
+                local_files_only=reranker_config.local_files_only,
+            )
+            if reranker_config.enabled else None
+        )
         self.knowledge_service = KnowledgeService(
             self._conn,
             embedding_provider=embedding_provider,
             semantic_index=semantic_index,
             default_retrieval_mode=embedding_config.default_retrieval_mode,
             auto_index_on_import=embedding_config.auto_index_on_import,
+            reranker=reranker,
+            workspace_roots=tuple(settings.parsed_workspace_roots()),
         )
         self.mail_knowledge_mirror = MailKnowledgeMirror(
             mail_service=self.mail_service,
@@ -195,7 +253,10 @@ class LocalKnowledgeAgentRuntime:
         self.tool_registry.register_tool(ListMattersTool(self.matter_service))
         self.tool_registry.register_tool(UpdateMatterTool(self.matter_service))
         self.tool_registry.register_tool(LinkMatterSourceTool(self.matter_service))
-        self.tool_registry.register_tool(SearchKnowledgeTool(self.knowledge_service))
+        self.tool_registry.register_tool(SearchKnowledgeTool(
+            self.knowledge_service, self.local_app_config.query_rewrite,
+        ))
+        self.tool_registry.register_tool(ListKnowledgeSourcesTool(self.knowledge_service))
         self.tool_registry.register_tool(LoadKnowledgeChunksTool(self.knowledge_service))
         self.tool_registry.register_tool(LoadKnowledgeDocumentTool(self.knowledge_service))
         file_policy = FileAccessPolicy.from_workspace_roots(
@@ -227,6 +288,53 @@ class LocalKnowledgeAgentRuntime:
         self.agent_run_manager = InMemoryAgentRunManager(
             durable_store=self.agent_run_store
         )
+        # A new Runtime cannot answer an app-server request held by a process
+        # owned by the previous Runtime. Never leave such approvals actionable
+        # or pretend a restarted Codex turn can safely resume its side effects.
+        stale_codex_journal: CodexTraceJournal | None = None
+        for stale_review in self.agent_run_manager.list_pending_safety_reviews():
+            if not stale_review.tool_name.startswith("codex."):
+                continue
+            self.agent_run_manager.fail_child_run(
+                stale_review.run_id,
+                error_type="codex_process_lost",
+                error="Codex approval was orphaned by Runtime restart; retry requires a new isolated attempt.",
+            )
+            if stale_codex_journal is None:
+                stale_codex_journal = CodexTraceJournal(self.db_path)
+            stale_codex_journal.mark_gap(
+                stale_review.run_id,
+                reason="codex_runtime_restart_during_approval",
+            )
+        self.tool_executor.run_manager = self.agent_run_manager
+        fork_policy = None
+        if self.local_app_config.agent.multi_agent_planning_enabled:
+            registered_tools = self.tool_registry.list_tools()
+            fork_policy = ForkPolicy(
+                max_depth=self.local_app_config.agent.max_fork_depth,
+                max_children=self.local_app_config.agent.max_children,
+                max_fork_size=self.local_app_config.agent.max_fork_size,
+                allowed_agent_ids=tuple(
+                    agent_id for agent_id, enabled in (
+                        (GENERAL_AGENT_ID, True),
+                        ("mock_workflow", self.local_app_config.agent.mock_workflow_agent_enabled),
+                        (CodexAppServerExpertExecutor.AGENT_ID, self.local_app_config.agent.codex_expert_enabled),
+                    ) if enabled
+                ),
+                allowed_inference_profile_ids=(
+                    self.local_app_config.agent.allowed_child_inference_profile_ids
+                ),
+                allowed_scope=ScopeGrant(
+                    workspace_paths=tuple(
+                        sorted(root.as_posix() for root in self.settings.parsed_workspace_roots())
+                    ),
+                    allowed_packages=tuple(
+                        sorted({tool.package for tool in registered_tools if tool.package})
+                    ),
+                    allowed_tools=tuple(sorted(tool.name for tool in registered_tools)),
+                    side_effect_level=SideEffectLevel.EXTERNAL,
+                ),
+            )
         self.agent_llm_client = build_text_llm_client(self.local_app_config.llm)
         self.agent_turn_loop = AgentTurnLoop(
             session_service=self.session_service,
@@ -240,7 +348,20 @@ class LocalKnowledgeAgentRuntime:
                 self.local_app_config.safety.manual_wait_poll_seconds
             ),
             tool_invocation_store=self.agent_run_store,
+            fork_policy=fork_policy,
+            fork_execution=self.execute_multi_agent_plan,
+            fork_scope_resolver=self.fork_scope_resolver,
+            fork_plan_finalizer=self.finalize_multi_agent_plan,
+            fast_path_single_agent_enabled=(
+                self.local_app_config.agent.fast_path_single_agent_enabled
+            ),
+            default_workspace_root=(
+                str(self.settings.parsed_workspace_roots()[0])
+                if self.settings.parsed_workspace_roots()
+                else None
+            ),
         )
+        self.agent_turn_loop.multi_agent_max_retries = self.local_app_config.agent.multi_agent_max_retries
         self.agent_turn_runner: AgentTurnRunner = self.agent_turn_loop
         if self.local_app_config.agent.orchestrator == "langgraph":
             checkpointer = None
@@ -255,6 +376,105 @@ class LocalKnowledgeAgentRuntime:
                 checkpoint_runtime=checkpoint_runtime,
                 artifact_store=self.agent_run_store,
             )
+        self.child_agent_executor = ChildAgentExecutor(
+            runner=self.agent_turn_runner,
+            run_manager=self.agent_run_manager,
+        )
+        self.agent_executor_registry = AgentExecutorRegistry.with_general_agent(
+            self.child_agent_executor, self.run_child_agent_async
+        )
+        for profile in self.local_app_config.agent.inference_profiles:
+            self.agent_executor_registry.register_inference_profile(profile)
+        self.agent_executor_registry.register(
+            # Explicit local opt-in only: this demonstration returns simulated
+            # output and must not silently answer ordinary user tasks.
+            AgentDefinition(
+                agent_id="mock_workflow",
+                version="1",
+                executor_kind="workflow",
+                enabled=self.local_app_config.agent.mock_workflow_agent_enabled,
+            ),
+            MockWorkflowExecutor(self.agent_run_manager),
+        )
+        self.codex_expert_executor: CodexAppServerExpertExecutor | None = None
+        self.codex_trace_journal: CodexTraceJournal | None = None
+        if self.local_app_config.agent.codex_expert_enabled:
+            codex_binary = self.local_app_config.agent.codex_binary_path
+            workspace_base = self.local_app_config.agent.codex_workspace_base
+            if codex_binary is None or workspace_base is None:
+                raise ValueError("Enabled Codex expert requires a binary and isolated workspace base.")
+            if not codex_binary.is_file():
+                raise ValueError("Configured Codex executable does not exist.")
+            workspace_factory = CodexWorkspaceFactory(workspace_base)
+            codex_state_home = (
+                self.local_app_config.agent.codex_state_home
+                or workspace_base / "_codex_state"
+            )
+            codex_home = self.local_app_config.agent.codex_home
+            for private_home in (codex_state_home, codex_home):
+                if private_home is None:
+                    continue
+                resolved_private_home = private_home.resolve(strict=False)
+                for configured_root in self.settings.parsed_workspace_roots():
+                    resolved_root = configured_root.resolve(strict=False)
+                    if (
+                        resolved_private_home == resolved_root
+                        or resolved_root in resolved_private_home.parents
+                        or resolved_private_home in resolved_root.parents
+                    ):
+                        raise ValueError(
+                            "Codex state home must be separate from every configured source workspace."
+                        )
+            self.codex_trace_journal = CodexTraceJournal(self.db_path)
+
+            async def create_codex_client(_child_run_id: str) -> CodexAppServerClient:
+                # Do not merge grants from a pre-existing user profile.
+                permission_profile_id = (
+                    f"lka_codex_{uuid4().hex}"
+                    if self.local_app_config.agent.codex_permission_mode == "profile"
+                    else None
+                )
+                transport = await CodexSubprocessTransport.start(
+                    binary_path=codex_binary,
+                    cwd=workspace_base,
+                    codex_state_home=codex_state_home,
+                    codex_home=codex_home,
+                    permission_profile_id=permission_profile_id,
+                )
+                return CodexAppServerClient(
+                    transport, permission_profile_id=permission_profile_id
+                )
+
+            self.codex_expert_executor = CodexAppServerExpertExecutor(
+                self.agent_run_manager,
+                client_factory=create_codex_client,
+                codex_model=self.local_app_config.agent.codex_model,
+                reasoning_effort=self.local_app_config.agent.codex_reasoning_effort,
+                route_human_approvals=True,
+                approval_guard=staged_file_change_approval_guard,
+                trace_journal=self.codex_trace_journal,
+                workspace_factory=workspace_factory,
+            )
+            self.agent_executor_registry.register(
+                AgentDefinition(
+                    agent_id=CodexAppServerExpertExecutor.AGENT_ID,
+                    version=CodexAppServerExpertExecutor.VERSION,
+                    executor_kind="external_cli",
+                    scope_mode="workspace_sandbox",
+                    enabled=True,
+                    can_resume=False,
+                ),
+                self.codex_expert_executor,
+            )
+        self.multi_agent_scheduler = MultiAgentScheduler(
+            run_manager=self.agent_run_manager,
+            child_executor=self.child_agent_executor,
+            agent_registry=self.agent_executor_registry,
+            max_concurrency=self.local_app_config.agent.multi_agent_max_concurrency,
+            max_global_concurrency=self.local_app_config.agent.multi_agent_global_max_concurrency,
+            max_retries=self.local_app_config.agent.multi_agent_max_retries,
+        )
+        self._multi_agent_resume_locks: dict[str, threading.Lock] = {}
         self.debug_loop = RuntimeLoop(
             context_assembler=ContextAssembler(),
             retrieval_provider=LocalDebugRetrievalProvider(
@@ -365,6 +585,7 @@ class LocalKnowledgeAgentRuntime:
         source_frontend: str | None,
         indexed_files: int,
         indexed_chunks: int,
+        status: str = "completed",
     ) -> None:
         conn = self._conn()
         try:
@@ -379,7 +600,7 @@ class LocalKnowledgeAgentRuntime:
                     indexed_files=excluded.indexed_files,
                     indexed_chunks=excluded.indexed_chunks
                 """,
-                (workspace_id, workspace, source_frontend, "completed", indexed_files, indexed_chunks),
+                (workspace_id, workspace, source_frontend, status, indexed_files, indexed_chunks),
             )
             conn.commit()
         finally:
@@ -423,18 +644,38 @@ class LocalKnowledgeAgentRuntime:
                 options=ScanOptions(max_files=0),
             )
 
+        indexed_files = scan_result.indexed_files
+        indexed_chunks = scan_result.indexed_chunks
+        knowledge_errors: list[str] = []
+        status = "completed"
+        if (options or {}).get("index_knowledge"):
+            if not self.path_resolver.is_allowed_workspace(resolved):
+                raise ValueError("workspace is outside configured roots")
+            knowledge_result = WorkspaceKnowledgeIndexer(
+                self.knowledge_service,
+                [resolved.resolved_path],
+                max_files=min(self.settings.max_scan_files, 500),
+            ).index_workspace(resolved.resolved_path)
+            indexed_files = knowledge_result.imported_files
+            indexed_chunks = knowledge_result.imported_chunks
+            knowledge_errors = knowledge_result.errors
+            if knowledge_result.failed_files or knowledge_result.errors:
+                status = "partial" if indexed_files else "failed"
+
         self._upsert_workspace(
             workspace_id,
             resolved.normalized_path,
             source_frontend,
-            scan_result.indexed_files,
-            scan_result.indexed_chunks,
+            indexed_files,
+            indexed_chunks,
+            status,
         )
         return WorkspaceIndexResponse(
             workspace_id=workspace_id,
-            status="completed",
-            indexed_files=scan_result.indexed_files,
-            indexed_chunks=scan_result.indexed_chunks,
+            status=status,
+            indexed_files=indexed_files,
+            indexed_chunks=indexed_chunks,
+            knowledge_errors=knowledge_errors,
         )
 
     def list_capabilities(self) -> list[CapabilityItem]:
@@ -487,6 +728,7 @@ class LocalKnowledgeAgentRuntime:
         llm_client_name: str | None = None,
         llm_model: str | None = None,
         llm_response_mode: LLMResponseMode = LLMResponseMode.TEXT,
+        safety_review_mode: SafetyReviewMode | None = None,
         existing_run_id: str | None = None,
     ) -> AgentTurnResult:
         """Run the minimal general agent turn loop."""
@@ -497,6 +739,7 @@ class LocalKnowledgeAgentRuntime:
             llm_client_name=llm_client_name,
             llm_model=llm_model,
             llm_response_mode=llm_response_mode,
+            safety_review_mode=safety_review_mode,
             existing_run_id=existing_run_id,
         )
 
@@ -508,6 +751,7 @@ class LocalKnowledgeAgentRuntime:
         llm_client_name: str | None = None,
         llm_model: str | None = None,
         llm_response_mode: LLMResponseMode = LLMResponseMode.TEXT,
+        safety_review_mode: SafetyReviewMode | None = None,
         existing_run_id: str | None = None,
     ) -> AgentTurnResult:
         """Run one agent turn without blocking the event loop."""
@@ -518,8 +762,460 @@ class LocalKnowledgeAgentRuntime:
             llm_client_name=llm_client_name,
             llm_model=llm_model,
             llm_response_mode=llm_response_mode,
+            safety_review_mode=safety_review_mode,
             existing_run_id=existing_run_id,
         )
+
+    async def run_child_agent_async(
+        self,
+        *,
+        child_run_id: str,
+        snapshot: ContextSnapshot,
+        views: ContextViews,
+        llm_client_name: str | None = None,
+        llm_model: str | None = None,
+    ) -> TaskResult:
+        """Execute a prepared child through the configured Agent Turn runner."""
+
+        return await self.child_agent_executor.execute(
+            child_run_id=child_run_id,
+            snapshot=snapshot,
+            views=views,
+            llm_client_name=llm_client_name,
+            llm_model=llm_model,
+        )
+
+    def fork_scope_resolver(
+        self, run_id: str
+    ) -> tuple[ScopeGrant, ScopeGrant, ScopeGrant]:
+        """Return parent, session, and workspace ceilings for a fork request."""
+        run = self.agent_run_manager.get_run(run_id)
+        if run is None:
+            return ScopeGrant(), ScopeGrant(), ScopeGrant()
+        tools = self.tool_registry.list_tools()
+        packages = tuple(sorted({tool.package for tool in tools if tool.package}))
+        tool_names = tuple(sorted(tool.name for tool in tools))
+        session = self.session_service.get_session_or_none(session_id=run.session_id)
+        configured_paths = tuple(
+            sorted(root.as_posix() for root in self.settings.parsed_workspace_roots())
+        )
+        selected_paths = (
+            (session.workspace.backend_path,)
+            if session is not None and session.workspace is not None
+            else configured_paths
+        )
+        account_ids = self.mail_service.list_authorized_account_ids()
+        visible_sources = set()
+        for path in selected_paths or (None,):
+            visible_sources.update(self.knowledge_service.list_authorized_source_ids(
+                workspace_path=path, session_id=run.session_id,
+            ))
+        source_ids = tuple(sorted({
+            *visible_sources,
+            *(self.mail_knowledge_mirror.source_id_for_account(account_id) for account_id in account_ids),
+        }))
+        workspace_scope = ScopeGrant(
+            workspace_paths=selected_paths,
+            source_ids=source_ids,
+            account_ids=account_ids,
+            allowed_packages=packages,
+            allowed_tools=tool_names,
+            side_effect_level=SideEffectLevel.EXTERNAL,
+        )
+        parent_snapshot = run.metadata.get("context_snapshot")
+        if isinstance(parent_snapshot, dict):
+            try:
+                effective_parent = ContextSnapshot.model_validate(parent_snapshot).effective_scope
+            except Exception:  # noqa: BLE001 - malformed persisted context fails closed.
+                effective_parent = ScopeGrant()
+        else:
+            effective_parent = ScopeGrant(
+                workspace_paths=selected_paths,
+                source_ids=source_ids,
+                account_ids=account_ids,
+                allowed_packages=packages,
+                allowed_tools=tool_names,
+                side_effect_level=SideEffectLevel.EXTERNAL,
+            )
+        session_scope = ScopeGrant(
+            workspace_paths=selected_paths,
+            source_ids=source_ids,
+            account_ids=account_ids,
+            allowed_packages=packages,
+            allowed_tools=tool_names,
+            side_effect_level=SideEffectLevel.EXTERNAL,
+        )
+        return effective_parent, session_scope, workspace_scope
+
+    def _live_fork_policy(self) -> ForkPolicy | None:
+        """Refresh trusted local inventories while preserving static fork limits."""
+        base = self.agent_turn_loop.fork_policy
+        if base is None:
+            return None
+        tools = self.tool_registry.list_tools()
+        accounts = self.mail_service.list_authorized_account_ids()
+        visible_sources = set(self.knowledge_service.list_authorized_source_ids())
+        for root in self.settings.parsed_workspace_roots():
+            visible_sources.update(
+                self.knowledge_service.list_authorized_source_ids(
+                    workspace_path=root.as_posix()
+                )
+            )
+        sources = tuple(sorted({
+            *visible_sources,
+            *(self.mail_knowledge_mirror.source_id_for_account(account_id) for account_id in accounts),
+        }))
+        updated_scope = base.allowed_scope.model_copy(update={
+            "workspace_paths": tuple(sorted(root.as_posix() for root in self.settings.parsed_workspace_roots())),
+            "source_ids": sources,
+            "account_ids": accounts,
+            "allowed_packages": tuple(sorted({tool.package for tool in tools if tool.package})),
+            "allowed_tools": tuple(sorted(tool.name for tool in tools)),
+        })
+        return base.model_copy(update={"allowed_scope": updated_scope})
+
+    def _parent_knowledge_evidence_candidates(
+        self, run_id: str, *, source_ids: tuple[str, ...], account_ids: tuple[str, ...]
+    ) -> tuple[EvidenceCandidate, ...]:
+        """Rehydrate only still-authorized parent RAG references for child derivation."""
+        events = self.agent_run_store.list_completed_tool_results(
+            run_id=run_id,
+            tool_names=("knowledge.search", "knowledge.load_chunks"),
+        )
+        references: list[tuple[str, str]] = []
+        seen_ids: set[str] = set()
+        for event in events:
+            result = event["result"]
+            if result.get("status") != "completed":
+                continue
+            output = result.get("output")
+            if not isinstance(output, dict):
+                continue
+            records = output.get("results", output.get("chunks", []))
+            if not isinstance(records, list):
+                continue
+            for record in records:
+                if not isinstance(record, dict) or record.get("policy_decision") not in {"allowed", "redacted"}:
+                    continue
+                chunk_id = record.get("chunk_id")
+                source_id = record.get("source_id")
+                source_ref = record.get("source_ref")
+                if not all(isinstance(value, str) and value for value in (chunk_id, source_id, source_ref)):
+                    continue
+                if chunk_id in seen_ids or source_id not in source_ids:
+                    continue
+                references.append((chunk_id, source_id))
+                seen_ids.add(chunk_id)
+                if len(references) >= 20:
+                    break
+            if len(references) >= 20:
+                break
+        if not references:
+            return ()
+        loaded = self.knowledge_service.load_chunks(
+            chunk_ids=[chunk_id for chunk_id, _ in references],
+            max_chars_per_chunk=420,
+            source_ids=list(source_ids),
+            account_ids=list(account_ids) if account_ids else None,
+        )
+        by_id = {chunk.chunk_id: chunk for chunk in loaded.chunks}
+        candidates: list[EvidenceCandidate] = []
+        for chunk_id, source_id in references:
+            chunk = by_id.get(chunk_id)
+            if chunk is None or chunk.source_id != source_id:
+                continue
+            candidates.append(EvidenceCandidate(
+                evidence=EvidenceRef(
+                    evidence_id=chunk_id, source_ref=chunk.source_ref,
+                    source_id=source_id, untrusted_data=True,
+                ),
+                summary=f"{chunk.title}: {chunk.text[:160]}",
+                excerpt=chunk.text[:420],
+            ))
+        return tuple(candidates)
+
+    async def execute_multi_agent_plan_async(
+        self,
+        parent_run_id: str,
+        *,
+        context: SchedulerContext | None = None,
+        llm_client_name: str | None = None,
+        llm_model: str | None = None,
+    ) -> MultiAgentScheduleResult:
+        """Run or resume the durable DAG attached to an active parent Agent run."""
+        if self.multi_agent_scheduler is None:
+            raise RuntimeError("Multi-Agent scheduling is not initialized.")
+        if llm_client_name is None and llm_model is None:
+            parent_events = self.agent_run_manager.list_events(parent_run_id)
+            run_started = next(
+                (event for event in parent_events if event.type == "run_started"),
+                None,
+            )
+            selection = run_started.payload if run_started is not None else {}
+            if selection.get("inference_selection_source") == "request":
+                client_override = selection.get("inference_client_name")
+                model_override = selection.get("inference_model")
+                llm_client_name = client_override if isinstance(client_override, str) else None
+                llm_model = model_override if isinstance(model_override, str) else None
+        if context is None:
+            parent_scope, session_scope, workspace_scope = self.fork_scope_resolver(parent_run_id)
+            evidence_candidates = self._parent_knowledge_evidence_candidates(
+                parent_run_id,
+                source_ids=session_scope.source_ids,
+                account_ids=session_scope.account_ids,
+            )
+            context = SchedulerContext(
+                parent_effective_scope=parent_scope,
+                session_scope=session_scope,
+                workspace_scope=workspace_scope,
+                policy_scope=ScopeGrant(
+                    workspace_paths=workspace_scope.workspace_paths,
+                    source_ids=session_scope.source_ids,
+                    account_ids=session_scope.account_ids,
+                    allowed_packages=tuple(sorted({tool.package for tool in self.tool_registry.list_tools() if tool.package})),
+                    allowed_tools=tuple(sorted(tool.name for tool in self.tool_registry.list_tools())),
+                    side_effect_level=SideEffectLevel.EXTERNAL,
+                ),
+                budget=RuntimeBudget(),
+                fork_policy=self._live_fork_policy(),
+                evidence_candidates=evidence_candidates,
+            )
+        return await self.multi_agent_scheduler.execute_plan_async(
+            parent_run_id,
+            context=context,
+            llm_client_name=llm_client_name,
+            llm_model=llm_model,
+        )
+
+    def execute_multi_agent_plan(self, parent_run_id: str) -> MultiAgentScheduleResult:
+        """Synchronous bridge for Agent graph nodes running in worker threads."""
+        return asyncio.run(self.execute_multi_agent_plan_async(parent_run_id))
+
+    def cancel_multi_agent_child(self, *, parent_run_id: str, child_run_id: str) -> AgentRunRecord:
+        """Cancel an active child owned by the given parent run."""
+        if self.multi_agent_scheduler is None:
+            raise RuntimeError("Multi-Agent scheduling is not initialized.")
+        return self.multi_agent_scheduler.cancel_child_run(
+            parent_run_id=parent_run_id,
+            child_run_id=child_run_id,
+        )
+
+    async def retry_multi_agent_child(
+        self, *, parent_run_id: str, child_run_id: str
+    ) -> MultiAgentScheduleResult:
+        """Retry an explicitly selected failed child attempt under its parent."""
+        if self.multi_agent_scheduler is None:
+            raise RuntimeError("Multi-Agent scheduling is not initialized.")
+        parent_scope, session_scope, workspace_scope = self.fork_scope_resolver(parent_run_id)
+        tools = self.tool_registry.list_tools()
+        evidence_candidates = self._parent_knowledge_evidence_candidates(
+            parent_run_id,
+            source_ids=session_scope.source_ids,
+            account_ids=session_scope.account_ids,
+        )
+        context = SchedulerContext(
+            parent_effective_scope=parent_scope,
+            session_scope=session_scope,
+            workspace_scope=workspace_scope,
+            policy_scope=ScopeGrant(
+                workspace_paths=workspace_scope.workspace_paths,
+                source_ids=session_scope.source_ids,
+                account_ids=session_scope.account_ids,
+                allowed_packages=tuple(sorted({tool.package for tool in tools if tool.package})),
+                allowed_tools=tuple(sorted(tool.name for tool in tools)),
+                side_effect_level=SideEffectLevel.EXTERNAL,
+            ),
+            budget=RuntimeBudget(),
+            evidence_candidates=evidence_candidates,
+            fork_policy=self._live_fork_policy(),
+        )
+        return await self.multi_agent_scheduler.retry_child_run_async(
+            parent_run_id=parent_run_id,
+            child_run_id=child_run_id,
+            context=context,
+        )
+
+    async def resume_multi_agent_parent_async(
+        self, parent_run_id: str
+    ) -> AgentTurnResult | MultiAgentScheduleResult | None:
+        """Resume parent orchestration after its child confirmation is resolved."""
+        lock = self._multi_agent_resume_locks.setdefault(parent_run_id, threading.Lock())
+        while not lock.acquire(blocking=False):
+            await asyncio.sleep(0.01)
+        try:
+            parent = self.agent_run_manager.get_run(parent_run_id)
+            if parent is None:
+                raise KeyError(f"Agent run not found: {parent_run_id}")
+            if parent.status in {AgentRunStatus.COMPLETED, AgentRunStatus.FAILED, AgentRunStatus.CANCELLED, AgentRunStatus.TIMED_OUT}:
+                if parent.parent_run_id is not None:
+                    return await self.resume_multi_agent_parent_async(parent.parent_run_id)
+                return None
+            if parent.status not in {AgentRunStatus.RUNNING, AgentRunStatus.WAITING_CONFIRMATION, AgentRunStatus.WAITING_USER}:
+                raise ValueError("Parent run is not resumable for multi-Agent scheduling.")
+            active_plan_id = parent.plan_id
+            nested_plan = parent.metadata.get("multi_agent_plan")
+            if (
+                isinstance(nested_plan, dict)
+                and nested_plan.get("parent_run_id") == parent.run_id
+                and isinstance(nested_plan.get("plan_id"), str)
+            ):
+                active_plan_id = nested_plan["plan_id"]
+            waiting = [
+                self.agent_run_manager.get_run(child_id)
+                for child_id in parent.child_run_ids
+            ]
+            waiting = [
+                child for child in waiting
+                if child is not None and child.plan_id == active_plan_id
+                and child.status in {AgentRunStatus.WAITING_CONFIRMATION, AgentRunStatus.WAITING_USER}
+            ]
+            if parent.status == AgentRunStatus.WAITING_USER:
+                if waiting:
+                    return None
+                waiting_child_ids = parent.metadata.get("waiting_child_user_run_ids", [])
+                # A continued child is RUNNING while its checkpoint is being
+                # driven. Keep the parent parked until every child recorded by
+                # the wait event is terminal; merely leaving WAITING_USER is
+                # not sufficient to unlock the parent's graph.
+                if not isinstance(waiting_child_ids, list) or not waiting_child_ids:
+                    return None
+                terminal_child_statuses = {
+                    AgentRunStatus.COMPLETED,
+                    AgentRunStatus.FAILED,
+                    AgentRunStatus.CANCELLED,
+                    AgentRunStatus.TIMED_OUT,
+                }
+                for child_id in waiting_child_ids:
+                    child = self.agent_run_manager.get_run(str(child_id))
+                    if (
+                        child is None
+                        or child.parent_run_id != parent_run_id
+                        or child.status not in terminal_child_statuses
+                    ):
+                        return None
+                resumed_parent = self.agent_run_manager.resume_after_child_user(parent_run_id)
+                if resumed_parent.status != AgentRunStatus.RUNNING:
+                    return None
+                parent = self.agent_run_manager.get_run(parent_run_id)
+                if parent is None:
+                    raise KeyError(f"Agent run not found: {parent_run_id}")
+            if waiting:
+                return await self.execute_multi_agent_plan_async(parent_run_id)
+            if isinstance(self.agent_turn_runner, AgentGraphRunner):
+                if parent.status == AgentRunStatus.WAITING_CONFIRMATION:
+                    self.agent_run_manager.resume_running(parent_run_id)
+                result = await self.agent_turn_runner.resume_async(parent_run_id)
+                updated_parent = self.agent_run_manager.get_run(parent_run_id)
+                if updated_parent is not None and updated_parent.parent_run_id is not None and updated_parent.status in {
+                    AgentRunStatus.COMPLETED, AgentRunStatus.FAILED, AgentRunStatus.CANCELLED, AgentRunStatus.TIMED_OUT
+                }:
+                    await self.resume_multi_agent_parent_async(updated_parent.parent_run_id)
+                return result
+            if parent.status == AgentRunStatus.WAITING_CONFIRMATION:
+                self.agent_run_manager.resume_running(parent_run_id)
+            result = await self.execute_multi_agent_plan_async(parent_run_id)
+            updated_parent = self.agent_run_manager.get_run(parent_run_id)
+            if updated_parent is not None and updated_parent.parent_run_id is not None and updated_parent.status in {
+                AgentRunStatus.COMPLETED, AgentRunStatus.FAILED, AgentRunStatus.CANCELLED, AgentRunStatus.TIMED_OUT
+            }:
+                await self.resume_multi_agent_parent_async(updated_parent.parent_run_id)
+            return result
+        finally:
+            lock.release()
+
+    async def resume_multi_agent_user_question_async(
+        self, run_id: str, command_id: str
+    ) -> AgentTurnResult:
+        """Resume a question interrupt using the private, durable answer journal."""
+        run = self.agent_run_manager.get_run(run_id)
+        if run is None:
+            raise KeyError(f"Agent run not found: {run_id}")
+        if run.status != AgentRunStatus.RUNNING:
+            raise ValueError("Agent run is not active after a user continuation.")
+        if run.metadata.get("pending_user_answer_command_id") != command_id:
+            raise ValueError("User continuation command does not match the active run.")
+        if self.agent_run_manager.get_user_continuation(run_id, command_id) is None:
+            raise ValueError("Trusted user continuation journal entry is missing.")
+        if not isinstance(self.agent_turn_runner, AgentGraphRunner):
+            raise TypeError("User-question continuation requires the LangGraph orchestrator.")
+        result = await self.agent_turn_runner.resume_async(run_id)
+        resumed = self.agent_run_manager.get_run(run_id)
+        if resumed is None or resumed.status not in {
+            AgentRunStatus.COMPLETED,
+            AgentRunStatus.FAILED,
+            AgentRunStatus.CANCELLED,
+            AgentRunStatus.TIMED_OUT,
+        }:
+            return result
+        parent_id = resumed.parent_run_id
+        if parent_id:
+            # The parent hook has its own persisted wait-set gate and lock. Call
+            # it for every terminal child, including nested children; it will
+            # resume only when all direct children it is waiting for are
+            # terminal, then propagate further up the ancestor chain.
+            await self.resume_multi_agent_parent_async(parent_id)
+        return result
+
+    def finalize_multi_agent_plan(self, parent_run_id: str) -> None:
+        """Close a plan after the parent Agent has produced its final answer."""
+        parent = self.agent_run_manager.get_run(parent_run_id)
+        if parent is None:
+            return
+        raw_plan = parent.metadata.get("multi_agent_plan")
+        if not isinstance(raw_plan, dict) or raw_plan.get("parent_run_id") != parent_run_id:
+            return
+        from app.core.multi_agent import Plan, PlanStatus, PlanStepStatus
+
+        plan = Plan.model_validate(raw_plan)
+        if self.multi_agent_scheduler is None:
+            raise RuntimeError("Multi-Agent scheduler is not initialized.")
+        child_steps = [step for step in plan.steps if step.step_id != "root_coordinator"]
+        if any(step.status in {PlanStepStatus.PENDING, PlanStepStatus.READY, PlanStepStatus.RUNNING, PlanStepStatus.WAITING} for step in child_steps):
+            unresolved = ", ".join(
+                step.step_id for step in child_steps
+                if step.status in {PlanStepStatus.PENDING, PlanStepStatus.READY, PlanStepStatus.RUNNING, PlanStepStatus.WAITING}
+            )
+            raise RuntimeError(f"Cannot finalize a plan with unresolved child steps: {unresolved}.")
+        root = next((step for step in plan.steps if step.step_id == "root_coordinator"), None)
+        if root is not None and root.status == PlanStepStatus.RUNNING:
+            plan = self.multi_agent_scheduler._set_step_status(
+                plan, root.step_id, PlanStepStatus.COMPLETED
+            )
+        if any(step.status in {PlanStepStatus.FAILED, PlanStepStatus.BLOCKED} for step in child_steps):
+            plan = plan.transition_to(PlanStatus.FAILED)
+        elif plan.status == PlanStatus.REPLANNING:
+            # The Planner chose a final answer after processing its last
+            # replan/user observation. Re-enter execution state before closing
+            # the plan; REPLANNING intentionally is not terminal.
+            plan = plan.transition_to(PlanStatus.RUNNING).transition_to(PlanStatus.COMPLETED)
+        elif plan.status == PlanStatus.RUNNING:
+            plan = plan.transition_to(PlanStatus.COMPLETED)
+        self.agent_run_manager.record_multi_agent_plan(
+            parent_run_id,
+            event_type="multi_agent_plan_finalized",
+            payload={"plan_id": plan.plan_id, "status": plan.status.value},
+            plan=plan.model_dump(mode="json"),
+        )
+
+    def list_codex_native_trace(
+        self,
+        child_run_id: str,
+        *,
+        after_sequence: int = 0,
+        limit: int = 100,
+    ) -> list[CodexTraceEvent]:
+        """Read private native Codex events for trusted runtime/eval consumers.
+
+        These payloads may contain source code, prompts, and command output;
+        they must not be returned through the ordinary Agent run API.
+        """
+        child = self.agent_run_manager.get_run(child_run_id)
+        if child is None or child.parent_run_id is None:
+            raise KeyError(f"Child Agent run not found: {child_run_id}")
+        if child.metadata.get("agent_id") != CodexAppServerExpertExecutor.AGENT_ID:
+            raise ValueError("Child run is not a Codex expert run.")
+        journal = self.codex_trace_journal or CodexTraceJournal(self.db_path)
+        return journal.list(child_run_id, after_sequence=after_sequence, limit=limit)
 
     def resume_agent_run(self, run_id: str) -> AgentTurnResult:
         """Resume an incomplete LangGraph run from its latest checkpoint."""
@@ -801,6 +1497,8 @@ class LocalKnowledgeAgentRuntime:
     ) -> OutlookSyncResult:
         """Read Outlook mail through Microsoft Graph and persist it locally."""
 
+        if not self.local_app_config.mail.outlook.enabled:
+            raise OutlookConfigError("Outlook sync is disabled by local configuration.")
         with self._mail_sync_lock:
             result = self.outlook_service.sync_messages(
                 folder=folder,

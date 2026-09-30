@@ -8,14 +8,16 @@ import json
 import queue
 import threading
 import time
+from collections.abc import Callable
+from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from hashlib import sha1
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from app.core.agent_runs import (
     AgentRunCancelled,
@@ -24,6 +26,7 @@ from app.core.agent_runs import (
 )
 from app.core.agent_storage import SqliteAgentRunStore
 from app.core.agent_tool_graph import AgentToolLifecycleGraph
+from app.core.context_driver import ToolView
 from app.core.llm import (
     LLMAuthenticationError,
     LLMClientError,
@@ -32,6 +35,7 @@ from app.core.llm import (
     LLMProviderHTTPError,
     LLMProviderStreamError,
     LLMRateLimitError,
+    LLMReasoningEffort,
     LLMRequest,
     LLMResponse,
     LLMResponseMode,
@@ -54,6 +58,37 @@ from app.core.llm.audit import (
 from app.core.llm.audit import (
     now_iso as llm_audit_now_iso,
 )
+from app.core.multi_agent import (
+    ContextSnapshot,
+    ForkCallerKind,
+    ForkPolicy,
+    ForkPolicyViolation,
+    ForkSubtasksOperation,
+    ForkValidationContext,
+    Plan,
+    PlanPatch,
+    PlanPatchContext,
+    PlanPatchOperation,
+    PlanStatus,
+    PlanStep,
+    PlanStepStatus,
+    ScopeGrant,
+    SideEffectLevel,
+    objective_fingerprint,
+    validate_fork_subtasks,
+)
+from app.core.multi_agent_fast_path import (
+    FastPathDisposition,
+    FastPathEvent,
+    FastPathEventType,
+    FastPathPolicy,
+    FastPathRequest,
+    FastPathTemplateKind,
+    assess_fast_path,
+    assess_fast_path_completion,
+    standard_fast_path_templates,
+)
+from app.core.multi_agent_replan import PlanPatchRejected, apply_plan_patch
 from app.core.runtime_context import current_time_payload
 from app.core.safety import (
     SafetyReviewDecision,
@@ -72,6 +107,7 @@ from app.core.tools import (
 )
 
 DEFAULT_MAX_DECISION_STEPS = 10
+ROOT_COORDINATOR_STEP_ID = "root_coordinator"
 DECISION_OBSERVATION_MAX_STRING_CHARS = 4_000
 DECISION_OBSERVATION_MAX_LIST_ITEMS = 20
 LLM_OBSERVATION_MAX_TOTAL_CHARS = 16_000
@@ -87,6 +123,91 @@ def _stable_id(prefix: str, *parts: str | None) -> str:
     return f"{prefix}_{digest}"
 
 
+def _fork_subtasks_function_schema() -> dict[str, Any]:
+    scope_properties = {
+        "workspace_paths": {"type": "array", "items": {"type": "string"}},
+        "source_ids": {"type": "array", "items": {"type": "string"}},
+        "account_ids": {"type": "array", "items": {"type": "string"}},
+        "allowed_packages": {"type": "array", "items": {"type": "string"}},
+        "allowed_tools": {"type": "array", "items": {"type": "string"}},
+        "side_effect_level": {
+            "type": "string",
+            "enum": ["none", "read", "write", "external"],
+        },
+    }
+    subtask_properties = {
+        "step_id": {"type": "string"},
+        "objective": {"type": "string"},
+        "role": {"type": "string"},
+        "inference_profile_id": {"type": "string"},
+        "agent_id": {"type": "string"},
+        "depends_on": {"type": "array", "items": {"type": "string"}},
+        "parallel_group": {"type": "string"},
+        "requested_scope": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": scope_properties,
+        },
+        "input_refs": {"type": "array", "items": {"type": "string"}},
+        "output_contract": {"type": "string"},
+        "verification_criteria": {"type": "array", "items": {"type": "string"}},
+    }
+    return {
+        "type": "object", "additionalProperties": False,
+        "required": ["operation_id", "parent_step_id", "subtasks"],
+        "properties": {
+            "operation_id": {"type": "string"}, "parent_step_id": {"type": "string"},
+            "subtasks": {"type": "array", "minItems": 1, "items": {
+                "type": "object", "additionalProperties": False,
+                "required": ["step_id", "objective", "output_contract"],
+                "properties": subtask_properties,
+            }},
+        },
+    }
+
+
+def _plan_patch_function_schema() -> dict[str, Any]:
+    scope = {
+        "type": "object", "additionalProperties": False,
+        "properties": {
+            "workspace_paths": {"type": "array", "items": {"type": "string"}},
+            "source_ids": {"type": "array", "items": {"type": "string"}},
+            "account_ids": {"type": "array", "items": {"type": "string"}},
+            "allowed_packages": {"type": "array", "items": {"type": "string"}},
+            "allowed_tools": {"type": "array", "items": {"type": "string"}},
+            "side_effect_level": {"type": "string", "enum": ["none", "read", "write", "external"]},
+        },
+    }
+    alternative = {
+        "type": "object", "additionalProperties": False,
+        "required": ["correlation_id", "step_id", "objective", "output_contract"],
+        "properties": {
+            "correlation_id": {"type": "string"},
+            "step_id": {"type": "string"}, "objective": {"type": "string"},
+            "role": {"type": ["string", "null"]}, "depends_on": {"type": "array", "items": {"type": "string"}},
+            "inference_profile_id": {"type": ["string", "null"]},
+            "parallel_group": {"type": ["string", "null"]},
+            "input_refs": {"type": "array", "items": {"type": "string"}},
+            "allowed_packages": {"type": "array", "items": {"type": "string"}},
+            "allowed_tools": {"type": "array", "items": {"type": "string"}},
+            "side_effect_level": {"type": "string", "enum": ["none", "read", "write", "external"]},
+            "output_contract": {"type": "string"}, "verification_criteria": {"type": "array", "items": {"type": "string"}},
+        },
+    }
+    return {
+        "type": "object", "additionalProperties": False,
+        "required": ["patch_id", "plan_id", "expected_revision", "operation", "reason"],
+        "properties": {
+            "patch_id": {"type": "string"}, "plan_id": {"type": "string"},
+            "expected_revision": {"type": "integer", "minimum": 0},
+            "operation": {"type": "string", "enum": [item.value for item in PlanPatchOperation]},
+            "reason": {"type": "string"}, "target_step_id": {"type": ["string", "null"]},
+            "reduced_scope": scope, "alternative_step": alternative,
+            "degradation_note": {"type": ["string", "null"]}, "user_question": {"type": ["string", "null"]},
+            "budget": {"type": ["object", "null"], "additionalProperties": False,
+                "properties": {key: {"type": ["integer", "null"], "minimum": 1} for key in ("max_tokens", "max_llm_calls", "max_tool_calls", "max_wall_time_seconds")}},
+        },
+    }
 def _session_workspace_path(session: AgentSession) -> str | None:
     """Return the already backend-validated session workspace, if configured."""
 
@@ -98,6 +219,12 @@ _turn_llm_client_name: ContextVar[str | None] = ContextVar(
     default=None,
 )
 _turn_llm_model: ContextVar[str | None] = ContextVar("turn_llm_model", default=None)
+_turn_safety_review_mode: ContextVar[SafetyReviewMode | None] = ContextVar(
+    "turn_safety_review_mode", default=None
+)
+_turn_inference_snapshot: ContextVar[ContextSnapshot | None] = ContextVar(
+    "turn_inference_snapshot", default=None
+)
 _turn_llm_response_mode: ContextVar[LLMResponseMode] = ContextVar(
     "turn_llm_response_mode",
     default=LLMResponseMode.TEXT,
@@ -247,6 +374,11 @@ class AgentTurnWorkingSet(BaseModel):
 class AgentTurnLoop:
     """Small first Main Agent Brain slice for routing to packages and calling tools."""
 
+    _llm_admission_guard: ClassVar[threading.Lock] = threading.Lock()
+    _llm_admission: ClassVar[
+        dict[tuple[str, str], threading.BoundedSemaphore]
+    ] = {}
+
     def __init__(
         self,
         *,
@@ -259,6 +391,14 @@ class AgentTurnLoop:
         safety_review_mode: SafetyReviewMode | str = SafetyReviewMode.SKIP,
         safety_manual_wait_poll_seconds: float = 0.5,
         tool_invocation_store: SqliteAgentRunStore | None = None,
+        fork_policy: ForkPolicy | None = None,
+        fork_scope_resolver: Callable[
+            [str], tuple[ScopeGrant, ScopeGrant, ScopeGrant]
+        ] | None = None,
+        fork_execution: Callable[[str], Any] | None = None,
+        fork_plan_finalizer: Callable[[str], Any] | None = None,
+        fast_path_single_agent_enabled: bool = False,
+        default_workspace_root: str | None = None,
     ) -> None:
         self.session_service = session_service
         self.tool_executor = tool_executor
@@ -274,6 +414,28 @@ class AgentTurnLoop:
         self.safety_review_mode = self._normalize_safety_review_mode(safety_review_mode)
         self.safety_manual_wait_poll_seconds = safety_manual_wait_poll_seconds
         self.tool_invocation_store = tool_invocation_store
+        self.fork_policy = fork_policy
+        self.fork_scope_resolver = fork_scope_resolver
+        self.fork_execution = fork_execution
+        self.fork_plan_finalizer = fork_plan_finalizer
+        self.default_workspace_root = default_workspace_root
+        self.fast_path_policy: FastPathPolicy | None = None
+        if fast_path_single_agent_enabled:
+            single_agent_template = next(
+                template
+                for template in standard_fast_path_templates(
+                    retrieval_capability_id="unavailable-retrieval",
+                    inspection_capability_id="unavailable-inspection",
+                    verification_capability_id="unavailable-verification",
+                )
+                if template.template_id == FastPathTemplateKind.SINGLE_AGENT
+            )
+            self.fast_path_policy = FastPathPolicy(
+                correlation_id="server-fast-path-policy",
+                enabled=True,
+                allowed_templates=(FastPathTemplateKind.SINGLE_AGENT,),
+                templates=(single_agent_template,),
+            )
 
     def _normalize_safety_review_mode(
         self,
@@ -286,6 +448,18 @@ class AgentTurnLoop:
         except ValueError:
             return SafetyReviewMode.SKIP
 
+    def _effective_safety_review_mode(self) -> SafetyReviewMode:
+        """A request may increase review strictness, never weaken local policy."""
+        requested = _turn_safety_review_mode.get()
+        priority = {
+            SafetyReviewMode.SKIP: 0,
+            SafetyReviewMode.LLM: 1,
+            SafetyReviewMode.MANUAL: 2,
+        }
+        if requested is None or priority[requested] <= priority[self.safety_review_mode]:
+            return self.safety_review_mode
+        return requested
+
     def run(
         self,
         *,
@@ -294,11 +468,14 @@ class AgentTurnLoop:
         llm_client_name: str | None = None,
         llm_model: str | None = None,
         llm_response_mode: LLMResponseMode = LLMResponseMode.TEXT,
+        safety_review_mode: SafetyReviewMode | None = None,
         existing_run_id: str | None = None,
     ) -> AgentTurnResult:
         client_token = _turn_llm_client_name.set(llm_client_name)
         model_token = _turn_llm_model.set(llm_model)
         mode_token = _turn_llm_response_mode.set(llm_response_mode)
+        review_mode_token = _turn_safety_review_mode.set(safety_review_mode)
+        inference_token = _turn_inference_snapshot.set(None)
         run_manager_token = None
         run_id_token = None
         try:
@@ -310,6 +487,9 @@ class AgentTurnLoop:
                         session_id=session_id,
                         user_input=user_input,
                     )
+                )
+                _turn_inference_snapshot.set(
+                    self._inference_snapshot_for_run(run)
                 )
                 session = self.session_service.ensure_session(
                     session_id=run.session_id,
@@ -326,7 +506,11 @@ class AgentTurnLoop:
                     "run_started",
                     "Agent run started.",
                     stage="run",
-                    payload={"session_id": session.session_id, "trace_id": trace_id},
+                    payload={
+                        "session_id": session.session_id,
+                        "trace_id": trace_id,
+                        **self._inference_call_metadata(),
+                    },
                 )
             else:
                 session = self.session_service.ensure_session(
@@ -356,6 +540,8 @@ class AgentTurnLoop:
             _turn_llm_client_name.reset(client_token)
             _turn_llm_model.reset(model_token)
             _turn_llm_response_mode.reset(mode_token)
+            _turn_safety_review_mode.reset(review_mode_token)
+            _turn_inference_snapshot.reset(inference_token)
 
     async def run_async(
         self,
@@ -365,6 +551,7 @@ class AgentTurnLoop:
         llm_client_name: str | None = None,
         llm_model: str | None = None,
         llm_response_mode: LLMResponseMode = LLMResponseMode.TEXT,
+        safety_review_mode: SafetyReviewMode | None = None,
         existing_run_id: str | None = None,
     ) -> AgentTurnResult:
         result_queue: queue.Queue[tuple[bool, AgentTurnResult | BaseException]] = queue.Queue(
@@ -382,6 +569,7 @@ class AgentTurnLoop:
                             llm_client_name=llm_client_name,
                             llm_model=llm_model,
                             llm_response_mode=llm_response_mode,
+                            safety_review_mode=safety_review_mode,
                             existing_run_id=existing_run_id,
                         ),
                     )
@@ -432,6 +620,82 @@ class AgentTurnLoop:
             raise KeyError(f"Agent run not found: {run_id}")
         return run
 
+    def _inference_snapshot_for_run(
+        self, run: AgentRunRecord
+    ) -> ContextSnapshot | None:
+        if run.parent_run_id is None:
+            return None
+        raw_snapshot = run.metadata.get("context_snapshot")
+        if not isinstance(raw_snapshot, dict):
+            return None
+        if (
+            raw_snapshot.get("inference_profile_id") is None
+            and raw_snapshot.get("inference_selection_source", "default") == "default"
+        ):
+            return None
+        snapshot = ContextSnapshot.model_validate(raw_snapshot)
+        if (
+            snapshot.child_run_id != run.run_id
+            or snapshot.session_id != run.session_id
+            or (
+                snapshot.inference_selection_source == "server_profile"
+                and (
+                    snapshot.inference_profile_id is None
+                    or snapshot.inference_client_name is None
+                    or snapshot.inference_model is None
+                )
+            )
+        ):
+            raise ValueError("Child inference profile does not match its immutable run snapshot.")
+        return snapshot
+
+    def _inference_selection(
+        self,
+    ) -> tuple[str | None, str | None, LLMReasoningEffort | None, str, str | None]:
+        """Apply explicit request > frozen child profile > configured client default."""
+        request_client = _turn_llm_client_name.get()
+        request_model = _turn_llm_model.get()
+        if request_client is not None or request_model is not None:
+            return request_client, request_model, None, "request", None
+        snapshot = _turn_inference_snapshot.get()
+        if snapshot is not None:
+            if snapshot.inference_selection_source == "default":
+                return None, None, None, "default", None
+            effort = (
+                LLMReasoningEffort(snapshot.inference_reasoning_effort)
+                if snapshot.inference_reasoning_effort is not None
+                else None
+            )
+            if effort is not None:
+                supports = getattr(self.llm_client, "supports_reasoning_effort", None)
+                if not callable(supports) or not supports(
+                    client_name=snapshot.inference_client_name
+                ):
+                    raise LLMClientError(
+                        "The frozen inference profile requests reasoning effort unsupported by its LLM client."
+                    )
+            return (
+                snapshot.inference_client_name,
+                snapshot.inference_model,
+                effort,
+                snapshot.inference_selection_source,
+                snapshot.inference_profile_id,
+            )
+        return None, None, None, "default", None
+
+    def _inference_call_metadata(self) -> dict[str, str]:
+        client_name, model, effort, source, profile_id = self._inference_selection()
+        metadata = {"inference_selection_source": source}
+        if client_name is not None:
+            metadata["inference_client_name"] = client_name
+        if model is not None:
+            metadata["inference_model"] = model
+        if effort is not None:
+            metadata["inference_reasoning_effort"] = effort.value
+        if profile_id is not None:
+            metadata["inference_profile_id"] = profile_id
+        return metadata
+
     def _run(
         self,
         *,
@@ -444,7 +708,9 @@ class AgentTurnLoop:
             session_id=session.session_id,
             trace_id=trace_id,
             context_id=trace_id,
-            workspace_root=_session_workspace_path(session),
+            workspace_root=_session_workspace_path(session) or self.default_workspace_root,
+            tool_view=self._tool_view_for_run(run_id),
+            run_id=run_id,
         )
         self.session_service.append_message(
             session_id=session.session_id,
@@ -466,10 +732,13 @@ class AgentTurnLoop:
         if cached_tool_observations:
             context_window_payload["cached_tool_observations"] = cached_tool_observations
 
-        package_catalog = [
-            package.model_dump(mode="json")
-            for package in self.tool_executor.registry.list_packages()
-        ]
+        self._assess_configured_fast_path(
+            run_id=run_id,
+            session_id=session.session_id,
+            user_input=user_input,
+        )
+
+        package_catalog = self._package_catalog(context.tool_view)
         llm_events: list[AgentTurnLLMEvent] = []
         decision_events: list[AgentTurnDecisionEvent] = []
         progress_events: list[AgentTurnProgressEvent] = []
@@ -501,7 +770,10 @@ class AgentTurnLoop:
         if isinstance(selected_package, str):
             expanded_tools = [
                 tool.model_dump(mode="json")
-                for tool in self.tool_executor.registry.list_tools(package=selected_package)
+                for tool in self._tools_for_package(
+                    selected_package,
+                    tool_view=context.tool_view,
+                )
             ]
             answer = self._run_package_tools(
                 user_input=user_input,
@@ -557,6 +829,7 @@ class AgentTurnLoop:
             answer=answer,
             tool_events=tool_events,
         )
+        self._complete_configured_fast_path(run_id=run_id, answer=answer)
         for warning in verification_warnings:
             self._append_progress(
                 progress_events,
@@ -566,6 +839,8 @@ class AgentTurnLoop:
                 message=warning.message,
                 metadata=warning.model_dump(mode="json"),
             )
+
+        self._finalize_multi_agent_plan(run_id)
 
         updated_context_window = self.session_service.record_context_exchange(
             session_id=session.session_id,
@@ -827,10 +1102,7 @@ class AgentTurnLoop:
         observations: list[dict[str, Any]] = []
         successful_call_fingerprints: set[str] = set()
         observations.extend(self._cached_tool_observations_from_context_window(context_window))
-        package_catalog = [
-            package.model_dump(mode="json")
-            for package in self.tool_executor.registry.list_packages()
-        ]
+        package_catalog = self._package_catalog(context.tool_view)
         expanded_package_names = {selected_package}
         allowed_tool_names = {
             str(tool.get("name")) for tool in expanded_tools if isinstance(tool.get("name"), str)
@@ -895,7 +1167,69 @@ class AgentTurnLoop:
                     metadata={"action": action, "step_index": step_index + 1},
                 )
 
+            if action in {"fork_subtasks", "fork_subtasks_invalid"}:
+                run_id = _turn_run_id.get()
+                if isinstance(run_id, str):
+                    self._upgrade_fast_path_for_multi_agent(run_id)
+                outcome = self._handle_fork_subtasks_decision(
+                    run_id=run_id,
+                    user_input=user_input,
+                    operation=decision.get("operation"),
+                    parse_error=(
+                        decision.get("reason") if action == "fork_subtasks_invalid" else None
+                    ),
+                )
+                observations.append({"action": "fork_subtasks", **outcome})
+                self._append_progress(
+                    progress_events,
+                    type=(
+                        "fork_subtasks_validated"
+                        if outcome.get("status") == "validated"
+                        else "fork_subtasks_rejected"
+                    ),
+                    stage="planner",
+                    status=str(outcome.get("status") or "rejected"),
+                    message=str(outcome.get("message") or "Planner fork operation processed."),
+                    metadata=self._planner_progress_summary(outcome),
+                )
+                continue
+
+            if action in {"plan_patch", "plan_patch_invalid"}:
+                outcome = self._handle_plan_patch_decision(
+                    run_id=_turn_run_id.get(),
+                    operation=decision.get("operation"),
+                    parse_error=decision.get("reason") if action == "plan_patch_invalid" else None,
+                )
+                observations.append({"action": "plan_patch", **outcome})
+                self._append_progress(
+                    progress_events,
+                    type="multi_agent_plan_patched" if outcome.get("status") in {"applied", "waiting_user", "aborted"} else "multi_agent_plan_patch_rejected",
+                    stage="planner",
+                    status=str(outcome.get("status") or "rejected"),
+                    message=str(outcome.get("message") or "Planner patch processed."),
+                    metadata=self._planner_progress_summary(outcome),
+                )
+                continue
+
             if action == "final_answer":
+                if self._multi_agent_replan_pending():
+                    observations.append({
+                        "action": "final_answer",
+                        "status": "rejected",
+                        "replan_required": True,
+                        "error": (
+                            "The persisted child plan has unresolved failures. Use a valid "
+                            "plan_patch to retry, degrade, ask the user, or abort before answering."
+                        ),
+                    })
+                    self._append_progress(
+                        progress_events,
+                        type="multi_agent_final_answer_rejected",
+                        stage="planner",
+                        status="rejected",
+                        message="Unresolved child failures require a structured PlanPatch.",
+                    )
+                    continue
                 return self._answer_with_llm(
                     user_input=user_input,
                     route=route,
@@ -938,7 +1272,7 @@ class AgentTurnLoop:
 
             if action == "expand_package":
                 package_name = str(decision.get("package_name") or "")
-                if not self._package_exists(package_name):
+                if not self._package_exists(package_name, tool_view=context.tool_view):
                     observations.append(
                         {
                             "action": "expand_package",
@@ -975,7 +1309,10 @@ class AgentTurnLoop:
                         message=f"`{package_name}` package was already expanded.",
                     )
                     continue
-                new_tools = self._tool_payloads_for_package(package_name)
+                new_tools = self._tool_payloads_for_package(
+                    package_name,
+                    tool_view=context.tool_view,
+                )
                 expanded_tools.extend(new_tools)
                 expanded_package_names.add(package_name)
                 new_tool_names = [
@@ -1114,6 +1451,8 @@ class AgentTurnLoop:
                     successful_call_fingerprints.clear()
                 successful_call_fingerprints.add(call_fingerprint)
 
+        if self._multi_agent_replan_pending():
+            return self._unresolved_multi_agent_answer()
         if observations:
             return self._answer_with_llm(
                 user_input=user_input,
@@ -1127,6 +1466,657 @@ class AgentTurnLoop:
                 llm_events=llm_events,
             )
         return None
+
+    def _multi_agent_replan_pending(self, run_id: str | None = None) -> bool:
+        manager = getattr(self, "run_manager", None)
+        run_id = run_id or _turn_run_id.get()
+        run = manager.get_run(run_id) if manager is not None and run_id else None
+        return bool(run and run.metadata.get("multi_agent_replan_required"))
+
+    @staticmethod
+    def _unresolved_multi_agent_answer() -> str:
+        return (
+            "子任务仍有未解决的失败或阻塞，当前无法将多 Agent 计划报告为完成。"
+            "本次运行已停止；请查看子任务状态并重试或调整任务。"
+        )
+
+    def _fork_caller_kind_for_run(self, run: AgentRunRecord) -> ForkCallerKind:
+        """Resolve child fork authority from immutable server-owned lineage.
+
+        Parentage alone does not imply Coordinator authority. Missing or legacy
+        role metadata fails closed to LEAF rather than upgrading a child.
+        """
+        if run.parent_run_id is None:
+            return ForkCallerKind.ROOT_PLANNER
+        snapshot = run.metadata.get("context_snapshot")
+        kind_value = snapshot.get("agent_kind") if isinstance(snapshot, dict) else None
+        if kind_value is None:
+            parent = self.run_manager.get_run(run.parent_run_id) if self.run_manager else None
+            raw_plan = parent.metadata.get("multi_agent_plan") if parent is not None else None
+            if isinstance(raw_plan, dict):
+                try:
+                    parent_plan = Plan.model_validate(raw_plan)
+                    parent_step = next(
+                        (step for step in parent_plan.steps if step.step_id == run.step_id),
+                        None,
+                    )
+                    kind_value = parent_step.agent_kind if parent_step is not None else None
+                except (ValidationError, ValueError):
+                    kind_value = None
+        try:
+            resolved = (
+                kind_value
+                if isinstance(kind_value, ForkCallerKind)
+                else ForkCallerKind(str(kind_value))
+            )
+        except ValueError:
+            return ForkCallerKind.LEAF
+        return (
+            ForkCallerKind.COORDINATOR
+            if resolved == ForkCallerKind.COORDINATOR
+            else ForkCallerKind.LEAF
+        )
+
+    def _handle_fork_subtasks_decision(
+        self,
+        *,
+        run_id: str | None,
+        user_input: str,
+        operation: Any,
+        parse_error: str | None = None,
+    ) -> dict[str, Any]:
+        raw_operation = operation if isinstance(operation, dict) else {}
+        operation_id = str(raw_operation.get("operation_id") or "")
+        if run_id is None or self.run_manager is None:
+            return {"status": "rejected", "message": "Run persistence is unavailable."}
+        run = self.run_manager.get_run(run_id)
+        if run is None:
+            return {"status": "rejected", "message": "Agent run no longer exists."}
+        if self.fork_policy is None:
+            parse_error = parse_error or "Structured multi-agent planning is disabled by server policy."
+        if parse_error is not None:
+            payload = {
+                "operation_id": operation_id,
+                "requested_operation": raw_operation,
+                "status": "rejected",
+                "error": parse_error,
+            }
+            self.run_manager.record_multi_agent_plan(
+                run_id,
+                event_type="fork_subtasks_rejected",
+                payload=payload,
+            )
+            return {"status": "rejected", "operation_id": operation_id, "message": parse_error}
+
+        try:
+            fork_operation = ForkSubtasksOperation.model_validate(operation)
+            assert run is not None and self.fork_policy is not None
+            if run.status.value != "running":
+                raise ForkPolicyViolation("Fork parent run is not active.")
+            prior_operation = run.metadata.get("fork_operations", {}).get(
+                fork_operation.operation_id
+            )
+            if prior_operation:
+                if (
+                    prior_operation.get("status") == "rejected"
+                    and prior_operation.get("requested_operation") == raw_operation
+                ):
+                    return {
+                        "status": "rejected",
+                        "operation_id": fork_operation.operation_id,
+                        "message": str(prior_operation.get("error") or "Fork operation was rejected."),
+                    }
+                if prior_operation.get("status") != "validated":
+                    raise ForkPolicyViolation("Fork operation_id has already been used.")
+                return self._execute_fork_plan(run_id=run_id, operation_id=operation_id)
+
+            self.run_manager.append_event(
+                run_id,
+                "fork_subtasks_requested",
+                "Planner proposed a structured fork operation.",
+                stage="planner",
+                payload={"operation_id": operation_id, "requested_operation": raw_operation},
+            )
+
+            raw_plan = run.metadata.get("multi_agent_plan")
+            if raw_plan is None:
+                plan = Plan(
+                    correlation_id=run.trace_id,
+                    plan_id=_stable_id("plan", run.run_id),
+                    parent_run_id=run.run_id,
+                    session_id=run.session_id,
+                    objective=user_input,
+                    steps=(
+                        PlanStep(
+                            correlation_id=run.trace_id,
+                            step_id=ROOT_COORDINATOR_STEP_ID,
+                            objective=user_input,
+                            output_contract="Coordinate the task and produce the user-facing answer.",
+                            status=PlanStepStatus.RUNNING,
+                        ),
+                    ),
+                ).transition_to(PlanStatus.VALIDATED).transition_to(
+                    PlanStatus.QUEUED
+                ).transition_to(PlanStatus.RUNNING)
+            else:
+                plan = Plan.model_validate(raw_plan)
+
+            active_step = next(
+                (step for step in plan.steps if step.step_id == fork_operation.parent_step_id),
+                None,
+            )
+            if active_step is None:
+                raise ForkPolicyViolation("Fork parent_step_id does not exist in the active plan.")
+            if active_step.status != PlanStepStatus.RUNNING:
+                raise ForkPolicyViolation("Fork parent step is not active.")
+            if any(
+                active_step.step_id in subtask.depends_on
+                for subtask in fork_operation.subtasks
+            ):
+                raise ForkPolicyViolation(
+                    "A forked subtask cannot depend on its still-running coordinator step."
+                )
+            known_step_ids = tuple(step.step_id for step in plan.steps)
+            existing_fork_count = sum(step.fork_operation_id is not None for step in plan.steps)
+            scope_resolver = getattr(self, "fork_scope_resolver", None)
+            if scope_resolver is not None:
+                parent_scope, session_scope, workspace_scope = scope_resolver(run_id)
+            elif run.parent_run_id is not None:
+                attached_snapshot = run.metadata.get("context_snapshot", {})
+                parent_scope = ScopeGrant.model_validate(
+                    attached_snapshot.get("effective_scope", {})
+                )
+                session_scope = parent_scope
+                workspace_scope = parent_scope
+            else:
+                # Compatibility fallback for direct AgentTurnLoop construction.
+                # Runtime supplies the authoritative resolver in normal operation.
+                parent_scope = session_scope = workspace_scope = self.fork_policy.allowed_scope
+            current_depth = 0
+            if run.parent_run_id is not None:
+                parent = self.run_manager.get_run(run.parent_run_id)
+                parent_plan = (
+                    Plan.model_validate(parent.metadata["multi_agent_plan"])
+                    if parent is not None and parent.metadata.get("multi_agent_plan")
+                    else None
+                )
+                parent_step = next(
+                    (
+                        step
+                        for step in (parent_plan.steps if parent_plan is not None else ())
+                        if step.step_id == run.step_id
+                    ),
+                    None,
+                )
+                current_depth = parent_step.fork_depth if parent_step and parent_step.fork_depth else 0
+            validation_context = ForkValidationContext(
+                parent_effective_scope=parent_scope,
+                session_scope=session_scope,
+                workspace_scope=workspace_scope,
+                parent_step_status=active_step.status,
+                caller_kind=self._fork_caller_kind_for_run(run),
+                created_by_run_id=run.run_id,
+                current_depth=current_depth,
+                # Coordinator generations are bounded separately from overall
+                # DAG depth: root-created agents are the sole coordinator tier;
+                # coordinators can create leaves only, never new coordinators.
+                coordinator_depth=0,
+                existing_child_count=max(existing_fork_count, len(run.child_run_ids)),
+                known_step_ids=known_step_ids,
+                current_objective_fingerprint=objective_fingerprint(run.user_input),
+                ancestor_objective_fingerprints=tuple(dict.fromkeys(
+                    objective_fingerprint(parent_run.user_input)
+                    for parent_run in self._ancestor_runs(run)
+                    if parent_run.user_input.strip()
+                )),
+            )
+            policy_scope = ScopeGrant(
+                workspace_paths=self.fork_policy.allowed_scope.workspace_paths,
+                source_ids=tuple(sorted(set(parent_scope.source_ids) & set(session_scope.source_ids) & set(workspace_scope.source_ids))),
+                account_ids=tuple(sorted(set(parent_scope.account_ids) & set(session_scope.account_ids) & set(workspace_scope.account_ids))),
+                allowed_packages=self.fork_policy.allowed_scope.allowed_packages,
+                allowed_tools=self.fork_policy.allowed_scope.allowed_tools,
+                side_effect_level=self.fork_policy.allowed_scope.side_effect_level,
+            )
+            effective_policy = self.fork_policy.model_copy(update={"allowed_scope": policy_scope})
+            validated = validate_fork_subtasks(
+                fork_operation,
+                policy=effective_policy,
+                context=validation_context,
+            )
+            updated_plan = Plan.model_validate(
+                {
+                    **plan.model_dump(mode="python"),
+                    "steps": (*plan.steps, *validated.validated_steps),
+                }
+            )
+            payload = {
+                "operation_id": fork_operation.operation_id,
+                "requested_operation": fork_operation.model_dump(mode="json"),
+                "validated_steps": [
+                    step.model_dump(mode="json") for step in validated.validated_steps
+                ],
+                "scope_adjustments": [
+                    adjustment.model_dump(mode="json")
+                    for adjustment in validated.scope_adjustments
+                ],
+                "plan_id": updated_plan.plan_id,
+                "status": "validated",
+            }
+            self.run_manager.record_multi_agent_plan(
+                run_id,
+                event_type="fork_subtasks_validated",
+                payload=payload,
+                plan=updated_plan.model_dump(mode="json"),
+            )
+            return self._execute_fork_plan(
+                run_id=run_id,
+                operation_id=fork_operation.operation_id,
+                step_ids=[step.step_id for step in validated.validated_steps],
+            )
+        except (ForkPolicyViolation, ValueError, ValidationError) as exc:
+            error = str(exc)
+            payload = {
+                "operation_id": operation_id,
+                "requested_operation": raw_operation,
+                "status": "rejected",
+                "error": error,
+            }
+            self.run_manager.record_multi_agent_plan(
+                run_id,
+                event_type="fork_subtasks_rejected",
+                payload=payload,
+            )
+            return {"status": "rejected", "operation_id": operation_id, "message": error}
+
+    def _ancestor_runs(self, run: Any) -> list[Any]:
+        ancestors = []
+        seen = {run.run_id}
+        parent_run_id = run.parent_run_id
+        while parent_run_id and parent_run_id not in seen:
+            seen.add(parent_run_id)
+            parent = self.run_manager.get_run(parent_run_id) if self.run_manager is not None else None
+            if parent is None:
+                break
+            ancestors.append(parent)
+            parent_run_id = parent.parent_run_id
+        return ancestors
+
+    @staticmethod
+    def _planner_progress_summary(outcome: dict[str, Any]) -> dict[str, Any]:
+        """Keep progress metadata compact; authoritative task data stays internal."""
+        aggregate = outcome.get("aggregate")
+        verification = outcome.get("verification")
+        summary = {
+            key: outcome[key]
+            for key in (
+                "status", "operation_id", "plan_id", "patch_revision",
+                "execution_status", "waiting_child_run_ids", "failed_step_ids",
+                "replan_required",
+            )
+            if key in outcome
+        }
+        summary["aggregation_status"] = aggregate.get("status") if isinstance(aggregate, dict) else None
+        summary["verification_status"] = verification.get("status") if isinstance(verification, dict) else None
+        summary["task_result_count"] = len(outcome.get("task_results", ()))
+        return summary
+
+    def _handle_plan_patch_decision(
+        self,
+        *,
+        run_id: str | None,
+        operation: Any,
+        parse_error: str | None = None,
+    ) -> dict[str, Any]:
+        if run_id is None or self.run_manager is None:
+            return {"status": "rejected", "message": "Run persistence is unavailable."}
+        run = self.run_manager.get_run(run_id)
+        if run is None:
+            return {"status": "rejected", "message": "Agent run no longer exists."}
+        if self.fork_policy is None:
+            parse_error = parse_error or "Structured multi-agent planning is disabled by server policy."
+        if parse_error:
+            self._record_plan_patch_rejection(
+                run_id, operation, "Structured patch payload was rejected.", code="invalid_patch"
+            )
+            return {"status": "rejected", "message": parse_error}
+        try:
+            patch = PlanPatch.model_validate(operation)
+            if run.status.value not in {"running", "waiting_user"}:
+                raise PlanPatchRejected("Plan patch requires an active parent run.")
+            raw_plan = run.metadata.get("multi_agent_plan")
+            if not isinstance(raw_plan, dict):
+                raise PlanPatchRejected("No persisted multi-Agent plan exists for this run.")
+            plan = Plan.model_validate(raw_plan)
+            prior_patch = next(
+                (record.patch for record in plan.patch_history if record.patch.patch_id == patch.patch_id),
+                None,
+            )
+            if prior_patch is not None:
+                if prior_patch != patch:
+                    raise PlanPatchRejected("Patch ID was already used for a different operation.")
+                if prior_patch.operation == PlanPatchOperation.ASK_USER:
+                    return self._continue_or_wait_for_plan_question(
+                        run=run,
+                        patch=prior_patch,
+                        plan=plan,
+                    )
+                if patch.operation == PlanPatchOperation.ABORT:
+                    self.run_manager._update_run(
+                        run_id,
+                        status=run.status,
+                        metadata_patch={"multi_agent_replan_required": False},
+                    )
+                    return {
+                        "status": "aborted", "plan_id": plan.plan_id,
+                        "patch_revision": plan.patch_revision,
+                        "message": "Previously persisted abort patch replayed idempotently.",
+                    }
+                target_ids = [patch.target_step_id] if patch.target_step_id else []
+                if patch.alternative_step is not None:
+                    target_ids.append(patch.alternative_step.step_id)
+                resumed = self._execute_fork_plan(
+                    run_id=run_id,
+                    operation_id=f"patch:{patch.patch_id}",
+                    step_ids=target_ids,
+                )
+                return {
+                    **resumed,
+                    "status": "applied",
+                    "patch_revision": plan.patch_revision,
+                    "patch_operation": patch.operation.value,
+                    "message": "Previously persisted PlanPatch resumed idempotently.",
+                }
+            if not run.metadata.get("multi_agent_replan_required"):
+                raise PlanPatchRejected("The persisted plan does not currently require replanning.")
+            scope_resolver = getattr(self, "fork_scope_resolver", None)
+            if scope_resolver is not None:
+                parent_scope, session_scope, workspace_scope = scope_resolver(run_id)
+            elif run.parent_run_id is not None:
+                attached = run.metadata.get("context_snapshot", {})
+                parent_scope = ScopeGrant.model_validate(attached.get("effective_scope", {}))
+                session_scope = workspace_scope = parent_scope
+            else:
+                parent_scope = session_scope = workspace_scope = self.fork_policy.allowed_scope
+            policy_scope = ScopeGrant(
+                workspace_paths=self.fork_policy.allowed_scope.workspace_paths,
+                source_ids=tuple(sorted(set(parent_scope.source_ids) & set(session_scope.source_ids) & set(workspace_scope.source_ids))),
+                account_ids=tuple(sorted(set(parent_scope.account_ids) & set(session_scope.account_ids) & set(workspace_scope.account_ids))),
+                allowed_packages=self.fork_policy.allowed_scope.allowed_packages,
+                allowed_tools=self.fork_policy.allowed_scope.allowed_tools,
+                side_effect_level=self.fork_policy.allowed_scope.side_effect_level,
+            )
+            effective_policy = self.fork_policy.model_copy(update={"allowed_scope": policy_scope})
+            target = next((item for item in plan.steps if item.step_id == patch.target_step_id), None)
+            if patch.budget is not None and (target is None or target.budget is None):
+                raise PlanPatchRejected("A patch cannot introduce a budget without a server-owned step budget ceiling.")
+            application = apply_plan_patch(
+                plan,
+                patch,
+                PlanPatchContext(
+                    fork_policy=effective_policy,
+                    parent_effective_scope=parent_scope,
+                    session_scope=session_scope,
+                    workspace_scope=workspace_scope,
+                    remaining_budget=target.budget if target is not None else None,
+                    max_retries_per_step=int(getattr(self, "multi_agent_max_retries", 1)),
+                ),
+            )
+            updated = application.plan
+            payload = {
+                "plan_id": updated.plan_id,
+                "patch": patch.model_dump(mode="json"),
+                "patch_record": application.record.model_dump(mode="json"),
+                "patch_revision": updated.patch_revision,
+                "status": updated.status.value,
+            }
+            self.run_manager.record_multi_agent_plan(
+                run_id,
+                event_type="multi_agent_plan_patched",
+                payload=payload,
+                plan=updated.model_dump(mode="json"),
+            )
+            if application.requires_user_input:
+                return self._continue_or_wait_for_plan_question(
+                    run=run,
+                    patch=patch,
+                    plan=updated,
+                )
+            if application.aborted:
+                self.run_manager._update_run(
+                    run_id, status=run.status, metadata_patch={"multi_agent_replan_required": False}
+                )
+                return {
+                    "status": "aborted", "plan_id": updated.plan_id,
+                    "patch_revision": updated.patch_revision,
+                    "message": "Plan was explicitly aborted by a validated patch.",
+                }
+            target_ids = [patch.target_step_id] if patch.target_step_id else []
+            if patch.alternative_step is not None:
+                target_ids.append(patch.alternative_step.step_id)
+            outcome = self._execute_fork_plan(
+                run_id=run_id,
+                operation_id=f"patch:{patch.patch_id}",
+                step_ids=target_ids,
+            )
+            return {
+                **outcome,
+                "status": "applied",
+                "patch_revision": updated.patch_revision,
+                "patch_operation": patch.operation.value,
+                "message": "Validated PlanPatch was applied and the DAG resumed.",
+            }
+        except (PlanPatchRejected, ValidationError, ValueError) as exc:
+            safe_reason = "Patch schema validation failed." if isinstance(exc, ValidationError) else str(exc)
+            self._record_plan_patch_rejection(
+                run_id,
+                operation,
+                safe_reason,
+                code="policy_rejected" if isinstance(exc, PlanPatchRejected) else "invalid_patch",
+            )
+            return {"status": "rejected", "message": safe_reason}
+
+    def _continue_or_wait_for_plan_question(
+        self,
+        *,
+        run: Any,
+        patch: PlanPatch,
+        plan: Plan,
+    ) -> dict[str, Any]:
+        """Repair/serve an ASK_USER patch from the durable question journal."""
+        if self.run_manager is None:
+            raise PlanPatchRejected("Run persistence is unavailable.")
+        question = (patch.user_question or "").strip()
+        if not question:
+            raise PlanPatchRejected("ASK_USER patches require a question.")
+        question_id = _stable_id("multi_agent_user_question", run.run_id, patch.patch_id)
+        current = self.run_manager.get_run(run.run_id)
+        if current is None:
+            raise PlanPatchRejected("Agent run no longer exists.")
+        pending_question = current.metadata.get("pending_user_question")
+        command_id = current.metadata.get("pending_user_answer_command_id")
+        # A prior question remains in metadata after its answer is consumed so
+        # graph replay can recover from a crash.  It is not an answer to a new,
+        # sequential ASK_USER patch; correlate both the patch and question IDs.
+        is_same_question = (
+            isinstance(pending_question, dict)
+            and pending_question.get("patch_id") == patch.patch_id
+            and pending_question.get("question_id") == question_id
+        )
+        if is_same_question and isinstance(command_id, str) and command_id:
+            answer = self.run_manager.get_user_continuation(run.run_id, command_id)
+            if answer is not None:
+                return {
+                    "status": "answer_ready",
+                    "plan_id": plan.plan_id,
+                    "patch_revision": plan.patch_revision,
+                    "question_id": question_id,
+                    "command_id": command_id,
+                    "message": "User continuation is available from the trusted journal.",
+                }
+        self.run_manager.mark_waiting_user(
+            run.run_id,
+            question_id=question_id,
+            question=question,
+            patch_id=patch.patch_id,
+        )
+        return {
+            "status": "waiting_user",
+            "plan_id": plan.plan_id,
+            "patch_revision": plan.patch_revision,
+            "question_id": question_id,
+            "user_question": question,
+            "message": "Plan paused for a user answer; this is not a safety approval request.",
+        }
+
+    def resume_user_question_plan(self, run_id: str, command_id: str) -> tuple[str, str] | None:
+        """Move the persisted plan out of WAITING_USER after journal acceptance."""
+        if self.run_manager is None:
+            return None
+        run = self.run_manager.get_run(run_id)
+        if run is None or run.metadata.get("pending_user_answer_command_id") != command_id:
+            return None
+        answer = self.run_manager.get_user_continuation(run_id, command_id)
+        question = run.metadata.get("pending_user_question")
+        question_id = question.get("question_id") if isinstance(question, dict) else None
+        if answer is None or not isinstance(question_id, str):
+            return None
+        raw_plan = run.metadata.get("multi_agent_plan")
+        if isinstance(raw_plan, dict):
+            plan = Plan.model_validate(raw_plan)
+            if plan.status == PlanStatus.WAITING_USER:
+                resumed = plan.transition_to(PlanStatus.REPLANNING)
+                self.run_manager.record_multi_agent_plan(
+                    run_id,
+                    event_type="multi_agent_user_question_answered",
+                    payload={"question_id": question_id, "command_id": command_id},
+                    plan=resumed.model_dump(mode="json"),
+                )
+                if not any(
+                    step.step_id != ROOT_COORDINATOR_STEP_ID
+                    and step.status in {PlanStepStatus.FAILED, PlanStepStatus.BLOCKED}
+                    for step in resumed.steps
+                ):
+                    self.run_manager._update_run(
+                        run_id,
+                        status=run.status,
+                        metadata_patch={"multi_agent_replan_required": False},
+                    )
+        return question_id, answer
+
+    def _record_plan_patch_rejection(
+        self,
+        run_id: str,
+        operation: Any,
+        reason: str,
+        *,
+        code: str,
+    ) -> None:
+        raw = operation if isinstance(operation, dict) else {}
+        fingerprint = sha1(
+            json.dumps(raw, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()
+        self.run_manager.append_event(
+            run_id,
+            "multi_agent_plan_patch_rejected",
+            "Planner PlanPatch proposal was rejected.",
+            stage="planner",
+            payload={
+                "patch_id": str(raw.get("patch_id") or "")[:200],
+                "request_fingerprint": fingerprint,
+                "failure_code": code,
+                "reason": reason[:500],
+            },
+        )
+
+    def _execute_fork_plan(
+        self,
+        *,
+        run_id: str,
+        operation_id: str,
+        step_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        run = self.run_manager.get_run(run_id) if self.run_manager is not None else None
+        raw_plan = run.metadata.get("multi_agent_plan") if run is not None else None
+        plan = Plan.model_validate(raw_plan) if raw_plan else None
+        fork_execution = getattr(self, "fork_execution", None)
+        if fork_execution is None:
+            return {
+                "status": "validated",
+                "operation_id": operation_id,
+                "plan_id": plan.plan_id if plan else None,
+                "step_ids": step_ids or [],
+                "message": "DAG validated and recorded; no child scheduler is configured.",
+                "task_results": [],
+            }
+        schedule = fork_execution(run_id)
+        task_results = tuple(getattr(schedule, "task_results", ()))
+        waiting = str(getattr(schedule, "status", "")) == "waiting_confirmation"
+        waiting_user = str(getattr(schedule, "status", "")) == "waiting_user"
+        if waiting and self.run_manager is not None:
+            # Pending results are placeholders, not observations. The graph
+            # checkpoints at the wait node and will rerun the fork operation
+            # after approval, when durable terminal results can be supplied.
+            task_results = ()
+            waiting_ids = tuple(getattr(schedule, "waiting_child_run_ids", ()))
+            confirmation_id = None
+            for child_id in waiting_ids:
+                child = self.run_manager.get_run(child_id)
+                if child is not None and child.status.value == "waiting_confirmation":
+                    confirmation_id = child.metadata.get("confirmation_id") or child_id
+                    break
+            self.run_manager.mark_waiting_confirmation(
+                run_id,
+                confirmation_id=str(confirmation_id or waiting_ids[0] if waiting_ids else "child_review_pending"),
+            )
+        elif waiting_user:
+            # The child's pending question is exposed by its own run record;
+            # the parent graph only parks until that child resumes.
+            task_results = ()
+        elif self.run_manager is not None and not waiting_user:
+            current = self.run_manager.get_run(run_id)
+            if current is not None and current.status.value == "waiting_confirmation":
+                self.run_manager.resume_running(run_id)
+        return {
+            "status": "validated",
+            "execution_status": str(getattr(schedule, "status", "running")),
+            "operation_id": operation_id,
+            "plan_id": plan.plan_id if plan else None,
+            "step_ids": step_ids or [],
+            "task_results": [
+                result.model_dump(mode="json")
+                if hasattr(result, "model_dump")
+                else dict(result)
+                for result in task_results
+            ],
+            "waiting_child_run_ids": list(getattr(schedule, "waiting_child_run_ids", ())),
+            "failed_step_ids": list(getattr(schedule, "failed_step_ids", ())),
+            "aggregate": (
+                schedule.aggregate.model_dump(mode="json")
+                if getattr(schedule, "aggregate", None) is not None else None
+            ),
+            "verification": (
+                schedule.verification.model_dump(mode="json")
+                if getattr(schedule, "verification", None) is not None else None
+            ),
+            "replan_required": bool(getattr(schedule, "replan_required", False)),
+            "message": (
+                "Child execution is waiting for safety confirmation."
+                if waiting
+                else "Child execution is waiting for a user response."
+                if waiting_user
+                else "Child plan execution advanced."
+            ),
+        }
+
+    def _finalize_multi_agent_plan(self, run_id: str) -> None:
+        plan_finalizer = getattr(self, "fork_plan_finalizer", None)
+        if plan_finalizer is None or self.run_manager is None:
+            return
+        run = self.run_manager.get_run(run_id)
+        raw_plan = run.metadata.get("multi_agent_plan") if run is not None else None
+        if isinstance(raw_plan, dict) and raw_plan.get("parent_run_id") == run_id:
+            plan_finalizer(run_id)
 
     @staticmethod
     def _tool_call_fingerprint(*, tool_name: str, tool_input: dict[str, Any]) -> str:
@@ -1180,6 +2170,33 @@ class AgentTurnLoop:
             )
             if native_decision is not None:
                 return native_decision
+        operation_types = "tool_call|expand_package|final_answer|request_confirmation|no_op"
+        fork_guidance = ""
+        if self.fork_policy is not None:
+            operation_types += "|fork_subtasks"
+            operation_types += "|plan_patch"
+            fork_guidance = (
+                f" You may propose fork_subtasks only for independent work that benefits from "
+                f"separate bounded agents. Use parent_step_id={ROOT_COORDINATOR_STEP_ID!r}; "
+                "The operation fields are operation_id, parent_step_id, and subtasks; every "
+                "subtask needs step_id, objective, and output_contract, and may include "
+                "depends_on, requested_scope, input_refs, verification_criteria, and "
+                f"agent_id (registered choices: {self.fork_policy.allowed_agent_ids}; "
+                "omit it for the default general Agent). "
+                f"inference_profile_id may only be one of the server-allowlisted IDs: {self.fork_policy.allowed_inference_profile_ids}. "
+                "If no profile is allowlisted, omit inference_profile_id and use the existing request/default model selection. "
+                "When prior results require re-planning, use plan_patch with a bounded structured "
+                "retry_step, reduced_scope, alternative_step, skip_and_degrade, ask_user, or abort. "
+                "A patch supplies patch_id, plan_id, expected_revision, operation, reason, and only "
+                "the fields required by that operation. ask_user pauses this run for a distinct "
+                "user answer; it is separate from safety approval. "
+                "Patches cannot increase any scope or policy limit. "
+                "The server applies the caller's registered-tool, session, workspace, safety, "
+                "budget, and fork-depth limits, then schedules child Agents. A child's results "
+                "return as observations before you continue. You may fork recursively only when "
+                "the server's depth policy allows it. Natural language or assistant_message "
+                "never requests a fork."
+            )
         base_system_prompt = (
             "You are the Main Agent Brain for Local Knowledge Agent OS. Choose the next "
             "single action for this agent turn. You may call one available tool, expand a "
@@ -1205,7 +2222,7 @@ class AgentTurnLoop:
             "field values. Use the deterministic context supplied in session_context_window "
             "when resolving relative references. Return only strict JSON using this operation-first "
             "envelope: "
-            '{"operation":{"type":"tool_call|expand_package|final_answer|request_confirmation|no_op",'
+            f'{{"operation":{{"type":"{operation_types}",'
             '"package_name":null,"tool_name":"<expanded tool name or null>","tool_input":{},'
             '"repeat_successful_call":false,"final_answer":null,"reason":"...","confidence":"low|medium|high"},'
             '"assistant_message":"short user-visible progress text"}. '
@@ -1216,6 +2233,7 @@ class AgentTurnLoop:
             "stage can now run. For a tool call, put all executable details in operation and "
             "only optional progress text in assistant_message. Never return plain text outside "
             "JSON."
+            + fork_guidance
         )
         decision_retry: dict[str, Any] | None = None
         for format_attempt in range(1, self.decision_format_max_attempts + 1):
@@ -1374,6 +2392,31 @@ class AgentTurnLoop:
                 )
             )
             actions[function_name] = {"action": "expand_package"}
+        if self.fork_policy is not None:
+            definitions.append(
+                LLMToolDefinition(
+                    name="agent_fork_subtasks",
+                    description=(
+                        "Propose a bounded DAG of independent child tasks. The server applies "
+                        "the caller's access and fork-depth limits and schedules child Agents."
+                    ),
+                    strict=False,
+                    parameters=_fork_subtasks_function_schema(),
+                )
+            )
+            actions["agent_fork_subtasks"] = {"action": "fork_subtasks"}
+            run_id = _turn_run_id.get()
+            run = self.run_manager.get_run(run_id) if self.run_manager is not None and run_id else None
+            if run is not None and run.metadata.get("multi_agent_plan"):
+                definitions.append(
+                    LLMToolDefinition(
+                        name="agent_plan_patch",
+                        description="Apply a validated structured patch to a persisted multi-Agent plan after results require replanning.",
+                        strict=False,
+                        parameters=_plan_patch_function_schema(),
+                    )
+                )
+                actions["agent_plan_patch"] = {"action": "plan_patch"}
         return definitions, actions
 
     def _decide_next_action_with_native_tools(
@@ -1393,8 +2436,8 @@ class AgentTurnLoop:
     ) -> dict[str, Any] | None:
         system_prompt = (
             "You are the Main Agent Brain for Local Knowledge Agent OS. Choose the next "
-            "single action. Call exactly one provided function only when a tool or package "
-            "expansion is needed. When observations and session context are sufficient, do not "
+            "single action. Call exactly one provided function when a tool, package expansion, "
+            "or enabled structured Planner operation is needed. When observations and session context are sufficient, do not "
             "call a function; return a short plain-text reason that the separate answer stage "
             "can now run. Never repeat a completed successful tool call with identical input "
             "unless the user explicitly requested it. Follow function schemas exactly."
@@ -1461,6 +2504,16 @@ class AgentTurnLoop:
                 "reason": "Provider-native function call.",
                 "_raw_output": response.content,
             }
+        if action["action"] == "fork_subtasks":
+            return self._normalize_decision_output(
+                {"operation": {"type": "fork_subtasks", **call.arguments}},
+                raw_output=response.content,
+            )
+        if action["action"] == "plan_patch":
+            return self._normalize_decision_output(
+                {"operation": {"type": "plan_patch", **call.arguments}},
+                raw_output=response.content,
+            )
         package_name = call.arguments.get("package_name")
         return {
             "action": "expand_package",
@@ -1590,6 +2643,54 @@ class AgentTurnLoop:
                 if isinstance(parsed.get("reason"), str)
                 else None
             )
+            if operation_type == "fork_subtasks":
+                request_payload = {
+                    key: value for key, value in operation.items() if key != "type"
+                }
+                request_payload["operation"] = "fork_subtasks"
+                request_payload.setdefault(
+                    "correlation_id",
+                    _stable_id(
+                        "fork_correlation",
+                        _turn_run_id.get(),
+                        str(request_payload.get("operation_id") or "unknown"),
+                    ),
+                )
+                try:
+                    fork_operation = ForkSubtasksOperation.model_validate(request_payload)
+                except ValidationError as exc:
+                    return {
+                        "action": "fork_subtasks_invalid",
+                        "operation": operation,
+                        "reason": str(exc),
+                        "assistant_message": assistant_message,
+                        "_raw_output": raw_output,
+                    }
+                return {
+                    "action": "fork_subtasks",
+                    "operation": fork_operation.model_dump(mode="json"),
+                    "assistant_message": assistant_message,
+                    "reason": reason,
+                    "_raw_output": raw_output,
+                }
+            if operation_type == "plan_patch":
+                try:
+                    patch = PlanPatch.model_validate({key: value for key, value in operation.items() if key != "type"})
+                except ValidationError as exc:
+                    return {
+                        "action": "plan_patch_invalid",
+                        "operation": operation,
+                        "reason": str(exc),
+                        "assistant_message": assistant_message,
+                        "_raw_output": raw_output,
+                    }
+                return {
+                    "action": "plan_patch",
+                    "operation": patch.model_dump(mode="json"),
+                    "assistant_message": assistant_message,
+                    "reason": reason,
+                    "_raw_output": raw_output,
+                }
             if operation_type in {"tool_call", "call_tool"}:
                 return {
                     "action": "call_tool",
@@ -1749,15 +2850,271 @@ class AgentTurnLoop:
         )
         return normalized
 
-    def _package_exists(self, package_name: str) -> bool:
-        return any(
-            package.name == package_name for package in self.tool_executor.registry.list_packages()
+    def _tool_view_for_run(self, run_id: str) -> ToolView | None:
+        if self.run_manager is None:
+            return None
+        run = self.run_manager.get_run(run_id)
+        views = run.metadata.get("context_views", {}) if run is not None else {}
+        tool_view_data = views.get("tool") if isinstance(views, dict) else None
+        return ToolView.model_validate(tool_view_data) if tool_view_data else None
+
+    def _configured_fast_path_request(
+        self, *, run_id: str, session_id: str, user_input: str
+    ) -> FastPathRequest | None:
+        policy = self.fast_path_policy
+        if policy is None or not policy.enabled or self.run_manager is None:
+            return None
+        run = self.run_manager.get_run(run_id)
+        if run is None:
+            return None
+        registered = self.tool_executor.registry.list_tools()
+        tool_view = self._tool_view_for_run(run_id)
+        if tool_view is None:
+            allowed = registered
+            workspace_paths: tuple[str, ...] = ()
+            source_ids: tuple[str, ...] = ()
+            account_ids: tuple[str, ...] = ()
+            side_effect_level = SideEffectLevel.EXTERNAL
+        else:
+            allowed = [
+                spec
+                for spec in registered
+                if tool_view.allows_tool(
+                    tool_name=spec.name,
+                    package=spec.package,
+                    read_only=effective_tool_read_only(spec, {}),
+                )
+            ]
+            workspace_paths = tool_view.allowed_paths
+            source_ids = tool_view.allowed_source_ids
+            account_ids = tool_view.allowed_account_ids
+            side_effect_level = tool_view.side_effect_level
+        tool_names = tuple(sorted(spec.name for spec in allowed))
+        package_names = tuple(sorted({spec.package for spec in allowed if spec.package}))
+        if not tool_names or not package_names:
+            return None
+        return FastPathRequest(
+            correlation_id=f"fast-path:{run_id}",
+            run_id=run_id,
+            session_id=session_id,
+            user_input=user_input,
+            objective=user_input,
+            requested_template=FastPathTemplateKind.SINGLE_AGENT,
+            authorized_scope=ScopeGrant(
+                workspace_paths=workspace_paths,
+                source_ids=source_ids,
+                account_ids=account_ids,
+                allowed_packages=package_names,
+                allowed_tools=tool_names,
+                side_effect_level=side_effect_level,
+            ),
+            react_agent_available=True,
         )
 
-    def _tool_payloads_for_package(self, package_name: str) -> list[dict[str, Any]]:
+    def _assess_configured_fast_path(
+        self, *, run_id: str, session_id: str, user_input: str
+    ) -> None:
+        if self.run_manager is None or self.fast_path_policy is None:
+            return
+        prior_events = self.run_manager.list_events(run_id)
+        if any(event.type.startswith("fast_path_") for event in prior_events):
+            return
+        request = self._configured_fast_path_request(
+            run_id=run_id, session_id=session_id, user_input=user_input
+        )
+        if request is None:
+            event = FastPathEvent(
+                correlation_id=f"fast-path:{run_id}",
+                event_type=FastPathEventType.UPGRADED,
+                run_id=run_id,
+                template_id=FastPathTemplateKind.SINGLE_AGENT,
+                reason_code="fast_path_agent_unavailable",
+            )
+            self.run_manager.append_event(
+                run_id,
+                "fast_path_upgraded",
+                "Configured fast-path could not establish an Agent capability scope; ordinary ReAct continues.",
+                stage="fast_path",
+                payload={"event": event.model_dump(mode="json"), "reason_code": event.reason_code},
+            )
+            return
+        decision = assess_fast_path(request, self.fast_path_policy, self.tool_executor.registry)
+        if decision.disposition == FastPathDisposition.MATCHED and decision.plan is not None:
+            self.run_manager.append_event(
+                run_id,
+                "fast_path_hit",
+                "Configured single-agent fast-path policy validated; ordinary ReAct execution continues.",
+                stage="fast_path",
+                payload={
+                    "event": decision.event.model_dump(mode="json"),
+                    "template_id": decision.template.template_id.value if decision.template else None,
+                    "plan": decision.plan.model_dump(mode="json"),
+                },
+            )
+            return
+        self.run_manager.append_event(
+            run_id,
+            "fast_path_upgraded",
+            "Fast-path policy did not match; the ordinary ReAct path continues.",
+            stage="fast_path",
+            payload={
+                "event": decision.event.model_dump(mode="json"),
+                "reason_code": decision.reason_code,
+                "escalation": (
+                    decision.escalation.model_dump(mode="json")
+                    if decision.escalation is not None
+                    else None
+                ),
+            },
+        )
+
+    def _complete_configured_fast_path(self, *, run_id: str, answer: str) -> None:
+        if self.run_manager is None or self.fast_path_policy is None:
+            return
+        events = self.run_manager.list_events(run_id)
+        hit = next((event for event in events if event.type == "fast_path_hit"), None)
+        if hit is None or any(
+            event.type in {"fast_path_completed", "fast_path_upgraded", "fast_path_error_completion"}
+            for event in events
+            if event.sequence > hit.sequence
+        ):
+            return
+        payload = hit.payload
+        try:
+            plan = Plan.model_validate(payload["plan"])
+            template_id = FastPathTemplateKind(str(payload["template_id"]))
+            template = next(
+                item for item in self.fast_path_policy.templates if item.template_id == template_id
+            )
+            run = self.run_manager.get_run(run_id)
+            if run is None:
+                return
+            request = self._configured_fast_path_request(
+                run_id=run_id, session_id=run.session_id, user_input=run.user_input
+            )
+            if request is None:
+                return
+            completion = assess_fast_path_completion(
+                request=request,
+                template=template,
+                plan=plan,
+                task_results=(),
+                evidence_refs=(),
+                answer_text=answer,
+            )
+        except (KeyError, StopIteration, TypeError, ValueError):
+            self.run_manager.append_event(
+                run_id,
+                "fast_path_error_completion",
+                "Fast-path completion could not be verified; ordinary run result is retained.",
+                stage="fast_path",
+                payload={"reason_code": "fast_path_completion_record_invalid"},
+            )
+            return
+        event_type = {
+            FastPathEventType.COMPLETED: "fast_path_completed",
+            FastPathEventType.UPGRADED: "fast_path_upgraded",
+            FastPathEventType.ERROR_COMPLETION: "fast_path_error_completion",
+            FastPathEventType.HIT: "fast_path_hit",
+            FastPathEventType.BYPASSED: "fast_path_upgraded",
+        }[completion.event.event_type]
+        self.run_manager.append_event(
+            run_id,
+            event_type,
+            "Configured fast-path completion assessed; ordinary Agent answer remains authoritative.",
+            stage="fast_path",
+            payload={
+                "event": completion.event.model_dump(mode="json"),
+                "completed": completion.completed,
+                "reason_code": completion.reason_code,
+                "escalation": (
+                    completion.escalation.model_dump(mode="json")
+                    if completion.escalation is not None
+                    else None
+                ),
+            },
+        )
+
+    def _upgrade_fast_path_for_multi_agent(self, run_id: str) -> None:
+        """Record a safe escalation before honoring an explicit Planner fork."""
+        if self.run_manager is None or self.fast_path_policy is None:
+            return
+        events = self.run_manager.list_events(run_id)
+        hit = next((event for event in events if event.type == "fast_path_hit"), None)
+        if hit is None or any(
+            event.type == "fast_path_upgraded" and event.sequence > hit.sequence
+            for event in events
+        ):
+            return
+        event = FastPathEvent(
+            correlation_id=f"fast-path:{run_id}",
+            event_type=FastPathEventType.UPGRADED,
+            run_id=run_id,
+            template_id=FastPathTemplateKind.SINGLE_AGENT,
+            reason_code="planner_requested_multi_agent",
+        )
+        self.run_manager.append_event(
+            run_id,
+            "fast_path_upgraded",
+            "Planner requested multi-agent work; continuing through the existing scheduler path.",
+            stage="fast_path",
+            payload={
+                "event": event.model_dump(mode="json"),
+                "reason_code": event.reason_code,
+            },
+        )
+
+    def _tools_for_package(
+        self,
+        package_name: str,
+        *,
+        tool_view: ToolView | None = None,
+    ) -> list[Any]:
+        tools = self.tool_executor.registry.list_tools(package=package_name)
+        if tool_view is None:
+            return tools
+        return [
+            tool
+            for tool in tools
+            if tool_view.allows_tool(
+                tool_name=tool.name,
+                package=tool.package,
+                read_only=(
+                    effective_tool_read_only(
+                        self.tool_executor.registry.get_tool(tool.name), {}
+                    )
+                ),
+            )
+        ]
+
+    def _package_catalog(self, tool_view: ToolView | None = None) -> list[dict[str, Any]]:
+        catalog: list[dict[str, Any]] = []
+        for package in self.tool_executor.registry.list_packages():
+            tools = self._tools_for_package(package.name, tool_view=tool_view)
+            if not tools:
+                continue
+            payload = package.model_dump(mode="json")
+            payload["tool_names"] = [tool.name for tool in tools]
+            catalog.append(payload)
+        return catalog
+
+    def _package_exists(
+        self,
+        package_name: str,
+        *,
+        tool_view: ToolView | None = None,
+    ) -> bool:
+        return bool(self._tools_for_package(package_name, tool_view=tool_view))
+
+    def _tool_payloads_for_package(
+        self,
+        package_name: str,
+        *,
+        tool_view: ToolView | None = None,
+    ) -> list[dict[str, Any]]:
         return [
             tool.model_dump(mode="json")
-            for tool in self.tool_executor.registry.list_tools(package=package_name)
+            for tool in self._tools_for_package(package_name, tool_view=tool_view)
         ]
 
     def _route_context(self, route: dict[str, Any]) -> dict[str, Any]:
@@ -1979,6 +3336,13 @@ class AgentTurnLoop:
         for observation in reversed(observations):
             compacted, compacted_changed = self._compact_for_decision_prompt(observation)
             serialized = json.dumps(compacted, ensure_ascii=False, separators=(",", ":"))
+            if len(serialized) > remaining and observation.get("action") == "fork_subtasks":
+                # A large child result must not hide the failure and re-plan
+                # signal from the next Planner decision. Full data remains in
+                # the durable result/event store.
+                compacted = self._planner_feedback_summary(observation)
+                compacted_changed = True
+                serialized = json.dumps(compacted, ensure_ascii=False, separators=(",", ":"))
             if len(serialized) <= remaining:
                 if compacted_changed and isinstance(compacted, dict):
                     compacted["_prompt_compacted"] = True
@@ -1999,6 +3363,79 @@ class AgentTurnLoop:
                 },
             )
         return bounded
+
+    @staticmethod
+    def _planner_feedback_summary(observation: dict[str, Any]) -> dict[str, Any]:
+        def brief(value: Any, limit: int = 320) -> str:
+            return str(value or "")[:limit]
+
+        summary = {
+            key: observation.get(key)
+            for key in (
+                "action", "status", "execution_status", "operation_id", "plan_id",
+                "failed_step_ids", "replan_required", "waiting_child_run_ids",
+            )
+            if key in observation
+        }
+        results = observation.get("task_results")
+        if isinstance(results, list):
+            summary["task_results"] = []
+            for result in results[:20]:
+                if not isinstance(result, dict):
+                    continue
+                projected = {
+                    key: result.get(key)
+                    for key in ("step_id", "child_run_id", "status", "attempt")
+                    if key in result
+                }
+                projected["summary"] = brief(result.get("summary"))
+                failure = result.get("failure")
+                if isinstance(failure, dict):
+                    projected["failure"] = {
+                        key: failure.get(key)
+                        for key in ("category", "code", "retryable")
+                        if key in failure
+                    }
+                    projected["failure"]["message"] = brief(failure.get("message"))
+                    projected["failure"]["recommended_actions"] = [
+                        brief(item, 160) for item in failure.get("recommended_actions", [])[:4]
+                    ] if isinstance(failure.get("recommended_actions"), list) else []
+                for key in ("missing_requirements", "warnings"):
+                    values = result.get(key)
+                    if isinstance(values, list):
+                        projected[key] = [brief(item, 160) for item in values[:6]]
+                summary["task_results"].append(projected)
+            summary["omitted_task_result_count"] = max(0, len(results) - 20)
+        aggregate = observation.get("aggregate")
+        if isinstance(aggregate, dict):
+            summary["aggregate"] = {
+                key: aggregate.get(key)
+                for key in (
+                    "status", "completed_step_ids", "partial_step_ids", "blocked_step_ids",
+                    "failed_step_ids", "missing_step_ids",
+                )
+                if key in aggregate
+            }
+            conflicts = aggregate.get("conflicts")
+            if isinstance(conflicts, list):
+                summary["aggregate"]["conflicts"] = [
+                    {"summary": brief(item.get("summary")), "references": item.get("references", [])[:4]}
+                    for item in conflicts[:6] if isinstance(item, dict)
+                ]
+        verification = observation.get("verification")
+        if isinstance(verification, dict):
+            summary["verification"] = {
+                "status": verification.get("status"),
+                "summary": brief(verification.get("summary")),
+                "missing_requirements": [
+                    brief(item, 160) for item in verification.get("missing_requirements", [])[:6]
+                ] if isinstance(verification.get("missing_requirements"), list) else [],
+                "recommended_actions": [
+                    brief(item, 160) for item in verification.get("recommended_actions", [])[:6]
+                ] if isinstance(verification.get("recommended_actions"), list) else [],
+            }
+        summary["_prompt_compacted"] = True
+        return summary
 
     @staticmethod
     def _completed_tool_call_summaries(observations: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -2118,6 +3555,7 @@ class AgentTurnLoop:
         read_only = effective_tool_read_only(tool, tool_input)
         if read_only is True:
             return None, None
+        review_mode = self._effective_safety_review_mode()
         run_manager = _turn_run_manager.get()
         run_id = _turn_run_id.get()
         if run_manager is None or run_id is None:
@@ -2145,7 +3583,7 @@ class AgentTurnLoop:
                     tool_risk=tool.spec.risk,
                     side_effects=tool.spec.side_effects,
                     read_only=read_only,
-                    mode=self.safety_review_mode,
+                    mode=review_mode,
                     reason=self._safety_review_reason(read_only=read_only),
                     created_at=_now_iso(),
                 )
@@ -2163,14 +3601,14 @@ class AgentTurnLoop:
                 payload={"review": review.model_dump(mode="json")},
             )
         if review.status == SafetyReviewStatus.PENDING:
-            if self.safety_review_mode == SafetyReviewMode.SKIP:
+            if review_mode == SafetyReviewMode.SKIP:
                 review = run_manager.decide_safety_review(
                     review_id=review.review_id,
                     decision=SafetyReviewDecision.APPROVE,
                     decided_by="system.skip",
                     reason="Safety review mode is skip; review recorded and automatically approved.",
                 )
-            elif self.safety_review_mode == SafetyReviewMode.LLM:
+            elif review_mode == SafetyReviewMode.LLM:
                 review = self._decide_safety_review_with_llm(review, llm_events=llm_events)
             else:
                 return None, review
@@ -2254,6 +3692,7 @@ class AgentTurnLoop:
         read_only = effective_tool_read_only(tool, tool_input)
         if read_only is True:
             return None, None
+        review_mode = self._effective_safety_review_mode()
         run_manager = _turn_run_manager.get()
         run_id = _turn_run_id.get()
         if run_manager is None or run_id is None:
@@ -2285,7 +3724,7 @@ class AgentTurnLoop:
                 tool_risk=tool.spec.risk,
                 side_effects=tool.spec.side_effects,
                 read_only=read_only,
-                mode=self.safety_review_mode,
+                mode=review_mode,
                 reason=reason,
                 created_at=_now_iso(),
             )
@@ -2302,7 +3741,7 @@ class AgentTurnLoop:
             stage="safety_review",
             payload={"review": review.model_dump(mode="json")},
         )
-        if self.safety_review_mode == SafetyReviewMode.SKIP:
+        if review_mode == SafetyReviewMode.SKIP:
             decided = run_manager.decide_safety_review(
                 review_id=review.review_id,
                 decision=SafetyReviewDecision.APPROVE,
@@ -2316,7 +3755,7 @@ class AgentTurnLoop:
                 message=f"Safety review skipped for `{tool_name}`.",
             )
             return None, decided
-        if self.safety_review_mode == SafetyReviewMode.LLM:
+        if review_mode == SafetyReviewMode.LLM:
             decided = self._decide_safety_review_with_llm(
                 review,
                 llm_events=llm_events,
@@ -2663,6 +4102,8 @@ class AgentTurnLoop:
         final_decision: dict[str, Any] | None,
         llm_events: list[AgentTurnLLMEvent],
     ) -> str | None:
+        if self._multi_agent_replan_pending():
+            return self._unresolved_multi_agent_answer()
         if self.llm_client is None:
             return None
         answer_decision = self._decision_context_for_answer_stage(final_decision)
@@ -2796,9 +4237,18 @@ class AgentTurnLoop:
         display_target = self._llm_display_target_for_stage(stage)
 
         async def collect() -> tuple[str, dict[str, Any]]:
+            client_name, model, reasoning_effort, selection_source, profile_id = (
+                self._inference_selection()
+            )
+            metadata = {
+                "stage": stage,
+                "inference_selection_source": selection_source,
+            }
+            if profile_id is not None:
+                metadata["inference_profile_id"] = profile_id
             request = LLMRequest(
-                client_name=_turn_llm_client_name.get(),
-                model=_turn_llm_model.get(),
+                client_name=client_name,
+                model=model,
                 response_mode=LLMResponseMode.STREAM,
                 messages=[
                     LLMMessage(role="system", content=system_prompt),
@@ -2806,11 +4256,12 @@ class AgentTurnLoop:
                 ],
                 prompt_summary=prompt_summary,
                 temperature=0.0,
+                reasoning_effort=reasoning_effort,
                 max_output_tokens=max_output_tokens,
                 require_json=self._llm_stage_requires_json(stage),
                 tools=tools or [],
                 tool_choice=tool_choice,
-                metadata={"stage": stage},
+                metadata=metadata,
             )
             snapshot = ""
             stream_metadata: dict[str, Any] = {}
@@ -2969,6 +4420,16 @@ class AgentTurnLoop:
         response_mode = LLMResponseMode.STREAM if use_stream else _turn_llm_response_mode.get()
         content_role = self._llm_content_role_for_stage(stage)
         for attempt in range(1, self.llm_max_attempts + 1):
+            child_output_cap = self._enforce_child_runtime_budget(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+            )
+            if child_output_cap is not None:
+                max_output_tokens = (
+                    child_output_cap
+                    if max_output_tokens is None
+                    else min(max_output_tokens, child_output_cap)
+                )
             started_at = llm_audit_now_iso()
             perf_start = time.perf_counter()
             llm_call_id = stable_llm_call_id(
@@ -2996,27 +4457,28 @@ class AgentTurnLoop:
                 },
             )
             try:
-                if use_stream:
-                    response = self._stream_text_once(
-                        system_prompt=system_prompt,
-                        user_prompt=user_prompt,
-                        prompt_summary=prompt_summary,
-                        max_output_tokens=max_output_tokens,
-                        stage=stage,
-                        llm_call_id=llm_call_id,
-                        tools=tools,
-                        tool_choice=tool_choice,
-                    )
-                else:
-                    response = self._complete_text_once(
-                        system_prompt=system_prompt,
-                        user_prompt=user_prompt,
-                        prompt_summary=prompt_summary,
-                        max_output_tokens=max_output_tokens,
-                        stage=stage,
-                        tools=tools,
-                        tool_choice=tool_choice,
-                    )
+                with self._admit_llm(provider):
+                    if use_stream:
+                        response = self._stream_text_once(
+                            system_prompt=system_prompt,
+                            user_prompt=user_prompt,
+                            prompt_summary=prompt_summary,
+                            max_output_tokens=max_output_tokens,
+                            stage=stage,
+                            llm_call_id=llm_call_id,
+                            tools=tools,
+                            tool_choice=tool_choice,
+                        )
+                    else:
+                        response = self._complete_text_once(
+                            system_prompt=system_prompt,
+                            user_prompt=user_prompt,
+                            prompt_summary=prompt_summary,
+                            max_output_tokens=max_output_tokens,
+                            stage=stage,
+                            tools=tools,
+                            tool_choice=tool_choice,
+                        )
             except LLMRateLimitError as exc:
                 duration_ms = self._duration_ms(perf_start)
                 llm_event = self._llm_error_event(
@@ -3128,6 +4590,11 @@ class AgentTurnLoop:
                     "response_mode": response.response_mode.value,
                     "status": response.status,
                     "content_length": len(response.content),
+                    "budget_token_count": (
+                        llm_event.total_token_count
+                        if llm_event.total_token_count is not None
+                        else max((len(system_prompt) + len(user_prompt) + len(response.content) + 3) // 4, 1)
+                    ),
                     "provider_request_id": response.provider_request_id,
                     "finish_reason": response.finish_reason,
                     "audit_record": llm_event.audit_record,
@@ -3135,6 +4602,35 @@ class AgentTurnLoop:
             )
             return response
         return None
+
+    @contextmanager
+    def _admit_llm(self, provider: str):
+        run_manager = _turn_run_manager.get()
+        run_id = _turn_run_id.get()
+        run = run_manager.get_run(run_id) if run_manager is not None and run_id else None
+        session_id = run.session_id if run is not None else "unscoped"
+        provider_key = _turn_llm_client_name.get() or provider
+        identities = (("global", "all", 16), ("provider", provider_key, 4), ("session", session_id, 4))
+        semaphores: list[threading.BoundedSemaphore] = []
+        acquired: list[threading.BoundedSemaphore] = []
+        with self._llm_admission_guard:
+            for kind, key, limit in identities:
+                identity = (kind, key)
+                semaphore = self._llm_admission.get(identity)
+                if semaphore is None:
+                    semaphore = threading.BoundedSemaphore(limit)
+                    self._llm_admission[identity] = semaphore
+                semaphores.append(semaphore)
+        try:
+            for semaphore in semaphores:
+                while not semaphore.acquire(timeout=0.1):
+                    self._raise_if_cancel_requested()
+                acquired.append(semaphore)
+            self._raise_if_cancel_requested()
+            yield
+        finally:
+            for semaphore in reversed(acquired):
+                semaphore.release()
 
     def _complete_text_once(
         self,
@@ -3149,24 +4645,42 @@ class AgentTurnLoop:
     ) -> LLMResponse:
         if self.llm_client is None:
             raise LLMClientError("No LLM client is configured.")
+        client_name, model, reasoning_effort, selection_source, profile_id = (
+            self._inference_selection()
+        )
+        request_metadata = {
+            "stage": stage,
+            "inference_selection_source": selection_source,
+        }
+        if profile_id is not None:
+            request_metadata["inference_profile_id"] = profile_id
         request_kwargs: dict[str, Any] = {
             "system_prompt": system_prompt,
             "user_prompt": user_prompt,
             "prompt_summary": prompt_summary,
             "temperature": 0.0,
             "max_output_tokens": max_output_tokens,
-            "client_name": _turn_llm_client_name.get(),
-            "model": _turn_llm_model.get(),
+            "client_name": client_name,
+            "model": model,
             "response_mode": _turn_llm_response_mode.get(),
+            "reasoning_effort": reasoning_effort,
             "require_json": self._llm_stage_requires_json(stage),
-            "metadata": {"stage": stage},
+            "metadata": request_metadata,
         }
         if tools is not None:
             request_kwargs["tools"] = tools
             request_kwargs["tool_choice"] = tool_choice
         try:
             result = self.llm_client.complete_text(**request_kwargs)
-        except TypeError:
+        except TypeError as exc:
+            if (
+                selection_source != "default"
+                or reasoning_effort is not None
+                or profile_id is not None
+            ):
+                raise LLMClientError(
+                    "The configured LLM client cannot honor the selected inference profile."
+                ) from exc
             result = self.llm_client.complete_text(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
@@ -3523,6 +5037,36 @@ class AgentTurnLoop:
         run_id = _turn_run_id.get()
         if run_manager is None or run_id is None:
             return
+        if not run_manager.claim_completion(run_id):
+            self._raise_if_cancel_requested()
+            raise RuntimeError(f"Agent run cannot claim completion: {run_id}")
+        try:
+            run_manager.flush_events()
+        except Exception as exc:
+            run_manager.fail_completion_claim(
+                run_id,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            raise
+        current_run = run_manager.get_run(run_id)
+        raw_plan = current_run.metadata.get("multi_agent_plan") if current_run else None
+        if isinstance(raw_plan, dict) and raw_plan.get("status") == PlanStatus.FAILED.value:
+            reason = "Multi-Agent plan ended with failed or blocked child steps."
+            run_manager.append_event(
+                run_id,
+                "run_failed",
+                reason,
+                stage="run",
+                payload={"error_type": "MultiAgentPlanFailed"},
+            )
+            run_manager.fail_completion_claim(
+                run_id,
+                error_type="MultiAgentPlanFailed",
+                error=reason,
+                log_path=result.log_path,
+            )
+            return
         run_manager.append_event(
             run_id,
             "run_completed",
@@ -3540,9 +5084,7 @@ class AgentTurnLoop:
                 "log_path": result.log_path,
             },
         )
-        run_manager.complete_run(
-            run_id,
-            result_snapshot={
+        result_snapshot = {
                 "session_id": result.session_id,
                 "trace_id": result.trace_id,
                 "answer": result.answer,
@@ -3551,9 +5093,20 @@ class AgentTurnLoop:
                 "expanded_packages": result.expanded_packages,
                 "used_packages": result.used_packages,
                 "active_package": result.active_package,
-            },
-            log_path=result.log_path,
-        )
+            }
+        current_run = run_manager.get_run(run_id)
+        if current_run is not None and current_run.parent_run_id is not None:
+            run_manager.complete_child_run(
+                run_id,
+                result_snapshot=result_snapshot,
+                log_path=result.log_path,
+            )
+        else:
+            run_manager.complete_run(
+                run_id,
+                result_snapshot=result_snapshot,
+                log_path=result.log_path,
+            )
 
     def _mark_current_run_failed(self, error_type: str, error: str) -> None:
         run_manager = _turn_run_manager.get()
@@ -3567,7 +5120,11 @@ class AgentTurnLoop:
             stage="run",
             payload={"error_type": error_type},
         )
-        run_manager.fail_run(run_id, error_type=error_type, error=error)
+        current_run = run_manager.get_run(run_id)
+        if current_run is not None and current_run.parent_run_id is not None:
+            run_manager.fail_child_run(run_id, error_type=error_type, error=error)
+        else:
+            run_manager.fail_run(run_id, error_type=error_type, error=error)
 
     def _mark_current_run_cancelled(self, reason: str) -> None:
         run_manager = _turn_run_manager.get()
@@ -3584,6 +5141,53 @@ class AgentTurnLoop:
         if run_manager.is_cancel_requested(run_id):
             reason = run_manager.cancel_reason(run_id) or "Run cancelled."
             raise AgentRunCancelled(reason)
+
+    def _enforce_child_runtime_budget(
+        self, *, system_prompt: str, user_prompt: str
+    ) -> int | None:
+        """Check durable child counters immediately before each provider request."""
+        manager = _turn_run_manager.get()
+        run_id = _turn_run_id.get()
+        if manager is None or run_id is None:
+            return None
+        run = manager.get_run(run_id)
+        if run is None or run.parent_run_id is None:
+            return None
+        self._raise_if_cancel_requested()
+        snapshot = run.metadata.get("context_snapshot", {})
+        budget = snapshot.get("budget", {}) if isinstance(snapshot, dict) else {}
+        if not isinstance(budget, dict):
+            return None
+        expires_at = snapshot.get("expires_at") if isinstance(snapshot, dict) else None
+        if expires_at:
+            try:
+                expiry = datetime.fromisoformat(str(expires_at))
+            except ValueError:
+                expiry = None
+            if expiry is not None and expiry <= datetime.now(UTC):
+                manager.timeout_child_run(run_id, error="Child Agent exceeded its wall-time budget.")
+                raise AgentRunCancelled("Child Agent exceeded its wall-time budget.")
+        events = manager.list_events(run_id)
+        max_calls = budget.get("max_llm_calls")
+        if max_calls is not None and sum(event.type == "llm_started" for event in events) >= int(max_calls):
+            raise RuntimeError("Child Agent exceeded its LLM-call budget.")
+        max_tokens = budget.get("max_tokens")
+        remaining_tokens: int | None = None
+        if max_tokens is not None:
+            consumed = 0
+            for event in events:
+                if event.type != "llm_completed":
+                    continue
+                count = event.payload.get("budget_token_count")
+                audit = event.payload.get("audit_record", {})
+                if count is None and isinstance(audit, dict):
+                    count = audit.get("total_token_count") or audit.get("content_length")
+                consumed += int(count or 0)
+            prompt_estimate = max((len(system_prompt) + len(user_prompt) + 3) // 4, 1)
+            remaining_tokens = int(max_tokens) - consumed - prompt_estimate
+            if remaining_tokens <= 0:
+                raise RuntimeError("Child Agent exceeded its token budget.")
+        return remaining_tokens
 
     def _write_log(self, *, result: AgentTurnResult, user_input: str) -> Path:
         self.log_dir.mkdir(parents=True, exist_ok=True)

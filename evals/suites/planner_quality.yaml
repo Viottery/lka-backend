@@ -1,0 +1,65 @@
+{
+  "suite_id": "planner_quality_minimal",
+  "suite_version": "1.0.0",
+  "schema_version": 1,
+  "description": "Offline oracle slice for structured Planner decisions. Candidate outputs are supplied separately; cases do not call a model.",
+  "cases": [
+    {
+      "case_id": "provider_failure_retry",
+      "input": {"execution_status": "failed", "replan_required": true, "failed_step_ids": ["research"], "task_results": [{"step_id": "research", "status": "failed", "failure": {"category": "provider", "code": "timeout", "retryable": true}}]},
+      "oracle": {"action": "plan_patch", "operation": {"operation": "retry_step", "target_step_id": "research"}},
+      "validation": {
+        "plan": {"correlation_id": "planner_eval", "plan_id": "failure-plan", "parent_run_id": "parent", "session_id": "session", "objective": "Collect facts", "status": "running", "steps": [{"correlation_id": "planner_eval", "step_id": "research", "objective": "Research", "output_contract": "Evidence summary", "status": "failed", "fork_operation_id": "fork", "fork_parent_step_id": "root", "fork_depth": 1, "created_by_run_id": "parent"}]},
+        "policy": {"max_depth": 2, "max_children": 4, "max_fork_size": 2, "allowed_scope": {"side_effect_level": "read"}}
+      }
+    },
+    {
+      "case_id": "child_timeout_retry",
+      "input": {"execution_status": "failed", "replan_required": true, "failed_step_ids": ["inspect"], "task_results": [{"step_id": "inspect", "status": "timed_out", "failure": {"category": "runtime", "code": "timeout", "retryable": true}}]},
+      "oracle": {"action": "plan_patch", "operation": {"operation": "retry_step", "target_step_id": "inspect"}},
+      "validation": {
+        "plan": {"correlation_id": "planner_eval", "plan_id": "timeout-plan", "parent_run_id": "parent", "session_id": "session", "objective": "Inspect inputs", "status": "running", "steps": [{"correlation_id": "planner_eval", "step_id": "inspect", "objective": "Inspect", "output_contract": "Inspection result", "status": "failed", "fork_operation_id": "fork", "fork_parent_step_id": "root", "fork_depth": 1, "created_by_run_id": "parent"}]},
+        "policy": {"max_depth": 2, "max_children": 4, "max_fork_size": 2, "allowed_scope": {"side_effect_level": "read"}}
+      }
+    },
+    {
+      "case_id": "blocked_dependency_retry_root",
+      "input": {"execution_status": "failed", "replan_required": true, "failed_step_ids": ["fetch"], "blocked_step_ids": ["report"], "aggregate": {"status": "blocked", "missing_step_ids": ["report"]}},
+      "oracle": {"action": "plan_patch", "operation": {"operation": "retry_step", "target_step_id": "fetch"}},
+      "validation": {
+        "plan": {"correlation_id": "planner_eval", "plan_id": "blocked-plan", "parent_run_id": "parent", "session_id": "session", "objective": "Fetch then report", "status": "running", "steps": [{"correlation_id": "planner_eval", "step_id": "fetch", "objective": "Fetch", "output_contract": "Source facts", "status": "failed", "fork_operation_id": "fork", "fork_parent_step_id": "root", "fork_depth": 1, "created_by_run_id": "parent"}, {"correlation_id": "planner_eval", "step_id": "report", "objective": "Report", "output_contract": "Report", "depends_on": ["fetch"], "status": "blocked", "fork_operation_id": "fork", "fork_parent_step_id": "root", "fork_depth": 1, "created_by_run_id": "parent"}]},
+        "policy": {"max_depth": 2, "max_children": 4, "max_fork_size": 2, "allowed_scope": {"side_effect_level": "read"}}
+      }
+    },
+    {
+      "case_id": "missing_required_evidence_ask_user",
+      "input": {"execution_status": "failed", "replan_required": true, "verification_policy": {"require_evidence": true, "source": "case-specific external verifier"}, "verification": {"status": "failed", "missing_requirements": ["evidence"], "recommended_actions": ["supply_missing_requirements"]}},
+      "oracle": {"action": "plan_patch", "operation": {"operation": "ask_user", "user_question": "Which authorized source should be used?"}},
+      "validation": {"plan": {"correlation_id": "planner_eval", "plan_id": "missing-evidence-plan", "parent_run_id": "parent", "session_id": "session", "objective": "Answer from evidence", "status": "running", "steps": [{"correlation_id": "planner_eval", "step_id": "root", "objective": "Answer from evidence", "output_contract": "Supported answer", "status": "running"}]}, "policy": {"max_depth": 1, "max_children": 2, "max_fork_size": 2, "allowed_scope": {"side_effect_level": "read"}}}
+    },
+    {
+      "case_id": "conflicting_evidence_resolve",
+      "input": {"execution_status": "failed", "replan_required": true, "aggregate": {"status": "conflicting", "conflicts": [{"conflict_id": "evidence:date", "references": ["source-a", "source-b"]}]}, "verification": {"status": "failed", "missing_requirements": ["conflict:evidence:date"], "recommended_actions": ["resolve_aggregation_conflicts"]}},
+      "oracle": {"action": "plan_patch", "operation": {"operation": "ask_user", "user_question": "The available sources conflict. Which source should take precedence?"}},
+      "validation": {"plan": {"correlation_id": "planner_eval", "plan_id": "conflict-plan", "parent_run_id": "parent", "session_id": "session", "objective": "Resolve source conflict", "status": "running", "steps": [{"correlation_id": "planner_eval", "step_id": "root", "objective": "Resolve source conflict", "output_contract": "Resolved answer", "status": "running"}]}, "policy": {"max_depth": 1, "max_children": 2, "max_fork_size": 2, "allowed_scope": {"side_effect_level": "read"}}}
+    },
+    {
+      "case_id": "invalid_dag_corrected_fork",
+      "input": {"proposed_plan_validation": {"status": "rejected", "reason": "cyclic_dependencies"}},
+      "oracle": {"action": "fork_subtasks", "operation": {"subtasks": [{"step_id": "inspect", "objective": "Inspect the rejected graph requirements", "output_contract": "Validated dependency list"}, {"step_id": "summarize", "objective": "Summarize the validated requirements", "output_contract": "Summary", "depends_on": ["inspect"]}]}},
+      "validation": {
+        "known_step_ids": ["root"],
+        "policy": {"max_depth": 1, "max_children": 4, "max_fork_size": 3, "allowed_scope": {"side_effect_level": "read"}}
+      }
+    },
+    {
+      "case_id": "omitted_required_step",
+      "input": {"request_contract": {"required_outputs": ["source evidence", "comparison"]}, "proposed_plan_validation": {"status": "valid", "step_ids": ["collect"]}},
+      "oracle": {"action": "fork_subtasks", "operation": {"subtasks": [{"step_id": "collect", "objective": "Collect source evidence", "output_contract": "Evidence list"}, {"step_id": "compare", "objective": "Compare source evidence", "output_contract": "Comparison", "depends_on": ["collect"]}]}},
+      "validation": {
+        "known_step_ids": ["root"],
+        "policy": {"max_depth": 1, "max_children": 4, "max_fork_size": 3, "allowed_scope": {"allowed_packages": ["knowledge"], "allowed_tools": ["knowledge.search"], "side_effect_level": "read"}, "allowed_agent_ids": ["general_agent"]}
+      }
+    }
+  ]
+}

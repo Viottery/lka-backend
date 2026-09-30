@@ -57,6 +57,156 @@ uv --cache-dir .uv-cache run python -m evals.lka_evals.runner evals/suites/mail_
 
 Reports are written to `evals/reports/` as JSON and Markdown.
 
+## Offline Public RAG Retrieval Benchmark
+
+`evals/lka_evals/public_retrieval.py` runs directly against isolated local
+`KnowledgeService` instances. It never calls an LLM or downloads a model. The
+checked-in HotpotQA, 2WikiMultiHopQA, MuSiQue, and MultiHop-RAG JSONL files are
+imported into temporary databases. Reports include dataset hashes, Recall@k,
+MRR@k, nDCG@k, supporting-document/all-hop recall, forbidden-leak count,
+fallback rate, failure rate, and p50/p95 query latency. Each dataset/mode result
+also includes query slices by dataset label, supporting-document source type,
+and a deterministic coarse question-language label (`en`, `zh`, `mixed`,
+`other`, or `unknown`), including slice-level leak, fallback, failure, and
+latency summaries. Corpus import/index-build times and query times are reported
+separately. Embedding indexing and reranker availability probing warm
+local inference before timed queries; these are warm-query results, not cold
+startup latency. Model identifiers, dimensions, cache path/existence, Python,
+platform, and warm-cache notes are recorded in report configuration.
+The runner mirrors the default `knowledge.search` candidate policy: at most
+two chunks per document, and the configured default reranker batch size, text
+limits, and 30-candidate cap. Its metrics are document-level retrieval metrics,
+not answer correctness.
+
+`public_rewrite_probe.py` is a separate, question-only diagnostic for multi-hop
+retrieval. It deterministically splits a question into up to eight clause queries,
+uses bounded parallel retrieval and one global rerank, and reports document-level
+metrics plus the number of queries actually rewritten. It never reads gold answers
+or supporting-document labels to form queries. It is **not** an Agent/LLM rewrite
+evaluation and does not measure final answer accuracy. For example:
+
+Curated multi-hop failure IDs, retrieval-stage observations, and annotation
+questions are recorded in `evals/fixtures/knowledge/multihop_rewrite_failcases.json`
+and `docs/rag_multihop_failcases_2026-09-30.md`. The annotation questions need
+manual review and are not automatic ground-truth assertions.
+
+```bash
+uv --cache-dir .uv-cache run python -m evals.lka_evals.public_rewrite_probe \
+  --dataset evals/datasets/public_multihop/multihop_rag_600.jsonl \
+  --sample-limit 100 --seed 20260929 --top-k 10 \
+  --output /tmp/lka-multihop-rewrite-probe.json
+```
+
+The comparison report checks each available mode against keyword on the same
+dataset, showing Recall@k/all-hop deltas and p95 latency ratio. Its illustrative
+defaults allow at most a 0.05 recall-point drop and 2x keyword p95; set project
+thresholds explicitly when using it as a gate. Unavailable modes are never
+compared as fallback scores. These comparisons do not establish a universal
+model ranking or justify a production default without full-data and language
+slices.
+
+```bash
+uv --cache-dir .uv-cache run python -m evals.lka_evals.public_retrieval \
+  --mode keyword --top-k 10 --sample-limit 200 \
+  --output /tmp/lka-public-rag-baseline.json
+```
+
+To measure semantic, hybrid, and hybrid+rerank, first explicitly cache compatible
+models outside this runner. Then pass `--embedding-model`, its actual
+`--embedding-dimensions`, `--rerank-model`, and `--model-cache-dir`; add
+`--mode semantic --mode hybrid --mode hybrid_rerank`. Without a cached model,
+the affected rows are `unavailable` with null quality metrics, not misleading
+keyword fallback scores. Production retrieval now attempts local reranking by
+default, with `local_files_only = true`; an unavailable model leaves retrieval
+ordering intact and reports a warning. Benchmark latency before deployment.
+
+To compare a local reranker without an embedding model, include
+`--mode keyword_rerank --rerank-model BAAI/bge-reranker-base`. This retrieves
+the keyword candidate pool and reranks it locally; it does not initialize the
+semantic index. The default model cache is `data/runtime/models` (override with
+`--model-cache-dir`). If the model cannot be loaded locally, the mode is
+reported unavailable rather than scored as keyword-only.
+
+For Agent-answer cases, `expect.knowledge_grounding` accepts
+`{"evidence_sufficient": true|false, "permitted_source_refs": [...]}`. It checks
+`[source-ref]` citations against successful, privacy-approved knowledge tool
+results and a deterministic abstention marker when evidence is insufficient.
+Optional explicit `claims: [{"text": "...", "supported": false}]` fixture
+annotations flag literal unsupported claim text in the answer. This is an
+oracle-driven regression check, not automatic claim discovery. Citation syntax
+and reference membership are structural checks and do not mean that cited
+evidence semantically supports the answer.
+
+## Multi-Agent Evaluation Foundations
+
+`evals/lka_evals/multi_agent_metrics.py` computes selected lifecycle, DAG,
+approval, and latency metrics from caller-supplied durable run/event JSON. It
+does not execute tasks or read live user data; missing evidence is reported as
+unavailable rather than counted as success. `evals/lka_evals/badcases.py` handles
+explicitly selected, de-identified badcase manifests and regression selection.
+These are data/metric foundations, not yet an isolated multi-Agent suite runner
+or a live shadow-evaluation service. Do not import raw production prompts,
+mail content, credentials, or writable workspace fixtures into badcases.
+
+To create an offline JSON report, provide explicit exported input files and an
+explicit output path:
+
+```bash
+uv run python -m evals.lka_evals.multi_agent_report \
+  --runs /path/to/run-records.json \
+  --events /path/to/run-events.json \
+  --output /path/to/multi-agent-report.json
+```
+
+Each input is a JSON array of durable records/events, or JSON `null` when that
+data source is unavailable. The command never queries a live backend or scans
+log directories. Reports use schema version 1 and the contract in
+`evals/schemas/multi_agent_trace_report.schema.json`. Trace terminal completeness,
+dependency correctness, and terminal consistency are structural hard gates: unavailable evidence makes the
+report fail (`passed: false`, exit status 1), as does a failed gate.
+Passing these gates does not by itself establish task-answer quality or scope safety.
+
+### Offline Planner Decision Slice
+
+`evals/suites/planner_quality.yaml` is a versioned, deterministic oracle slice
+for child failure/timeout, blocked dependencies, missing or conflicting
+evidence, invalid DAG feedback, and required-step coverage. Supply structured
+candidate outputs explicitly; the evaluator calls existing plan/fork/patch
+schema and policy validation using only the case's trusted fixture ceilings.
+It reports structure/policy validity separately from oracle decision match.
+Scripted fixture scores describe only those supplied fixtures and must not be
+reported as real LLM Planner capability. This evaluator never invokes a model
+or discovers backend logs. The missing-evidence case uses an explicit external
+verifier with `require_evidence: true` and `replan_required: true`; the current
+default `VerificationPolicy.require_evidence` is false, so that case does not
+claim the runtime raises this requirement automatically.
+
+```bash
+uv run python -m evals.lka_evals.planner_quality \
+  evals/suites/planner_quality.yaml \
+  --candidates /path/to/planner-candidates.json \
+  --output /tmp/planner-quality-report.json
+```
+
+Run the bundled scripted baseline as an evaluator smoke example:
+
+```bash
+uv run python -m evals.lka_evals.planner_quality \
+  evals/suites/planner_quality.yaml \
+  --candidates evals/fixtures/planner_quality_scripted_candidates.json \
+  --output /tmp/planner-quality-scripted-report.json
+```
+
+This checks the evaluator plumbing and oracle fixture only; its scores are not
+model results.
+
+Candidate files use `schema_version: 1`, `candidate_kind`, optional `provider`,
+`model`, and `configuration_id`, plus an `outputs` array. Each output has a
+`case_id` and `action`; fork and patch actions include an `operation` object.
+`candidate_kind: "real_llm_export"` and its provider/model fields are caller
+claims. The report records them as unverified; the evaluator does not establish
+provenance.
+
 ## Suite Format
 
 Suite files are JSON-compatible YAML in this first version. This avoids adding a

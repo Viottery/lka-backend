@@ -12,6 +12,13 @@ import urllib.request
 from collections.abc import AsyncIterator
 from typing import Any
 
+from app.core.llm.audit import (
+    audit_headers,
+    classify_provider_error,
+    parse_error_body,
+    provider_request_id_from_headers,
+    retry_after_from_headers,
+)
 from app.core.llm.errors import (
     LLMAuthenticationError,
     LLMClientError,
@@ -21,14 +28,8 @@ from app.core.llm.errors import (
     LLMResponseParseError,
     LLMTimeoutError,
 )
-from app.core.llm.audit import (
-    audit_headers,
-    classify_provider_error,
-    parse_error_body,
-    provider_request_id_from_headers,
-    retry_after_from_headers,
-)
 from app.core.llm.models import (
+    LLMReasoningEffort,
     LLMRequest,
     LLMResponse,
     LLMResponseMode,
@@ -54,6 +55,7 @@ class OpenAICompatibleLLMClient:
         supports_json_mode: bool = False,
         supports_function_calling: bool = False,
         function_calling_strict: bool = False,
+        supports_reasoning_effort: bool = False,
     ) -> None:
         if not api_key:
             raise LLMClientError(f"Missing API key for LLM client: {name}")
@@ -68,6 +70,7 @@ class OpenAICompatibleLLMClient:
         self.supports_json_mode = supports_json_mode
         self.supports_function_calling = supports_function_calling
         self.function_calling_strict = function_calling_strict
+        self.supports_reasoning_effort = supports_reasoning_effort
 
     async def complete(self, request: LLMRequest) -> LLMResponse:
         response_payload, response_headers = await _run_blocking(
@@ -226,12 +229,18 @@ class OpenAICompatibleLLMClient:
         raise LLMResponseParseError("LLM provider stream returned no response.")
 
     def _build_request(self, request: LLMRequest, *, stream: bool) -> urllib.request.Request:
+        if request.reasoning_effort is not None and not self.supports_reasoning_effort:
+            raise LLMClientError(
+                f"LLM client {self.name} does not support reasoning_effort."
+            )
         payload: dict[str, Any] = {
             "model": self._model_for(request),
             "messages": [message.model_dump() for message in request.messages],
             "temperature": request.temperature,
             "stream": stream,
         }
+        if request.reasoning_effort is not None:
+            payload["reasoning_effort"] = LLMReasoningEffort(request.reasoning_effort).value
         if request.max_output_tokens is not None:
             payload["max_tokens"] = request.max_output_tokens
         if request.require_json and self.supports_json_mode and not request.tools:

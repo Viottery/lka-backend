@@ -14,6 +14,14 @@ class LLMResponseMode(str, Enum):
     STREAM = "stream"
 
 
+class LLMReasoningEffort(str, Enum):
+    """Provider-neutral reasoning effort hint for models that support it."""
+
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
 class LLMMessage(BaseModel):
     role: Literal["system", "user", "assistant", "tool"]
     content: str
@@ -44,6 +52,7 @@ class LLMRequest(BaseModel):
     client_name: str | None = None
     model: str | None = None
     temperature: float = 0.0
+    reasoning_effort: LLMReasoningEffort | None = None
     max_output_tokens: int | None = None
     require_json: bool = False
     tools: list[LLMToolDefinition] = Field(default_factory=list)

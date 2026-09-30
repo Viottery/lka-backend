@@ -168,6 +168,7 @@ class BashSession:
     process: subprocess.Popen[bytes]
     master_fd: int
     started_at: float
+    owner_run_id: str | None = None
     output: bytearray = field(default_factory=bytearray)
     output_start_offset: int = 0
     reader_error: str | None = None
@@ -187,6 +188,7 @@ class BashSessionManager:
         workspace_root: Path,
         read_only: bool,
         env: dict[str, str],
+        owner_run_id: str | None = None,
     ) -> BashSession:
         if pty is None:
             raise RuntimeError("background bash sessions require POSIX pty support.")
@@ -216,6 +218,7 @@ class BashSessionManager:
                 process=process,
                 master_fd=master_fd,
                 started_at=time.time(),
+                owner_run_id=owner_run_id,
             )
             self._sessions[session_id] = session
         threading.Thread(
@@ -226,18 +229,24 @@ class BashSessionManager:
         ).start()
         return session
 
-    def get(self, session_id: str) -> BashSession:
+    def get(self, session_id: str, *, owner_run_id: str | None = None) -> BashSession:
         with self._lock:
             session = self._sessions.get(session_id)
             if session is None:
                 raise KeyError(f"bash session not found: {session_id}")
+            if owner_run_id is not None and session.owner_run_id != owner_run_id:
+                raise KeyError(f"bash session not found: {session_id}")
             return session
 
-    def list(self, *, active_only: bool = False) -> list[BashSession]:
+    def list(
+        self, *, active_only: bool = False, owner_run_id: str | None = None
+    ) -> list[BashSession]:
         with self._lock:
             sessions = list(self._sessions.values())
         if active_only:
-            return [session for session in sessions if session.process.poll() is None]
+            sessions = [session for session in sessions if session.process.poll() is None]
+        if owner_run_id is not None:
+            sessions = [session for session in sessions if session.owner_run_id == owner_run_id]
         return sessions
 
     def read(
@@ -246,8 +255,9 @@ class BashSessionManager:
         session_id: str,
         offset: int = 0,
         max_bytes: int = DEFAULT_OUTPUT_BYTES,
+        owner_run_id: str | None = None,
     ) -> dict[str, Any]:
-        session = self.get(session_id)
+        session = self.get(session_id, owner_run_id=owner_run_id)
         with self._lock:
             start = max(offset, session.output_start_offset)
             local_start = start - session.output_start_offset
@@ -268,19 +278,19 @@ class BashSessionManager:
             "reader_error": reader_error,
         }
 
-    def write(self, *, session_id: str, text: str) -> int:
-        session = self.get(session_id)
+    def write(self, *, session_id: str, text: str, owner_run_id: str | None = None) -> int:
+        session = self.get(session_id, owner_run_id=owner_run_id)
         if session.process.poll() is not None:
             raise RuntimeError(f"bash session is not running: {session_id}")
         return os.write(session.master_fd, text.encode("utf-8"))
 
-    def interrupt(self, *, session_id: str) -> None:
-        session = self.get(session_id)
+    def interrupt(self, *, session_id: str, owner_run_id: str | None = None) -> None:
+        session = self.get(session_id, owner_run_id=owner_run_id)
         if session.process.poll() is None:
             os.killpg(session.process.pid, signal.SIGINT)
 
-    def terminate(self, *, session_id: str) -> None:
-        session = self.get(session_id)
+    def terminate(self, *, session_id: str, owner_run_id: str | None = None) -> None:
+        session = self.get(session_id, owner_run_id=owner_run_id)
         if session.process.poll() is None:
             os.killpg(session.process.pid, signal.SIGTERM)
 
@@ -346,6 +356,7 @@ class BashRunTool:
         requires_confirmation=False,
         read_only=False,
         side_effects=["execute_local_process", "read_local_files", "write_local_files"],
+        scope_uses_workspace=True,
         input_schema={
             "type": "object",
             "required": ["command"],
@@ -379,6 +390,20 @@ class BashRunTool:
         return is_read_only_command(str(tool_input.get("command") or ""))
 
     def invoke(self, *, invocation: ToolInvocation, context: ToolContext) -> ToolResult:
+        if (
+            _child_run_id(context) is not None
+            and context.tool_view is not None
+            and not context.tool_view.full_workspace_authority
+        ):
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=self.spec.name,
+                status="rejected",
+                error=(
+                    "bash.run is unavailable because arbitrary shell paths cannot be safely "
+                    "constrained to a narrowed child workspace scope."
+                ),
+            )
         command = str(invocation.input.get("command") or "")
         mode = str(invocation.input.get("mode") or "sync")
         read_only = self.is_read_only_invocation(invocation.input)
@@ -389,7 +414,11 @@ class BashRunTool:
             cwd = policy.resolve_cwd(invocation.input.get("cwd"))
             if mode == "background":
                 payload = self._run_background(
-                    command=command, cwd=cwd, read_only=read_only, policy=policy
+                    command=command,
+                    cwd=cwd,
+                    read_only=read_only,
+                    policy=policy,
+                    owner_run_id=_child_run_id(context),
                 )
             else:
                 payload = self._run_sync(
@@ -476,6 +505,7 @@ class BashRunTool:
         cwd: Path,
         read_only: bool,
         policy: BashAccessPolicy,
+        owner_run_id: str | None = None,
     ) -> dict[str, Any]:
         session = self.session_manager.start(
             command=command,
@@ -483,6 +513,7 @@ class BashRunTool:
             workspace_root=policy.default_root,
             read_only=read_only,
             env=self._env(policy),
+            owner_run_id=owner_run_id,
         )
         return {
             "mode": "background",
@@ -532,7 +563,8 @@ class BashListSessionsTool:
         sessions = [
             self.session_manager._session_status_payload(session)
             for session in self.session_manager.list(
-                active_only=bool(invocation.input.get("active_only"))
+                active_only=bool(invocation.input.get("active_only")),
+                owner_run_id=_child_run_id(context),
             )
         ]
         return ToolResult(
@@ -590,6 +622,7 @@ class BashReadSessionTool:
                 session_id=str(invocation.input.get("session_id") or ""),
                 offset=int(invocation.input.get("offset") or 0),
                 max_bytes=int(invocation.input.get("max_bytes") or DEFAULT_OUTPUT_BYTES),
+                owner_run_id=_child_run_id(context),
             )
         except (KeyError, ValueError) as exc:
             return ToolResult(
@@ -637,6 +670,7 @@ class BashWriteSessionTool:
             bytes_written = self.session_manager.write(
                 session_id=session_id,
                 text=str(invocation.input.get("text") or ""),
+                owner_run_id=_child_run_id(context),
             )
         except (KeyError, OSError, RuntimeError) as exc:
             return ToolResult(
@@ -678,7 +712,7 @@ class BashInterruptSessionTool:
         _ = context
         session_id = str(invocation.input.get("session_id") or "")
         try:
-            self.session_manager.interrupt(session_id=session_id)
+            self.session_manager.interrupt(session_id=session_id, owner_run_id=_child_run_id(context))
         except (KeyError, OSError) as exc:
             return ToolResult(
                 invocation_id=invocation.invocation_id,
@@ -719,7 +753,7 @@ class BashTerminateSessionTool:
         _ = context
         session_id = str(invocation.input.get("session_id") or "")
         try:
-            self.session_manager.terminate(session_id=session_id)
+            self.session_manager.terminate(session_id=session_id, owner_run_id=_child_run_id(context))
         except (KeyError, OSError) as exc:
             return ToolResult(
                 invocation_id=invocation.invocation_id,
@@ -791,3 +825,8 @@ def _decode_limited(raw: bytes, max_bytes: int) -> str:
         return raw.decode("utf-8", errors="replace")
     suffix = f"\n...[truncated {len(raw) - max_bytes} bytes]"
     return raw[:max_bytes].decode("utf-8", errors="replace") + suffix
+
+
+def _child_run_id(context: ToolContext) -> str | None:
+    view = context.tool_view
+    return view.child_run_id if view is not None else None

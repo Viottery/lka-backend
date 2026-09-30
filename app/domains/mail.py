@@ -5,14 +5,14 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from hashlib import sha1
 
 from pydantic import BaseModel, Field
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _stable_id(prefix: str, *parts: str | None) -> str:
@@ -72,6 +72,7 @@ class MailSearchResult(BaseModel):
 
 class MailMessageRecord(BaseModel):
     message_id: str
+    account_id: str = Field(exclude=True)
     subject: str
     sender: str
     folder: str
@@ -114,6 +115,15 @@ class MailService:
 
     def __init__(self, conn_factory: Callable[[], sqlite3.Connection]) -> None:
         self._conn_factory = conn_factory
+
+    def list_authorized_account_ids(self) -> tuple[str, ...]:
+        """Return the currently configured local mail-account inventory."""
+        conn = self._conn_factory()
+        try:
+            rows = conn.execute("SELECT account_id FROM mail_accounts ORDER BY account_id").fetchall()
+        finally:
+            conn.close()
+        return tuple(str(row["account_id"]) for row in rows)
 
     def import_messages(
         self,
@@ -368,22 +378,32 @@ class MailService:
             return '""'
         return " OR ".join(f'"{term}"' for term in terms)
 
-    def load_messages(self, message_ids: list[str]) -> list[MailMessageRecord]:
+    def load_messages(
+        self,
+        message_ids: list[str],
+        *,
+        account_ids: list[str] | None = None,
+    ) -> list[MailMessageRecord]:
         if not message_ids:
             return []
 
         placeholders = ", ".join("?" for _ in message_ids)
+        account_clause = ""
+        params: list[str] = list(message_ids)
+        if account_ids:
+            account_clause = f" AND account_id IN ({', '.join('?' for _ in account_ids)})"
+            params.extend(account_ids)
         conn = self._conn_factory()
         try:
             rows = conn.execute(
                 f"""
                 SELECT
-                    message_id, subject, sender, folder, recipients, cc,
+                    message_id, account_id, subject, sender, folder, recipients, cc,
                     received_at, body_text
                 FROM mail_messages
-                WHERE message_id IN ({placeholders})
+                WHERE message_id IN ({placeholders}) {account_clause}
                 """,
-                message_ids,
+                params,
             ).fetchall()
             attachment_rows = conn.execute(
                 f"""
@@ -411,6 +431,7 @@ class MailService:
         records_by_id = {
             row["message_id"]: MailMessageRecord(
                 message_id=row["message_id"],
+                account_id=row["account_id"],
                 subject=row["subject"],
                 sender=row["sender"],
                 folder=row["folder"],

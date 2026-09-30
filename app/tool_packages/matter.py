@@ -2,13 +2,33 @@
 
 from __future__ import annotations
 
+from app.core.tools import ToolContext, ToolInvocation, ToolPackageSpec, ToolResult, ToolSpec
 from app.domains.matters import (
     MatterCreateInput,
     MatterService,
     MatterSourceLinkInput,
     MatterUpdateInput,
 )
-from app.core.tools import ToolContext, ToolInvocation, ToolPackageSpec, ToolResult, ToolSpec
+
+
+def _child_scope(
+    context: ToolContext,
+) -> tuple[tuple[str, ...] | None, tuple[str, ...] | None, bool]:
+    view = context.tool_view
+    if view is None or getattr(view, "child_run_id", None) is None:
+        return None, None, True
+    return (
+        tuple(getattr(view, "allowed_source_ids", ())),
+        tuple(getattr(view, "allowed_account_ids", ())),
+        bool(getattr(view, "full_data_authority", False)),
+    )
+
+
+_MATTER_CHILD_SCOPE = {
+    "scope_uses_sources": True,
+    "scope_uses_accounts": True,
+    "scope_filtering_required": True,
+}
 
 
 MATTER_PACKAGE = ToolPackageSpec(
@@ -109,13 +129,23 @@ class CreateMatterTool:
         requires_confirmation=False,
         read_only=False,
         side_effects=["write_local_db"],
+        **_MATTER_CHILD_SCOPE,
         input_schema=MATTER_CREATE_SCHEMA,
         output_schema={"matter": "object"},
     )
 
     def invoke(self, *, invocation: ToolInvocation, context: ToolContext) -> ToolResult:
+        source_ids, account_ids, full_authority = _child_scope(context)
+        if (
+            source_ids is not None
+            and not invocation.input.get("source_links")
+            and not full_authority
+        ):
+            raise PermissionError("Unlinked matters are outside the child source/account scope.")
         matter = self.matter_service.create_matter(
-            MatterCreateInput.model_validate(invocation.input)
+            MatterCreateInput.model_validate(invocation.input),
+            source_ids=source_ids, account_ids=account_ids,
+            allow_unattributed=full_authority,
         )
         return ToolResult(
             invocation_id=invocation.invocation_id,
@@ -138,6 +168,7 @@ class CreateManyMattersTool:
         requires_confirmation=False,
         read_only=False,
         side_effects=["write_local_db"],
+        **_MATTER_CHILD_SCOPE,
         input_schema={
             "type": "object",
             "required": ["matters"],
@@ -156,10 +187,27 @@ class CreateManyMattersTool:
     )
 
     def invoke(self, *, invocation: ToolInvocation, context: ToolContext) -> ToolResult:
+        source_ids, account_ids, full_authority = _child_scope(context)
+        payloads = [
+            MatterCreateInput.model_validate(payload)
+            for payload in invocation.input.get("matters", []) if isinstance(payload, dict)
+        ]
+        if source_ids is not None:
+            if not full_authority and any(not payload.source_links for payload in payloads):
+                raise PermissionError("Unlinked matters are outside the child source/account scope.")
+            for payload in payloads:
+                self.matter_service.validate_source_links_scope(
+                    source_links=payload.source_links,
+                    source_ids=source_ids,
+                    account_ids=account_ids, allow_unattributed=full_authority,
+                )
         created = [
-            self.matter_service.create_matter(MatterCreateInput.model_validate(payload))
-            for payload in invocation.input.get("matters", [])
-            if isinstance(payload, dict)
+            self.matter_service.create_matter(
+                payload,
+                source_ids=source_ids,
+                account_ids=account_ids,
+                allow_unattributed=full_authority,
+            ) for payload in payloads
         ]
         return ToolResult(
             invocation_id=invocation.invocation_id,
@@ -185,6 +233,7 @@ class SearchMattersTool:
         requires_confirmation=False,
         read_only=True,
         side_effects=["read_local_db"],
+        **_MATTER_CHILD_SCOPE,
         input_schema={
             "type": "object",
             "required": ["query"],
@@ -197,9 +246,12 @@ class SearchMattersTool:
     )
 
     def invoke(self, *, invocation: ToolInvocation, context: ToolContext) -> ToolResult:
+        source_ids, account_ids, full_authority = _child_scope(context)
         result = self.matter_service.search_matters(
             query=str(invocation.input.get("query") or ""),
             limit=int(invocation.input.get("limit") or 10),
+            source_ids=source_ids, account_ids=account_ids,
+            allow_unattributed=full_authority,
         )
         return ToolResult(
             invocation_id=invocation.invocation_id,
@@ -222,6 +274,7 @@ class ListMattersTool:
         requires_confirmation=False,
         read_only=True,
         side_effects=["read_local_db"],
+        **_MATTER_CHILD_SCOPE,
         input_schema={
             "type": "object",
             "properties": {
@@ -236,10 +289,13 @@ class ListMattersTool:
     )
 
     def invoke(self, *, invocation: ToolInvocation, context: ToolContext) -> ToolResult:
+        source_ids, account_ids, full_authority = _child_scope(context)
         status_value = invocation.input.get("status")
         result = self.matter_service.list_matters(
             limit=int(invocation.input.get("limit") or 50),
             status=str(status_value) if status_value else None,
+            source_ids=source_ids, account_ids=account_ids,
+            allow_unattributed=full_authority,
         )
         return ToolResult(
             invocation_id=invocation.invocation_id,
@@ -262,6 +318,7 @@ class UpdateMatterTool:
         requires_confirmation=False,
         read_only=False,
         side_effects=["write_local_db"],
+        **_MATTER_CHILD_SCOPE,
         input_schema={
             "type": "object",
             "required": ["matter_id"],
@@ -286,6 +343,7 @@ class UpdateMatterTool:
     )
 
     def invoke(self, *, invocation: ToolInvocation, context: ToolContext) -> ToolResult:
+        source_ids, account_ids, full_authority = _child_scope(context)
         matter_id = str(invocation.input.get("matter_id") or "")
         payload = MatterUpdateInput.model_validate(
             {
@@ -297,6 +355,8 @@ class UpdateMatterTool:
         matter = self.matter_service.update_matter(
             matter_id=matter_id,
             payload=payload,
+            source_ids=source_ids, account_ids=account_ids,
+            allow_unattributed=full_authority,
         )
         return ToolResult(
             invocation_id=invocation.invocation_id,
@@ -319,6 +379,7 @@ class LinkMatterSourceTool:
         requires_confirmation=False,
         read_only=False,
         side_effects=["write_local_db"],
+        **_MATTER_CHILD_SCOPE,
         input_schema={
             "type": "object",
             "required": ["matter_id", "source_type", "source_id", "reason"],
@@ -331,6 +392,7 @@ class LinkMatterSourceTool:
     )
 
     def invoke(self, *, invocation: ToolInvocation, context: ToolContext) -> ToolResult:
+        source_ids, account_ids, full_authority = _child_scope(context)
         matter = self.matter_service.link_source(
             matter_id=str(invocation.input.get("matter_id") or ""),
             source_link=MatterSourceLinkInput(
@@ -338,6 +400,8 @@ class LinkMatterSourceTool:
                 source_id=str(invocation.input.get("source_id") or ""),
                 reason=str(invocation.input.get("reason") or ""),
             ),
+            source_ids=source_ids, account_ids=account_ids,
+            allow_unattributed=full_authority,
         )
         return ToolResult(
             invocation_id=invocation.invocation_id,

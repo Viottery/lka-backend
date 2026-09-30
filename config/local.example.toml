@@ -38,6 +38,42 @@ checkpoint_backend = "sqlite"
 # Maximum decision-loop steps after the initial route. Raise for longer workflows
 # such as sync -> search -> load -> dedupe -> create/update -> verify -> answer.
 max_decision_steps = 10
+# Enable Planner fork operations and bounded DAG scheduling. This requires
+# orchestrator = "langgraph" for parent checkpoint and approval resumption.
+multi_agent_planning_enabled = false
+# Demonstration-only expert that produces simulated workflow results. Keep off
+# for ordinary user tasks; enabling it also permits Planner to select it.
+mock_workflow_agent_enabled = false
+# External Codex worker is opt-in. It runs against a staged copy of one Git
+# workspace; staged edits are not applied to the source workspace automatically.
+codex_expert_enabled = false
+# codex_binary_path = "/absolute/path/to/codex"
+# codex_workspace_base = "/absolute/path/outside/source/workspaces"
+# Optional: private Codex app-server SQLite state directory. When configured,
+# it is created with private permissions and passed as a sqlite_home override.
+# codex_state_home = "/absolute/path/outside/source/codex-state"
+# Optional: isolated Codex profile directory. This overrides CODEX_HOME and
+# requires separate local authentication for this profile; credentials are not copied.
+# codex_home = "/absolute/path/outside/source/codex-profile"
+# Current Codex CLI versions use a per-process restricted-read permissions
+# profile. Use "legacy" only with a CLI that supports readOnlyAccess in turn/start.
+codex_permission_mode = "profile"
+# codex_model = "your-authorized-codex-model"
+# codex_reasoning_effort = "medium"
+# Opt in to single-agent fast-path policy telemetry. No ReAct/Planner LLM step
+# is skipped; explicit Planner fork requests record an upgrade before normal
+# scheduling. Context-answer/retrieval templates remain unavailable until
+# trusted selection and evidence contracts are configured.
+fast_path_single_agent_enabled = false
+max_fork_depth = 2
+max_children = 8
+max_fork_size = 4
+# Maximum child DAG steps executing at once, and retry attempts after a
+# retryable child failure. Retries are bounded per step.
+multi_agent_max_concurrency = 2
+# Process-wide cap across concurrent multi-Agent plans.
+multi_agent_global_max_concurrency = 8
+multi_agent_max_retries = 1
 
 # Optional named clients. Keep commented until configured locally.
 # [[llm.clients]]
@@ -50,6 +86,8 @@ max_decision_steps = 10
 # supports_function_calling = true
 # Set this only when the configured provider/base URL supports strict function schemas.
 # function_calling_strict = false
+# Set true only for endpoints that accept a reasoning_effort chat-completions field.
+# supports_reasoning_effort = false
 #
 # [[llm.clients]]
 # name = "openai"
@@ -63,6 +101,7 @@ max_decision_steps = 10
 # supports_json_mode = true
 
 [mail.outlook]
+# This is a hard switch: false disables startup, background, API, and Agent tool sync.
 enabled = false
 auth_method = "device_code"
 client_id = ""
@@ -99,10 +138,34 @@ cache_dir = "./data/runtime/models"
 batch_size = 16
 normalize_embeddings = true
 query_prefix = "为这个句子生成表示以用于检索相关文章："
-default_retrieval_mode = "hybrid"
+# Start with measured lexical behavior; enable hybrid after corpus/language eval.
+default_retrieval_mode = "keyword"
 # Use POST /knowledge/semantic-index/sync for existing content. Enabling this
 # makes future imports synchronously embed their new non-secret chunks.
 auto_index_on_import = false
 # Avoid any network access while serving queries. The first model download must
 # be requested explicitly through semantic-index sync.
+local_files_only = true
+
+[query_rewrite]
+# Per knowledge.search call: original query plus at most max_rewrites alternatives.
+# Retrieval fans out with bounded parallelism, then fuses and reranks once.
+max_rewrites = 8
+max_total_chars = 2400
+max_parallel_searches = 4
+max_total_candidates = 240
+
+[reranker]
+# Rerank the locally recalled candidate pool before selecting top-k. Keep
+# local_files_only=true: a missing model falls back to retrieval order with a warning.
+# Download the model explicitly to cache_dir before deployment for full quality.
+enabled = true
+model_name = "BAAI/bge-reranker-base"
+cache_dir = "./data/runtime/models"
+batch_size = 8
+max_candidates = 30
+max_query_chars = 1000
+max_candidate_chars = 1800
+max_concurrent_inferences = 1
+queue_timeout_ms = 25
 local_files_only = true

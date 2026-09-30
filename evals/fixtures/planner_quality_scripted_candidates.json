@@ -1,0 +1,112 @@
+{
+  "schema_version": 1,
+  "candidate_kind": "scripted_fixture",
+  "outputs": [
+    {
+      "case_id": "provider_failure_retry",
+      "action": "plan_patch",
+      "operation": {
+        "patch_id": "scripted-provider-retry",
+        "plan_id": "failure-plan",
+        "expected_revision": 0,
+        "operation": "retry_step",
+        "reason": "Retry the transient provider failure within the existing budget.",
+        "target_step_id": "research"
+      }
+    },
+    {
+      "case_id": "child_timeout_retry",
+      "action": "plan_patch",
+      "operation": {
+        "patch_id": "scripted-timeout-retry",
+        "plan_id": "timeout-plan",
+        "expected_revision": 0,
+        "operation": "retry_step",
+        "reason": "Retry the timed out step through its bounded retry path.",
+        "target_step_id": "inspect"
+      }
+    },
+    {
+      "case_id": "blocked_dependency_retry_root",
+      "action": "plan_patch",
+      "operation": {
+        "patch_id": "scripted-blocked-retry",
+        "plan_id": "blocked-plan",
+        "expected_revision": 0,
+        "operation": "retry_step",
+        "reason": "Retry the failed prerequisite so eligible dependents can resume.",
+        "target_step_id": "fetch"
+      }
+    },
+    {
+      "case_id": "missing_required_evidence_ask_user",
+      "action": "plan_patch",
+      "operation": {
+        "patch_id": "scripted-ask-source",
+        "plan_id": "missing-evidence-plan",
+        "expected_revision": 0,
+        "operation": "ask_user",
+        "reason": "No authorized source is available for the required evidence.",
+        "user_question": "Which authorized source should be used?"
+      }
+    },
+    {
+      "case_id": "conflicting_evidence_resolve",
+      "action": "plan_patch",
+      "operation": {
+        "patch_id": "scripted-ask-conflict",
+        "plan_id": "conflict-plan",
+        "expected_revision": 0,
+        "operation": "ask_user",
+        "reason": "The available evidence conflicts and needs user direction.",
+        "user_question": "The available sources conflict. Which source should take precedence?"
+      }
+    },
+    {
+      "case_id": "invalid_dag_corrected_fork",
+      "action": "fork_subtasks",
+      "operation": {
+        "correlation_id": "planner_quality_fixture",
+        "operation": "fork_subtasks",
+        "operation_id": "scripted-corrected-dag",
+        "parent_step_id": "root",
+        "subtasks": [
+          {
+            "step_id": "inspect",
+            "objective": "Inspect the rejected graph requirements",
+            "output_contract": "Validated dependency list"
+          },
+          {
+            "step_id": "summarize",
+            "objective": "Summarize the validated requirements",
+            "output_contract": "Summary",
+            "depends_on": ["inspect"]
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "omitted_required_step",
+      "action": "fork_subtasks",
+      "operation": {
+        "correlation_id": "planner_quality_fixture",
+        "operation": "fork_subtasks",
+        "operation_id": "scripted-collect-compare",
+        "parent_step_id": "root",
+        "subtasks": [
+          {
+            "step_id": "collect",
+            "objective": "Collect source evidence",
+            "output_contract": "Evidence list"
+          },
+          {
+            "step_id": "compare",
+            "objective": "Compare source evidence",
+            "output_contract": "Comparison",
+            "depends_on": ["collect"]
+          }
+        ]
+      }
+    }
+  ]
+}

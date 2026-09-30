@@ -79,6 +79,12 @@ class CandidateRetriever(Protocol):
     def retrieve(self, query: str, limit: int) -> list[RetrievalCandidate]: ...
 
 
+class Reranker(Protocol):
+    max_candidates: int
+
+    def score(self, query: str, candidates: Sequence[str]) -> list[float]: ...
+
+
 class RankFusion(Protocol):
     def fuse(
         self,
@@ -137,7 +143,10 @@ class ConfigurableKnowledgeRetriever:
         self._retrievers = {retriever.channel: retriever for retriever in retrievers}
         self._fusion = fusion or ReciprocalRankFusion()
 
-    def retrieve(self, *, query: str, limit: int, mode: str) -> RetrievalSelection:
+    def retrieve(
+        self, *, query: str, limit: int, mode: str,
+        candidate_limits: dict[str, int] | None = None,
+    ) -> RetrievalSelection:
         requested_mode = mode if mode in {"keyword", "semantic", "hybrid"} else "hybrid"
         requested_channels = {
             "keyword": ["keyword"],
@@ -145,23 +154,37 @@ class ConfigurableKnowledgeRetriever:
             "hybrid": ["keyword", "semantic"],
         }[requested_mode]
         candidates_by_channel: dict[str, list[RetrievalCandidate]] = {}
+        warnings: list[str] = []
         for channel in requested_channels:
             retriever = self._retrievers.get(channel)
             if retriever is None:
+                warnings.append(f"{channel} retrieval is not configured")
                 continue
-            candidates = retriever.retrieve(query, max(limit * 4, limit))
+            try:
+                candidates = retriever.retrieve(
+                    query, (candidate_limits or {}).get(channel, limit)
+                )
+            except Exception as exc:
+                if channel == "keyword":
+                    raise
+                warnings.append(f"semantic retrieval unavailable: {type(exc).__name__}")
+                continue
             if candidates:
                 candidates_by_channel[channel] = candidates
+            elif channel == "semantic":
+                warnings.append("semantic index has no eligible vectors")
         if not candidates_by_channel and requested_mode != "keyword":
             fallback = self._retrievers.get("keyword")
             if fallback is not None:
-                candidates_by_channel["keyword"] = fallback.retrieve(query, max(limit * 4, limit))
+                candidates_by_channel["keyword"] = fallback.retrieve(
+                    query, (candidate_limits or {}).get("keyword", limit)
+                )
                 return RetrievalSelection(
                     requested_mode=requested_mode,
                     applied_mode="keyword",
                     candidates=candidates_by_channel["keyword"][:limit],
                     available_channels=sorted(self._retrievers),
-                    warning="semantic index has no eligible vectors; keyword retrieval was used",
+                    warning="; ".join([*warnings, "keyword retrieval was used"]),
                 )
         if len(candidates_by_channel) == 1:
             channel, candidates = next(iter(candidates_by_channel.items()))
@@ -170,12 +193,14 @@ class ConfigurableKnowledgeRetriever:
                 applied_mode=channel,
                 candidates=candidates[:limit],
                 available_channels=sorted(self._retrievers),
+                warning="; ".join(warnings) or None,
             )
         return RetrievalSelection(
             requested_mode=requested_mode,
             applied_mode="hybrid" if candidates_by_channel else requested_mode,
             candidates=self._fusion.fuse(candidates_by_channel, limit),
             available_channels=sorted(self._retrievers),
+            warning="; ".join(warnings) or None,
         )
 
 

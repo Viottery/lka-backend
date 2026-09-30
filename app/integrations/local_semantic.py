@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Callable, Iterable, Sequence
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from hashlib import sha256
+from threading import RLock
 
 from app.domains.knowledge_retrieval import (
     EmbeddingModelInfo,
@@ -18,7 +19,7 @@ from app.domains.knowledge_retrieval import (
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 class FastEmbedEmbeddingProvider(EmbeddingProvider):
@@ -46,6 +47,7 @@ class FastEmbedEmbeddingProvider(EmbeddingProvider):
         self._query_prefix = query_prefix
         self._local_files_only = local_files_only
         self._model = None
+        self._model_lock = RLock()
 
     @property
     def model_info(self) -> EmbeddingModelInfo:
@@ -65,8 +67,11 @@ class FastEmbedEmbeddingProvider(EmbeddingProvider):
     def _embed(self, values: Sequence[str]) -> list[list[float]]:
         if not values:
             return []
-        model = self._get_model()
-        vectors = list(model.embed(values, batch_size=self._batch_size))
+        # FastEmbed initializes lazily; serialize local model access while
+        # independent database/keyword searches fan out across queries.
+        with self._model_lock:
+            model = self._get_model()
+            vectors = list(model.embed(values, batch_size=self._batch_size))
         normalized = [self._normalize(vector.tolist()) for vector in vectors]
         for vector in normalized:
             if len(vector) != self._model_info.dimensions:
@@ -77,14 +82,16 @@ class FastEmbedEmbeddingProvider(EmbeddingProvider):
 
     def _get_model(self):
         if self._model is None:
-            from fastembed import TextEmbedding
+            with self._model_lock:
+                if self._model is None:
+                    from fastembed import TextEmbedding
 
-            self._model = TextEmbedding(
-                model_name=self._model_info.model_name,
-                cache_dir=self._cache_dir,
-                lazy_load=True,
-                local_files_only=self._local_files_only,
-            )
+                    self._model = TextEmbedding(
+                        model_name=self._model_info.model_name,
+                        cache_dir=self._cache_dir,
+                        lazy_load=True,
+                        local_files_only=self._local_files_only,
+                    )
         return self._model
 
     def _normalize(self, vector: list[float]) -> list[float]:
@@ -235,6 +242,79 @@ class SQLiteVecSemanticIndex(SemanticIndex):
                 [self._model_info.index_key, *vector_ids],
             ).fetchall()
             chunk_ids = {int(row["vector_id"]): str(row["chunk_id"]) for row in mapping_rows}
+            return [
+                SemanticHit(
+                    chunk_id=chunk_ids[int(row["vector_id"])],
+                    rank=index + 1,
+                    score=1 - float(row["distance"]),
+                )
+                for index, row in enumerate(rows)
+                if int(row["vector_id"]) in chunk_ids
+            ]
+        finally:
+            conn.close()
+
+    def search_scoped(
+        self,
+        vector: Sequence[float],
+        limit: int,
+        *,
+        source_types: Sequence[str] | None = None,
+        source_ids: Sequence[str] | None = None,
+        account_ids: Sequence[str] | None = None,
+    ) -> list[SemanticHit]:
+        """Run KNN only over eligible vector rowids, before top-k truncation."""
+        if not vector or limit < 1:
+            return []
+        if any(values is not None and not values for values in (source_types, source_ids, account_ids)):
+            return []
+        clauses = [
+            "m.index_key = ?", "d.status = 'active'", "s.status = 'active'",
+            "c.sensitivity != 'secret'", "c.remote_policy NOT IN ('deny', 'confirm')",
+        ]
+        params: list[object] = [self._model_info.index_key]
+        for column, values in (("d.source_type", source_types), ("d.source_id", source_ids)):
+            if values is not None:
+                clauses.append(f"{column} IN ({', '.join('?' for _ in values)})")
+                params.extend(values)
+        if account_ids is not None:
+            account_expr = (
+                "COALESCE(json_extract(d.metadata, '$.account_id'), "
+                "json_extract(d.metadata, '$.mail_account_id'), "
+                "json_extract(s.metadata, '$.account_id'))"
+            )
+            clauses.append(
+                f"({account_expr} IS NULL OR {account_expr} IN ("
+                + ", ".join("?" for _ in account_ids) + "))"
+            )
+            params.extend(account_ids)
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                f"""
+                SELECT vector_id, distance FROM {self._table_name}
+                WHERE embedding MATCH ? AND k = ?
+                  AND vector_id IN (
+                    SELECT m.vector_id FROM knowledge_embedding_records m
+                    JOIN knowledge_chunks c ON c.chunk_id = m.chunk_id
+                    JOIN knowledge_documents d ON d.document_id = c.document_id
+                    JOIN knowledge_sources s ON s.source_id = d.source_id
+                    WHERE {' AND '.join(clauses)}
+                  )
+                ORDER BY distance
+                """,
+                [self._serialize(vector), limit, *params],
+            ).fetchall()
+            if not rows:
+                return []
+            vector_ids = [int(row["vector_id"]) for row in rows]
+            mapping = conn.execute(
+                "SELECT vector_id, chunk_id FROM knowledge_embedding_records "
+                "WHERE index_key = ? AND vector_id IN ("
+                + ", ".join("?" for _ in vector_ids) + ")",
+                [self._model_info.index_key, *vector_ids],
+            ).fetchall()
+            chunk_ids = {int(row["vector_id"]): str(row["chunk_id"]) for row in mapping}
             return [
                 SemanticHit(
                     chunk_id=chunk_ids[int(row["vector_id"])],

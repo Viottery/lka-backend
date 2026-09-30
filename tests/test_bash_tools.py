@@ -6,6 +6,8 @@ from pathlib import Path
 from app.core.config import get_settings
 from app.core.runtime import LocalKnowledgeAgentRuntime
 from app.core.tools import ToolContext
+from app.core.context_driver import ToolView
+from app.core.multi_agent import SideEffectLevel
 from app.tool_packages.bash import is_read_only_command
 
 
@@ -26,6 +28,18 @@ def _approved_context() -> ToolContext:
         safety_review_approved=True,
         safety_review_id="test_review_bash",
     )
+
+
+def _active_child_run_id(runtime: LocalKnowledgeAgentRuntime) -> str:
+    manager = runtime.agent_run_manager
+    parent = manager.create_run(session_id="parent_session", user_input="parent")
+    manager.mark_running(parent.run_id)
+    child = manager.create_child_run(
+        parent_run_id=parent.run_id, plan_id="scope_plan", step_id="scope_step",
+        attempt=1, user_input="child",
+    )
+    manager.mark_child_running(child.run_id)
+    return child.run_id
 
 
 def test_bash_read_only_classifier_is_conservative():
@@ -98,6 +112,98 @@ def test_bash_non_read_only_command_requires_safety_review(tmp_path, monkeypatch
     assert completed.output["read_only"] is False
     assert completed.output["exit_code"] == 0
     assert (workspace / "marker.txt").read_text(encoding="utf-8") == "hi"
+
+
+def test_child_bash_run_fails_closed_when_command_paths_are_unverifiable(tmp_path, monkeypatch):
+    runtime = _runtime(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    marker = workspace / "escaped.txt"
+    child_view = ToolView(
+        snapshot_id="child_bash_snapshot", child_run_id=_active_child_run_id(runtime),
+        allowed_packages=("bash",), allowed_tools=("bash.run",),
+        allowed_paths=(str(workspace / "narrow"),),
+        side_effect_level=SideEffectLevel.EXTERNAL,
+    )
+    result = runtime.tool_executor.execute(
+        invocation_id="child-bash-denied", tool_name="bash.run",
+        tool_input={
+            "command": f"printf leaked > {marker}",
+            "cwd": str(workspace), "mode": "sync",
+        },
+        context=ToolContext(session_id="child_bash", workspace_root=str(workspace), tool_view=child_view,
+                            safety_review_approved=True, safety_review_id="approved-but-scoped"),
+    )
+    assert result.status == "rejected"
+    assert "workspace scope" in (result.error or "") or "does not enforce" in (result.error or "")
+    assert not marker.exists()
+
+
+def test_child_bash_run_works_with_full_authorized_workspace(tmp_path, monkeypatch):
+    runtime = _runtime(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    child_view = ToolView(
+        snapshot_id="child_bash_full_snapshot",
+        child_run_id=_active_child_run_id(runtime),
+        allowed_packages=("bash",),
+        allowed_tools=("bash.run",),
+        allowed_paths=(str(workspace),),
+        full_workspace_authority=True,
+        side_effect_level=SideEffectLevel.EXTERNAL,
+    )
+    result = runtime.tool_executor.execute(
+        invocation_id="child-bash-full-scope-read",
+        tool_name="bash.run",
+        tool_input={"command": "pwd", "cwd": str(workspace), "mode": "sync"},
+        context=ToolContext(
+            session_id="child_bash",
+            workspace_root=str(workspace),
+            tool_view=child_view,
+        ),
+    )
+    assert result.status == "completed", result.error
+    assert result.output["read_only"] is True
+
+
+def test_bash_child_cannot_read_or_control_another_run_session(tmp_path, monkeypatch):
+    runtime = _runtime(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    root_context = _approved_context()
+    started = runtime.tool_executor.execute(
+        invocation_id="root-bash-session", tool_name="bash.run",
+        tool_input={"command": "sleep 5", "cwd": str(workspace), "mode": "background"},
+        context=root_context,
+    )
+    assert started.status == "completed"
+    session_id = started.output["session_id"]
+    child_view = ToolView(
+        snapshot_id="child_bash_snapshot", child_run_id=_active_child_run_id(runtime),
+        allowed_packages=("bash",), allowed_tools=("bash.list_sessions", "bash.read_session", "bash.write_session"),
+        full_workspace_authority=True,
+        side_effect_level=SideEffectLevel.EXTERNAL,
+    )
+    child_context = ToolContext(
+        session_id="child_bash", tool_view=child_view,
+        safety_review_approved=True, safety_review_id="approved-session-control",
+    )
+    listed = runtime.tool_executor.execute(
+        invocation_id="child-bash-list", tool_name="bash.list_sessions",
+        tool_input={}, context=child_context,
+    )
+    assert listed.status == "completed", listed.error
+    assert listed.output["sessions"] == []
+    read = runtime.tool_executor.execute(
+        invocation_id="child-bash-read", tool_name="bash.read_session",
+        tool_input={"session_id": session_id}, context=child_context,
+    )
+    assert read.status == "failed"
+    assert "not found" in (read.error or "")
+    write = runtime.tool_executor.execute(
+        invocation_id="child-bash-write", tool_name="bash.write_session",
+        tool_input={"session_id": session_id, "text": "echo escaped\n"}, context=child_context,
+    )
+    assert write.status == "failed"
+    assert "not found" in (write.error or "")
+    runtime.bash_session_manager.terminate(session_id=session_id)
 
 
 def test_bash_injects_workspace_variables_and_resolves_relative_cwd(

@@ -9,17 +9,21 @@ from types import SimpleNamespace
 
 import pytest
 
+import app.api.routes.agent as agent_routes
 from app.api.main import create_app
 from app.api.routes.agent import (
     decide_agent_safety_review,
     get_agent_safety_review,
+    list_agent_safety_review_queue,
     list_agent_run_safety_reviews,
+    resume_agent_run,
 )
 from app.api.schemas import SafetyReviewDecisionRequest
 from app.core.agent_graph import AgentTurnWaitingForConfirmation
 from app.core.config import get_settings
 from app.core.llm import LLMResponse
 from app.core.safety import SafetyReviewDecision, SafetyReviewMode, SafetyReviewRequest
+from app.storage.db import connect
 from app.core.tools import ToolContext
 
 
@@ -84,9 +88,21 @@ def test_agent_skip_review_records_and_executes_write_tool(tmp_path, monkeypatch
     assert listed.reviews[0].review_id == reviews[0].review_id
 
 
+def test_request_cannot_lower_configured_safety_review_mode(tmp_path, monkeypatch):
+    app = _app(tmp_path, monkeypatch)
+    loop = app.state.runtime.agent_turn_loop
+    loop.safety_review_mode = SafetyReviewMode.MANUAL
+    from app.core.agent_turn import _turn_safety_review_mode
+
+    token = _turn_safety_review_mode.set(SafetyReviewMode.SKIP)
+    try:
+        assert loop._effective_safety_review_mode() == SafetyReviewMode.MANUAL
+    finally:
+        _turn_safety_review_mode.reset(token)
+
+
 def test_manual_review_api_approves_waiting_agent_run(tmp_path, monkeypatch):
     app = _app(tmp_path, monkeypatch)
-    app.state.runtime.agent_turn_loop.safety_review_mode = SafetyReviewMode.MANUAL
     app.state.runtime.agent_turn_loop.llm_client = _CreateMatterLLM()
     request = SimpleNamespace(app=app)
     result_holder: dict[str, object] = {}
@@ -95,6 +111,7 @@ def test_manual_review_api_approves_waiting_agent_run(tmp_path, monkeypatch):
         result_holder["response"] = app.state.runtime.run_agent_turn(
             session_id="session_safety_manual",
             user_input="创建一个需要人工确认的本地事务",
+            safety_review_mode=SafetyReviewMode.MANUAL,
         )
 
     thread = threading.Thread(target=target, daemon=True)
@@ -104,9 +121,20 @@ def test_manual_review_api_approves_waiting_agent_run(tmp_path, monkeypatch):
     run = app.state.runtime.agent_run_manager.get_run(review.run_id)
     assert run is not None
     assert run.status == "waiting_confirmation"
+    assert review.mode == SafetyReviewMode.MANUAL
 
     fetched = asyncio.run(get_agent_safety_review(review.review_id, request))
     assert fetched.review_id == review.review_id
+    assert "tool_input" not in fetched.model_dump()
+    assert "llm_output" not in fetched.model_dump()
+
+    queue = asyncio.run(list_agent_safety_review_queue(request))
+    assert [item.review_id for item in queue.reviews] == [review.review_id]
+    assert queue.reviews[0].parent_run_id is None
+    assert queue.reviews[0].child_run_id is None
+    assert queue.reviews[0].input_fields == ["priority", "status", "summary", "title"]
+    assert len(queue.reviews[0].invocation_fingerprint) == 20
+    assert "tool_input" not in queue.reviews[0].model_dump()
 
     decided = asyncio.run(
         decide_agent_safety_review(
@@ -195,6 +223,51 @@ def test_langgraph_manual_review_api_resumes_waiting_run(tmp_path, monkeypatch):
         runtime.stop()
 
 
+def test_langgraph_resume_endpoint_recovers_running_checkpoint_after_restart(tmp_path, monkeypatch):
+    config_path = tmp_path / "local.toml"
+    config_path.write_text(
+        '[agent]\norchestrator = "langgraph"\ncheckpoint_backend = "sqlite"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(config_path))
+    get_settings.cache_clear()
+
+    first_app = create_app()
+    first_runner = first_app.state.runtime.agent_turn_runner
+    first_runner.interrupt_after = ["initialize_run"]
+    run = first_runner.create_run_for_turn(
+        session_id="session_resume_endpoint", user_input="Resume from HTTP control plane."
+    )
+    asyncio.run(
+        first_runner._invoke(
+            run_id=run.run_id,
+            session_id=run.session_id,
+            user_input=run.user_input,
+        )
+    )
+    first_app.state.runtime.stop()
+
+    get_settings.cache_clear()
+    second_app = create_app()
+    request = SimpleNamespace(app=second_app)
+    try:
+        response = asyncio.run(resume_agent_run(run.run_id, request))
+        assert response.status == "running"
+        for _ in range(100):
+            restored = second_app.state.runtime.agent_run_manager.get_run(run.run_id)
+            if restored is not None and restored.status.value == "completed":
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError("HTTP resume did not complete the checkpointed run.")
+        assert second_app.state.runtime.agent_run_manager.get_run(run.run_id).status.value == (
+            "completed"
+        )
+    finally:
+        second_app.state.runtime.stop()
+
+
 def test_safety_review_decision_api_rehydrates_run_after_runtime_restart(tmp_path, monkeypatch):
     first_app = _app(tmp_path, monkeypatch)
     first_manager = first_app.state.runtime.agent_run_manager
@@ -235,6 +308,109 @@ def test_safety_review_decision_api_rehydrates_run_after_runtime_restart(tmp_pat
     assert response.status == "approved"
     assert second_app.state.runtime.agent_run_manager.get_run(run.run_id) is not None
     second_app.state.runtime.stop()
+
+
+def test_replaying_committed_safety_decision_recovers_run_after_restart(tmp_path, monkeypatch):
+    first_app = _app(tmp_path, monkeypatch)
+    first_manager = first_app.state.runtime.agent_run_manager
+    run = first_manager.create_run(
+        session_id="session_review_replay",
+        user_input="recover an approved review",
+        trace_id="trace_review_replay",
+    )
+    review = first_manager.create_safety_review(
+        SafetyReviewRequest(
+            review_id="review_replay_api",
+            run_id=run.run_id,
+            session_id=run.session_id,
+            trace_id=run.trace_id,
+            invocation_id="invocation_replay_api",
+            tool_name="filesystem.edit_file",
+            mode=SafetyReviewMode.MANUAL,
+            reason="Write requires confirmation.",
+            created_at=run.created_at,
+        )
+    )
+
+    def crash_after_decision_transaction(*_args, **_kwargs):
+        raise RuntimeError("simulated process loss after decision transaction")
+
+    monkeypatch.setattr(first_manager, "_cache_persisted_event", crash_after_decision_transaction)
+    request = SimpleNamespace(app=first_app)
+    with pytest.raises(RuntimeError, match="simulated process loss"):
+        asyncio.run(
+            decide_agent_safety_review(
+                review.review_id,
+                SafetyReviewDecisionRequest(
+                    decision=SafetyReviewDecision.APPROVE,
+                    reason="Approved before simulated crash.",
+                ),
+                request,
+            )
+        )
+    durable_store = first_manager.durable_store
+    assert durable_store is not None
+    assert [
+        event["type"] for event in durable_store.list_events(run.run_id)
+    ].count("safety_review_decided") == 1
+    first_app.state.runtime.stop()
+
+    # Model a legacy crash from before decision events were transactional.
+    with connect(durable_store.db_path) as conn:
+        conn.execute(
+            """
+            DELETE FROM agent_run_events
+            WHERE run_id = ?
+              AND json_extract(event_payload, '$.type') = 'safety_review_decided'
+              AND json_extract(event_payload, '$.payload.review.review_id') = ?
+            """,
+            (run.run_id, review.review_id),
+        )
+
+    get_settings.cache_clear()
+    second_app = create_app()
+    request = SimpleNamespace(app=second_app)
+    scheduled: list[str] = []
+    monkeypatch.setattr(
+        agent_routes,
+        "_start_agent_resume_task",
+        lambda *, runtime, run_id: scheduled.append(run_id),
+    )
+    try:
+        replayed = asyncio.run(
+            decide_agent_safety_review(
+                review.review_id,
+                SafetyReviewDecisionRequest(
+                    decision=SafetyReviewDecision.APPROVE,
+                    reason="Replay the already committed approval.",
+                ),
+                request,
+            )
+        )
+        restored = second_app.state.runtime.agent_run_manager.get_run(run.run_id)
+        assert replayed.status == "approved"
+        assert restored is not None and restored.status.value == "running"
+        assert scheduled == [run.run_id]
+        events = second_app.state.runtime.agent_run_manager.list_events(run.run_id)
+        assert [event.type for event in events].count("safety_review_decided") == 1
+
+        # A further idempotent replay must not append a second decision event.
+        asyncio.run(
+            decide_agent_safety_review(
+                review.review_id,
+                SafetyReviewDecisionRequest(
+                    decision=SafetyReviewDecision.APPROVE,
+                    reason="Repeated approval replay.",
+                ),
+                request,
+            )
+        )
+        assert [
+            event.type
+            for event in second_app.state.runtime.agent_run_manager.list_events(run.run_id)
+        ].count("safety_review_decided") == 1
+    finally:
+        second_app.state.runtime.stop()
 
 
 def _wait_for_review(run_manager):

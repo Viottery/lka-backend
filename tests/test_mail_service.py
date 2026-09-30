@@ -12,6 +12,9 @@ from app.domains.mail import MailMatterDraft
 from app.tool_packages.mail import PersistMailMattersTool, SyncMailTool
 from app.integrations.outlook import OutlookSyncResult
 from app.core.tools import ToolContext, ToolInvocation
+from app.core.context_driver import ToolView
+from app.core.multi_agent import SideEffectLevel
+from app.domains.mail_knowledge import MailKnowledgeMirror
 
 
 def test_mail_import_search_and_matters_endpoints(tmp_path, monkeypatch):
@@ -277,6 +280,65 @@ def test_mail_tools_search_load_and_persist_without_mail_agent_endpoint(tmp_path
     assert matters.matters[0].priority == "high"
 
 
+def test_child_mail_search_and_load_require_source_and_account_scope(tmp_path, monkeypatch):
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
+    get_settings.cache_clear()
+    app = create_app()
+    request = SimpleNamespace(app=app)
+    imports = []
+    for account, message in (
+        ("one@example.com", "msg_scope_one"),
+        ("two@example.com", "msg_scope_two"),
+    ):
+        imports.append(import_mail(
+            MailImportRequest(
+                account={"provider": "local_json", "email_address": account},
+                messages=[{
+                    "external_id": message, "folder": "Inbox", "subject": f"scope sentinel {message}",
+                    "sender": "sender@example.com", "body_text": f"scope sentinel body for {account}",
+                }],
+            ), request,
+        ))
+    first, second = imports
+    manager = app.state.runtime.agent_run_manager
+    parent = manager.create_run(session_id="parent_session", user_input="parent")
+    manager.mark_running(parent.run_id)
+    child_run = manager.create_child_run(
+        parent_run_id=parent.run_id, plan_id="scope_plan", step_id="scope_step",
+        attempt=1, user_input="child",
+    )
+    manager.mark_child_running(child_run.run_id)
+    root = ToolContext(session_id="mail_root")
+    root_result = app.state.runtime.tool_executor.execute(
+        invocation_id="mail-root-search", tool_name="mail.search",
+        tool_input={"query": "scope sentinel", "limit": 10}, context=root,
+    )
+    assert root_result.status == "completed"
+    by_account = {
+        account: next(item["message_id"] for item in root_result.output["messages"] if account.split("@")[0] in item["subject"])
+        for account in ("one@example.com", "two@example.com")
+    }
+    child_view = ToolView(
+        snapshot_id="mail_child_snapshot", child_run_id=child_run.run_id,
+        allowed_packages=("mail",), allowed_tools=("mail.search", "mail.load_messages"),
+        allowed_source_ids=(MailKnowledgeMirror.source_id_for_account(first.account_id),),
+        allowed_account_ids=(first.account_id,),
+        side_effect_level=SideEffectLevel.READ,
+    )
+    child = ToolContext(session_id="mail_child_session", tool_view=child_view)
+    search = app.state.runtime.tool_executor.execute(
+        invocation_id="mail-child-search", tool_name="mail.search",
+        tool_input={"query": "scope sentinel", "limit": 10}, context=child,
+    )
+    assert search.status == "completed"
+    assert {item["message_id"] for item in search.output["messages"]} == {by_account["one@example.com"]}
+    load = app.state.runtime.tool_executor.execute(
+        invocation_id="mail-child-known-id", tool_name="mail.load_messages",
+        tool_input={"message_ids": [by_account["two@example.com"]]}, context=child,
+    )
+    assert load.status == "completed"
+    assert load.output["messages"] == []
 def test_mail_search_uses_knowledge_time_order_and_bounded_evidence(tmp_path, monkeypatch):
     monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))

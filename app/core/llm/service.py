@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator
 from app.core.llm.errors import LLMClientError
 from app.core.llm.models import (
     LLMMessage,
+    LLMReasoningEffort,
     LLMRequest,
     LLMResponse,
     LLMResponseMode,
@@ -43,6 +44,7 @@ class LLMService:
         user_prompt: str,
         prompt_summary: str,
         temperature: float = 0.0,
+        reasoning_effort: LLMReasoningEffort | None = None,
         max_output_tokens: int | None = None,
         client_name: str | None = None,
         model: str | None = None,
@@ -61,6 +63,7 @@ class LLMService:
                 ],
                 prompt_summary=prompt_summary,
                 temperature=temperature,
+                reasoning_effort=reasoning_effort,
                 max_output_tokens=max_output_tokens,
                 require_json=require_json,
                 metadata=metadata or {},
@@ -90,6 +93,15 @@ class LLMService:
             clients = self.registry.list_clients()
             client = clients[0] if clients else None
         return bool(client and getattr(client, "supports_function_calling", False))
+
+    def supports_reasoning_effort(self, *, client_name: str | None = None) -> bool:
+        """Return whether the selected configured client accepts the effort field."""
+        resolved_name = client_name or self.config.default_client
+        client = self.registry.get(resolved_name) if resolved_name else None
+        if client is None and not resolved_name:
+            clients = self.registry.list_clients()
+            client = clients[0] if clients else None
+        return bool(client and getattr(client, "supports_reasoning_effort", False))
 
     def _client_name_for(self, request: LLMRequest) -> str:
         if request.client_name:

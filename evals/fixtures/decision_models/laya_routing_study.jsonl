@@ -1,0 +1,120 @@
+{"id":"F01","split":"dev","task":"fast","request":"把你刚才列出的三条会议准备事项压缩成一句话。","context":"会议准备事项：确认议程、发送材料、检查会议室设备。","context_age_hours":1,"scope_same":true,"evidence_conflict":false,"expected":"answer"}
+{"id":"F02","split":"dev","task":"fast","request":"这段话改成更礼貌的中文：请今天给我回复。","context":"用户在当前消息中提供了完整待改写文本。","context_age_hours":0,"scope_same":true,"evidence_conflict":false,"expected":"answer"}
+{"id":"F03","split":"dev","task":"fast","request":"刚才那封邮件的发送时间是几点？","context":"此前只显示邮件主题和发件人，没有发送时间。","context_age_hours":1,"scope_same":true,"evidence_conflict":false,"expected":"retrieve"}
+{"id":"F04","split":"dev","task":"fast","request":"今天邮箱里新增了什么邮件？","context":"昨天已经查询过收件箱并列出邮件。","context_age_hours":26,"scope_same":true,"evidence_conflict":false,"expected":"retrieve"}
+{"id":"F05","split":"dev","task":"fast","request":"把刚才那三个文件名按字母顺序排列。","context":"文件名：beta.md、alpha.md、gamma.md。","context_age_hours":1,"scope_same":true,"evidence_conflict":false,"expected":"answer"}
+{"id":"F06","split":"dev","task":"fast","request":"查一下项目文档中最新的备份策略。","context":"本轮尚未读取项目文档；会话里只有项目名称。","context_age_hours":1,"scope_same":true,"evidence_conflict":false,"expected":"retrieve"}
+{"id":"F07","split":"dev","task":"fast","request":"上一轮提到的报销上限是多少？","context":"上轮从授权文档取得：报销上限为每次 800 元，来源仍有效。","context_age_hours":2,"scope_same":true,"evidence_conflict":false,"expected":"answer"}
+{"id":"F08","split":"dev","task":"fast","request":"上一轮提到的报销上限是多少？","context":"上轮从其他工作区文档取得：报销上限为每次 800 元。当前工作区不同。","context_age_hours":2,"scope_same":false,"evidence_conflict":false,"expected":"retrieve"}
+{"id":"F09","split":"dev","task":"fast","request":"这两份资料说的截止日期到底是哪天？","context":"资料 A 写 10 月 3 日；资料 B 写 10 月 8 日，尚未解决冲突。","context_age_hours":2,"scope_same":true,"evidence_conflict":true,"expected":"retrieve"}
+{"id":"F10","split":"dev","task":"fast","request":"把刚才给我的英文摘要翻译成中文。","context":"English summary: The migration finished and the data checks passed.","context_age_hours":1,"scope_same":true,"evidence_conflict":false,"expected":"answer"}
+{"id":"F11","split":"holdout","task":"fast","request":"根据刚才的清单，哪些项目负责人是王琳？","context":"清单：王琳负责合同审查和发票核对；赵明负责归档。","context_age_hours":1,"scope_same":true,"evidence_conflict":false,"expected":"answer"}
+{"id":"F12","split":"holdout","task":"fast","request":"王琳今天又发来哪些合同邮件？","context":"上一轮讨论过王琳昨天的一封合同邮件。","context_age_hours":25,"scope_same":true,"evidence_conflict":false,"expected":"retrieve"}
+{"id":"F13","split":"holdout","task":"fast","request":"把这句话改成英文：会议推迟到周五。","context":"当前请求已经提供待翻译的完整句子。","context_age_hours":0,"scope_same":true,"evidence_conflict":false,"expected":"answer"}
+{"id":"F14","split":"holdout","task":"fast","request":"刚才的研究报告作者是谁？","context":"上一轮只展示研究报告标题和摘要，没有作者信息。","context_age_hours":1,"scope_same":true,"evidence_conflict":false,"expected":"retrieve"}
+{"id":"F15","split":"holdout","task":"fast","request":"总结一下刚才确定的两项行动。","context":"已确定行动：周四前确认供应商报价；周五前提交采购单。","context_age_hours":1,"scope_same":true,"evidence_conflict":false,"expected":"answer"}
+{"id":"F16","split":"holdout","task":"fast","request":"根据最新政策，今年出差住宿标准是多少？","context":"会话引用的是上个月下载的旧政策节选。","context_age_hours":720,"scope_same":true,"evidence_conflict":false,"expected":"retrieve"}
+{"id":"F17","split":"holdout","task":"fast","request":"这些编号里哪个最大：A-12、A-09、A-23？","context":"编号均已由用户在当前消息给出。","context_age_hours":0,"scope_same":true,"evidence_conflict":false,"expected":"answer"}
+{"id":"F18","split":"holdout","task":"fast","request":"上一轮说的部署端口是多少？","context":"端口 8765 来自另一个工作区的配置，当前范围不允许复用。","context_age_hours":1,"scope_same":false,"evidence_conflict":false,"expected":"retrieve"}
+{"id":"F19","split":"holdout","task":"fast","request":"那个项目的负责人到底是谁？","context":"历史对话同时出现项目甲和项目乙，分别由不同负责人管理，指代未确定。","context_age_hours":1,"scope_same":true,"evidence_conflict":true,"expected":"retrieve"}
+{"id":"F20","split":"holdout","task":"fast","request":"刚才列的付款日期分别是哪天？","context":"已读取有效票据：甲单付款日 10 月 5 日，乙单付款日 10 月 9 日。","context_age_hours":2,"scope_same":true,"evidence_conflict":false,"expected":"answer"}
+{"id":"T01","split":"dev","task":"tool","package":"mail","request":"查一下上周王琳发来的报价邮件。","observations":"尚无邮件检索结果。","known_ids":[],"expected":"mail.search"}
+{"id":"T02","split":"dev","task":"tool","package":"mail","request":"打开刚才找到的邮件 m-42，核对完整合同条款。","observations":"mail.search 已返回邮件 m-42 的摘要和 id，但条款片段不完整。","known_ids":["m-42"],"known_id_type":"mail_message","expected":"mail.load_messages"}
+{"id":"T03","split":"dev","task":"tool","package":"mail","request":"手动同步一下 Outlook 邮箱。","observations":"尚未运行本轮同步。","known_ids":[],"expected":"mail.sync"}
+{"id":"T04","split":"dev","task":"tool","package":"mail","request":"给王琳回复并发送确认邮件。","observations":"发送动作需要 Agent 判断和安全审查。","known_ids":[],"expected":"agent_decides"}
+{"id":"T05","split":"dev","task":"tool","package":"knowledge","request":"在本地产品说明里查找导出格式。","observations":"尚无知识库检索结果。","known_ids":[],"expected":"knowledge.search"}
+{"id":"T06","split":"dev","task":"tool","package":"knowledge","request":"列出这个工作区当前能访问的知识来源。","observations":"尚未列出来源。","known_ids":[],"expected":"knowledge.list_sources"}
+{"id":"T07","split":"dev","task":"tool","package":"knowledge","request":"加载刚才搜索命中的片段 c-17，看完整定义。","observations":"knowledge.search 返回片段 c-17，但摘要被截断。","known_ids":["c-17"],"known_id_type":"knowledge_chunk","expected":"knowledge.load_chunks"}
+{"id":"T08","split":"dev","task":"tool","package":"knowledge","request":"把知识库中旧版本政策全部删除。","observations":"写入和删除动作不能由预选器决定。","known_ids":[],"expected":"agent_decides"}
+{"id":"T09","split":"dev","task":"tool","package":"matter","request":"找出已保存的下周到期事项。","observations":"尚无事项查询结果。","known_ids":[],"expected":"matter.search"}
+{"id":"T10","split":"dev","task":"tool","package":"matter","request":"把刚才的邮件变成三个新待办。","observations":"需检查证据、去重和写入安全。","known_ids":[],"expected":"agent_decides"}
+{"id":"T11","split":"dev","task":"tool","package":"mail","request":"这周收件箱有哪些需要处理的事？","observations":"本地邮件索引可用，尚未搜索。","known_ids":[],"expected":"mail.search"}
+{"id":"T12","split":"dev","task":"tool","package":"knowledge","request":"已知文档 p-3 的两个段落说法不同，帮我确认最终结论。","observations":"证据冲突，需 Agent 调查。","known_ids":["p-3"],"known_id_type":"knowledge_document","expected":"agent_decides"}
+{"id":"T13","split":"holdout","task":"tool","package":"mail","request":"找到今天来自采购组的邮件。","observations":"本轮还没有检索结果。","known_ids":[],"expected":"mail.search"}
+{"id":"T14","split":"holdout","task":"tool","package":"mail","request":"核对已检索到的邮件 m-77 的附件说明原文。","observations":"搜索摘要未覆盖附件说明，已知邮件 id 为 m-77。","known_ids":["m-77"],"known_id_type":"mail_message","expected":"mail.load_messages"}
+{"id":"T15","split":"holdout","task":"tool","package":"mail","request":"请立即同步邮箱，然后再看新邮件。","observations":"本轮尚未同步，用户明确要求同步。","known_ids":[],"expected":"mail.sync"}
+{"id":"T16","split":"holdout","task":"tool","package":"mail","request":"删除所有垃圾邮件。","observations":"删除属于写操作，需 Agent 和安全审查。","known_ids":[],"expected":"agent_decides"}
+{"id":"T17","split":"holdout","task":"tool","package":"knowledge","request":"搜索本地运维手册里的回滚步骤。","observations":"尚未检索手册。","known_ids":[],"expected":"knowledge.search"}
+{"id":"T18","split":"holdout","task":"tool","package":"knowledge","request":"我有哪些已经索引的资料来源？","observations":"尚未枚举已授权来源。","known_ids":[],"expected":"knowledge.list_sources"}
+{"id":"T19","split":"holdout","task":"tool","package":"knowledge","request":"检索结果里的片段 c-81 被截断了，请读取它。","observations":"已返回片段 c-81 的引用和 id。","known_ids":["c-81"],"known_id_type":"knowledge_chunk","expected":"knowledge.load_chunks"}
+{"id":"T20","split":"holdout","task":"tool","package":"knowledge","request":"根据两篇互相矛盾的报告给出投资决定。","observations":"涉及冲突证据和决策，需 Agent。","known_ids":[],"expected":"agent_decides"}
+{"id":"T21","split":"holdout","task":"tool","package":"matter","request":"查找上个月标记为等待中的事项。","observations":"尚未查询事项。","known_ids":[],"expected":"matter.search"}
+{"id":"T22","split":"holdout","task":"tool","package":"matter","request":"把所有待办直接标记完成。","observations":"批量修改是写操作。","known_ids":[],"expected":"agent_decides"}
+{"id":"T23","split":"holdout","task":"tool","package":"knowledge","request":"工作区中查一下 API 合同的错误码定义。","observations":"该合同已索引进本地知识库。","known_ids":[],"expected":"knowledge.search"}
+{"id":"T24","split":"holdout","task":"tool","package":"mail","request":"上一轮查到 m-10 和 m-11，现在要逐字比较这两封邮件的免责条款。","observations":"已知两个邮件 id；搜索片段不足以逐字比较。","known_ids":["m-10","m-11"],"known_id_type":"mail_message","expected":"mail.load_messages"}
+{"id":"K01","split":"dev","task":"knowledge","request":"在手册中找错误码 E402 的定义。","sources":"已授权本地手册","expected":"exact_lookup"}
+{"id":"K02","split":"dev","task":"knowledge","request":"VPN-017 的操作步骤在哪一节？","sources":"已授权运维文档","expected":"exact_lookup"}
+{"id":"K03","split":"dev","task":"knowledge","request":"找和远程办公时连接不稳定有关的经验总结。","sources":"已授权笔记和文档","expected":"semantic_retrieval"}
+{"id":"K04","split":"dev","task":"knowledge","request":"有哪些资料源可以查询？","sources":"来源列表未知","expected":"source_discovery"}
+{"id":"K05","split":"dev","task":"knowledge","request":"比较三份架构设计对故障隔离的不同看法。","sources":"已授权三份不同文档","expected":"multi_step"}
+{"id":"K06","split":"dev","task":"knowledge","request":"查一下规范第 4.2.1 节的原文。","sources":"已授权规范文档","expected":"exact_lookup"}
+{"id":"K07","split":"dev","task":"knowledge","request":"有没有解释用户登录偶发失败的复盘？","sources":"已授权技术笔记","expected":"semantic_retrieval"}
+{"id":"K08","split":"dev","task":"knowledge","request":"先告诉我这个知识库里有哪些网页快照。","sources":"来源列表未知","expected":"source_discovery"}
+{"id":"K09","split":"dev","task":"knowledge","request":"从多个事故报告推断根因并处理互相矛盾的时间线。","sources":"已授权多份事故报告","expected":"multi_step"}
+{"id":"K10","split":"dev","task":"knowledge","request":"找到文档标题为部署检查表的章节。","sources":"已授权本地文档","expected":"exact_lookup"}
+{"id":"K11","split":"dev","task":"knowledge","request":"有没有团队讨论过如何减少重复通知？","sources":"已授权团队笔记","expected":"semantic_retrieval"}
+{"id":"K12","split":"dev","task":"knowledge","request":"当前可用的知识来源有哪些类型？","sources":"来源列表未知","expected":"source_discovery"}
+{"id":"K13","split":"holdout","task":"knowledge","request":"在文档中定位配置项 max_decision_steps。","sources":"已授权配置文档","expected":"exact_lookup"}
+{"id":"K14","split":"holdout","task":"knowledge","request":"查找工单编号 INC-204 的处理记录。","sources":"已授权事故记录","expected":"exact_lookup"}
+{"id":"K15","split":"holdout","task":"knowledge","request":"关于新人上手慢的问题，有哪些改进建议？","sources":"已授权内部笔记","expected":"semantic_retrieval"}
+{"id":"K16","split":"holdout","task":"knowledge","request":"我能查询哪些本地导入的资料？","sources":"当前来源目录未展示","expected":"source_discovery"}
+{"id":"K17","split":"holdout","task":"knowledge","request":"综合几份采购规则，解释两种相反例外条款如何适用。","sources":"已授权采购规则","expected":"multi_step"}
+{"id":"K18","split":"holdout","task":"knowledge","request":"定位文档中 RFC-8321 的引用。","sources":"已授权规范文档","expected":"exact_lookup"}
+{"id":"K19","split":"holdout","task":"knowledge","request":"哪份复盘可能提到发布后内存逐渐上涨？","sources":"已授权复盘文档","expected":"semantic_retrieval"}
+{"id":"K20","split":"holdout","task":"knowledge","request":"把当前可见的数据源名称列出来。","sources":"来源列表未展示","expected":"source_discovery"}
+{"id":"K21","split":"holdout","task":"knowledge","request":"比较两篇论文的证据链，指出结论冲突并说明还缺什么信息。","sources":"已授权论文","expected":"multi_step"}
+{"id":"K22","split":"holdout","task":"knowledge","request":"查找关键字 source_time_desc 的说明。","sources":"已授权接口文档","expected":"exact_lookup"}
+{"id":"K23","split":"holdout","task":"knowledge","request":"寻找与长期任务记忆丢失有关的排查经验。","sources":"已授权知识笔记","expected":"semantic_retrieval"}
+{"id":"K24","split":"holdout","task":"knowledge","request":"先检查我们有哪几类本地文档来源。","sources":"来源目录未知","expected":"source_discovery"}
+{"id":"F21","split":"transfer","task":"fast","request":"把刚才确认的两位联系人按姓氏排序。","context":"联系人是李华和陈敏，均来自本轮用户提供的名单。","context_age_hours":1,"scope_same":true,"evidence_conflict":false,"expected":"answer"}
+{"id":"F22","split":"transfer","task":"fast","request":"供应商现在是否已经回复？","context":"昨晚检查时供应商尚未回复，本轮没有新邮件证据。","context_age_hours":27,"scope_same":true,"evidence_conflict":false,"expected":"retrieve"}
+{"id":"F23","split":"transfer","task":"fast","request":"请把下面这句英文改得更简洁：We have completed the initial review.","context":"用户在当前请求里提供了全部待改写内容。","context_age_hours":0,"scope_same":true,"evidence_conflict":false,"expected":"answer"}
+{"id":"F24","split":"transfer","task":"fast","request":"上一轮提到的合同税率是多少？","context":"先前只看到合同编号与签约方，没有税率条款。","context_age_hours":2,"scope_same":true,"evidence_conflict":false,"expected":"retrieve"}
+{"id":"F25","split":"transfer","task":"fast","request":"把刚才确定的时间安排写成一行。","context":"本轮确定：周一开需求会，周三提交草案，周五做复核。","context_age_hours":1,"scope_same":true,"evidence_conflict":false,"expected":"answer"}
+{"id":"F26","split":"transfer","task":"fast","request":"查询目前服务是否恢复正常。","context":"三天前记录过一次服务健康状态，但没有当前观测。","context_age_hours":72,"scope_same":true,"evidence_conflict":false,"expected":"retrieve"}
+{"id":"F27","split":"transfer","task":"fast","request":"刚才提到的客户编号是什么？","context":"客户编号 C-998 来自另一个会话的私有工作区，当前范围不同。","context_age_hours":1,"scope_same":false,"evidence_conflict":false,"expected":"retrieve"}
+{"id":"F28","split":"transfer","task":"fast","request":"帮我总结刚才给你的采购流程。","context":"本轮已给出流程：提需求、核预算、审批、下单、验收。","context_age_hours":1,"scope_same":true,"evidence_conflict":false,"expected":"answer"}
+{"id":"F29","split":"transfer","task":"fast","request":"上一轮的赔付金额是多少？","context":"来源 A 写 1200 元，来源 B 写 1500 元，尚未核实哪份有效。","context_age_hours":1,"scope_same":true,"evidence_conflict":true,"expected":"retrieve"}
+{"id":"F30","split":"transfer","task":"fast","request":"将 18、7、12 从小到大排列。","context":"全部数字已在当前请求给出。","context_age_hours":0,"scope_same":true,"evidence_conflict":false,"expected":"answer"}
+{"id":"T25","split":"transfer","task":"tool","package":"mail","request":"找出昨天带有验收单的邮件。","observations":"目前没有搜索结果。","known_ids":[],"expected":"mail.search"}
+{"id":"T26","split":"transfer","task":"tool","package":"mail","request":"读取搜索命中的邮件 em-21 的完整正文。","observations":"仅有 em-21 的摘要和消息 id。","known_ids":["em-21"],"known_id_type":"mail_message","expected":"mail.load_messages"}
+{"id":"T27","split":"transfer","task":"tool","package":"mail","request":"刷新邮箱并导入新消息。","observations":"本轮没有同步记录。","known_ids":[],"expected":"mail.sync"}
+{"id":"T28","split":"transfer","task":"tool","package":"mail","request":"替我发送会议取消通知。","observations":"发送请求需由 Agent 判断和审查。","known_ids":[],"expected":"agent_decides"}
+{"id":"T29","split":"transfer","task":"tool","package":"knowledge","request":"在已索引的部署笔记中查找 Redis 连接配置。","observations":"尚未读取相关知识。","known_ids":[],"expected":"knowledge.search"}
+{"id":"T30","split":"transfer","task":"tool","package":"knowledge","request":"展示当前索引里全部可见的数据源名称。","observations":"尚未枚举来源。","known_ids":[],"expected":"knowledge.list_sources"}
+{"id":"T31","split":"transfer","task":"tool","package":"knowledge","request":"把已检索片段 ch-9 的原文加载出来。","observations":"已拿到 ch-9 的 id 和截断摘要。","known_ids":["ch-9"],"known_id_type":"knowledge_chunk","expected":"knowledge.load_chunks"}
+{"id":"T32","split":"transfer","task":"tool","package":"knowledge","request":"根据不同版本的合同找出冲突条款，并决定以哪版为准。","observations":"存在多份冲突证据，需要 Agent 判断。","known_ids":[],"expected":"agent_decides"}
+{"id":"T33","split":"transfer","task":"tool","package":"matter","request":"查找明天截止的待办事项。","observations":"尚未查询事项。","known_ids":[],"expected":"matter.search"}
+{"id":"T34","split":"transfer","task":"tool","package":"matter","request":"把所有逾期事项延期一个月。","observations":"批量写入请求必须由 Agent 控制。","known_ids":[],"expected":"agent_decides"}
+{"id":"K25","split":"transfer","task":"knowledge","request":"查明错误代码 ERR-719 在手册中的含义。","sources":"已授权手册","expected":"exact_lookup"}
+{"id":"K26","split":"transfer","task":"knowledge","request":"查一下配置项 retrieval_max_rounds 的文档。","sources":"已授权配置说明","expected":"exact_lookup"}
+{"id":"K27","split":"transfer","task":"knowledge","request":"去资料里找远程团队沟通不畅的改善方法。","sources":"已授权管理笔记","expected":"semantic_retrieval"}
+{"id":"K28","split":"transfer","task":"knowledge","request":"当前已连接的资料库来源清单是什么？","sources":"未展示来源清单","expected":"source_discovery"}
+{"id":"K29","split":"transfer","task":"knowledge","request":"比较三个供应商方案，识别各自假设和互相矛盾的成本预测。","sources":"已授权方案文档","expected":"multi_step"}
+{"id":"K30","split":"transfer","task":"knowledge","request":"找到规范 7.3 节关于保留期的原文。","sources":"已授权规范","expected":"exact_lookup"}
+{"id":"K31","split":"transfer","task":"knowledge","request":"有哪些和低带宽情况下文件上传失败有关的经验？","sources":"已授权故障记录","expected":"semantic_retrieval"}
+{"id":"K32","split":"transfer","task":"knowledge","request":"列出本工作区允许查询的文档种类。","sources":"来源目录未知","expected":"source_discovery"}
+{"id":"K33","split":"transfer","task":"knowledge","request":"综合两份审计记录，判断数字不一致的原因与可信来源。","sources":"已授权审计记录","expected":"multi_step"}
+{"id":"K34","split":"transfer","task":"knowledge","request":"在笔记中定位字段 source_ref 的定义。","sources":"已授权接口笔记","expected":"exact_lookup"}
+{"id":"K35","split":"transfer","task":"knowledge","request":"找讨论过如何减轻值班疲劳的内部经验。","sources":"已授权团队知识","expected":"semantic_retrieval"}
+{"id":"K36","split":"transfer","task":"knowledge","request":"先看有哪些知识来源可以用。","sources":"未知来源目录","expected":"source_discovery"}
+{"id":"F31","split":"challenge","task":"fast","request":"上一轮提到的设备报价是多少？","context":"本轮已确认设备报价为 4800 元，来源记录仍在当前工作区有效。","context_age_hours":1,"scope_same":true,"evidence_conflict":false,"expected":"answer"}
+{"id":"F32","split":"challenge","task":"fast","request":"上一轮提到的设备报价是否含税？","context":"本轮只确认设备报价为 4800 元，未看到税费条款。","context_age_hours":1,"scope_same":true,"evidence_conflict":false,"expected":"retrieve"}
+{"id":"F33","split":"challenge","task":"fast","request":"把刚才三项任务倒序排列。","context":"三项任务依次为核对清单、提交申请、归档记录。","context_age_hours":1,"scope_same":true,"evidence_conflict":false,"expected":"answer"}
+{"id":"F34","split":"challenge","task":"fast","request":"今天新增了哪些审批？","context":"昨天的审批清单已保存，但尚未读取今天的变动。","context_age_hours":27,"scope_same":true,"evidence_conflict":false,"expected":"retrieve"}
+{"id":"F35","split":"challenge","task":"fast","request":"翻译成中文：The review is complete.","context":"待翻译原文已经完整提供在当前请求中。","context_age_hours":0,"scope_same":true,"evidence_conflict":false,"expected":"answer"}
+{"id":"F36","split":"challenge","task":"fast","request":"刚才那张发票的付款截止日是哪天？","context":"上一轮只看到发票编号 INV-77 和总额 320 元，没有到期日。","context_age_hours":1,"scope_same":true,"evidence_conflict":false,"expected":"retrieve"}
+{"id":"F37","split":"challenge","task":"fast","request":"甲和乙哪个数量更大？","context":"本轮用户提供甲为 17 件，乙为 12 件。","context_age_hours":1,"scope_same":true,"evidence_conflict":false,"expected":"answer"}
+{"id":"F38","split":"challenge","task":"fast","request":"那个合同的最终负责人是谁？","context":"会话里有合同 A 与合同 B，两者负责人不同，指代尚未消歧。","context_age_hours":1,"scope_same":true,"evidence_conflict":true,"expected":"retrieve"}
+{"id":"F39","split":"challenge","task":"fast","request":"用一句话总结刚才的检查结论。","context":"本轮检查结果：配置文件存在、数据库可访问、后端健康检查通过。","context_age_hours":1,"scope_same":true,"evidence_conflict":false,"expected":"answer"}
+{"id":"F40","split":"challenge","task":"fast","request":"现在远程邮箱同步是否成功？","context":"一小时前同步成功过一次；尚未执行当前请求的同步。","context_age_hours":1,"scope_same":true,"evidence_conflict":false,"expected":"retrieve"}
+{"id":"F41","split":"challenge","task":"fast","request":"把这句简化：我们正在对有关事项进行相关处理。","context":"当前请求已经提供完整的待简化句子。","context_age_hours":0,"scope_same":true,"evidence_conflict":false,"expected":"answer"}
+{"id":"F42","split":"challenge","task":"fast","request":"刚才客户张三的电话是多少？","context":"电话 123456 来自另一个账号范围，当前会话无权复用。","context_age_hours":1,"scope_same":false,"evidence_conflict":false,"expected":"retrieve"}
+{"id":"F43","split":"challenge","task":"fast","request":"把刚才提到的两个风险列出来。","context":"本轮指出两个风险：证书即将过期；磁盘余量不足。","context_age_hours":1,"scope_same":true,"evidence_conflict":false,"expected":"answer"}
+{"id":"F44","split":"challenge","task":"fast","request":"刚才那个合同附件的免责条款原文是什么？","context":"仅有合同附件摘要，没有免责条款原文；附件 id 已知。","context_age_hours":1,"scope_same":true,"evidence_conflict":false,"expected":"retrieve"}
+{"id":"F45","split":"challenge","task":"fast","request":"上一轮确定的服务端口是什么？","context":"当前工作区配置里已核对端口为 8765，本轮仍有效。","context_age_hours":1,"scope_same":true,"evidence_conflict":false,"expected":"answer"}
+{"id":"F46","split":"challenge","task":"fast","request":"早上九点以后还有哪些新邮件？","context":"八点已列出收件箱，但没有九点后的邮件证据。","context_age_hours":2,"scope_same":true,"evidence_conflict":false,"expected":"retrieve"}
+{"id":"F47","split":"challenge","task":"fast","request":"把负责人和截止日写成一行：李敏，10 月 8 日。","context":"当前请求给出负责人和截止日两个完整字段。","context_age_hours":0,"scope_same":true,"evidence_conflict":false,"expected":"answer"}
+{"id":"F48","split":"challenge","task":"fast","request":"上一轮的预算到底是多少？","context":"有效来源 A 写 2 万元，来源 B 写 3 万元，冲突未消解。","context_age_hours":1,"scope_same":true,"evidence_conflict":true,"expected":"retrieve"}
+{"id":"F49","split":"challenge","task":"fast","request":"计算 12 加 7。","context":"所需数字都在当前请求中。","context_age_hours":0,"scope_same":true,"evidence_conflict":false,"expected":"answer"}
+{"id":"F50","split":"challenge","task":"fast","request":"刚才检索到的报告是哪天发布的？","context":"上一轮只显示报告标题和作者，未加载发布日期。","context_age_hours":1,"scope_same":true,"evidence_conflict":false,"expected":"retrieve"}

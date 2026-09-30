@@ -17,6 +17,7 @@ from app.core.agent_runs import AgentRunCancelled
 from app.core.agent_turn import LLM_OBSERVATION_MAX_TOTAL_CHARS
 from app.core.config import get_settings
 from app.core.llm import LLMRateLimitError, LLMResponse, LLMResponseMode, LLMStreamEvent
+from app.core.multi_agent_fast_path import FastPathEvent, project_fast_path_metrics
 from app.core.tools import ToolContext, ToolExecutor, ToolRegistry, ToolResult, ToolSpec
 from app.domains.mail import MailAccountInput, MailMessageInput
 from app.domains.matters import MatterCreateInput
@@ -33,6 +34,107 @@ def test_agent_turn_uses_configured_max_decision_steps(tmp_path, monkeypatch):
 
     assert app.state.runtime.agent_turn_loop.max_decision_steps == 12
     assert app.state.runtime.agent_turn_runner is app.state.runtime.agent_turn_loop
+
+
+def test_configured_single_agent_fast_path_is_observed_and_react_behavior_is_preserved(
+    tmp_path, monkeypatch
+):
+    config_path = tmp_path / "local.toml"
+    config_path.write_text(
+        '[agent]\nfast_path_single_agent_enabled = true\n', encoding="utf-8"
+    )
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(config_path))
+    get_settings.cache_clear()
+
+    app = create_app()
+    response = run_agent_turn(
+        AgentTurnRequest(
+            session_id="session_fast_path_single_agent",
+            user_input="Answer directly without using a tool.",
+        ),
+        SimpleNamespace(app=app),
+    )
+
+    events = app.state.runtime.agent_run_manager.list_events(response.run_id)
+    fast_path_events = [event for event in events if event.type.startswith("fast_path_")]
+    assert [event.type for event in fast_path_events] == [
+        "fast_path_hit",
+        "fast_path_completed",
+    ]
+    assert fast_path_events[0].payload["template_id"] == "single_agent"
+    assert fast_path_events[0].payload["plan"]["steps"][0]["role"] == "react_agent"
+    projected = project_fast_path_metrics(
+        FastPathEvent.model_validate(event.payload["event"])
+        for event in fast_path_events
+    )
+    assert projected.hits == 1
+    assert projected.completed == 1
+    assert response.answer
+    assert response.selected_package is None
+    assert app.state.runtime.agent_run_manager.get_run(response.run_id).status.value == "completed"
+
+
+def test_configured_single_agent_fast_path_preflights_langgraph_turn(tmp_path, monkeypatch):
+    config_path = tmp_path / "local.toml"
+    config_path.write_text(
+        '[agent]\norchestrator = "langgraph"\nfast_path_single_agent_enabled = true\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(config_path))
+    get_settings.cache_clear()
+    app = create_app()
+
+    response = run_agent_turn(
+        AgentTurnRequest(
+            session_id="session_fast_path_graph",
+            user_input="Answer directly without using a tool.",
+        ),
+        SimpleNamespace(app=app),
+    )
+
+    events = app.state.runtime.agent_run_manager.list_events(response.run_id)
+    fast_path_events = [event for event in events if event.type.startswith("fast_path_")]
+    assert [event.type for event in fast_path_events] == [
+        "fast_path_hit",
+        "fast_path_completed",
+    ]
+    assert response.answer
+    assert app.state.runtime.agent_run_manager.get_run(response.run_id).status.value == "completed"
+
+
+def test_single_agent_policy_records_sanitized_fork_upgrade_once(tmp_path, monkeypatch):
+    config_path = tmp_path / "local.toml"
+    config_path.write_text(
+        '[agent]\nfast_path_single_agent_enabled = true\n', encoding="utf-8"
+    )
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(config_path))
+    get_settings.cache_clear()
+    app = create_app()
+    loop = app.state.runtime.agent_turn_loop
+    run = loop.create_run_for_turn(
+        session_id="session_fast_path_fork_upgrade",
+        user_input="A task requiring independent work.",
+    )
+    loop._assess_configured_fast_path(
+        run_id=run.run_id,
+        session_id=run.session_id,
+        user_input=run.user_input,
+    )
+
+    loop._upgrade_fast_path_for_multi_agent(run.run_id)
+    loop._upgrade_fast_path_for_multi_agent(run.run_id)
+
+    events = app.state.runtime.agent_run_manager.list_events(run.run_id)
+    fast_path_events = [event for event in events if event.type.startswith("fast_path_")]
+    assert [event.type for event in fast_path_events] == [
+        "fast_path_hit",
+        "fast_path_upgraded",
+    ]
+    assert fast_path_events[1].payload["reason_code"] == "planner_requested_multi_agent"
+    assert "operation" not in fast_path_events[1].payload
 
 
 def test_agent_turn_can_run_through_langgraph_orchestrator(tmp_path, monkeypatch):
@@ -62,6 +164,10 @@ def test_agent_turn_can_run_through_langgraph_orchestrator(tmp_path, monkeypatch
     assert response.session_id == "session_langgraph_scaffold"
     assert response.answer
     assert app.state.runtime.agent_run_manager.get_run(response.run_id).status.value == "completed"
+    assert not any(
+        event.type.startswith("fast_path_")
+        for event in app.state.runtime.agent_run_manager.list_events(response.run_id)
+    )
 
     snapshot = runner.get_state(response.run_id)
     assert snapshot.values["phase"] == "finalized"
@@ -177,6 +283,70 @@ def test_langgraph_cancelled_run_stops_before_context_or_llm(tmp_path, monkeypat
     assert cancelled is not None
     assert cancelled.status.value == "cancelled"
     assert app.state.runtime.session_service.get_session(session_id=run.session_id).messages == []
+
+
+def test_langgraph_finalize_cancel_wins_before_completion_claim(tmp_path, monkeypatch):
+    config_path = tmp_path / "local.toml"
+    config_path.write_text('[agent]\norchestrator = "langgraph"\n', encoding="utf-8")
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(config_path))
+    get_settings.cache_clear()
+    app = create_app()
+    runner = app.state.runtime.agent_turn_runner
+    manager = app.state.runtime.agent_run_manager
+    assert isinstance(runner, AgentGraphRunner)
+    run = runner.create_run_for_turn(
+        session_id="session_finalize_cancel", user_input="Cancel at finalize boundary."
+    )
+    store_result = runner._store_result
+
+    def cancel_after_result_artifact(result):
+        ref = store_result(result)
+        manager.cancel_run(result.run_id, reason="cancel before completion claim")
+        return ref
+
+    monkeypatch.setattr(runner, "_store_result", cancel_after_result_artifact)
+
+    with pytest.raises(AgentRunCancelled, match="cancel before completion claim"):
+        runner.run(
+            session_id=run.session_id,
+            user_input=run.user_input,
+            existing_run_id=run.run_id,
+        )
+
+    cancelled = manager.get_run(run.run_id)
+    assert cancelled is not None
+    assert cancelled.status.value == "cancelled"
+    assert "run_completed" not in [event.type for event in manager.list_events(run.run_id)]
+    messages = app.state.runtime.session_service.get_session(session_id=run.session_id).messages
+    assert [str(message.role) for message in messages] == ["user"]
+
+
+def test_langgraph_flushes_delta_events_before_run_completed(tmp_path, monkeypatch):
+    config_path = tmp_path / "local.toml"
+    config_path.write_text('[agent]\norchestrator = "langgraph"\n', encoding="utf-8")
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(config_path))
+    get_settings.cache_clear()
+    app = create_app()
+    manager = app.state.runtime.agent_run_manager
+    observed_event_types: list[list[str]] = []
+    flush_events = manager.flush_events
+
+    def assert_flush_happens_before_completion():
+        observed_event_types.append(
+            [event.type for run_events in manager._events.values() for event in run_events]
+        )
+        flush_events()
+
+    monkeypatch.setattr(manager, "flush_events", assert_flush_happens_before_completion)
+    result = app.state.runtime.run_agent_turn(
+        session_id="session_flush_before_complete", user_input="Answer directly."
+    )
+
+    assert result.answer
+    assert observed_event_types
+    assert all("run_completed" not in event_types for event_types in observed_event_types)
 
 
 def test_langgraph_decision_event_step_matches_working_set_step(tmp_path, monkeypatch):

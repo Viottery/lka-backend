@@ -1,11 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+import json
 from email.message import Message
 from io import BytesIO
 from urllib.error import HTTPError
-
-import asyncio
-import json
 
 import pytest
 
@@ -17,11 +16,17 @@ from app.core.llm.audit import (
 )
 from app.core.llm.errors import (
     LLMAuthenticationError,
+    LLMClientError,
     LLMProviderHTTPError,
     LLMRateLimitError,
 )
+from app.core.llm.models import (
+    LLMMessage,
+    LLMReasoningEffort,
+    LLMRequest,
+    LLMToolDefinition,
+)
 from app.core.llm.openai_compatible import OpenAICompatibleLLMClient
-from app.core.llm.models import LLMMessage, LLMRequest, LLMToolDefinition
 
 
 @pytest.mark.parametrize(
@@ -225,6 +230,36 @@ def test_openai_compatible_success_response_preserves_headers_usage_and_finish_r
     assert headers["x-request-id"] == "req_success"
     assert headers["openai-processing-ms"] == "42"
     assert headers["x-ratelimit-remaining-tokens"] == "1000"
+
+
+def test_openai_compatible_reasoning_effort_is_sent_only_when_configured():
+    request = LLMRequest(
+        messages=[LLMMessage(role="user", content="think carefully")],
+        prompt_summary="reasoning-effort-test",
+        reasoning_effort=LLMReasoningEffort.HIGH,
+    )
+    client = OpenAICompatibleLLMClient(
+        name="test-client",
+        provider_name="openai-compatible",
+        base_url="https://example.invalid/v1",
+        api_key="test-key",
+        default_model="test-model",
+    )
+
+    with pytest.raises(LLMClientError, match="does not support reasoning_effort"):
+        client._build_request(request, stream=False)
+
+    capable_client = OpenAICompatibleLLMClient(
+        name="reasoning-client",
+        provider_name="openai-compatible",
+        base_url="https://example.invalid/v1",
+        api_key="test-key",
+        default_model="test-model",
+        supports_reasoning_effort=True,
+    )
+    outgoing = capable_client._build_request(request, stream=False)
+    payload = json.loads(outgoing.data.decode("utf-8"))
+    assert payload["reasoning_effort"] == "high"
 
 
 def test_openai_compatible_http_error_uses_status_over_conflicting_body_type():

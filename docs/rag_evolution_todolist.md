@@ -81,6 +81,68 @@
 
 ## 2. 目标架构
 
+### 2.0 与当前 LangGraph ReAct 图的融合原则
+
+当前 LangGraph 已经拥有通用外层图：`prepare_context → route_package → expand_package →
+decide_next_operation → validate_operation → safety_gate → execute_tool →
+build_observation → ... → answer`。RAG 演化不得再建立一张重复的全局 RAG 状态图，
+而应作为该图中的结构化、受策略约束的工具能力。
+
+- [ ] LangGraph 继续拥有 run 生命周期、条件边、checkpoint、interrupt、恢复、取消和终态。
+- [ ] `KnowledgeService` / `RetrievalWorkflow` 继续拥有摄取、检索、排序、过滤和证据打包，不依赖图实现。
+- [ ] Agent ReAct 继续拥有动态工具选择和后续策略调整，不被固定领域流程替换。
+- [ ] RAG working state 只保存 topic、策略、assessment 和 artifact/evidence 引用；完整正文仍留在项目自有 artifact / audit 存储。
+- [ ] 不为 RAG 引入第二个 `StateGraph`，除非未来存在独立的长运行、可恢复 RAG 作业需求。
+
+### 2.0.1 融合式 Router：轻量理解、主题判断与首轮剪枝
+
+不新增一个固定全局 intent classifier，也不在 `route_package` 之后无条件追加“意图识别 →
+主题识别 → 检索计划”三个 LLM 阶段。应扩展现有 router 的结构化输出，让同一次 route
+调用完成**面向下一步动作**的轻量判断：
+
+```json
+{
+  "selected_package": "knowledge | mail | null",
+  "reason": "...",
+  "topic_relation": "continue | refine | switch | ambiguous | none",
+  "retrieval_need": "none | likely | required",
+  "route_mode": "context_answer | fast_retrieval | react_loop",
+  "retrieval_hint": {
+    "goal": "...",
+    "rewrite": "true | false | auto",
+    "mode": "keyword | semantic | hybrid | auto",
+    "source_types": ["..."],
+    "query": "..."
+  }
+}
+```
+
+- [ ] `selected_package` 仍仅表示初始 package，不锁定整个 turn，也不作为后续 decision prompt 的领域约束。
+- [ ] `topic_relation` 是对当前 session topic 的关系判断，不是固定业务 intent，也不授予访问权限。
+- [ ] `retrieval_hint` 是受限候选策略；它不是可直接执行的工具调用，必须经 package metadata、策略校验和 Tool Executor。
+- [ ] router 不能输出未注册 package、未授权 source、写操作、任意 SQL、文件路径或 provider policy。
+- [ ] router 失败时保留当前保守回退：不凭领域关键词猜测 package 或执行检索。
+
+### 2.0.2 按复杂度分流，而非固定流程加长
+
+```text
+已有 session / cache 已足够
+  → context_answer
+
+明确、低风险、单一信息缺口
+  → fast_retrieval（一次复合只读检索）→ evidence assessment → answer / normal loop
+
+模糊、跨来源、多跳、冲突、实时或需写操作
+  → react_loop（Agent 自主决定后续 retrieval strategy 和 package）
+```
+
+- [ ] `context_answer` 只允许使用当前 session context 中仍有效且受策略允许的内容；无证据时不能伪装为 grounded answer。
+- [ ] `fast_retrieval` 只允许 package metadata 明确声明的只读复合检索工具，例如未来的 `knowledge.retrieve_evidence`。
+- [ ] fast path 的首轮工具调用必须照常经过 `validate_operation → safety_gate → Tool Executor → build_observation`。
+- [ ] 首轮 assessment 为 `sufficient` 时直接进入 answer；为 `incomplete`、`conflicting`、`blocked` 或 `action_needed` 时回到常规 ReAct loop。
+- [ ] `react_loop` 才允许 query decomposition、多 source、rewrite、同步和 action package 协作。
+- [ ] 分流依据是 query / topic / evidence 的复杂度和风险，不是硬编码具体 package 名或业务关键词。
+
 目标链路：
 
 ```text
@@ -88,7 +150,7 @@
   ↓
 Topic / Intent State
   ↓
-Agent Route
+融合式 Agent Route
   ↓
   Agent Retrieval Strategy
   ↓
@@ -134,6 +196,8 @@ Citation + Verification + Audit
 - [ ] Egress Gateway 负责远程模型调用前的最终数据出境检查。
 - [ ] Answer stage 只能使用通过策略检查的 evidence，不能直接读取数据库。
 - [ ] Domain service 不变成领域小 Agent，不负责 LLM 推理和步骤选择。
+- [ ] Router 只负责首轮的轻量策略和剪枝；在 observation 出现后，后续策略由现有 `decide_next_operation` 继续调整。
+- [ ] `route_mode` 是控制提示而非安全绕过；所有工具操作仍进入通用 operation validation 和 safety gate。
 
 ---
 
@@ -246,6 +310,9 @@ Citation + Verification + Audit
 - [ ] 将 fusion、rerank、dedupe、privacy filter 和 budget 作为独立步骤。
 - [ ] Workflow 不替 Agent 决定是否 rewrite，但负责执行已批准的 rewrite 策略。
 - [ ] 保留完整候选结果用于审计，同时只将压缩 evidence 放入 prompt。
+- [ ] 提供一个面向 Agent 的只读复合检索工具，例如 `knowledge.retrieve_evidence`；内部封装 normalize、候选召回、fusion、rerank、过滤、packing 和 assessment。
+- [ ] 继续保留 `knowledge.search`、`knowledge.load_chunks`、`knowledge.load_document` 作为兼容、精细追问和调试工具，不强迫每次请求走复合工具。
+- [ ] 复合工具输出 `retrieval_id`、`evidence_set_id`、requested/applied strategy、policy warnings、evidence refs 和 assessment，不能只返回无上下文的 snippets。
 
 ### C2. Query normalization
 
@@ -263,6 +330,26 @@ Citation + Verification + Audit
 - [ ] 对过滤导致的空结果返回可解释 warning。
 
 ### C4. Query rewrite
+
+当前已落地的最小闭环：`knowledge.search` 可选传入 `rewrite`（不传即快速路径）。
+Agent 必须填写 `evidence_gap`、`expected_gain`，并提供多条包含 `query` 与
+`purpose` 的改写；数量由 `query_rewrite.max_rewrites` 控制（默认 8，硬上限 16），
+不是固定两条。工具侧确定性规范化空白，拒绝空值、重复查询、额外字段及超长文本；
+每个查询仍使用同一组服务端 source/account/workspace 约束。原查询和改写查询
+在共享候选预算内有界并行召回（默认最多 4 条同时进行，全局 worker 上限 8），
+再按输入顺序确定性合并候选；若本地重排器可用则统一重排，再截取 Top-K；
+返回 `rewrite_trace`，记录原文、
+规范化文本、改写原因、各查询命中数、新增去重命中数和最终结果数。此协议不增加固定 LLM 阶段，
+由现有 Agent decision 按观察到的证据缺口选择调用。
+
+尚未落地：跨调用的独立 rewrite 轮数/信息增益预算、时间/实体规范化、
+自动证据充分性判定与全量数据集的 query-rewrite 效果评测；这些不能因本次
+最小闭环而视为完成。
+
+多跳检索失败案例、阶段归因、标注待核查项与回归方向见
+[`rag_multihop_failcases_2026-09-30.md`](rag_multihop_failcases_2026-09-30.md)。
+特别注意原问题超过 300 字符时改写入口被拒绝，以及 clause 拆分后共同实体丢失；
+当前 100 题 probe 未带来总体 all-hop 提升，不能将“支持多条并行”视为质量验收。
 
 - [ ] 先实现本地确定性规范化，不对每次请求调用 LLM。
 - [ ] 复杂请求支持一个受控 rewrite 阶段。
@@ -299,7 +386,7 @@ Citation + Verification + Audit
 - [ ] rerank 前完成禁止内容过滤，不能用低分代替拒绝。
 - [ ] 记录各阶段排名变化，便于离线诊断。
 
-### C7. 自适应检索剪枝
+### C6. 自适应检索剪枝
 
 - [ ] 为每轮检索计算 `coverage_before`、`coverage_after`、`new_facts`、`duplicate_ratio` 和 `evidence_gain`。
 - [ ] 当 query 明确且 exact match 充分时，优先走 keyword 快速路径。
@@ -309,8 +396,9 @@ Citation + Verification + Audit
 - [ ] 当结果为空时，允许一次 targeted rewrite 或切换已授权 retrieval channel。
 - [ ] 将“继续检索”的理由绑定到具体 missing facts，不接受泛化的“再搜一下”。
 - [ ] 记录模型提出的策略、系统裁剪原因和最终执行策略。
+- [ ] fast path 的首轮检索只允许一次受预算约束的复合调用；assessment 未充分时才升级到常规 ReAct，而不是隐式扩展为多轮流程。
 
-### C6. Context packing
+### C7. Context packing
 
 - [ ] 定义 answer context、decision observation 和 audit result 三种视图。
 - [ ] 按 token budget 压缩 evidence，不截断 source ref 和 evidence id。
@@ -330,6 +418,8 @@ Citation + Verification + Audit
 - [ ] 至少记录 user goal、requires retrieval、preferred sources、requires action、time scope 和 risk hints。
 - [ ] 意图识别失败时回退到通用 route，不触发领域特判。
 - [ ] 意图状态不拥有权限，只影响检索计划和 package 候选。
+- [ ] 不新增与 router 分离的常驻 intent LLM 调用；将首轮 `retrieval_need`、`route_mode` 和 topic relation 合并进现有 route 结构化输出。
+- [ ] 将复杂的目标分解留给 observation 后的 Agent decision，而不是让 router 在无证据时预测完整工作流。
 
 ### D2. ConversationTopicState
 
@@ -339,6 +429,8 @@ Citation + Verification + Audit
 - [ ] 主题切换时保留长期历史，但替换当前 working set。
 - [ ] topic state 变化写入 trace，便于解释动态 RAG 行为。
 - [ ] 主题置信度低时优先澄清，而不是盲目加载旧证据。
+- [ ] 将当前 topic 的有界摘要、实体、open questions、evidence set refs 和 freshness 写入 `AgentTurnWorkingSet` 的项目自有扩展字段或其 artifact，不把正文写进 graph checkpoint。
+- [ ] 在 `prepare_context` 恢复相关 topic refs；在现有 `route_package` 节点判断 `continue/refine/switch/ambiguous`，避免增加独立 topic graph node。
 
 ### D3. 动态 evidence / cache
 
@@ -347,6 +439,7 @@ Citation + Verification + Audit
 - [ ] 主题切换时旧 evidence 降权或移出 prompt，不直接删除历史。
 - [ ] source 更新、权限改变和 freshness 超时触发重新检索。
 - [ ] 防止旧主题 evidence 污染新主题答案。
+- [ ] context-answer fast path 仅在 topic 延续、evidence 未过期、scope 未变化且 cached evidence 满足 assessment 时启用。
 
 ### D4. 对话测试
 
@@ -371,10 +464,12 @@ Citation + Verification + Audit
 - [ ] 服务端对 plan 做 schema、scope、budget、policy 和信息增益相关校验。
 - [ ] plan 不能修改 system policy、tool permissions 或 provider policy。
 
-### E2. Agentic 状态机
+### E2. 复用 LangGraph 外层图的 Agentic RAG 循环
 
-- [ ] 实现 `UNDERSTAND → PLAN_RETRIEVAL → RETRIEVE → EVALUATE_EVIDENCE`。
-- [ ] 支持 `ANSWER`、`REWRITE_AND_RETRIEVE`、`RESOLVE_CONFLICT`、`ASK_CLARIFICATION` 和 `ACTION_PLAN`。
+- [ ] 不实现第二套全局 RAG 状态机；复用当前 LangGraph 的 `route → expand → decide → validate → safety → execute → observe → decide` 循环。
+- [ ] 在该循环中表达 `RETRIEVE`、`REWRITE_AND_RETRIEVE`、`RESOLVE_CONFLICT`、`ASK_CLARIFICATION`、`ANSWER` 和 `ACTION_PLAN` 等通用 operation 语义。
+- [ ] router 可为 fast path 生成一个受限的 bootstrap retrieval hint；package 展开后由通用 validation 转换为首个 pending operation，而不是绕过 `decide_next_operation` 的安全语义。
+- [ ] 首轮 fast retrieval 完成后，assessment 决定直接进入 answer 或恢复正常 `decide_next_operation`；不能以 package/tool 名硬编码图边。
 - [ ] 每一步只能执行一个受控 operation。
 - [ ] 每轮检索必须产生 observation 和 retrieval trace。
 - [ ] 每轮检索后必须生成 evidence assessment，不能直接由 Agent 宣布“证据足够”。
@@ -397,6 +492,7 @@ Citation + Verification + Audit
 - [ ] 检索阶段和写入阶段分离。
 - [ ] 只有 evidence 充分后才允许进入 action package。
 - [ ] action package 仍必须经过 read_only、confirmation 和 Tool Executor。
+- [ ] package metadata 声明是否有可用于 fast path 的只读复合检索工具、支持哪些 retrieval strategy 和可缓存的 evidence 类型；Agent core 只消费该通用 metadata，不写 package 特判。
 
 ### E5. Agentic 默认策略
 
@@ -410,6 +506,9 @@ Citation + Verification + Audit
 - [ ] 时间、发件人、状态等精确字段优先选择 keyword + metadata filter。
 - [ ] 开放主题、多跳问题才允许增加 query、source 或 retrieval round。
 - [ ] 模型策略必须包含选择理由，理由应关联 query 特征或 evidence gap。
+- [ ] router 对低风险且明确的请求优先输出 `fast_retrieval` 或 `context_answer`，避免 route 后再无条件产生一次完整 decision LLM 调用。
+- [ ] 当 router 置信度不足、topic 为 ambiguous、策略涉及多 source / freshness / write action 或 fast retrieval 未充分时，统一降级为 `react_loop`。
+- [ ] 不把 `fast_retrieval` 当成确定性答案捷径；answer 仍使用独立 answer stage，并接受 evidence / policy 校验。
 
 ---
 
@@ -481,6 +580,10 @@ Citation + Verification + Audit
 - [ ] retrieval mode decision accuracy。
 - [ ] adaptive pruning precision：被剪枝的检索是否确实没有带来新增有效证据。
 - [ ] unnecessary second-round retrieval rate。
+- [ ] router fusion accuracy：`context_answer`、`fast_retrieval` 与 `react_loop` 的分流是否正确。
+- [ ] fast-path escape rate：首轮 assessment 不充分而正确回到 ReAct loop 的比例。
+- [ ] fast-path false-completion rate：本应继续检索却直接回答的比例。
+- [ ] route-to-first-evidence latency：router 融合后，简单问题获得首条有效 evidence 的端到端时延。
 - [ ] action-before-evidence violation rate。
 
 ### G3. 可信与安全评估
@@ -526,6 +629,7 @@ Citation + Verification + Audit
 
 ### 第二优先级：稳定的 Workflow RAG
 
+- [ ] C1 中的复合 `retrieve_evidence` 工具和结构化输出协议。
 - [ ] B1 结构化 chunking。
 - [ ] C1 RetrievalWorkflow。
 - [ ] C2 query normalization。
@@ -535,6 +639,7 @@ Citation + Verification + Audit
 
 ### 第三优先级：多轮动态上下文
 
+- [ ] 2.0.1 融合式 Router 与 `route_mode` / topic relation 兼容协议。
 - [ ] D1 通用意图状态。
 - [ ] D2 ConversationTopicState。
 - [ ] D3 topic-aware evidence cache。
@@ -544,9 +649,10 @@ Citation + Verification + Audit
 
 - [ ] C4 受控 query rewrite。
 - [ ] E1 retrieval plan。
-- [ ] E2 Agentic 状态机。
+- [ ] E2 复用 LangGraph 外层图的 Agentic RAG 循环。
 - [ ] E3 循环和预算控制。
 - [ ] E4 动态 package 协作。
+- [ ] E2 中 fast path 到常规 ReAct loop 的无损回退。
 
 ### 第五优先级：可信度和持续评估
 

@@ -126,12 +126,16 @@ GET  /agent/runs/{run_id}
 GET  /agent/runs/{run_id}/events?after_sequence=N
 GET  /agent/runs/{run_id}/stream?after_sequence=N
 POST /agent/runs/{run_id}/cancel
+POST /agent/runs/{run_id}/resume
 ```
 
 `cancel` 会立即发布 cancelled run 状态并写入 durable cancellation request；节点边界会检查并停止
 后续 LLM/tool/finalize 操作。已经进入 provider 的请求无法保证被强制中止，但其迟到结果不会让
-run 回到 completed。
+run 回到 completed。finalize 会先持久化 result artifact，再原子获取 completion claim；取消和完成
+只能有一个赢家，避免产生 cancelled 状态却带有 `run_completed` event 或 agent answer 的记录。
 manual review 的审批 API 仅在 review 从 `pending` 首次转换到 `approved/rejected` 时调度 resume。
+服务重启留下的 `running` LangGraph run 可通过 resume API 显式恢复；同一进程内的重复 resume 会
+合并为一个恢复任务。
 
 ### 3.6 API 隐私边界与 delta 存储
 
@@ -141,9 +145,12 @@ manual review 的审批 API 仅在 review 从 `pending` 首次转换到 `approve
 - 移除 session context、expanded tool schema、decision raw output、工具输入/原始输出、完整 prompt、
   LLM output、audit record 和本地 log path；
 - SSE/事件查询同样剥离普通工具 lifecycle event 中的原始 input/result metadata。
+- safety-review API 与 `safety_review_*` SSE event 仅公开 review 摘要；原始 `tool_input` 与
+  审查 LLM output 只保留在本地审计记录。
 
 对于 streaming：内存中的 SSE event 仍保留 `content_snapshot` 兼容旧前端；SQLite 只保存 `delta`，
 恢复/回放时按 `llm_call_id` 聚合重建 snapshot，避免长输出的平方级磁盘增长。
+每次正常终结前都会 flush 异步 delta writer；flush 失败会让 run 失败而不会发布 `run_completed`。
 
 ## 4. 审查问题、原因与解决方案
 
@@ -163,6 +170,10 @@ manual review 的审批 API 仅在 review 从 `pending` 首次转换到 `approve
 | SSE 断连取消运行且无法重连 | task 由 generator 持有，断连路径调用 cancel；无 event API | 后台 task 与连接分离；新增 status/event/reconnect/cancel API | 已修复 |
 | 重启后事件无法回放 | hot cache 未恢复 durable event | run restore 从 SQLite 读取并恢复 ordered events | 已修复 |
 | delta snapshot 持久化 O(n²) | 每个 token event 保存不断增长的全文 snapshot | SQLite 去除 snapshot，只保存 delta；rehydrate 重建 snapshot | 已修复 |
+| cancel 与 finalize 竞态产生 cancelled + completed 混合记录 | cancel/complete 分别更新状态，finalize 内部副作用没有终结仲裁 | result artifact 后写入 durable completion claim；取消和完成互斥，终结前再发布 completed event | 已修复 |
+| safety review 公开 API/SSE 泄露原始工具输入 | public DTO 继承内部 review record，event filter 未处理 review | 独立公开摘要 DTO，并在 transport filter 中只保留安全字段 | 已修复 |
+| terminal event 前 delta 未确保落库 | `llm_delta` 走异步 writer，正常完成未 flush | `run_completed` 前 flush；持久化失败转为 failed run | 已修复 |
+| 重启后的 running run 没有 HTTP 恢复入口 | runtime recovery 未接入 API 控制面 | 新增 `POST /agent/runs/{run_id}/resume`，等待审查和终态返回 409 | 已修复 |
 | manual review 初始 progress 不在 checkpoint | `interrupt()` 在 `_save()` 前中断节点返回 | 拆为 `safety_gate` 持久化节点和后续 `manual_review_interrupt` 节点 | 已修复 |
 | Agent `trace_id` 未写入旧 `traces` 表 | 旧 TraceRecorder 仅为 debug RuntimeLoop 设计 | 新增 Agent run 查询以 trace_id 关联 run；不双写 debug traces，避免不一致/原始事件复制 | 有意保持分离 |
 

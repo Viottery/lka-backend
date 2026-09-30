@@ -11,6 +11,7 @@ from app.domains.knowledge import (
     KnowledgeImportResult,
     KnowledgeService,
     KnowledgeSourceInput,
+    _stable_id,
 )
 from app.domains.mail import MailMirrorRecord, MailSearchResult, MailSearchResultItem, MailService
 
@@ -64,6 +65,8 @@ class MailKnowledgeMirror:
         mode: str | None = None,
         order_by: Literal["relevance", "source_time_desc"] = "relevance",
         max_snippet_chars: int = 420,
+        source_ids: list[str] | None = None,
+        account_ids: list[str] | None = None,
     ) -> MailSearchResult:
         """Search mail evidence through the local knowledge index.
 
@@ -81,6 +84,8 @@ class MailKnowledgeMirror:
             mode=resolved_mode,
             sort_by=order_by,
             distinct_documents=True,
+            source_ids=source_ids,
+            account_ids=account_ids,
         )
         message_ids = [self._message_id_from_source_ref(item.source_ref) for item in result.results]
         summaries = self._mail_service.get_message_summaries(
@@ -166,3 +171,9 @@ class MailKnowledgeMirror:
         if not source_ref.startswith(prefix):
             return None
         return source_ref.removeprefix(prefix).split("#", 1)[0] or None
+
+    @staticmethod
+    def source_id_for_account(account_id: str) -> str:
+        """Return the stable source ID used for this account's mirrored mail."""
+
+        return _stable_id("knowledge_source", "mail_message", f"mail://{account_id}")

@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LKA Offline Multi-Agent Trace Report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "report_type", "generated_at", "passed", "safety_hard_gates", "metrics", "input_counts"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "report_type": {"const": "multi_agent_trace"},
+    "generated_at": {"type": "string", "format": "date-time"},
+    "passed": {"type": "boolean"},
+    "safety_hard_gates": {
+      "type": "object",
+      "required": ["trace_terminal_completeness", "dependency_correctness", "terminal_inconsistency_count"],
+      "properties": {
+        "trace_terminal_completeness": {"$ref": "#/$defs/gate"},
+        "dependency_correctness": {"$ref": "#/$defs/gate"},
+        "terminal_inconsistency_count": {"$ref": "#/$defs/gate"}
+      }
+    },
+    "metrics": {"type": "object", "additionalProperties": {"$ref": "#/$defs/metric"}},
+    "input_counts": {
+      "type": "object",
+      "required": ["runs", "events"],
+      "properties": {
+        "runs": {"type": ["integer", "null"], "minimum": 0},
+        "events": {"type": ["integer", "null"], "minimum": 0}
+      }
+    }
+  },
+  "$defs": {
+    "metric": {
+      "type": "object",
+      "required": ["value", "available", "reason", "details"],
+      "properties": {
+        "value": {"type": ["integer", "number", "boolean", "null"]},
+        "available": {"type": "boolean"},
+        "reason": {"type": ["string", "null"]},
+        "details": {"type": ["object", "null"]}
+      }
+    },
+    "gate": {
+      "type": "object",
+      "required": ["status", "value", "reason"],
+      "properties": {
+        "status": {"enum": ["passed", "failed", "unavailable"]},
+        "value": {"type": ["integer", "number", "boolean", "null"]},
+        "reason": {"type": ["string", "null"]}
+      }
+    }
+  }
+}

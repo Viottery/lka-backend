@@ -21,6 +21,12 @@ from app.api.schemas import (
 from app.core.config import get_settings
 from app.core.llm import LLMResponse
 from app.core.tools import ToolContext
+from app.domains.matters import (
+    MatterCreateInput,
+    MatterSourceLinkInput,
+    MatterUpdateInput,
+)
+from app.domains.mail_knowledge import MailKnowledgeMirror
 
 
 def test_matter_api_create_search_update_and_link(tmp_path, monkeypatch):
@@ -121,6 +127,12 @@ def test_matter_tools_are_registered(tmp_path, monkeypatch):
         "matter.update",
         "matter.link_source",
     }
+    assert all(
+        matter_tool_specs[name].scope_uses_sources
+        and matter_tool_specs[name].scope_uses_accounts
+        and matter_tool_specs[name].scope_filtering_required
+        for name in matter_tool_names
+    )
     assert app.state.runtime.tool_registry.list_tools(package="runtime") == []
     assert "Before create or create_many, call matter.search" in " ".join(
         matter_package.decision_hints
@@ -228,6 +240,122 @@ def test_matter_tools_are_registered(tmp_path, monkeypatch):
     assert "tool_input.query is required." in missing_search_query.output[
         "validation_errors"
     ]
+
+
+def test_child_matter_scope_filters_and_blocks_cross_account_links(tmp_path, monkeypatch):
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
+    get_settings.cache_clear()
+    app = create_app()
+    service = app.state.runtime.matter_service
+    conn = app.state.runtime._conn()
+    try:
+        for account_id, email in (("acct_a", "a@example.test"), ("acct_b", "b@example.test")):
+            conn.execute(
+                "INSERT INTO mail_accounts(account_id, provider, email_address, created_at, updated_at) VALUES(?, 'test', ?, 'now', 'now')",
+                (account_id, email),
+            )
+            message_id = f"msg_{account_id}"
+            conn.execute(
+                """INSERT INTO mail_messages(
+                    message_id, account_id, external_id, folder, subject, sender,
+                    recipients, cc, body_text, created_at, updated_at
+                ) VALUES(?, ?, ?, 'inbox', 'Subject', 'sender', '[]', '[]', 'body', 'now', 'now')""",
+                (message_id, account_id, message_id),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    own = service.create_matter(MatterCreateInput(
+        title="Own scope matter", summary="Belongs to account A",
+        source_links=[MatterSourceLinkInput(source_type="mail_message", source_id="msg_acct_a")],
+    ))
+    other = service.create_matter(MatterCreateInput(
+        title="Other scope matter", summary="Belongs to account B",
+        source_links=[MatterSourceLinkInput(source_type="mail_message", source_id="msg_acct_b")],
+    ))
+    unlinked = service.create_matter(MatterCreateInput(title="Unlinked matter", summary="No ownership"))
+    scope = {
+        "source_ids": (MailKnowledgeMirror.source_id_for_account("acct_a"),),
+        "account_ids": ("acct_a",),
+        "allow_unattributed": False,
+    }
+    account_only_scope = {
+        "source_ids": (
+            MailKnowledgeMirror.source_id_for_account("acct_a"),
+            MailKnowledgeMirror.source_id_for_account("acct_b"),
+        ),
+        "account_ids": ("acct_a",),
+        "allow_unattributed": False,
+    }
+
+    assert [item.matter_id for item in service.list_matters(**scope).matters] == [own.matter_id]
+    assert [item.matter_id for item in service.list_matters(**account_only_scope).matters] == [own.matter_id]
+    assert [item.matter_id for item in service.search_matters(query="scope matter", **scope).matters] == [own.matter_id]
+    for matter_id in (other.matter_id, unlinked.matter_id):
+        try:
+            service.update_matter(
+                matter_id=matter_id,
+                payload=MatterUpdateInput(title="forbidden"),
+                **scope,
+            )
+        except PermissionError:
+            pass
+        else:
+            raise AssertionError("Child updated a matter outside its source/account scope")
+    for links in (
+        [],
+        [MatterSourceLinkInput(source_type="mail_message", source_id="msg_acct_b")],
+    ):
+        try:
+            service.create_matter(
+                MatterCreateInput(title="forbidden create", source_links=links),
+                **scope,
+            )
+        except PermissionError:
+            pass
+        else:
+            raise AssertionError("Child created a matter outside its source/account scope")
+    try:
+        service.create_matter(
+            MatterCreateInput(
+                title="unknown owner", source_links=[
+                    MatterSourceLinkInput(source_type="mail_message", source_id="missing_message")
+                ]
+            ),
+            source_ids=(MailKnowledgeMirror.source_id_for_account("acct_a"),),
+            account_ids=("acct_a",),
+            allow_unattributed=True,
+        )
+    except PermissionError:
+        pass
+    else:
+        raise AssertionError("Child accepted a mail link with an unresolvable owner")
+    try:
+        service.create_matter(
+            MatterCreateInput(
+                title="unknown source type",
+                source_links=[MatterSourceLinkInput(source_type="agent_trace", source_id="trace_1")],
+            ),
+            source_ids=(),
+            account_ids=(),
+            allow_unattributed=True,
+        )
+    except PermissionError:
+        pass
+    else:
+        raise AssertionError("Child accepted a source type with no ownership resolver")
+    try:
+        service.link_source(
+            matter_id=own.matter_id,
+            source_link=MatterSourceLinkInput(source_type="mail_message", source_id="msg_acct_b"),
+            **account_only_scope,
+        )
+    except PermissionError:
+        pass
+    else:
+        raise AssertionError("Child linked a source owned by another account")
 
 
 def test_agent_turn_can_create_matter_and_receives_current_time(tmp_path, monkeypatch):

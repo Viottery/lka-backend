@@ -10,7 +10,6 @@ from app.core.llm.mock import AsyncMockLLMClient
 from app.core.llm.openai_compatible import OpenAICompatibleLLMClient
 from app.core.local_config import LLMClientConfig, LLMProviderConfig
 
-
 ClientFactory = Callable[[LLMClientConfig], AsyncLLMClient]
 
 
@@ -78,4 +77,5 @@ def _build_openai_compatible_client(config: LLMClientConfig) -> AsyncLLMClient:
         supports_json_mode=config.supports_json_mode,
         supports_function_calling=config.supports_function_calling,
         function_calling_strict=config.function_calling_strict,
+        supports_reasoning_effort=config.supports_reasoning_effort,
     )

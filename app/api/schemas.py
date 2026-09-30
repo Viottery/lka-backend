@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.core.agent_runs import AgentRunEvent, AgentRunRecord, AgentRunStatus
 from app.core.agent_turn import (
@@ -16,7 +18,7 @@ from app.core.context import SessionContext, TaskContext
 from app.core.events import EventRecord
 from app.core.llm import LLMResponse, LLMResponseMode
 from app.core.retrieval import RetrievalResult
-from app.core.safety import SafetyReviewDecision, SafetyReviewRecord
+from app.core.safety import SafetyReviewDecision, SafetyReviewMode, SafetyReviewRecord
 from app.core.sessions import (
     AgentSession,
     AgentSessionDetail,
@@ -77,6 +79,7 @@ class WorkspaceIndexResponse(BaseModel):
     status: str
     indexed_files: int
     indexed_chunks: int
+    knowledge_errors: list[str] = Field(default_factory=list)
 
 
 class CapabilityItem(BaseModel):
@@ -119,6 +122,7 @@ class AgentTurnRequest(BaseModel):
     session_id: str | None = None
     user_input: str
     llm: AgentTurnLLMOptions | None = None
+    safety_review_mode: SafetyReviewMode | None = None
 
 
 class AgentTurnLLMEventSummary(BaseModel):
@@ -252,6 +256,31 @@ class AgentTurnResponse(BaseModel):
         )
 
 
+class PendingAgentQuestionResponse(BaseModel):
+    question_id: str
+    patch_id: str | None = None
+    question: str = Field(max_length=4000)
+    asked_at: str
+
+    @classmethod
+    def from_metadata(cls, metadata: dict[str, Any]) -> PendingAgentQuestionResponse | None:
+        value = metadata.get("pending_user_question")
+        if not isinstance(value, dict):
+            return None
+        question_id = value.get("question_id")
+        question = value.get("question")
+        asked_at = value.get("asked_at")
+        if not all(isinstance(item, str) and item for item in (question_id, question, asked_at)):
+            return None
+        patch_id = value.get("patch_id")
+        return cls(
+            question_id=question_id,
+            patch_id=patch_id if isinstance(patch_id, str) else None,
+            question=question,
+            asked_at=asked_at,
+        )
+
+
 class AgentRunResponse(BaseModel):
     run_id: str
     session_id: str
@@ -267,11 +296,22 @@ class AgentRunResponse(BaseModel):
     error_type: str | None = None
     error: str | None = None
     has_result: bool = False
+    pending_user_question: PendingAgentQuestionResponse | None = None
 
     @classmethod
     def from_record(cls, record: AgentRunRecord) -> AgentRunResponse:
         payload = record.model_dump(include=set(cls.model_fields) - {"has_result"}, mode="python")
-        return cls(**payload, has_result=record.result_snapshot is not None)
+        return cls(
+            **payload,
+            has_result=record.result_snapshot is not None,
+            pending_user_question=(
+                PendingAgentQuestionResponse.from_metadata(record.metadata)
+                if record.status == AgentRunStatus.WAITING_USER
+                and not record.metadata.get("waiting_child_user_run_ids")
+                and not record.metadata.get("pending_user_answer_command_id")
+                else None
+            ),
+        )
 
 
 class AgentRunEventsResponse(BaseModel):
@@ -279,18 +319,126 @@ class AgentRunEventsResponse(BaseModel):
     events: list[AgentRunEvent] = Field(default_factory=list)
 
 
-class SafetyReviewResponse(SafetyReviewRecord):
-    pass
+class AgentTaskResultSnapshot(BaseModel):
+    """Safe current result summary for one child attempt."""
+
+    result_id: str
+    child_run_id: str
+    plan_id: str
+    step_id: str
+    snapshot_id: str
+    status: str
+    summary: str
+    artifact_refs: list[str] = Field(default_factory=list)
+    artifacts: list[dict[str, Any]] = Field(default_factory=list)
+    evidence_refs: list[dict[str, Any]] = Field(default_factory=list)
+    verification: dict[str, Any] | None = None
+    failure: dict[str, Any] | None = None
+    missing_requirements: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    completed_at: str
+
+
+class AgentChildRunSnapshot(BaseModel):
+    run_id: str
+    parent_run_id: str
+    plan_id: str | None = None
+    step_id: str | None = None
+    attempt: int | None = None
+    status: AgentRunStatus
+    depth: int
+    pending_user_question: PendingAgentQuestionResponse | None = None
+    step_status: str | None = None
+    step: dict[str, Any] | None = None
+    has_result: bool = False
+    result: AgentTaskResultSnapshot | None = None
+    children: list[AgentChildRunSnapshot] = Field(default_factory=list)
+
+
+class AgentRunSnapshotResponse(BaseModel):
+    run: AgentRunResponse
+    plan: dict[str, Any] | None = None
+    children: list[AgentChildRunSnapshot] = Field(default_factory=list)
+
+
+class SafetyReviewResponse(BaseModel):
+    """Public safety-review summary.
+
+    Raw tool input and reviewer LLM output are local audit material.  They stay
+    in the durable review record and run log, but are not exposed through the
+    unauthenticated Agent HTTP/SSE transport.
+    """
+
+    review_id: str
+    run_id: str
+    invocation_id: str
+    tool_name: str
+    tool_risk: str
+    side_effects: list[str] = Field(default_factory=list)
+    read_only: bool | None = None
+    mode: str
+    reason: str
+    created_at: str
+    status: str
+    decided_by: str | None = None
+    decision_reason: str | None = None
+    decided_at: str | None = None
+    parent_run_id: str | None = None
+    child_run_id: str | None = None
+    input_fields: list[str] = Field(default_factory=list)
+    invocation_fingerprint: str = ""
+
+    @classmethod
+    def from_record(cls, record: SafetyReviewRecord) -> SafetyReviewResponse:
+        encoded_input = json.dumps(
+            record.tool_input, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return cls(
+            **record.model_dump(
+                include=set(cls.model_fields) - {
+                    "parent_run_id", "child_run_id", "input_fields",
+                    "invocation_fingerprint",
+                },
+                mode="python",
+            ),
+            input_fields=sorted(record.tool_input)[:32],
+            invocation_fingerprint=hashlib.sha256(encoded_input).hexdigest()[:20],
+        )
 
 
 class SafetyReviewListResponse(BaseModel):
-    reviews: list[SafetyReviewRecord]
+    reviews: list[SafetyReviewResponse]
+
+
+class SafetyReviewQueueResponse(BaseModel):
+    reviews: list[SafetyReviewResponse]
 
 
 class SafetyReviewDecisionRequest(BaseModel):
     decision: SafetyReviewDecision
     reason: str | None = None
     decided_by: str = "user"
+
+
+class ContinueAgentRunRequest(BaseModel):
+    command_id: str = Field(min_length=1, max_length=200)
+    answer: str = Field(min_length=1, max_length=20_000)
+
+    @field_validator("command_id", "answer")
+    @classmethod
+    def require_non_whitespace(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Value must not be empty or whitespace.")
+        return value
+
+
+class ContinueAgentRunResponse(BaseModel):
+    run_id: str
+    command_id: str
+    question_id: str
+    status: AgentRunStatus
+    replayed: bool
+    resume_scheduled: bool
 
 
 class SessionCreateRequest(BaseModel):

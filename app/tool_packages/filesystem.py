@@ -117,6 +117,8 @@ class ReadFileTool:
         requires_confirmation=False,
         read_only=True,
         side_effects=["read_local_file"],
+        scope_path_fields=("path",),
+        scope_uses_workspace=True,
         input_schema={
             "type": "object",
             "required": ["path"],
@@ -144,10 +146,12 @@ class ReadFileTool:
     def invoke(self, *, invocation: ToolInvocation, context: ToolContext) -> ToolResult:
         try:
             policy = self.policy.for_session_workspace(context.workspace_root)
-            resolved = policy.resolve(str(invocation.input.get("path") or ""))
+            requested_path = str(invocation.input.get("path") or "")
+            resolved = policy.resolve(requested_path)
+            _require_child_path_scope(resolved, context)
             payload = read_file_slice(
                 path=resolved,
-                requested_path=str(invocation.input.get("path") or ""),
+                requested_path=requested_path,
                 start_line=int(invocation.input.get("start_line") or 1),
                 max_lines=int(invocation.input.get("max_lines") or DEFAULT_READ_MAX_LINES),
                 max_bytes=int(invocation.input.get("max_bytes") or DEFAULT_READ_MAX_BYTES),
@@ -183,6 +187,8 @@ class EditFileTool:
         requires_confirmation=False,
         read_only=False,
         side_effects=["write_local_file"],
+        scope_path_fields=("path",),
+        scope_uses_workspace=True,
         input_schema={
             "type": "object",
             "required": ["path", "expected_sha256", "edits"],
@@ -217,10 +223,12 @@ class EditFileTool:
     def invoke(self, *, invocation: ToolInvocation, context: ToolContext) -> ToolResult:
         try:
             policy = self.policy.for_session_workspace(context.workspace_root)
-            resolved = policy.resolve(str(invocation.input.get("path") or ""))
+            requested_path = str(invocation.input.get("path") or "")
+            resolved = policy.resolve(requested_path)
+            _require_child_path_scope(resolved, context)
             payload = edit_file(
                 path=resolved,
-                requested_path=str(invocation.input.get("path") or ""),
+                requested_path=requested_path,
                 expected_sha256=str(invocation.input.get("expected_sha256") or ""),
                 edits=invocation.input.get("edits"),
             )
@@ -237,6 +245,25 @@ class EditFileTool:
             status="completed",
             output=payload,
         )
+
+
+def _require_child_path_scope(path: Path, context: ToolContext) -> None:
+    """Recheck the snapshot path ceiling even when the base policy is broader."""
+
+    view = context.tool_view
+    if view is None or view.child_run_id is None:
+        return
+    allowed = tuple(Path(value).expanduser().resolve(strict=False) for value in view.allowed_paths)
+    if not allowed or not any(_is_path_within(path, root) for root in allowed):
+        raise PermissionError("path is outside the child ContextSnapshot workspace scope")
+
+
+def _is_path_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve(strict=False).relative_to(root.resolve(strict=False))
+        return True
+    except ValueError:
+        return False
 
 
 def read_file_slice(

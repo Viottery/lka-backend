@@ -28,15 +28,18 @@ from app.core.agent_turn import (
     AgentTurnWorkingSet,
     _session_workspace_path,
     _stable_id,
+    _turn_inference_snapshot,
     _turn_llm_client_name,
     _turn_llm_model,
     _turn_llm_response_mode,
+    _turn_safety_review_mode,
     _turn_run_id,
     _turn_run_manager,
 )
+from app.core.context_driver import ToolView
 from app.core.llm import LLMResponseMode
 from app.core.runtime_context import current_time_payload
-from app.core.safety import SafetyReviewRecord, SafetyReviewStatus
+from app.core.safety import SafetyReviewMode, SafetyReviewRecord, SafetyReviewStatus
 from app.core.tools import ToolContext, ToolResult
 
 
@@ -46,7 +49,7 @@ class AgentGraphState(TypedDict, total=False):
     checkpoint_schema_version: int
     request: dict[str, Any]
     phase: str
-    status: Literal["queued", "running", "waiting_confirmation", "completed", "failed", "cancelled"]
+    status: Literal["queued", "running", "waiting_confirmation", "waiting_user", "completed", "failed", "cancelled"]
     run_snapshot: dict[str, Any]
     working_set: dict[str, Any]
     runtime_artifact_ref: dict[str, Any]
@@ -62,6 +65,15 @@ class AgentTurnWaitingForConfirmation(RuntimeError):
         super().__init__(f"Agent run is waiting for confirmation: {run_id}")
         self.run_id = run_id
         self.review_id = review_id
+
+
+class AgentTurnWaitingForUser(RuntimeError):
+    """A graph turn stopped at a durable, non-safety user-question interrupt."""
+
+    def __init__(self, *, run_id: str, question_id: str | None) -> None:
+        super().__init__(f"Agent run is waiting for a user response: {run_id}")
+        self.run_id = run_id
+        self.question_id = question_id
 
 
 class AgentGraphRunner:
@@ -81,6 +93,8 @@ class AgentGraphRunner:
         self.turn_loop, self.checkpoint_runtime = turn_loop, checkpoint_runtime
         self.artifact_store, self.interrupt_after = artifact_store, interrupt_after
         self._lock = threading.RLock()
+        self._execution_locks_guard = threading.Lock()
+        self._execution_locks: dict[str, threading.Lock] = {}
         self._results: dict[str, AgentTurnResult] = {}
         self._errors: dict[str, Exception] = {}
         self._requests: dict[str, dict[str, Any]] = {}
@@ -92,6 +106,9 @@ class AgentGraphRunner:
             ("expand_package", self._expand_package),
             ("decide_next_operation", self._decide),
             ("validate_operation", self._validate),
+            ("fork_wait_interrupt", self._fork_wait_interrupt),
+            ("child_user_wait_interrupt", self._child_user_wait_interrupt),
+            ("user_question_interrupt", self._user_question_interrupt),
             ("safety_gate", self._safety),
             ("manual_review_interrupt", self._manual_review_interrupt),
             ("execute_tool", self._execute),
@@ -114,11 +131,17 @@ class AgentGraphRunner:
             self._after_validate,
             {
                 "decide": "decide_next_operation",
+                "fork_wait": "fork_wait_interrupt",
+                "child_user_wait": "child_user_wait_interrupt",
+                "user_question": "user_question_interrupt",
                 "expand": "expand_package",
                 "safety": "safety_gate",
                 "answer": "answer",
             },
         )
+        builder.add_edge("fork_wait_interrupt", "validate_operation")
+        builder.add_edge("child_user_wait_interrupt", "validate_operation")
+        builder.add_edge("user_question_interrupt", "decide_next_operation")
         builder.add_conditional_edges(
             "safety_gate",
             self._after_safety,
@@ -149,17 +172,74 @@ class AgentGraphRunner:
 
     def run(self, **kwargs: Any) -> AgentTurnResult:
         run_id = self._resolve_run_id(**kwargs)
-        self._invoke_sync(run_id=run_id, **kwargs)
-        return self._take_result(run_id)
+        with self._execution_lease(run_id):
+            existing = self._run(run_id)
+            if existing.status.value == "completed":
+                recovered = self._completed_result_from_checkpoint(run_id)
+                if recovered is not None:
+                    return recovered
+            if existing.status.value == "waiting_confirmation":
+                raise AgentTurnWaitingForConfirmation(
+                    run_id=run_id,
+                    review_id=existing.metadata.get("confirmation_id"),
+                )
+            if existing.status.value == "waiting_user":
+                question = existing.metadata.get("pending_user_question")
+                raise AgentTurnWaitingForUser(
+                    run_id=run_id,
+                    question_id=question.get("question_id") if isinstance(question, dict) else None,
+                )
+            if existing.status.value != "queued":
+                raise RuntimeError(
+                    f"Cannot start Agent run {run_id} from {existing.status.value}."
+                )
+            if existing.parent_run_id is not None:
+                self.turn_loop.run_manager.mark_child_running(run_id)
+            self._invoke_sync(run_id=run_id, **kwargs)
+            return self._take_result(run_id)
 
     async def run_async(self, **kwargs: Any) -> AgentTurnResult:
         return await self._run_in_worker(self.run, **kwargs)
 
     def resume(self, run_id: str) -> AgentTurnResult:
-        if self._run(run_id).status.value == "completed":
+        with self._execution_lease(run_id):
+            current = self._run(run_id)
+            if current.status.value == "completed":
+                recovered = self._completed_result_from_checkpoint(run_id)
+                if recovered is not None:
+                    return recovered
+                return self._take_result(run_id)
+            if current.status.value == "waiting_confirmation":
+                raise AgentTurnWaitingForConfirmation(
+                    run_id=run_id,
+                    review_id=current.metadata.get("confirmation_id"),
+                )
+            if current.status.value == "waiting_user":
+                question = current.metadata.get("pending_user_question")
+                raise AgentTurnWaitingForUser(
+                    run_id=run_id,
+                    question_id=question.get("question_id") if isinstance(question, dict) else None,
+                )
+            if current.status.value in {"failed", "cancelled", "timed_out"}:
+                raise RuntimeError(
+                    f"Cannot resume terminal Agent run {run_id} ({current.status.value})."
+                )
+            if current.status.value != "running":
+                raise RuntimeError(
+                    f"Cannot resume Agent run {run_id} from {current.status.value}."
+                )
+            self._resume_sync(run_id)
             return self._take_result(run_id)
-        self._resume_sync(run_id)
-        return self._take_result(run_id)
+
+    def _execution_lease(self, run_id: str) -> threading.Lock:
+        """Return the process-wide per-run graph execution lease.
+
+        Scheduler child execution and HTTP resume both enter this runner.  A
+        shared lease serializes checkpoint mutation and side effects even when
+        the callers originate in separate task registries.
+        """
+        with self._execution_locks_guard:
+            return self._execution_locks.setdefault(run_id, threading.Lock())
 
     async def resume_async(self, run_id: str) -> AgentTurnResult:
         return await self._run_in_worker(self.resume, run_id)
@@ -224,6 +304,7 @@ class AgentGraphRunner:
         llm_client_name: str | None = None,
         llm_model: str | None = None,
         llm_response_mode: LLMResponseMode = LLMResponseMode.TEXT,
+        safety_review_mode: SafetyReviewMode | None = None,
         existing_run_id: str | None = None,
     ) -> None:
         state: AgentGraphState = {
@@ -238,6 +319,7 @@ class AgentGraphRunner:
                 "llm_client_name": llm_client_name,
                 "llm_model": llm_model,
                 "llm_response_mode": llm_response_mode.value,
+                "safety_review_mode": safety_review_mode.value if safety_review_mode else None,
             },
         }
         # Compatibility hook used by recovery tests and internal callers.  The
@@ -253,6 +335,7 @@ class AgentGraphRunner:
         llm_client_name: str | None = None,
         llm_model: str | None = None,
         llm_response_mode: LLMResponseMode = LLMResponseMode.TEXT,
+        safety_review_mode: SafetyReviewMode | None = None,
         existing_run_id: str | None = None,
     ) -> None:
         state: AgentGraphState = {
@@ -267,6 +350,7 @@ class AgentGraphRunner:
                 "llm_client_name": llm_client_name,
                 "llm_model": llm_model,
                 "llm_response_mode": llm_response_mode.value,
+                "safety_review_mode": safety_review_mode.value if safety_review_mode else None,
             },
         }
         self._invoke_graph_input(state, run_id)
@@ -316,12 +400,24 @@ class AgentGraphRunner:
             ),
             _turn_run_manager.set(self.turn_loop.run_manager),
             _turn_run_id.set(run_id),
+            _turn_safety_review_mode.set(
+                SafetyReviewMode(request["safety_review_mode"])
+                if request.get("safety_review_mode") else None
+            ),
         )
+        inference_token = None
         try:
+            run = self._run(run_id)
+            inference_token = _turn_inference_snapshot.set(
+                self.turn_loop._inference_snapshot_for_run(run)
+            )
             await graph.ainvoke(value, config=self._config(run_id))
         except Exception as exc:  # noqa: BLE001 - graph boundary persists every failure.
             self._fail(run_id, exc)
         finally:
+            if inference_token is not None:
+                _turn_inference_snapshot.reset(inference_token)
+            _turn_safety_review_mode.reset(tokens[5])
             _turn_run_id.reset(tokens[4])
             _turn_run_manager.reset(tokens[3])
             _turn_llm_response_mode.reset(tokens[2])
@@ -339,12 +435,24 @@ class AgentGraphRunner:
             ),
             _turn_run_manager.set(self.turn_loop.run_manager),
             _turn_run_id.set(run_id),
+            _turn_safety_review_mode.set(
+                SafetyReviewMode(request["safety_review_mode"])
+                if request.get("safety_review_mode") else None
+            ),
         )
+        inference_token = None
         try:
+            run = self._run(run_id)
+            inference_token = _turn_inference_snapshot.set(
+                self.turn_loop._inference_snapshot_for_run(run)
+            )
             graph.invoke(value, config=self._config(run_id))
         except Exception as exc:  # noqa: BLE001 - graph boundary persists every failure.
             self._fail(run_id, exc)
         finally:
+            if inference_token is not None:
+                _turn_inference_snapshot.reset(inference_token)
+            _turn_safety_review_mode.reset(tokens[5])
             _turn_run_id.reset(tokens[4])
             _turn_run_manager.reset(tokens[3])
             _turn_llm_response_mode.reset(tokens[2])
@@ -365,7 +473,11 @@ class AgentGraphRunner:
                 "run_started",
                 "Agent run started.",
                 stage="run",
-                payload={"session_id": run.session_id, "trace_id": run.trace_id},
+                payload={
+                    "session_id": run.session_id,
+                    "trace_id": run.trace_id,
+                    **self.turn_loop._inference_call_metadata(),
+                },
             )
         return {
             "phase": "initialized",
@@ -376,15 +488,19 @@ class AgentGraphRunner:
     def _prepare_context(self, s: AgentGraphState) -> AgentGraphState:
         self.turn_loop._raise_if_cancel_requested()
         run = self._run(s["run_id"])
+        request = self._request_for_run(run.run_id)
+        turn_user_input = request.get("user_input")
+        if not isinstance(turn_user_input, str) or not turn_user_input.strip():
+            turn_user_input = run.user_input
         session = self.turn_loop.session_service.ensure_session(
             session_id=run.session_id,
-            title=run.user_input[:60] or "Agent Session",
+            title=turn_user_input[:60] or "Agent Session",
             metadata={"entrypoint": "agent.turn"},
         )
         self.turn_loop.session_service.append_message(
             session_id=session.session_id,
             role="user",
-            content=run.user_input,
+            content=turn_user_input,
             payload={"trace_id": run.trace_id, "entrypoint": "agent.turn"},
             message_id=f"agent_graph_user_{run.run_id}",
         )
@@ -399,12 +515,16 @@ class AgentGraphRunner:
         )
         if cached:
             window["cached_tool_observations"] = cached
+        self.turn_loop._assess_configured_fast_path(
+            run_id=run.run_id,
+            session_id=session.session_id,
+            user_input=turn_user_input,
+        )
         data = {
             "context_window": window,
-            "package_catalog": [
-                p.model_dump(mode="json")
-                for p in self.turn_loop.tool_executor.registry.list_packages()
-            ],
+            "package_catalog": self.turn_loop._package_catalog(
+                self.turn_loop._tool_view_for_run(run.run_id)
+            ),
             "expanded_tools": [],
             "observations": list(cached),
             "successful": [],
@@ -419,7 +539,7 @@ class AgentGraphRunner:
             run_id=run.run_id,
             session_id=session.session_id,
             trace_id=run.trace_id,
-            user_input=run.user_input,
+            user_input=turn_user_input,
             context_artifact_ref=ref,
         )
         return {
@@ -465,13 +585,16 @@ class AgentGraphRunner:
         ws, data = self._data(s)
         requested_package = ws.pending_decision.get("package_name")
         package = requested_package or ws.initial_package
+        tool_view = self.turn_loop._tool_view_for_run(ws.run_id)
         # Legacy turns expand the route-selected package before entering the
         # decision loop.  That bootstrap is reflected by expanded_tools, not by
         # a decision observation.  Only an expansion explicitly requested by a
         # later decision belongs in observations, where it can inform the next
         # decision just like the legacy dynamic-expansion path.
         is_initial_expansion = requested_package is None
-        if not isinstance(package, str) or not self.turn_loop._package_exists(package):
+        if not isinstance(package, str) or not self.turn_loop._package_exists(
+            package, tool_view=tool_view
+        ):
             if not is_initial_expansion:
                 data["observations"].append(
                     {
@@ -492,7 +615,7 @@ class AgentGraphRunner:
                     }
                 )
         else:
-            tools = self.turn_loop._tool_payloads_for_package(package)
+            tools = self.turn_loop._tool_payloads_for_package(package, tool_view=tool_view)
             data["expanded_tools"].extend(tools)
             ws.expanded_packages.append(package)
             names = [str(t["name"]) for t in tools if isinstance(t.get("name"), str)]
@@ -524,7 +647,17 @@ class AgentGraphRunner:
         ws, data = self._data(s)
         if ws.step_index >= self.turn_loop.max_decision_steps:
             ws.terminal_reason = "Step limit reached after loading evidence."
-            ws.pending_decision = {"action": "final_answer"}
+            # A pending re-plan rejects final_answer by design. Sending one at
+            # the decision limit would loop decide -> reject forever because
+            # this branch cannot advance the step counter. Route unresolved
+            # plans to the bounded failure answer/finalization path instead.
+            ws.pending_decision = {
+                "action": (
+                    "step_limit_exhausted"
+                    if self.turn_loop._multi_agent_replan_pending(ws.run_id)
+                    else "final_answer"
+                )
+            }
             return self._save(s, ws, data, "step_limit")
         llm = self._models(data["llm_events"], AgentTurnLLMEvent)
         d = self.turn_loop._decide_next_action(
@@ -584,9 +717,115 @@ class AgentGraphRunner:
         ws, data = self._data(s)
         x = ws.pending_decision
         action = str(x.get("action") or "")
+        if action in {"fork_subtasks", "fork_subtasks_invalid"}:
+            self.turn_loop._upgrade_fast_path_for_multi_agent(ws.run_id)
+            outcome = self.turn_loop._handle_fork_subtasks_decision(
+                run_id=ws.run_id,
+                user_input=ws.user_input,
+                operation=x.get("operation"),
+                parse_error=(
+                    x.get("reason") if action == "fork_subtasks_invalid" else None
+                ),
+            )
+            operation_id = outcome.get("operation_id")
+            if isinstance(operation_id, str) and operation_id:
+                data["observations"] = [
+                    item for item in data["observations"]
+                    if not (
+                        isinstance(item, dict)
+                        and item.get("action") == "fork_subtasks"
+                        and item.get("operation_id") == operation_id
+                    )
+                ]
+            data["observations"].append({"action": "fork_subtasks", **outcome})
+            progress = self._models(data["progress_events"], AgentTurnProgressEvent)
+            self.turn_loop._append_progress(
+                progress,
+                type=(
+                    "fork_subtasks_validated"
+                    if outcome.get("status") == "validated"
+                    else "fork_subtasks_rejected"
+                ),
+                stage="planner",
+                status=str(outcome.get("status") or "rejected"),
+                message=str(outcome.get("message") or "Planner fork operation processed."),
+                metadata=self.turn_loop._planner_progress_summary(outcome),
+            )
+            data["progress_events"] = self._dump(progress)
+            if outcome.get("execution_status") == "waiting_user":
+                return self._save(s, ws, data, "fork_waiting_user")
+            if outcome.get("execution_status") == "waiting_confirmation":
+                return self._save(s, ws, data, "fork_waiting_confirmation", "waiting_confirmation")
+            return self._save(
+                s,
+                ws,
+                data,
+                "fork_subtasks_recorded"
+                if outcome.get("status") == "validated"
+                else "fork_subtasks_rejected",
+            )
+        if action in {"plan_patch", "plan_patch_invalid"}:
+            outcome = self.turn_loop._handle_plan_patch_decision(
+                run_id=ws.run_id,
+                operation=x.get("operation"),
+                parse_error=x.get("reason") if action == "plan_patch_invalid" else None,
+            )
+            data["observations"].append({"action": "plan_patch", **outcome})
+            progress = self._models(data["progress_events"], AgentTurnProgressEvent)
+            self.turn_loop._append_progress(
+                progress,
+                type="multi_agent_plan_patched" if outcome.get("status") in {"applied", "waiting_user", "answer_ready", "aborted"} else "multi_agent_plan_patch_rejected",
+                stage="planner",
+                status=str(outcome.get("status") or "rejected"),
+                message=str(outcome.get("message") or "Planner patch processed."),
+                metadata=self.turn_loop._planner_progress_summary(outcome),
+            )
+            data["progress_events"] = self._dump(progress)
+            if outcome.get("status") == "waiting_user":
+                return self._save(s, ws, data, "plan_waiting_user", "waiting_user")
+            if outcome.get("status") == "answer_ready":
+                command_id = str(outcome.get("command_id") or "")
+                accepted = self.turn_loop.resume_user_question_plan(ws.run_id, command_id)
+                if accepted is None:
+                    raise RuntimeError("User continuation journal record is missing.")
+                question_id, answer = accepted
+                self._append_user_answer_observation(
+                    data,
+                    question_id=question_id,
+                    command_id=command_id,
+                    answer=answer,
+                )
+                return self._save(s, ws, data, "plan_patch_answered")
+            if outcome.get("execution_status") == "waiting_confirmation":
+                return self._save(s, ws, data, "fork_waiting_confirmation", "waiting_confirmation")
+            return self._save(
+                s, ws, data,
+                "fork_subtasks_recorded" if outcome.get("status") == "applied" else "fork_subtasks_rejected",
+            )
         if action == "expand_package":
             return self._save(s, ws, data, "operation_expand")
         if action == "final_answer":
+            if self.turn_loop._multi_agent_replan_pending(ws.run_id):
+                data["observations"].append({
+                    "action": "final_answer",
+                    "status": "rejected",
+                    "replan_required": True,
+                    "error": (
+                        "The persisted child plan has unresolved failures. Use a valid "
+                        "plan_patch to retry, degrade, ask the user, or abort before answering."
+                    ),
+                })
+                progress = self._models(data["progress_events"], AgentTurnProgressEvent)
+                self.turn_loop._append_progress(
+                    progress,
+                    type="multi_agent_final_answer_rejected",
+                    stage="planner",
+                    status="rejected",
+                    message="Unresolved child failures require a structured PlanPatch.",
+                )
+                data["progress_events"] = self._dump(progress)
+                ws.pending_decision = {}
+                return self._save(s, ws, data, "operation_rejected")
             return self._save(s, ws, data, "operation_answer")
         if action != "call_tool":
             ws.terminal_reason = (
@@ -626,6 +865,116 @@ class AgentGraphRunner:
         ws.pending_tool_name = name
         ws.pending_tool_input = dict(tool_input)
         return self._save(s, ws, data, "operation_valid")
+
+    def _fork_wait_interrupt(self, s: AgentGraphState) -> AgentGraphState:
+        """Checkpoint the parent coordinator while a child review is pending."""
+
+        self.turn_loop._raise_if_cancel_requested()
+        ws, data = self._data(s)
+        run = self._run(ws.run_id)
+        interrupt(
+            {
+                "run_id": ws.run_id,
+                "confirmation_id": run.metadata.get("confirmation_id"),
+                "child_run_ids": data.get("observations", [])[-1].get(
+                    "waiting_child_run_ids", []
+                ),
+            }
+        )
+        current = self._run(ws.run_id)
+        if current.status.value == "waiting_confirmation":
+            self.turn_loop.run_manager.resume_running(ws.run_id)
+        return self._save(s, ws, data, "fork_resumed")
+
+    def _child_user_wait_interrupt(self, s: AgentGraphState) -> AgentGraphState:
+        """Park the parent graph while the child's own user question is pending."""
+        self.turn_loop._raise_if_cancel_requested()
+        ws, data = self._data(s)
+        last = data.get("observations", [])[-1] if data.get("observations") else {}
+        child_run_ids = tuple(
+            str(value) for value in last.get("waiting_child_run_ids", [])
+            if isinstance(value, str)
+        ) if isinstance(last, dict) else ()
+        payload = {
+            "run_id": ws.run_id,
+            "child_run_ids": list(child_run_ids),
+            "kind": "child_user_question",
+        }
+        active_statuses = {"queued", "running", "waiting_confirmation", "waiting_user"}
+        while True:
+            interrupt(payload)
+            active = [
+                child_id
+                for child_id in child_run_ids
+                if (child := self.turn_loop.run_manager.get_run(child_id)) is not None
+                and child.status.value in active_statuses
+            ]
+            if not active:
+                break
+            payload["active_child_run_ids"] = active
+        return self._save(s, ws, data, "fork_resumed")
+
+    def _user_question_interrupt(self, s: AgentGraphState) -> AgentGraphState:
+        """Pause graph execution until a journaled user answer is committed."""
+        self.turn_loop._raise_if_cancel_requested()
+        ws, data = self._data(s)
+        run = self._run(ws.run_id)
+        question = run.metadata.get("pending_user_question")
+        question_id = question.get("question_id") if isinstance(question, dict) else None
+        interrupt({
+            "run_id": ws.run_id,
+            "question_id": question_id,
+            "question": question.get("question") if isinstance(question, dict) else None,
+        })
+        current = self._run(ws.run_id)
+        command_id = current.metadata.get("pending_user_answer_command_id")
+        accepted = (
+            self.turn_loop.resume_user_question_plan(ws.run_id, command_id)
+            if isinstance(command_id, str) and command_id
+            else None
+        )
+        if accepted is None:
+            raise RuntimeError("User-question interrupt resumed without a journaled answer.")
+        accepted_question_id, answer = accepted
+        self._append_user_answer_observation(
+            data,
+            question_id=accepted_question_id,
+            command_id=command_id,
+            answer=answer,
+        )
+        progress = self._models(data["progress_events"], AgentTurnProgressEvent)
+        self.turn_loop._append_progress(
+            progress,
+            type="multi_agent_user_answer_received",
+            stage="planner",
+            status="completed",
+            message="A user continuation was added to the Planner observations.",
+            metadata={"question_id": accepted_question_id, "command_id": command_id},
+        )
+        data["progress_events"] = self._dump(progress)
+        return self._save(s, ws, data, "plan_patch_answered")
+
+    @staticmethod
+    def _append_user_answer_observation(
+        data: dict[str, Any], *, question_id: str, command_id: str, answer: str
+    ) -> None:
+        if not question_id or not command_id or not answer:
+            raise RuntimeError("Journaled user continuation is incomplete.")
+        observations = data.get("observations", [])
+        if any(
+            isinstance(item, dict)
+            and item.get("action") == "user_answer"
+            and item.get("command_id") == command_id
+            for item in observations
+        ):
+            return
+        observations.append({
+            "action": "user_answer",
+            "question_id": question_id,
+            "command_id": command_id,
+            "answer": answer,
+        })
+        data["observations"] = observations
 
     def _safety(self, s: AgentGraphState) -> AgentGraphState:
         self.turn_loop._raise_if_cancel_requested()
@@ -762,23 +1111,27 @@ class AgentGraphRunner:
         ws, data = self._data(s)
         llm = self._models(data["llm_events"], AgentTurnLLMEvent)
         answer = (
-            self.turn_loop._answer_from_context_with_llm(
-                user_input=ws.user_input,
-                route=ws.route,
-                context_window=data["context_window"],
-                llm_events=llm,
-            )
-            if ws.initial_package is None
-            else self.turn_loop._answer_with_llm(
-                user_input=ws.user_input,
-                route=ws.route,
-                context_window=data["context_window"],
-                observations=data["observations"],
-                final_decision={
-                    "action": "final_answer",
-                    "reason": ws.terminal_reason or ws.pending_decision.get("reason"),
-                },
-                llm_events=llm,
+            self.turn_loop._unresolved_multi_agent_answer()
+            if self.turn_loop._multi_agent_replan_pending(ws.run_id)
+            else (
+                self.turn_loop._answer_from_context_with_llm(
+                    user_input=ws.user_input,
+                    route=ws.route,
+                    context_window=data["context_window"],
+                    llm_events=llm,
+                )
+                if ws.initial_package is None
+                else self.turn_loop._answer_with_llm(
+                    user_input=ws.user_input,
+                    route=ws.route,
+                    context_window=data["context_window"],
+                    observations=data["observations"],
+                    final_decision={
+                        "action": "final_answer",
+                        "reason": ws.terminal_reason or ws.pending_decision.get("reason"),
+                    },
+                    llm_events=llm,
+                )
             )
         ) or "我还没有获得足够的有效证据来完成这个请求。请重试或提供更多上下文。"
         data["llm_events"] = self._dump(llm)
@@ -802,6 +1155,10 @@ class AgentGraphRunner:
             answer=ws.terminal_answer or "",
             tool_events=self._models(data["tool_events"], AgentTurnToolEvent),
         )
+        self.turn_loop._complete_configured_fast_path(
+            run_id=ws.run_id,
+            answer=ws.terminal_answer or "",
+        )
         data["warnings"] = self._dump(warnings)
         progress = self._models(data["progress_events"], AgentTurnProgressEvent)
         for warning in warnings:
@@ -820,23 +1177,7 @@ class AgentGraphRunner:
         self.turn_loop._raise_if_cancel_requested()
         ws, data = self._data(s)
         answer = ws.terminal_answer or ""
-        updated = self.turn_loop.session_service.record_context_exchange(
-            session_id=ws.session_id,
-            user_input=ws.user_input,
-            agent_answer=answer,
-            trace_id=ws.trace_id,
-            effect_id=f"agent_graph_context_exchange_{ws.run_id}",
-            token_budget=self.turn_loop.session_context_token_budget,
-            context_summarizer=lambda summary, messages, recent, budget: (
-                self.turn_loop._summarize_context_window(
-                    summary=summary,
-                    messages_to_summarize=messages,
-                    retained_recent_messages=recent,
-                    token_budget=budget,
-                    llm_events=self._models(data["llm_events"], AgentTurnLLMEvent),
-                )
-            ),
-        )
+        self.turn_loop._finalize_multi_agent_plan(ws.run_id)
         result = AgentTurnResult(
             run_id=ws.run_id,
             session_id=ws.session_id,
@@ -858,6 +1199,75 @@ class AgentGraphRunner:
         )
         log = self.turn_loop._write_log(result=result, user_input=ws.user_input)
         result = result.model_copy(update={"log_path": str(log)})
+        # Persist the recoverable result before competing with cancellation.  The
+        # durable completion claim makes cancel/complete mutually exclusive while
+        # retaining replay-safe finalization after a process crash.
+        ref = self._store_result(result)
+        completed_snapshot = {
+            "session_id": result.session_id,
+            "trace_id": result.trace_id,
+            "answer": result.answer,
+            "selected_package": result.selected_package,
+            "initial_package": result.initial_package,
+            "expanded_packages": result.expanded_packages,
+            "used_packages": result.used_packages,
+            "active_package": result.active_package,
+            "result_artifact_ref": ref,
+        }
+        if not self.turn_loop.run_manager.claim_completion(ws.run_id):
+            self.turn_loop._raise_if_cancel_requested()
+            raise RuntimeError(f"Agent run cannot claim completion: {ws.run_id}")
+        final_run = self._run(ws.run_id)
+        final_plan = final_run.metadata.get("multi_agent_plan")
+        if isinstance(final_plan, dict) and final_plan.get("status") == "failed":
+            reason = "Multi-Agent plan ended with failed or blocked child steps."
+            try:
+                self.turn_loop.run_manager.flush_events()
+            except Exception as exc:
+                self.turn_loop.run_manager.fail_completion_claim(
+                    ws.run_id, error_type=type(exc).__name__, error=str(exc),
+                    log_path=str(log),
+                )
+                raise
+            self.turn_loop.run_manager.append_event(
+                ws.run_id,
+                "run_failed",
+                reason,
+                stage="run",
+                payload={"error_type": "MultiAgentPlanFailed"},
+            )
+            self.turn_loop.run_manager.fail_completion_claim(
+                ws.run_id,
+                error_type="MultiAgentPlanFailed",
+                error=reason,
+                log_path=str(log),
+            )
+            with self._lock:
+                self._results[ws.run_id] = result
+            return {
+                "phase": "finalized",
+                "status": "failed",
+                "result_artifact_ref": ref,
+                "result_summary": {"run_id": ws.run_id, "answer_chars": len(answer), "log_path": str(log)},
+            }
+
+        updated = self.turn_loop.session_service.record_context_exchange(
+            session_id=ws.session_id,
+            user_input=ws.user_input,
+            agent_answer=answer,
+            trace_id=ws.trace_id,
+            effect_id=f"agent_graph_context_exchange_{ws.run_id}",
+            token_budget=self.turn_loop.session_context_token_budget,
+            context_summarizer=lambda summary, messages, recent, budget: (
+                self.turn_loop._summarize_context_window(
+                    summary=summary,
+                    messages_to_summarize=messages,
+                    retained_recent_messages=recent,
+                    token_budget=budget,
+                    llm_events=self._models(data["llm_events"], AgentTurnLLMEvent),
+                )
+            ),
+        )
         self.turn_loop.session_service.append_message(
             session_id=ws.session_id,
             role="agent",
@@ -878,6 +1288,17 @@ class AgentGraphRunner:
             },
             message_id=f"agent_graph_agent_{ws.run_id}",
         )
+        try:
+            # A completed run promises replayable token events.  Flush every
+            # asynchronous delta before emitting the durable terminal event.
+            self.turn_loop.run_manager.flush_events()
+        except Exception as exc:
+            self.turn_loop.run_manager.fail_completion_claim(
+                ws.run_id,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            raise
         # Do not depend on ContextVar lookup during a worker-thread graph node.
         # The durable manager remains the project-owned lifecycle authority.
         if not any(
@@ -900,27 +1321,19 @@ class AgentGraphRunner:
                     "log_path": result.log_path,
                 },
             )
-        # The completed state is a recovery promise: persist the terminal
-        # result before publishing it.  If the process dies after this point,
-        # ``_take_result`` can reload the artifact even before LangGraph has
-        # committed the final node checkpoint.
-        ref = self._store_result(result)
-        completed_snapshot = {
-            "session_id": result.session_id,
-            "trace_id": result.trace_id,
-            "answer": result.answer,
-            "selected_package": result.selected_package,
-            "initial_package": result.initial_package,
-            "expanded_packages": result.expanded_packages,
-            "used_packages": result.used_packages,
-            "active_package": result.active_package,
-            "result_artifact_ref": ref,
-        }
-        self.turn_loop.run_manager.complete_run(
-            ws.run_id,
-            result_snapshot=completed_snapshot,
-            log_path=result.log_path,
-        )
+        run = self._run(ws.run_id)
+        if run.parent_run_id is not None:
+            self.turn_loop.run_manager.complete_child_run(
+                ws.run_id,
+                result_snapshot=completed_snapshot,
+                log_path=result.log_path,
+            )
+        else:
+            self.turn_loop.run_manager.complete_run(
+                ws.run_id,
+                result_snapshot=completed_snapshot,
+                log_path=result.log_path,
+            )
         with self._lock:
             self._results[ws.run_id] = result
         return {
@@ -948,6 +1361,13 @@ class AgentGraphRunner:
 
     def _after_validate(self, s: AgentGraphState) -> str:
         return {
+            "fork_subtasks_recorded": "decide",
+            "fork_subtasks_rejected": "decide",
+            "multi_agent_plan_patched": "decide",
+            "fork_waiting_confirmation": "fork_wait",
+            "fork_waiting_user": "child_user_wait",
+            "plan_waiting_user": "user_question",
+            "plan_patch_answered": "decide",
             "operation_expand": "expand",
             "operation_valid": "safety",
             "operation_answer": "answer",
@@ -1032,11 +1452,19 @@ class AgentGraphRunner:
         session = self.turn_loop.session_service.ensure_session(
             session_id=ws.session_id, title="Agent Session", metadata={"entrypoint": "agent.turn"}
         )
+        run = self._run(ws.run_id)
+        views = run.metadata.get("context_views", {})
+        tool_view_data = views.get("tool") if isinstance(views, dict) else None
         return ToolContext(
             session_id=ws.session_id,
             trace_id=ws.trace_id,
             context_id=ws.trace_id,
-            workspace_root=_session_workspace_path(session),
+            workspace_root=(
+                _session_workspace_path(session)
+                or self.turn_loop.default_workspace_root
+            ),
+            tool_view=ToolView.model_validate(tool_view_data) if tool_view_data else None,
+            run_id=ws.run_id,
         )
 
     def _fail(self, run_id: str, exc: Exception) -> None:
@@ -1066,6 +1494,12 @@ class AgentGraphRunner:
         if run.status.value == "waiting_confirmation":
             raise AgentTurnWaitingForConfirmation(
                 run_id=run_id, review_id=run.metadata.get("confirmation_id")
+            )
+        if run.status.value == "waiting_user":
+            question = run.metadata.get("pending_user_question")
+            raise AgentTurnWaitingForUser(
+                run_id=run_id,
+                question_id=question.get("question_id") if isinstance(question, dict) else None,
             )
         if run.status.value in {"failed", "cancelled"}:
             raise RuntimeError(

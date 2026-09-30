@@ -4,6 +4,8 @@ from pathlib import Path
 
 from app.core.config import get_settings
 from app.core.runtime import LocalKnowledgeAgentRuntime
+from app.core.context_driver import ToolView
+from app.core.multi_agent import SideEffectLevel
 from app.core.tools import ToolContext
 
 
@@ -15,6 +17,18 @@ def _runtime(tmp_path: Path, monkeypatch) -> LocalKnowledgeAgentRuntime:
     monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
     get_settings.cache_clear()
     return LocalKnowledgeAgentRuntime(get_settings())
+
+
+def _active_child_run_id(runtime: LocalKnowledgeAgentRuntime) -> str:
+    manager = runtime.agent_run_manager
+    parent = manager.create_run(session_id="parent_session", user_input="parent")
+    manager.mark_running(parent.run_id)
+    child = manager.create_child_run(
+        parent_run_id=parent.run_id, plan_id="scope_plan", step_id="scope_step",
+        attempt=1, user_input="child",
+    )
+    manager.mark_child_running(child.run_id)
+    return child.run_id
 
 
 def test_filesystem_read_file_returns_bounded_slice_and_sha(tmp_path, monkeypatch):
@@ -88,6 +102,37 @@ def test_filesystem_read_rejects_paths_outside_workspace(tmp_path, monkeypatch):
 
     assert result.status == "failed"
     assert "outside allowed workspace roots" in (result.error or "")
+
+
+def test_filesystem_tool_executor_rejects_paths_outside_narrow_child_scope(tmp_path, monkeypatch):
+    runtime = _runtime(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    narrow = workspace / "allowed"
+    narrow.mkdir()
+    allowed = narrow / "ok.txt"
+    denied = workspace / "outside-narrow.txt"
+    allowed.write_text("allowed", encoding="utf-8")
+    denied.write_text("denied", encoding="utf-8")
+    view = ToolView(
+        snapshot_id="child_fs_snapshot", child_run_id=_active_child_run_id(runtime),
+        allowed_packages=("filesystem",),
+        allowed_tools=("filesystem.read_file", "filesystem.edit_file"),
+        allowed_paths=(str(narrow),),
+        side_effect_level=SideEffectLevel.EXTERNAL,
+    )
+    context = ToolContext(session_id="child_fs", workspace_root=str(workspace), tool_view=view)
+
+    allowed_result = runtime.tool_executor.execute(
+        invocation_id="child-fs-allowed", tool_name="filesystem.read_file",
+        tool_input={"path": "allowed/ok.txt"}, context=context,
+    )
+    assert allowed_result.status == "completed", allowed_result.error
+    denied_result = runtime.tool_executor.execute(
+        invocation_id="child-fs-denied", tool_name="filesystem.read_file",
+        tool_input={"path": str(denied)}, context=context,
+    )
+    assert denied_result.status == "rejected"
+    assert "outside the child workspace scope" in (denied_result.error or "")
 
 
 def test_filesystem_edit_file_requires_matching_sha_and_unique_old_text(

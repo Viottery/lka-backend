@@ -7,6 +7,7 @@ from typing import Protocol
 from app.core.agent_runs import AgentRunRecord
 from app.core.agent_turn import AgentTurnResult
 from app.core.llm import LLMResponseMode
+from app.core.safety import SafetyReviewMode
 
 
 class AgentTurnRunner(Protocol):
@@ -20,6 +21,7 @@ class AgentTurnRunner(Protocol):
         llm_client_name: str | None = None,
         llm_model: str | None = None,
         llm_response_mode: LLMResponseMode = LLMResponseMode.TEXT,
+        safety_review_mode: SafetyReviewMode | None = None,
         existing_run_id: str | None = None,
     ) -> AgentTurnResult: ...
 
@@ -31,6 +33,7 @@ class AgentTurnRunner(Protocol):
         llm_client_name: str | None = None,
         llm_model: str | None = None,
         llm_response_mode: LLMResponseMode = LLMResponseMode.TEXT,
+        safety_review_mode: SafetyReviewMode | None = None,
         existing_run_id: str | None = None,
     ) -> AgentTurnResult: ...
 

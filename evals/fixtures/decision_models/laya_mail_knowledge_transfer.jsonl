@@ -1,0 +1,10 @@
+{"id":"MK01","split":"transfer","task":"package","request":"查一下去年收到的保险续费提醒邮件。","context":"本轮没有邮件证据。","expected":"mail"}
+{"id":"MK02","split":"transfer","task":"package","request":"在导入的邮件处理规范文档里查同步周期。","context":"规范文档已导入本地知识库。","expected":"knowledge"}
+{"id":"MK03","split":"transfer","task":"package","request":"找最近来自财务部的发票邮件。","context":"需要查询收件箱。","expected":"mail"}
+{"id":"MK04","split":"transfer","task":"package","request":"在已索引的项目笔记里找报销流程。","context":"这是本地笔记，不是邮箱消息。","expected":"knowledge"}
+{"id":"MK05","split":"transfer","task":"package","request":"邮件里上周提到的上线窗口是什么时间？","context":"需要读取邮件证据。","expected":"mail"}
+{"id":"MK06","split":"transfer","task":"package","request":"从已导入的网页快照查邮箱设置教程。","context":"教程在本地网页快照中。","expected":"knowledge"}
+{"id":"MK07","split":"transfer","task":"package","request":"采购组有没有发来新的报价？","context":"需要查看已同步邮件。","expected":"mail"}
+{"id":"MK08","split":"transfer","task":"package","request":"在本地事故复盘里查邮件发送失败的根因。","context":"复盘是已导入知识文档。","expected":"knowledge"}
+{"id":"MK09","split":"transfer","task":"package","request":"找到客户昨天发的合同修订说明。","context":"这是客户通过邮箱发来的消息。","expected":"mail"}
+{"id":"MK10","split":"transfer","task":"package","request":"从导入的培训资料里找邮件礼仪章节。","context":"培训资料在知识库里。","expected":"knowledge"}
