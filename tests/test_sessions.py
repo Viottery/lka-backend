@@ -5,24 +5,36 @@ import sqlite3
 from types import SimpleNamespace
 
 import pytest
+from fastapi import HTTPException
 
 from app.api.main import create_app
 from app.api.routes.mail import import_mail
 from app.api.routes.sessions import (
+    SessionRenameRequest,
     append_session_message,
     create_session,
+    delete_session,
     get_session,
+    list_deleted_sessions,
     list_sessions,
+    rename_session,
+    restore_session,
+    set_session_workspace,
 )
-from app.api.schemas import MailImportRequest
-from app.api.schemas import SessionAppendMessageRequest, SessionCreateRequest
-from app.api.schemas import SessionWorkspaceUpdateRequest
-from app.api.routes.sessions import set_session_workspace
+from app.api.routes.sessions import (
+    router as sessions_router,
+)
+from app.api.schemas import (
+    MailImportRequest,
+    SessionAppendMessageRequest,
+    SessionCreateRequest,
+    SessionWorkspaceUpdateRequest,
+)
 from app.core.config import get_settings
+from app.core.prompt_tokens import PromptTokenCounter
 from app.core.sessions import SessionService
 from app.core.tools import ToolContext
-from app.storage.db import connect
-from app.storage.db import init_db
+from app.storage.db import connect, init_db
 
 
 def test_parallel_sessions_and_mail_tool_access_are_independent(tmp_path, monkeypatch):
@@ -113,6 +125,164 @@ def test_parallel_sessions_and_mail_tool_access_are_independent(tmp_path, monkey
     assert {first_session_id, second_session_id}.issubset(listed_ids)
 
 
+def test_delete_session_persists_tombstone_and_hides_session(tmp_path, monkeypatch):
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
+    get_settings.cache_clear()
+
+    app = create_app()
+    request = SimpleNamespace(app=app)
+    created = create_session(
+        SessionCreateRequest(title="delete me", initial_message="keep the audit"),
+        request,
+    )
+    session_id = created.session.session_id
+    service = app.state.runtime.session_service
+
+    assert delete_session(session_id, request) is None
+    assert service.get_session_or_none(session_id=session_id) is None
+    assert all(s.session_id != session_id for s in list_sessions(request, limit=50).sessions)
+    with pytest.raises(HTTPException) as get_error:
+        get_session(session_id, request)
+    assert get_error.value.status_code == 404
+    with pytest.raises(HTTPException) as repeat_error:
+        delete_session(session_id, request)
+    assert repeat_error.value.status_code == 404
+
+    with pytest.raises(KeyError, match="Session is deleted"):
+        service.ensure_session(session_id=session_id)
+    with pytest.raises(HTTPException) as append_error:
+        append_session_message(
+            session_id,
+            SessionAppendMessageRequest(role="user", content="do not revive"),
+            request,
+        )
+    assert append_error.value.status_code == 404
+
+    conn = connect(app.state.runtime.db_path)
+    try:
+        row = conn.execute(
+            "SELECT status FROM agent_sessions WHERE session_id = ?", (session_id,)
+        ).fetchone()
+        messages = conn.execute(
+            "SELECT COUNT(*) AS n FROM agent_session_messages WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()["n"]
+    finally:
+        conn.close()
+    assert row["status"] == "deleted"
+    assert messages == 1
+
+
+def test_deleted_sessions_can_be_listed_and_restored(tmp_path, monkeypatch):
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
+    get_settings.cache_clear()
+
+    app = create_app()
+    request = SimpleNamespace(app=app)
+    created = create_session(
+        SessionCreateRequest(title="restore me", initial_message="preserve this message"),
+        request,
+    )
+    session_id = created.session.session_id
+    assert delete_session(session_id, request) is None
+
+    service_after_restart = SessionService(lambda: connect(app.state.runtime.db_path))
+    deleted = service_after_restart.list_deleted_sessions(limit=50)
+    assert [session.session_id for session in deleted.sessions] == [session_id]
+
+    route_paths = [route.path for route in sessions_router.routes]
+    assert route_paths.index("/sessions/deleted") < route_paths.index("/sessions/{session_id}")
+    assert [session.session_id for session in list_deleted_sessions(request, limit=50).sessions] == [
+        session_id
+    ]
+    assert [
+        session.session_id
+        for session in list_deleted_sessions(request, limit=50, q="preserve this").sessions
+    ] == [session_id]
+    assert list_deleted_sessions(request, limit=50, q="missing").sessions == []
+    restored_response = restore_session(session_id, request)
+    assert restored_response.session.status == "active"
+    assert [message.content for message in restored_response.messages] == [
+        "preserve this message"
+    ]
+    assert [s.session_id for s in list_sessions(request, limit=50).sessions] == [session_id]
+    assert list_deleted_sessions(request, limit=50).sessions == []
+
+    with pytest.raises(HTTPException) as missing_restore:
+        restore_session("missing_session", request)
+    assert missing_restore.value.status_code == 404
+
+
+def test_session_search_and_offset_pagination_cover_full_history(tmp_path, monkeypatch):
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
+    get_settings.cache_clear()
+
+    app = create_app()
+    request = SimpleNamespace(app=app)
+    service = app.state.runtime.session_service
+    for index in range(7):
+        session = service.create_session(title=f"Routine {index}").session
+        if index == 0:
+            service.append_message(
+                session_id=session.session_id,
+                role="user",
+                content="needle in an older conversation",
+            )
+    # The matching message belongs to a session outside the unfiltered first page.
+    assert list_sessions(request, limit=2, q="needle").sessions[0].title == "Routine 0"
+    assert len(list_sessions(request, limit=2, q="Routine").sessions) == 2
+    first_page = list_sessions(request, limit=3, offset=0)
+    second_page = list_sessions(request, limit=3, offset=3)
+    assert {session.session_id for session in first_page.sessions}.isdisjoint(
+        session.session_id for session in second_page.sessions
+    )
+    assert len(first_page.sessions) == len(second_page.sessions) == 3
+
+
+def test_session_rename_persists_custom_title_and_rejects_deleted_or_missing(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
+    get_settings.cache_clear()
+
+    app = create_app()
+    request = SimpleNamespace(app=app)
+    created = create_session(
+        SessionCreateRequest(title="Generated title", initial_message="keep this message"),
+        request,
+    )
+    session_id = created.session.session_id
+
+    renamed = rename_session(session_id, SessionRenameRequest(title="  Review invoices  "), request)
+    assert renamed.session.title == "Review invoices"
+    assert renamed.session.metadata["title_is_custom"] is True
+    assert [message.content for message in renamed.messages] == ["keep this message"]
+
+    service_after_restart = SessionService(lambda: connect(app.state.runtime.db_path))
+    persisted = service_after_restart.get_session(session_id=session_id)
+    assert persisted.session.title == "Review invoices"
+    assert persisted.session.metadata["title_is_custom"] is True
+
+    assert delete_session(session_id, request) is None
+    with pytest.raises(HTTPException) as deleted_error:
+        rename_session(session_id, SessionRenameRequest(title="Hidden"), request)
+    assert deleted_error.value.status_code == 404
+    with pytest.raises(HTTPException) as missing_error:
+        rename_session("missing_session", SessionRenameRequest(title="Missing"), request)
+    assert missing_error.value.status_code == 404
+
+
+def test_session_rename_rejects_blank_and_overlong_titles():
+    with pytest.raises(ValueError):
+        SessionRenameRequest(title="   ")
+    with pytest.raises(ValueError):
+        SessionRenameRequest(title="x" * 41)
+
+
 def test_session_context_window_summarizes_old_messages(tmp_path, monkeypatch):
     monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
@@ -142,6 +312,55 @@ def test_session_context_window_summarizes_old_messages(tmp_path, monkeypatch):
     assert "alpha" in window.summary
     assert window.recent_messages
     assert any("second" in message.content for message in window.recent_messages)
+
+
+def test_session_window_uses_configured_tokenizer_for_estimate_and_trim(tmp_path, monkeypatch):
+    tokenizers = pytest.importorskip("tokenizers")
+    tokenizer = tokenizers.Tokenizer(
+        tokenizers.models.WordLevel(
+            vocab={"[UNK]": 0, "alpha": 1, "beta": 2, "gamma": 3},
+            unk_token="[UNK]",
+        )
+    )
+    tokenizer.pre_tokenizer = tokenizers.pre_tokenizers.Whitespace()
+    tokenizer_path = tmp_path / "tokenizer.json"
+    tokenizer.save(str(tokenizer_path))
+    counter = PromptTokenCounter(tokenizer_path)
+
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    config_path = tmp_path / "local.toml"
+    config_path.write_text(
+        '[llm]\ndefault_client = "local"\n'
+        '[[llm.clients]]\nname = "local"\nprovider = "mock"\n'
+        'default_model = "demo"\ncontext_window_tokens = 100000\n'
+        f'tokenizer_json_path = "{tokenizer_path}"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(config_path))
+    get_settings.cache_clear()
+    app = create_app()
+    service = app.state.runtime.session_service
+    assert service._context_token_counter is not None
+    assert service.context_token_count_method == "local_tokenizers_json"
+    with service.use_context_token_counter(PromptTokenCounter()):
+        assert service.context_token_count_method == "utf8_byte_upper_bound"
+        assert service._context_token_estimate("你好", []) == len("你好\n".encode())
+    assert service.context_token_count_method == "local_tokenizers_json"
+    service.ensure_session(session_id="tokenized_window")
+    window = service.record_context_exchange(
+        session_id="tokenized_window", user_input="alpha beta",
+        agent_answer="gamma", trace_id="tokenized_trace", token_budget=100,
+    )
+    visible = window.summary + "\n" + "\n".join(
+        message.content for message in window.recent_messages
+    )
+    assert window.token_estimate == counter.count_text(visible).count
+    assert service.get_context_window(session_id="tokenized_window").token_estimate == window.token_estimate
+
+    trimmed = service._trim_summary_for_budget(
+        summary="alpha beta gamma " * 12, messages=[], token_budget=5
+    )
+    assert service._context_token_estimate(trimmed, []) <= 5
 
 
 def test_session_workspace_controls_file_and_bash_tool_roots(tmp_path, monkeypatch):

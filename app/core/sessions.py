@@ -5,11 +5,15 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Callable
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import UTC, datetime
 from hashlib import sha1
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
+
+from app.core.prompt_tokens import PromptTokenCounter
 
 SessionRole = Literal["user", "agent", "system", "tool"]
 
@@ -30,6 +34,7 @@ class AgentSession(BaseModel):
     status: str
     metadata: dict[str, Any] = Field(default_factory=dict)
     workspace: SessionWorkspace | None = None
+    project_id: str | None = None
     created_at: str
     updated_at: str
 
@@ -62,6 +67,7 @@ class AgentSessionContextWindow(BaseModel):
     session_id: str
     token_budget: int = 65_536
     summary: str = ""
+    summary_metadata: dict[str, Any] = Field(default_factory=dict)
     recent_messages: list[SessionRecentMessage] = Field(default_factory=list)
     token_estimate: int = 0
     updated_at: str
@@ -81,8 +87,36 @@ class SessionService:
 
     default_context_token_budget = 65_536
 
-    def __init__(self, conn_factory: Callable[[], sqlite3.Connection]) -> None:
+    def __init__(
+        self,
+        conn_factory: Callable[[], sqlite3.Connection],
+        *,
+        context_token_counter: PromptTokenCounter | None = None,
+    ) -> None:
         self._conn_factory = conn_factory
+        self._context_token_counter = context_token_counter
+        self._turn_context_counter: ContextVar[PromptTokenCounter | None] = ContextVar(
+            "session_context_counter", default=None
+        )
+
+    @contextmanager
+    def use_context_token_counter(self, counter: PromptTokenCounter):
+        """Use the selected turn model's tokenizer without changing background jobs."""
+        token = self._turn_context_counter.set(counter)
+        try:
+            yield
+        finally:
+            self._turn_context_counter.reset(token)
+
+    def _active_context_token_counter(self) -> PromptTokenCounter | None:
+        return self._turn_context_counter.get() or self._context_token_counter
+
+    @property
+    def context_token_count_method(self) -> str:
+        counter = self._active_context_token_counter()
+        if counter is None:
+            return "legacy_chars_per_4"
+        return counter.count_text("").method
 
     def create_session(
         self,
@@ -139,6 +173,12 @@ class SessionService:
             now = _now_iso()
             conn = self._conn_factory()
             try:
+                tombstone = conn.execute(
+                    "SELECT 1 FROM agent_sessions WHERE session_id = ? AND status = 'deleted'",
+                    (session_id,),
+                ).fetchone()
+                if tombstone is not None:
+                    raise KeyError(f"Session is deleted: {session_id}")
                 conn.execute(
                     """
                     INSERT INTO agent_sessions(
@@ -165,17 +205,67 @@ class SessionService:
 
         return self.create_session(title=title, metadata=metadata).session
 
-    def list_sessions(self, *, limit: int = 50) -> AgentSessionList:
+    def list_sessions(
+        self, *, limit: int = 50, offset: int = 0, q: str | None = None,
+        project_id: str | None = None,
+    ) -> AgentSessionList:
+        return self._list_sessions(
+            status_clause="status != 'deleted'", limit=limit, offset=offset, q=q,
+            project_id=project_id,
+        )
+
+    def list_deleted_sessions(
+        self, *, limit: int = 50, offset: int = 0, q: str | None = None
+    ) -> AgentSessionList:
+        return self._list_sessions(
+            status_clause="status = 'deleted'", limit=limit, offset=offset, q=q
+        )
+
+    def _list_sessions(
+        self, *, status_clause: str, limit: int, offset: int, q: str | None,
+        project_id: str | None = None,
+    ) -> AgentSessionList:
+        query = q.strip() if q else ""
+        search_clause = ""
+        params: list[Any] = []
+        if query:
+            # Treat q as literal substring text; LIKE metacharacters are escaped.
+            escaped_query = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            pattern = f"%{escaped_query}%"
+            search_clause = """
+                AND (
+                    title LIKE ? ESCAPE '\\'
+                    OR EXISTS (
+                        SELECT 1 FROM agent_session_messages AS message
+                        WHERE message.session_id = agent_sessions.session_id
+                          AND message.content LIKE ? ESCAPE '\\'
+                    )
+                )
+            """
+            params.extend((pattern, pattern))
+        if project_id is not None:
+            search_clause += """ AND (
+                json_extract(metadata,'$.project_id')=? OR (
+                    json_extract(metadata,'$.project_id') IS NULL AND
+                    json_extract(metadata,'$.workspace.backend_path') IN (
+                        SELECT path_key FROM memory_project_paths WHERE project_id=? AND active=1
+                    )
+                ))"""
+            params.extend((project_id, project_id))
+        params.extend((limit, offset))
         conn = self._conn_factory()
         try:
             rows = conn.execute(
-                """
+                f"""
                 SELECT session_id, title, status, metadata, created_at, updated_at
                 FROM agent_sessions
-                ORDER BY updated_at DESC
+                WHERE {status_clause}
+                {search_clause}
+                ORDER BY updated_at DESC, session_id DESC
                 LIMIT ?
+                OFFSET ?
                 """,
-                (limit,),
+                params,
             ).fetchall()
         finally:
             conn.close()
@@ -205,6 +295,90 @@ class SessionService:
             messages=[self._message_from_row(row) for row in rows],
         )
 
+    def rename_session(self, *, session_id: str, title: str) -> AgentSessionDetail:
+        """Persist a user-selected title without changing other session metadata."""
+
+        clean_title = title.strip()
+        if not clean_title or len(clean_title) > 40:
+            raise ValueError("title must contain 1 to 40 non-whitespace characters")
+
+        conn = self._conn_factory()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT metadata FROM agent_sessions
+                WHERE session_id = ? AND status != 'deleted'
+                """,
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Session not found: {session_id}")
+
+            metadata = json.loads(row["metadata"] or "{}")
+            metadata["title_is_custom"] = True
+            cursor = conn.execute(
+                """
+                UPDATE agent_sessions
+                SET title = ?, metadata = ?, updated_at = ?
+                WHERE session_id = ? AND status != 'deleted'
+                """,
+                (
+                    clean_title,
+                    json.dumps(metadata, ensure_ascii=False),
+                    _now_iso(),
+                    session_id,
+                ),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(f"Session not found: {session_id}")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+        return self.get_session(session_id=session_id)
+
+    def delete_session(self, *, session_id: str) -> bool:
+        """Soft delete a session while retaining its local audit and run data."""
+
+        now = _now_iso()
+        conn = self._conn_factory()
+        try:
+            cursor = conn.execute(
+                """
+                UPDATE agent_sessions
+                SET status = 'deleted', updated_at = ?
+                WHERE session_id = ? AND status != 'deleted'
+                """,
+                (now, session_id),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+        finally:
+            conn.close()
+
+    def restore_session(self, *, session_id: str) -> bool:
+        """Restore a soft-deleted session without changing its associated data."""
+
+        now = _now_iso()
+        conn = self._conn_factory()
+        try:
+            cursor = conn.execute(
+                """
+                UPDATE agent_sessions
+                SET status = 'active', updated_at = ?
+                WHERE session_id = ? AND status = 'deleted'
+                """,
+                (now, session_id),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+        finally:
+            conn.close()
+
     def get_session_or_none(self, *, session_id: str) -> AgentSession | None:
         conn = self._conn_factory()
         try:
@@ -212,7 +386,7 @@ class SessionService:
                 """
                 SELECT session_id, title, status, metadata, created_at, updated_at
                 FROM agent_sessions
-                WHERE session_id = ?
+                WHERE session_id = ? AND status != 'deleted'
                 """,
                 (session_id,),
             ).fetchone()
@@ -225,12 +399,17 @@ class SessionService:
         *,
         session_id: str,
         workspace: SessionWorkspace,
+        project_id: str | None = None,
     ) -> AgentSession:
         session = self.get_session_or_none(session_id=session_id)
         if session is None:
             raise KeyError(f"Session not found: {session_id}")
         metadata = dict(session.metadata)
         metadata["workspace"] = workspace.model_dump(mode="json")
+        if project_id is not None:
+            metadata["project_id"] = project_id
+        else:
+            metadata.pop("project_id", None)
         now = _now_iso()
         conn = self._conn_factory()
         try:
@@ -258,7 +437,15 @@ class SessionService:
         content: str,
         payload: dict[str, Any] | None = None,
         message_id: str | None = None,
+        persisted_message_callback: Callable[[sqlite3.Connection, AgentSessionMessage], None]
+        | None = None,
     ) -> AgentSessionMessage:
+        """Persist a message and optionally enqueue work in the same transaction.
+
+        The callback runs only for `role='agent'`, after insertion and before commit. It
+        receives the live connection and persisted message; callback failure rolls both
+        message and outbox writes back. Use an idempotency key in the callback's outbox.
+        """
         self.ensure_session(session_id=session_id)
         now = _now_iso()
         message_id = message_id or _stable_id("session_msg", session_id, role, content, now)
@@ -266,6 +453,7 @@ class SessionService:
 
         conn = self._conn_factory()
         try:
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 """
                 INSERT OR IGNORE INTO agent_session_messages(
@@ -290,18 +478,19 @@ class SessionService:
                 """,
                 (now, session_id),
             )
+            persisted = AgentSessionMessage(
+                message_id=message_id, session_id=session_id, role=role, content=content,
+                payload=payload, created_at=now,
+            )
+            if role == "agent" and persisted_message_callback is not None:
+                persisted_message_callback(conn, persisted)
             conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             conn.close()
-
-        return AgentSessionMessage(
-            message_id=message_id,
-            session_id=session_id,
-            role=role,
-            content=content,
-            payload=payload,
-            created_at=now,
-        )
+        return persisted
 
     def get_context_window(
         self,
@@ -309,10 +498,13 @@ class SessionService:
         session_id: str,
         token_budget: int | None = None,
     ) -> AgentSessionContextWindow:
+        """Return the published summary plus every raw message beyond its watermark."""
+
         self.ensure_session(session_id=session_id)
         budget = token_budget or self.default_context_token_budget
         conn = self._conn_factory()
         try:
+            self._ensure_context_state_table(conn)
             row = conn.execute(
                 """
                 SELECT session_id, token_budget, summary, recent_messages, token_estimate, updated_at
@@ -333,12 +525,27 @@ class SessionService:
                 token_estimate=0,
                 updated_at=_now_iso(),
             )
+        summary = row["summary"]
+        messages = self._recent_messages_from_json(row["recent_messages"])
+        state = self._read_context_state(conn_factory=self._conn_factory, session_id=session_id)
+        covered_seq = state["covered_seq"] if state else 0
+        raw_tail = self._messages_after_seq(session_id=session_id, covered_seq=covered_seq)
+        # The JSON recent_messages remains compatible with old windows. The sidecar watermark
+        # prevents a newly committed exchange from disappearing while async work is pending.
+        merged = messages
+        if raw_tail:
+            seen = {(m.role, m.content, m.created_at, m.trace_id) for m in merged}
+            merged.extend(
+                m for m in raw_tail
+                if (m.role, m.content, m.created_at, m.trace_id) not in seen
+            )
         return AgentSessionContextWindow(
             session_id=row["session_id"],
             token_budget=row["token_budget"],
             summary=row["summary"],
-            recent_messages=self._recent_messages_from_json(row["recent_messages"]),
-            token_estimate=row["token_estimate"],
+            summary_metadata=json.loads(state["summary_metadata"]) if state else {},
+            recent_messages=merged,
+            token_estimate=self._context_token_estimate(summary, merged),
             updated_at=row["updated_at"],
         )
 
@@ -356,7 +563,19 @@ class SessionService:
             str | None,
         ]
         | None = None,
+        background_enqueue: Callable[..., Any] | None = None,
     ) -> AgentSessionContextWindow:
+        """Atomically append an exchange and update its context window.
+
+        `background_enqueue` opts into asynchronous precompaction. It receives
+        `(session_id, revision, target_seq)`; callbacks accepting `conn=` (or a fourth
+        positional connection argument) run inside the same SQLite transaction and should
+        insert an idempotent outbox item. Other callbacks are invoked after commit and are
+        best effort; durable delivery requires the transactional form. The published summary
+        and its covered sequence remain unchanged in background mode, so readers always see
+        the raw tail. Synchronous hard-threshold compaction remains available through
+        `context_summarizer` when the window exceeds budget.
+        """
         if effect_id is not None:
             conn = self._conn_factory()
             try:
@@ -367,42 +586,277 @@ class SessionService:
                 conn.close()
             if existing is not None:
                 return self.get_context_window(session_id=session_id, token_budget=token_budget)
-        window = self.get_context_window(
-            session_id=session_id,
-            token_budget=token_budget,
-        )
         now = _now_iso()
-        messages = [
-            *window.recent_messages,
-            SessionRecentMessage(
+        conn = self._conn_factory()
+        post_commit_enqueue: tuple[int, int] | None = None
+        sync_compaction: tuple[int, int, int, str, list[SessionRecentMessage], int] | None = None
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            self._ensure_context_state_table(conn)
+            if effect_id is not None and conn.execute(
+                "SELECT 1 FROM agent_session_effects WHERE effect_id = ?", (effect_id,)
+            ).fetchone():
+                conn.rollback()
+                return self.get_context_window(session_id=session_id, token_budget=token_budget)
+            row = conn.execute(
+                "SELECT token_budget, summary, recent_messages, token_estimate FROM agent_session_context_windows WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            state = conn.execute(
+                "SELECT revision, next_seq, covered_seq FROM agent_session_context_state WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            budget = token_budget or (row["token_budget"] if row else self.default_context_token_budget)
+            summary = row["summary"] if row else ""
+            existing = self._recent_messages_from_json(row["recent_messages"]) if row else []
+            revision = state["revision"] if state else 0
+            next_seq = state["next_seq"] if state else 1
+            covered_seq = state["covered_seq"] if state else 0
+            if state is None:
+                # Adopt pre-existing recent messages as sequence-addressed raw tail.
+                for seq, message in enumerate(existing, start=1):
+                    conn.execute(
+                        "INSERT OR IGNORE INTO agent_session_context_messages(session_id, seq, role, content, created_at, trace_id) VALUES(?, ?, ?, ?, ?, ?)",
+                        (session_id, seq, message.role, message.content, message.created_at, message.trace_id),
+                    )
+                next_seq = len(existing) + 1
+            user_message = SessionRecentMessage(
                 role="user",
                 content=user_input,
                 created_at=now,
                 trace_id=trace_id,
-            ),
-            SessionRecentMessage(
+            )
+            agent_message = SessionRecentMessage(
                 role="agent",
                 content=agent_answer,
                 created_at=now,
                 trace_id=trace_id,
-            ),
-        ]
-        summary, kept_messages, token_estimate = self._fit_context_window(
-            summary=window.summary,
-            messages=messages,
-            token_budget=window.token_budget,
-            context_summarizer=context_summarizer,
-        )
-        updated = AgentSessionContextWindow(
-            session_id=session_id,
-            token_budget=window.token_budget,
-            summary=summary,
-            recent_messages=kept_messages,
-            token_estimate=token_estimate,
-            updated_at=now,
-        )
-        self._upsert_context_window(updated, effect_id=effect_id)
+            )
+            for seq, message in ((next_seq, user_message), (next_seq + 1, agent_message)):
+                conn.execute(
+                    "INSERT INTO agent_session_context_messages(session_id, seq, role, content, created_at, trace_id) VALUES(?, ?, ?, ?, ?, ?)",
+                    (session_id, seq, message.role, message.content, message.created_at, message.trace_id),
+                )
+            conn.execute(
+                "INSERT INTO agent_session_context_state(session_id, revision, next_seq, covered_seq) VALUES(?, ?, ?, ?) "
+                "ON CONFLICT(session_id) DO UPDATE SET revision=excluded.revision, next_seq=excluded.next_seq",
+                (session_id, revision + 1, next_seq + 2, covered_seq),
+            )
+            all_messages = self._context_messages_from_connection(
+                conn, session_id=session_id, after_seq=covered_seq
+            )
+            estimate = self._context_token_estimate(summary, all_messages)
+            background_mode = (
+                background_enqueue is not None
+                and estimate >= int(budget * 0.70)
+                and estimate <= budget
+            )
+            if background_mode or estimate > budget:
+                kept_summary = summary
+                kept_messages = all_messages
+                token_estimate = estimate
+                if estimate > budget:
+                    target_seq = next_seq - 1 if len(all_messages) > 2 else next_seq + 1
+                    sync_compaction = (
+                        revision + 1, covered_seq, target_seq,
+                        summary, all_messages, budget,
+                    )
+            else:
+                kept_summary, kept_messages, token_estimate = self._fit_context_window(
+                    summary=summary, messages=all_messages, token_budget=budget,
+                    context_summarizer=None,
+                )
+            updated = AgentSessionContextWindow(
+                session_id=session_id, token_budget=budget, summary=kept_summary,
+                recent_messages=kept_messages, token_estimate=token_estimate, updated_at=now,
+            )
+            conn.execute(
+                "INSERT INTO agent_session_context_windows(session_id, token_budget, summary, recent_messages, token_estimate, updated_at) VALUES(?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(session_id) DO UPDATE SET token_budget=excluded.token_budget, summary=excluded.summary, recent_messages=excluded.recent_messages, token_estimate=excluded.token_estimate, updated_at=excluded.updated_at",
+                (session_id, budget, kept_summary,
+                 json.dumps([m.model_dump(mode="json") for m in kept_messages], ensure_ascii=False),
+                 token_estimate, now),
+            )
+            if effect_id is not None:
+                conn.execute(
+                    "INSERT OR IGNORE INTO agent_session_effects(effect_id, session_id, effect_type, created_at) VALUES(?, ?, 'context_exchange', ?)",
+                    (effect_id, session_id, now),
+                )
+            if background_mode:
+                target_seq = next_seq + 1
+                if self._callback_accepts_connection(background_enqueue):
+                    self._invoke_enqueue(background_enqueue, session_id, revision + 1, target_seq, conn)
+                else:
+                    post_commit_enqueue = (revision + 1, target_seq)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        if post_commit_enqueue is not None and background_enqueue is not None:
+            self._invoke_enqueue(background_enqueue, session_id, *post_commit_enqueue, None)
+        if sync_compaction is not None:
+            expected_revision, expected_covered, target_seq, prior_summary, raw, hard_budget = sync_compaction
+            try:
+                if len(raw) > 2:
+                    new_summary, _, _ = self._fit_context_window(
+                        summary=prior_summary, messages=raw, token_budget=hard_budget,
+                        context_summarizer=context_summarizer,
+                    )
+                else:
+                    new_summary = (
+                        context_summarizer(prior_summary, raw, [], hard_budget)
+                        if context_summarizer is not None else None
+                    ) or self._summarize_messages_locally(prior_summary, raw)
+                    new_summary = self._trim_summary_for_budget(
+                        summary=new_summary, messages=[], token_budget=hard_budget,
+                    )
+            except Exception:  # noqa: BLE001 - preserve turn on compressor failure.
+                new_summary, _, _ = self._fit_context_window(
+                    summary=prior_summary, messages=raw, token_budget=hard_budget,
+                    context_summarizer=None,
+                )
+            try:
+                self.publish_context_summary(
+                    session_id=session_id, expected_revision=expected_revision,
+                    expected_covered_seq=expected_covered, target_seq=target_seq,
+                    summary=new_summary, token_budget=hard_budget,
+                )
+            except sqlite3.Error:
+                # Raw sequenced messages were already committed. Another turn
+                # can retry; losing an answer is worse than delayed compaction.
+                pass
+            return self.get_context_window(session_id=session_id, token_budget=hard_budget)
         return updated
+
+    def _ensure_context_state_table(self, conn: sqlite3.Connection) -> None:
+        conn.execute("CREATE TABLE IF NOT EXISTS agent_session_context_state (session_id TEXT PRIMARY KEY, revision INTEGER NOT NULL, next_seq INTEGER NOT NULL, covered_seq INTEGER NOT NULL DEFAULT 0)")
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(agent_session_context_state)")}
+        if "summary_revision" not in columns:
+            self._add_context_column(conn, "summary_revision", "INTEGER NOT NULL DEFAULT 0")
+        if "summary_metadata" not in columns:
+            self._add_context_column(conn, "summary_metadata", "TEXT NOT NULL DEFAULT '{}' ")
+        conn.execute("CREATE TABLE IF NOT EXISTS agent_session_context_messages (session_id TEXT NOT NULL, seq INTEGER NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL, trace_id TEXT, PRIMARY KEY(session_id, seq))")
+
+    @staticmethod
+    def _add_context_column(conn, name: str, declaration: str) -> None:
+        try:
+            conn.execute(f"ALTER TABLE agent_session_context_state ADD COLUMN {name} {declaration}")
+        except sqlite3.OperationalError:
+            # Another connection may have performed the additive migration
+            # between PRAGMA and ALTER. Do not suppress actual storage errors.
+            if name not in {row[1] for row in conn.execute("PRAGMA table_info(agent_session_context_state)")}:
+                raise
+
+    def _read_context_state(self, *, conn_factory, session_id: str):
+        conn = conn_factory()
+        try:
+            self._ensure_context_state_table(conn)
+            row = conn.execute("SELECT revision, next_seq, covered_seq,summary_metadata FROM agent_session_context_state WHERE session_id = ?", (session_id,)).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    def _messages_after_seq(self, *, session_id: str, covered_seq: int) -> list[SessionRecentMessage]:
+        conn = self._conn_factory()
+        try:
+            self._ensure_context_state_table(conn)
+            rows = conn.execute("SELECT role, content, created_at, trace_id FROM agent_session_context_messages WHERE session_id = ? AND seq > ? ORDER BY seq", (session_id, covered_seq)).fetchall()
+            return [SessionRecentMessage(role=r["role"], content=r["content"], created_at=r["created_at"], trace_id=r["trace_id"]) for r in rows]
+        finally:
+            conn.close()
+
+    def _callback_accepts_connection(self, callback: Callable[..., Any]) -> bool:
+        import inspect
+        try:
+            parameters = inspect.signature(callback).parameters
+        except (TypeError, ValueError):
+            return False
+        return "conn" in parameters or len(parameters) >= 4
+
+    def _invoke_enqueue(self, callback, session_id, revision, target_seq, conn) -> None:
+        if conn is not None:
+            try:
+                callback(session_id, revision, target_seq, conn=conn)
+            except TypeError as exc:
+                if "conn" not in str(exc):
+                    raise
+                callback(session_id, revision, target_seq, conn)
+        else:
+            callback(session_id, revision, target_seq)
+
+    def publish_context_summary(
+        self, *, session_id: str, expected_revision: int, expected_covered_seq: int,
+        target_seq: int,
+        summary: str, token_budget: int | None = None,
+        expected_summary_revision: int | None = None,
+        publication_lease: tuple[str, str, int] | None = None,
+        summary_metadata: dict[str, Any] | None = None,
+    ) -> bool:
+        """Publish a worker result through its fixed target watermark and revision CAS.
+
+        `target_seq` must be the sequence captured when that job was enqueued. Newer
+        messages are stored as raw tail and are never folded into the worker's summary.
+        """
+        conn = self._conn_factory()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            self._ensure_context_state_table(conn)
+            state = conn.execute("SELECT revision, covered_seq,summary_revision FROM agent_session_context_state WHERE session_id = ?", (session_id,)).fetchone()
+            valid_revision = state is not None and (
+                state["revision"] == expected_revision if expected_summary_revision is None
+                else state["summary_revision"] == expected_summary_revision
+            )
+            if not valid_revision or state["covered_seq"] != expected_covered_seq:
+                conn.rollback()
+                return False
+            if publication_lease is not None:
+                now = _now_iso()
+                owned = conn.execute(
+                    "SELECT 1 FROM background_jobs WHERE job_id=? AND lease_owner=? AND lease_epoch=? AND status='running' AND lease_expires_at>? AND (deadline IS NULL OR deadline>?)",
+                    (*publication_lease, now, now),
+                ).fetchone()
+                if owned is None:
+                    conn.rollback()
+                    return False
+            current_seq = conn.execute("SELECT COALESCE(MAX(seq), 0) AS seq FROM agent_session_context_messages WHERE session_id = ?", (session_id,)).fetchone()["seq"]
+            if target_seq < expected_covered_seq or target_seq > current_seq:
+                conn.rollback()
+                return False
+            tail_rows = conn.execute("SELECT role, content, created_at, trace_id FROM agent_session_context_messages WHERE session_id = ? AND seq > ? ORDER BY seq", (session_id, target_seq)).fetchall()
+            tail = [SessionRecentMessage(role=r["role"], content=r["content"], created_at=r["created_at"], trace_id=r["trace_id"]) for r in tail_rows]
+            budget = token_budget or self.default_context_token_budget
+            estimate = self._context_token_estimate(summary, tail)
+            metadata = summary_metadata or {"method": "synchronous_or_local", "lossy_fallback_possible": True}
+            encoded_metadata = json.dumps(metadata, ensure_ascii=False)
+            if len(encoded_metadata.encode("utf-8")) > 8192:
+                raise ValueError("summary metadata exceeds bounded diagnostic budget")
+            conn.execute("UPDATE agent_session_context_state SET covered_seq = ?, revision = revision + 1,summary_revision=summary_revision+1,summary_metadata=? WHERE session_id = ? AND covered_seq = ?", (target_seq, encoded_metadata, session_id, expected_covered_seq))
+            conn.execute("INSERT INTO agent_session_context_windows(session_id, token_budget, summary, recent_messages, token_estimate, updated_at) VALUES(?, ?, ?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET token_budget=excluded.token_budget, summary=excluded.summary, recent_messages=excluded.recent_messages, token_estimate=excluded.token_estimate, updated_at=excluded.updated_at", (session_id, budget, summary, json.dumps([m.model_dump(mode="json") for m in tail], ensure_ascii=False), estimate, _now_iso()))
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def _context_messages_from_connection(
+        self, conn: sqlite3.Connection, *, session_id: str, after_seq: int
+    ) -> list[SessionRecentMessage]:
+        rows = conn.execute(
+            "SELECT role, content, created_at, trace_id FROM agent_session_context_messages "
+            "WHERE session_id = ? AND seq > ? ORDER BY seq",
+            (session_id, after_seq),
+        ).fetchall()
+        return [
+            SessionRecentMessage(
+                role=row["role"], content=row["content"],
+                created_at=row["created_at"], trace_id=row["trace_id"],
+            )
+            for row in rows
+        ]
 
     def _upsert_context_window(
         self, window: AgentSessionContextWindow, *, effect_id: str | None = None
@@ -502,6 +956,9 @@ class SessionService:
         messages: list[SessionRecentMessage],
     ) -> int:
         text = summary + "\n" + "\n".join(message.content for message in messages)
+        counter = self._active_context_token_counter()
+        if counter is not None:
+            return counter.count_text(text).count
         return self._estimate_tokens(text)
 
     def _estimate_tokens(self, text: str) -> int:
@@ -522,9 +979,23 @@ class SessionService:
     ) -> str:
         message_tokens = self._context_token_estimate("", messages)
         available_summary_tokens = max(token_budget - message_tokens, 0)
-        max_summary_chars = available_summary_tokens * 4
-        if max_summary_chars <= 0:
+        if available_summary_tokens <= 0:
             return ""
+        if self._active_context_token_counter() is not None:
+            if self._context_token_estimate(summary, messages) <= token_budget:
+                return summary
+            # Keep the newest suffix, and measure the actual combined window:
+            # tokenization is not generally additive across a text boundary.
+            low, high = 0, len(summary)
+            while low < high:
+                middle = (low + high + 1) // 2
+                candidate = summary[-middle:]
+                if self._context_token_estimate(candidate, messages) <= token_budget:
+                    low = middle
+                else:
+                    high = middle - 1
+            return summary[-low:].lstrip() if low else ""
+        max_summary_chars = available_summary_tokens * 4
         if len(summary) <= max_summary_chars:
             return summary
         return summary[-max_summary_chars:].lstrip()
@@ -561,6 +1032,7 @@ class SessionService:
             status=row["status"],
             metadata=metadata,
             workspace=workspace,
+            project_id=metadata.get("project_id"),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )

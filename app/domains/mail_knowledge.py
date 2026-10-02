@@ -31,6 +31,17 @@ class MailKnowledgeMirror:
         self._mail_service = mail_service
         self._knowledge_service = knowledge_service
 
+    def active_account_ids(self, *, session_id: str | None = None) -> tuple[str, ...]:
+        """Return mail accounts whose mirrored knowledge source is currently authorized/active."""
+        active_sources = set(
+            self._knowledge_service.list_authorized_source_ids(session_id=session_id)
+        )
+        return tuple(
+            account_id
+            for account_id in self._mail_service.list_authorized_account_ids()
+            if self.source_id_for_account(account_id) in active_sources
+        )
+
     def sync(
         self,
         *,
@@ -74,10 +85,12 @@ class MailKnowledgeMirror:
         chunking, and provenance remain owned by the source-agnostic knowledge layer.
         """
 
+        requested_limit = max(1, int(limit))
+        applied_limit = min(requested_limit, 100)
         resolved_mode = "keyword" if order_by == "source_time_desc" else mode
         result = self._knowledge_service.search(
             query=query,
-            limit=limit,
+            limit=applied_limit,
             source_types=["mail_message"],
             max_snippet_chars=max_snippet_chars,
             tool_name="mail.search",
@@ -110,7 +123,16 @@ class MailKnowledgeMirror:
                     }
                 )
             )
-        return MailSearchResult(query=query, messages=messages)
+        returned_count = len(messages)
+        return MailSearchResult(
+            query=query,
+            messages=messages,
+            requested_limit=requested_limit,
+            applied_limit=applied_limit,
+            returned_count=returned_count,
+            # Retrieval is candidate/rank bounded; this is a signal, not an exact total.
+            possible_more=returned_count >= applied_limit,
+        )
 
     def _mirror_record(self, message: MailMirrorRecord) -> KnowledgeImportResult:
         source_uri = f"mail://{message.account_id}"

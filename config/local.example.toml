@@ -18,6 +18,15 @@ default_client = ""
 fallback_client = ""
 default_response_mode = "json"
 max_attempts = 2
+# Optional legacy/default-client limits. Capacity and tokenizer apply only to
+# this configured default model; use model_overrides for exact model names.
+# context_window_tokens = 131072
+# output_reserve_tokens = 8192
+# tokenizer_json_path = "./data/tokenizers/model/tokenizer.json"
+# [llm.model_overrides."your-model-id"]
+# context_window_tokens = 131072
+# output_reserve_tokens = 8192
+# tokenizer_json_path = "./data/tokenizers/model/tokenizer.json"
 
 [safety]
 # Tool calls with read_only != true must always enter the safety review step.
@@ -44,6 +53,8 @@ multi_agent_planning_enabled = false
 # Demonstration-only expert that produces simulated workflow results. Keep off
 # for ordinary user tasks; enabling it also permits Planner to select it.
 mock_workflow_agent_enabled = false
+# Read-only mail expert workflow. Does not automatically route user turns.
+mail_expert_enabled = false
 # External Codex worker is opt-in. It runs against a staged copy of one Git
 # workspace; staged edits are not applied to the source workspace automatically.
 codex_expert_enabled = false
@@ -81,13 +92,23 @@ multi_agent_max_retries = 1
 # provider = "mock"
 # default_model = "mock"
 # available_models = ["mock"]
+# context_window_tokens = 131072
+# output_reserve_tokens = 8192
+# tokenizer_json_path = "./data/tokenizers/model/tokenizer.json"
+# [llm.clients.model_overrides."another-model-id"]
+# context_window_tokens = 65536
+# output_reserve_tokens = 8192
+# tokenizer_json_path = "./data/tokenizers/another/tokenizer.json"
 # supports_stream = true
 # supports_json_mode = true
 # supports_function_calling = true
+# Set true only when this endpoint accepts tool_choice = "required".
+# supports_required_tool_choice = false
 # Set this only when the configured provider/base URL supports strict function schemas.
 # function_calling_strict = false
 # Set true only for endpoints that accept a reasoning_effort chat-completions field.
 # supports_reasoning_effort = false
+# thinking_control = "deepseek" # Opt-in only when the endpoint supports thinking.type.
 #
 # [[llm.clients]]
 # name = "openai"
@@ -154,6 +175,51 @@ max_rewrites = 8
 max_total_chars = 2400
 max_parallel_searches = 4
 max_total_candidates = 240
+
+[web_search]
+# Read-only public web/news search. Set BRAVE_SEARCH_API_KEY in your shell or
+# .env; without it web.search reports unavailable. web.open needs no API key.
+provider = "brave"
+api_key_env = "BRAVE_SEARCH_API_KEY"
+# Conservative local cap, below Brave's current $5 monthly Search credit at
+# $5/1,000 requests. Set 0 to disable paid searches entirely.
+monthly_request_limit = 900
+
+[memory]
+# Local memory store and scoped recall are enabled by default. Background
+# local extraction learns explicit "记住：..." requests and tightly scoped,
+# low-impact enduring preferences such as "我希望以后...". Enabling this
+# subsystem authorizes background processing of the conversation. Remote
+# extraction is a separate cost/quality option. Raw messages stay out of jobs.
+enabled = true
+background_enabled = true
+# Use the configured LLM to consider less explicit long-term memories. This
+# increases background model calls; it is not an additional consent switch.
+allow_remote_extraction = false
+max_recalled_items = 8
+max_recalled_chars = 2400
+extraction_debounce_seconds = 5
+background_worker_count = 2
+max_job_tokens = 32768
+generation_output_tokens = 4096 # Includes reasoning and final output, not summary size.
+recovery_output_tokens = 8192 # One bounded recovery; thinking disabled when supported.
+# Optional separate low-cost route; must declare its context_window_tokens.
+# background_client_name = "background"
+# background_model = "your-configured-model"
+
+[background]
+request_timeout_seconds = 30
+max_pending_jobs = 1024
+max_llm_concurrency = 4
+interactive_reserved = 2
+memory_concurrency = 1
+io_concurrency = 1
+hourly_token_limit = 200000
+daily_token_limit = 1000000
+# Monetary limits are opt-in, with configured prices; usage always records tokens.
+daily_cost_limit = 0
+input_cost_per_million = 0
+output_cost_per_million = 0
 
 [reranker]
 # Rerank the locally recalled candidate pool before selecting top-k. Keep

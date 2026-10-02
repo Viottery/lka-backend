@@ -9,6 +9,12 @@ class LLMClientError(RuntimeError):
     """Raised when a configured LLM provider cannot complete a request."""
 
 
+class LLMContextCapacityError(LLMClientError):
+    def __init__(self, message: str, *, error_category: str):
+        super().__init__(message)
+        self.error_category = error_category
+
+
 class LLMProviderHTTPError(LLMClientError):
     def __init__(
         self,

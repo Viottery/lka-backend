@@ -35,8 +35,9 @@ def get_db_path(data_dir: Path) -> Path:
 def connect(db_path: Path) -> sqlite3.Connection:
     """Open a SQLite connection with row access by column name."""
 
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=5.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 5000")
     return conn
 
 
@@ -130,6 +131,9 @@ def init_db(db_path: Path) -> None:
 
     conn = connect(db_path)
     try:
+        # The background worker and interactive API use separate connections.
+        # WAL permits readers to proceed during a short writer transaction.
+        conn.execute("PRAGMA journal_mode = WAL")
         _prepare_schema_migrations(conn)
         conn.executescript(
             """
@@ -169,6 +173,12 @@ def init_db(db_path: Path) -> None:
                 status TEXT NOT NULL,
                 metadata TEXT NOT NULL,
                 created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS agent_ui_preferences (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                preferences TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
 

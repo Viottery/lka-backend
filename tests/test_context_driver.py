@@ -19,6 +19,7 @@ from app.core.context_driver import (
 from app.core.local_config import AgentInferenceProfile
 from app.core.multi_agent import (
     ForkCallerKind,
+    MemoryReference,
     PlanStep,
     RuntimeBudget,
     ScopeGrant,
@@ -595,3 +596,59 @@ def test_tool_view_filters_child_package_catalog_and_expansion() -> None:
         "knowledge.search"
     ]
     assert loop._tool_payloads_for_package("mail", tool_view=view) == []
+
+
+def test_child_memories_are_explicit_versioned_and_bounded():
+    ref = MemoryReference(memory_id="mem-1", version=2, content="Prefer source links", scope="global", updated_at="now")
+    request = _request(_step(input_refs=("memory:mem-1@2",)), memory_candidates=(ref,),
+                       budget=RuntimeBudget(max_tokens=1000))
+    result = asyncio.run(ContextDriver().derive(request))
+    assert result.status == ContextDerivationStatus.READY
+    assert result.snapshot.memory_refs == (ref,)
+    assert result.views.agent.memory_refs == result.views.tool.memory_refs == (ref,)
+    empty = asyncio.run(ContextDriver().derive(_request(memory_candidates=(ref,))))
+    assert empty.snapshot.memory_refs == ()
+    stale = request.model_copy(update={"plan_step": _step(input_refs=("memory:mem-1@1",))})
+    assert asyncio.run(ContextDriver().derive(stale)).status == ContextDerivationStatus.SCOPE_DENIED
+    tiny = request.model_copy(update={"budget": RuntimeBudget(max_tokens=10)})
+    assert asyncio.run(ContextDriver().derive(tiny)).status == ContextDerivationStatus.BUDGET_EXCEEDED
+
+
+def test_parallel_child_memory_snapshots_do_not_follow_later_parent_updates():
+    original = MemoryReference(memory_id="shared", version=1, content="Original preference", scope="global", updated_at="first")
+
+    async def derive_children():
+        return await asyncio.gather(*[
+            ContextDriver().derive(_request(
+                _step(input_refs=("memory:shared@1",)), memory_candidates=(original,),
+                snapshot_id=f"snapshot_{index}", child_run_id=f"child_{index}", budget=RuntimeBudget(max_tokens=1000),
+            )) for index in range(2)
+        ])
+
+    children = asyncio.run(derive_children())
+    updated = original.model_copy(update={"version": 2, "content": "New preference"})
+    next_turn = asyncio.run(ContextDriver().derive(_request(
+        _step(input_refs=("memory:shared@2",)), memory_candidates=(updated,), budget=RuntimeBudget(max_tokens=1000),
+    )))
+    assert next_turn.snapshot.memory_refs == (updated,)
+    assert all(child.snapshot.memory_refs == child.views.agent.memory_refs == (original,) for child in children)
+
+
+def test_child_memory_budget_counts_provenance_metadata_not_only_content():
+    ref = MemoryReference(memory_id="repeated", version=1, content="Short preference", scope="global",
+                          source_ids=tuple(f"source-{index}-" + "x" * 80 for index in range(50)), updated_at="now")
+    result = asyncio.run(ContextDriver().derive(_request(
+        _step(input_refs=("memory:repeated@1",)), memory_candidates=(ref,), budget=RuntimeBudget(max_tokens=1000),
+    )))
+    assert result.status == ContextDerivationStatus.BUDGET_EXCEEDED
+
+
+def test_duplicate_explicit_memory_refs_are_charged_once():
+    ref = MemoryReference(memory_id="duplicate", version=1, content="Preference", scope="global", updated_at="now")
+    budget = len(ref.model_dump_json().encode("utf-8"))
+    result = asyncio.run(ContextDriver().derive(_request(
+        _step(input_refs=("memory:duplicate", "memory:duplicate@1")), memory_candidates=(ref,),
+        memory_budget_tokens=budget, budget=RuntimeBudget(max_tokens=1000),
+    )))
+    assert result.status == ContextDerivationStatus.READY
+    assert result.snapshot.memory_refs == (ref,)

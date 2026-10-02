@@ -868,6 +868,14 @@ def test_agent_turn_maintains_recent_session_context_window(tmp_path, monkeypatc
 
     assert first.answer == "第一轮回答：已记录ICA学生签证关注点。"
     assert second.answer == "第二轮回答：我看到了上一轮关于ICA学生签证的近期问答。"
+    completed = [
+        event for event in app.state.runtime.agent_run_manager.list_events(second.run_id)
+        if event.type == "llm_completed"
+    ]
+    assert completed
+    assert all(isinstance(event.payload["input_token_estimate"], int) for event in completed)
+    assert all("input_token_actual" in event.payload for event in completed)
+    assert all("input_token_estimate_delta" in event.payload for event in completed)
     assert fake_llm.route_contexts[0]["recent_messages"] == []
     second_context = fake_llm.route_contexts[1]
     assert second_context["token_budget"] == 65_536
@@ -1085,6 +1093,35 @@ def test_agent_turn_enforces_aggregate_observation_prompt_budget(tmp_path, monke
     assert "EARLY_0_" not in serialized
     assert "EARLY_7_" in serialized
     assert any(item.get("_prompt_compacted") for item in bounded)
+
+
+def test_compacted_tool_list_preserves_original_and_visible_counts(tmp_path, monkeypatch):
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
+    get_settings.cache_clear()
+    loop = create_app().state.runtime.agent_turn_loop
+    observation = loop._observation_for_decision_prompt(
+        tool_name="mail.search",
+        tool_input={"query": "", "limit": 100},
+        tool_result=ToolResult(
+            invocation_id="list_count",
+            tool_name="mail.search",
+            status="completed",
+            output={"messages": [{"message_id": str(index)} for index in range(100)]},
+        ),
+        feedback={"status": "accepted"},
+    )
+
+    assert len(observation["result"]["output"]["messages"]) == 20
+    assert observation["_prompt_compaction"]["truncated_lists"] == [{
+        "path": "result.output.messages",
+        "total_count": 100,
+        "visible_count": 20,
+        "omitted_count": 80,
+    }]
+    assert loop._observations_within_prompt_budget([observation])[0]["_prompt_compaction"] == (
+        observation["_prompt_compaction"]
+    )
 
 
 def test_agent_turn_recovers_mail_route_from_malformed_llm_json(tmp_path, monkeypatch):
@@ -2028,6 +2065,7 @@ class _LLMOptionsRecordingLLM:
         max_output_tokens: int | None = None,
         client_name: str | None = None,
         model: str | None = None,
+        reasoning_effort: str | None = None,
         response_mode=None,
         require_json: bool = False,
         metadata: dict | None = None,
@@ -2041,7 +2079,7 @@ class _LLMOptionsRecordingLLM:
                 "metadata": metadata,
             }
         )
-        if "Choose at most one tool package" in system_prompt:
+        if (metadata or {}).get("stage") == "route":
             content = '{"selected_package":null,"reason":"context is enough"}'
         else:
             content = "request llm options received"

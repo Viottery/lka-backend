@@ -1,0 +1,376 @@
+"""Brave web search and tightly bounded public page text fetching."""
+
+from __future__ import annotations
+
+import http.client
+import ipaddress
+import re
+import socket
+import sqlite3
+import ssl
+import time
+from collections.abc import Callable
+from datetime import UTC, datetime
+from html.parser import HTMLParser
+from typing import Any, ClassVar
+from urllib.parse import urljoin, urlsplit, urlunsplit
+
+import httpx
+
+BRAVE_SEARCH_BASE = "https://api.search.brave.com/res/v1"
+MAX_QUERY_CHARS = 400
+MAX_SEARCH_RESULTS = 10
+MAX_PAGE_BYTES = 1_000_000
+MAX_PAGE_TEXT_CHARS = 20_000
+MAX_REDIRECTS = 3
+
+
+class WebSearchError(RuntimeError):
+    """Expected provider or page fetching failure suitable for tool feedback."""
+
+
+class BraveSearchQuota:
+    """Persistent, process-safe upper bound on paid search requests per UTC month."""
+
+    def __init__(self, conn_factory: Callable[[], sqlite3.Connection], monthly_limit: int) -> None:
+        if monthly_limit < 0:
+            raise ValueError("monthly_limit must be non-negative")
+        self.conn_factory = conn_factory
+        self.monthly_limit = monthly_limit
+
+    def reserve(self) -> None:
+        month = datetime.now(UTC).strftime("%Y-%m")
+        conn = self.conn_factory()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("CREATE TABLE IF NOT EXISTS web_search_quota (month TEXT PRIMARY KEY, requests INTEGER NOT NULL)")
+            row = conn.execute("SELECT requests FROM web_search_quota WHERE month=?", (month,)).fetchone()
+            count = int(row[0]) if row else 0
+            if count >= self.monthly_limit:
+                raise WebSearchError("Monthly web search request limit reached.")
+            conn.execute(
+                "INSERT INTO web_search_quota(month,requests) VALUES(?,1) "
+                "ON CONFLICT(month) DO UPDATE SET requests=requests+1",
+                (month,),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+
+class BraveSearchAdapter:
+    """Small synchronous Brave Search API adapter; transport is injectable for tests."""
+
+    def __init__(
+        self,
+        api_key: str | None,
+        *,
+        timeout_seconds: float = 8.0,
+        transport: httpx.BaseTransport | None = None,
+        quota: BraveSearchQuota | None = None,
+    ) -> None:
+        self.api_key = api_key.strip() if api_key else ""
+        self.timeout_seconds = timeout_seconds
+        self.transport = transport
+        self.quota = quota
+
+    def search(self, query: str, *, mode: str = "web", limit: int = 5,
+               freshness: str | None = None, country: str | None = None,
+               search_lang: str | None = None) -> dict[str, Any]:
+        query = query.strip()
+        if not query or len(query) > MAX_QUERY_CHARS or len(query.split()) > 50:
+            raise WebSearchError(f"query must contain 1 to {MAX_QUERY_CHARS} characters and at most 50 words")
+        if mode not in {"web", "news"}:
+            raise WebSearchError("mode must be 'web' or 'news'")
+        if not 1 <= limit <= MAX_SEARCH_RESULTS:
+            raise WebSearchError(f"limit must be between 1 and {MAX_SEARCH_RESULTS}")
+        if freshness not in {None, "pd", "pw", "pm", "py"}:
+            raise WebSearchError("freshness must be pd, pw, pm, or py")
+        if country is not None and not re.fullmatch(r"[A-Z]{2}", country):
+            raise WebSearchError("country must be a two-letter uppercase country code")
+        if search_lang is not None and not re.fullmatch(r"[a-z]{2,8}(?:-[a-z]{2,8})?", search_lang):
+            raise WebSearchError("search_lang must be a language code")
+        if not self.api_key:
+            raise WebSearchError("Web search is unavailable: no Brave Search API key is configured.")
+        if self.quota is not None:
+            self.quota.reserve()
+
+        endpoint = "web/search" if mode == "web" else "news/search"
+        try:
+            with httpx.Client(
+                timeout=self.timeout_seconds, transport=self.transport, trust_env=False,
+                follow_redirects=False,
+            ) as client:
+                response = client.get(
+                    f"{BRAVE_SEARCH_BASE}/{endpoint}",
+                    params={"q": query, "count": limit, "safesearch": "strict",
+                            "text_decorations": "false",
+                            **({"freshness": freshness} if freshness else {}),
+                            **({"country": country} if country else {}),
+                            **({"search_lang": search_lang} if search_lang else {})},
+                    headers={"Accept": "application/json", "X-Subscription-Token": self.api_key},
+                )
+                response.raise_for_status()
+                if response.status_code != 200:
+                    raise WebSearchError(f"Brave Search returned HTTP {response.status_code}")
+                payload = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            raise WebSearchError(f"Brave Search request failed: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise WebSearchError("Brave Search returned an invalid JSON payload")
+        container = payload.get("web") if mode == "web" else None
+        rows = container.get("results") if isinstance(container, dict) else payload.get("results") if mode == "news" else None
+        if not isinstance(rows, list):
+            raise WebSearchError("Brave Search returned an invalid results payload")
+        results = []
+        for row in rows:
+            if len(results) >= limit:
+                break
+            if not isinstance(row, dict):
+                continue
+            try:
+                safe_url = _safe_public_https_url(str(row.get("url") or ""))
+            except WebSearchError:
+                continue
+            results.append({
+                "title": _clean_text(row.get("title")),
+                "url": safe_url,
+                "snippet": _clean_text(row.get("description"))[:1000],
+                "published_at": _published_at(row, mode),
+                "provider_fetched_at": row.get("page_fetched"),
+                "source": {"provider": "Brave Search", "mode": mode},
+            })
+        return {"query": query, "mode": mode, "freshness": freshness,
+                "country": country, "search_lang": search_lang, "results": results,
+                "result_count": len(results), "possible_more": len(rows) >= limit}
+
+
+def _published_at(row: dict[str, Any], mode: str) -> str | None:
+    if mode == "news":
+        value = row.get("page_age")
+    else:
+        value = row.get("page_age") or row.get("published_at")
+    return str(value) if value else None
+
+
+def _clean_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+class _PlainTextParser(HTMLParser):
+    _SKIP: ClassVar[set[str]] = {"script", "style", "noscript", "template", "svg", "iframe", "object"}
+    _BLOCK: ClassVar[set[str]] = {
+        "address", "article", "br", "dd", "div", "dt", "h1", "h2", "h3", "h4",
+        "li", "p", "pre", "section",
+    }
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.skip_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in self._SKIP:
+            self.skip_depth += 1
+        elif not self.skip_depth and tag in self._BLOCK:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in self._SKIP and self.skip_depth:
+            self.skip_depth -= 1
+        elif not self.skip_depth and tag in self._BLOCK:
+            self.parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if not self.skip_depth:
+            self.parts.append(data)
+
+    def text(self) -> str:
+        value = "".join(self.parts)
+        value = re.sub(r"[ \t\xa0]+", " ", value)
+        value = re.sub(r" *\n *", "\n", value)
+        return re.sub(r"\n{3,}", "\n\n", value).strip()
+
+
+def _safe_public_https_url(url: str) -> str:
+    try:
+        parts = urlsplit(url)
+        if (len(url) > 2048 or any(ord(ch) < 32 or ord(ch) == 127 for ch in url)
+                or parts.scheme.lower() != "https" or not parts.hostname
+                or parts.username or parts.password):
+            raise ValueError
+        if parts.port not in (None, 443):
+            raise ValueError
+        try:
+            address = ipaddress.ip_address(parts.hostname)
+        except ValueError:
+            address = None
+        if address is not None:
+            if not address.is_global:
+                raise ValueError
+            host = f"[{address.compressed}]" if address.version == 6 else address.compressed
+        else:
+            host = parts.hostname.encode("idna").decode("ascii").lower().rstrip(".")
+            if "." not in host or host.endswith((".localhost", ".local", ".internal")):
+                raise ValueError
+        path = parts.path or "/"
+        return urlunsplit(("https", host, path, parts.query, ""))
+    except (ValueError, TypeError, UnicodeError) as exc:
+        raise WebSearchError("Only public HTTPS URLs without credentials or nonstandard ports are supported.") from exc
+
+
+def _public_address(host: str) -> str:
+    """Resolve once and require every DNS answer to be globally routable."""
+    try:
+        literal = ipaddress.ip_address(host)
+    except ValueError:
+        literal = None
+    if literal is not None:
+        if not literal.is_global:
+            raise WebSearchError("Page host is not a public IP address.")
+        return literal.compressed
+    try:
+        answers = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        raise WebSearchError(f"Page DNS lookup failed: {type(exc).__name__}") from exc
+    addresses = [ipaddress.ip_address(answer[4][0]) for answer in answers]
+    if not addresses or any(not address.is_global for address in addresses):
+        raise WebSearchError("Page DNS resolved to a non-public address.")
+    return addresses[0].compressed
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """Connect to a validated IP while verifying TLS against the original host."""
+
+    def __init__(self, host: str, pinned_ip: str, timeout: float) -> None:
+        super().__init__(host, 443, timeout=timeout, context=ssl.create_default_context())
+        self.pinned_ip = pinned_ip
+
+    def connect(self) -> None:
+        raw = socket.create_connection((self.pinned_ip, 443), timeout=self.timeout)
+        try:
+            self.sock = self._context.wrap_socket(raw, server_hostname=self.host)
+        except BaseException:
+            raw.close()
+            raise
+
+
+class PublicPageFetcher:
+    """Fetch bounded public HTTPS text with per-hop DNS validation and pinning."""
+
+    def __init__(
+        self,
+        *,
+        timeout_seconds: float = 8.0,
+        max_bytes: int = MAX_PAGE_BYTES,
+        max_text_chars: int = MAX_PAGE_TEXT_CHARS,
+        max_redirects: int = MAX_REDIRECTS,
+        transport: httpx.BaseTransport | None = None,
+    ) -> None:
+        self.timeout_seconds = timeout_seconds
+        self.max_bytes = max_bytes
+        self.max_text_chars = max_text_chars
+        self.max_redirects = max_redirects
+        self.transport = transport
+
+    def open(self, url: str) -> dict[str, Any]:
+        target = _safe_public_https_url(url)
+        try:
+            for hop in range(self.max_redirects + 1):
+                status, headers, content = self._fetch(target)
+                if status in {301, 302, 303, 307, 308}:
+                    location = headers.get("location")
+                    if not location or hop >= self.max_redirects:
+                        raise WebSearchError("Page fetch exceeded the redirect limit or had no redirect target.")
+                    target = _safe_public_https_url(urljoin(target, location))
+                    continue
+                if status != 200:
+                    raise WebSearchError(f"Page fetch returned HTTP {status}.")
+                content_type = headers.get("content-type", "")
+                media_type = content_type.split(";", 1)[0].lower()
+                if media_type not in {"text/html", "application/xhtml+xml", "text/plain"}:
+                    raise WebSearchError("Page content type is not HTML or plain text.")
+                charset_match = re.search(r"charset=([^;\s]+)", content_type, flags=re.IGNORECASE)
+                charset = charset_match.group(1).strip('"\'') if charset_match else "utf-8"
+                raw = content.decode(charset, errors="replace")
+                parser = _PlainTextParser()
+                if media_type != "text/plain":
+                    parser.feed(raw)
+                    parser.close()
+                    text = parser.text()
+                else:
+                    text = _clean_text(raw)
+                return {
+                    "url": target,
+                    "fetched_at": datetime.now(UTC).isoformat(),
+                    "text": text[: self.max_text_chars],
+                    "truncated": len(text) > self.max_text_chars,
+                }
+        except WebSearchError:
+            raise
+        except (httpx.HTTPError, OSError, ssl.SSLError, UnicodeError, LookupError) as exc:
+            raise WebSearchError(f"Page fetch failed: {exc}") from exc
+        raise WebSearchError("Page fetch did not produce a response.")
+
+    def _fetch(self, target: str) -> tuple[int, dict[str, str], bytes]:
+        if self.transport is not None:
+            # Injected transport is for deterministic tests only; production uses
+            # a pinned socket so DNS cannot change between validation and connect.
+            with (
+                httpx.Client(timeout=self.timeout_seconds, transport=self.transport,
+                             trust_env=False, follow_redirects=False) as client,
+                client.stream("GET", target, headers={"Accept": "text/html,text/plain;q=0.9"}) as response,
+            ):
+                if response.status_code in {301, 302, 303, 307, 308}:
+                    return response.status_code, dict(response.headers), b""
+                content = bytearray()
+                for chunk in response.iter_bytes():
+                    content.extend(chunk)
+                    if len(content) > self.max_bytes:
+                        raise WebSearchError("Page exceeded the configured byte limit.")
+                return response.status_code, dict(response.headers), bytes(content)
+
+        parts = urlsplit(target)
+        host = parts.hostname or ""
+        pinned_ip = _public_address(host)
+        conn = _PinnedHTTPSConnection(host, pinned_ip, self.timeout_seconds)
+        deadline = time.monotonic() + self.timeout_seconds
+        path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
+        try:
+            conn.request("GET", path, headers={
+                "Host": host, "User-Agent": "LocalKnowledgeAgent/0.1",
+                "Accept": "text/html,text/plain;q=0.9", "Accept-Encoding": "identity",
+            })
+            response = conn.getresponse()
+            headers = {key.lower(): value for key, value in response.getheaders()}
+            if response.status in {301, 302, 303, 307, 308}:
+                return response.status, headers, b""
+            if headers.get("content-encoding", "identity").lower() != "identity":
+                raise WebSearchError("Compressed page responses are not supported.")
+            length = headers.get("content-length")
+            if length:
+                try:
+                    declared_length = int(length)
+                except ValueError as exc:
+                    raise WebSearchError("Page returned an invalid content length.") from exc
+                if declared_length > self.max_bytes:
+                    raise WebSearchError("Page exceeded the configured byte limit.")
+            content = bytearray()
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise WebSearchError("Page fetch timed out.")
+                if conn.sock is not None:
+                    conn.sock.settimeout(remaining)
+                chunk = response.read(min(65_536, self.max_bytes + 1 - len(content)))
+                if not chunk:
+                    break
+                content.extend(chunk)
+                if len(content) > self.max_bytes:
+                    raise WebSearchError("Page exceeded the configured byte limit.")
+            return response.status, headers, bytes(content)
+        finally:
+            conn.close()

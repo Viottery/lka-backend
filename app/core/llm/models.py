@@ -53,6 +53,7 @@ class LLMRequest(BaseModel):
     model: str | None = None
     temperature: float = 0.0
     reasoning_effort: LLMReasoningEffort | None = None
+    thinking_enabled: bool | None = None
     max_output_tokens: int | None = None
     require_json: bool = False
     tools: list[LLMToolDefinition] = Field(default_factory=list)

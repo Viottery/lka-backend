@@ -4,6 +4,10 @@ This repository is **Local Knowledge Agent OS**, a local Python backend for a
 knowledge-augmented desktop Agent. Keep this file short: it records only
 project-specific rules. Use `docs/` for full architecture details.
 
+This repository file also serves as project guidance for the LKA Agent runtime
+when this repository is its selected workspace. Runtime-wide and scheduled-watch
+guidance live in separate local files; see `docs/agent_instruction_files.md`.
+
 ## Source Of Truth
 
 Read these before meaningful changes:

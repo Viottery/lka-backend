@@ -445,6 +445,7 @@ class SessionCreateRequest(BaseModel):
     title: str | None = None
     initial_message: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    project_id: str | None = Field(default=None, min_length=1, max_length=100)
 
 
 class SessionCreateResponse(AgentSessionDetail):
@@ -459,6 +460,7 @@ class SessionWorkspaceUpdateRequest(BaseModel):
 class SessionWorkspaceResponse(BaseModel):
     session_id: str
     workspace: SessionWorkspace
+    project_id: str | None = None
 
 
 class SessionListResponse(AgentSessionList):

@@ -120,6 +120,72 @@ def test_planner_fork_validates_and_persists_replayable_dag(tmp_path) -> None:
     assert restored.list_events(run_id)[-1].type == "fork_subtasks_validated"
 
 
+def test_schema_rejection_keeps_operation_id_available_for_durable_correction(tmp_path) -> None:
+    store = SqliteAgentRunStore(tmp_path / "agent_runs.sqlite3")
+    loop, manager, run_id = _loop_and_run(store)
+    malformed = {"type": "fork_subtasks", "operation_id": "fork_correctable"}
+
+    rejected = loop._handle_fork_subtasks_decision(
+        run_id=run_id,
+        user_input="compare options",
+        operation=malformed,
+        parse_error="subtasks: required field missing",
+    )
+
+    assert rejected["status"] == "rejected"
+    assert manager.list_events(run_id)[-1].type == "fork_subtasks_rejected"
+    assert manager.get_run(run_id).metadata.get("fork_operations", {}).get("fork_correctable") is None
+
+    restored = InMemoryAgentRunManager(durable_store=store)
+    loop.run_manager = restored
+    corrected = _fork(
+        "fork_correctable",
+        (ForkSubtaskSpec(
+            step_id="option_a",
+            objective="Research option A.",
+            output_contract="A concise supported finding.",
+        ),),
+    )
+    accepted = loop._handle_fork_subtasks_decision(
+        run_id=run_id, user_input="compare options", operation=corrected,
+    )
+
+    assert accepted["status"] == "validated"
+    assert restored.get_run(run_id).metadata["fork_operations"]["fork_correctable"]["status"] == "validated"
+
+    loop._handle_fork_subtasks_decision(
+        run_id=run_id,
+        user_input="compare options",
+        operation=malformed,
+        parse_error="subtasks: required field missing",
+    )
+    assert restored.get_run(run_id).metadata["fork_operations"]["fork_correctable"]["status"] == "validated"
+
+
+def test_omitted_requested_scope_keeps_server_computed_child_grant() -> None:
+    loop, manager, run_id = _loop_and_run()
+    operation = _fork(
+        "fork_server_scope",
+        (ForkSubtaskSpec(
+            step_id="option_a",
+            objective="Research option A.",
+            output_contract="A concise supported finding.",
+        ),),
+    )
+
+    accepted = loop._handle_fork_subtasks_decision(
+        run_id=run_id, user_input="compare options", operation=operation,
+    )
+
+    assert accepted["status"] == "validated"
+    validated = next(
+        step for step in manager.get_run(run_id).metadata["multi_agent_plan"]["steps"]
+        if step["step_id"] == "option_a"
+    )
+    assert validated["allowed_tools"] == ["knowledge.search"]
+    assert validated["effective_scope"]["side_effect_level"] == "read"
+
+
 def test_only_structured_fork_operation_can_enter_fork_action() -> None:
     loop = AgentTurnLoop.__new__(AgentTurnLoop)
     structured = loop._normalize_decision_output(
@@ -176,6 +242,7 @@ def test_planner_rejects_cyclic_fork_without_creating_child_runs() -> None:
     assert manager.get_run(run_id).metadata.get("multi_agent_plan") is None
     assert manager.child_tree(run_id) == []
     assert manager.list_events(run_id)[-1].type == "fork_subtasks_rejected"
+    assert manager.get_run(run_id).metadata["fork_operations"]["fork_cycle"]["status"] == "rejected"
 
 
 def test_fork_step_cannot_depend_on_active_coordinator() -> None:

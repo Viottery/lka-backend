@@ -848,6 +848,16 @@ class SqliteAgentRunStore:
             ).fetchone()
         return _json_load(row["payload"]) if row is not None else None
 
+    def load_tool_result_artifact(self, artifact_id: str, run_id: str) -> dict[str, Any] | None:
+        """Load a tool result only when both its artifact kind and owning run match."""
+        with connect(self.db_path) as conn:
+            row = conn.execute(
+                """SELECT payload FROM agent_run_artifacts
+                   WHERE artifact_id = ? AND run_id = ? AND kind = 'tool_result'""",
+                (artifact_id, run_id),
+            ).fetchone()
+        return _json_load(row["payload"]) if row is not None else None
+
     def claim_tool_invocation(
         self,
         *,

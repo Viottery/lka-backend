@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Iterable
 from enum import Enum
 
 from pydantic import Field
 
+from app.core.agent_runs import AgentRunEvent, AgentRunRecord, AgentRunStatus
 from app.core.multi_agent import (
+    GENERAL_AGENT_ID,
     AggregationStatus,
     Artifact,
     EvidenceRef,
@@ -192,6 +195,156 @@ class VerificationPolicy(MultiAgentModel):
     require_evidence: bool = False
     required_artifact_kinds: tuple[str, ...] = ()
     require_side_effect_confirmation: bool = True
+    require_side_effect_audit: bool = False
+
+
+def derive_child_execution_evidence(
+    run: AgentRunRecord,
+    events: Iterable[AgentRunEvent],
+    *,
+    tool_audit: dict[str, object] | None = None,
+) -> tuple[bool | None, ConfirmationState]:
+    """Derive side-effect evidence from a complete, durable child-run event log.
+
+    ``False`` is returned only when the completed run's tool lifecycle events
+    reconcile with its terminal summary and every non-read-only invocation has
+    a durable approved review. Missing or inconsistent audit data stays unknown.
+    """
+
+    ordered = sorted(events, key=lambda event: event.sequence)
+    if not ordered or [event.sequence for event in ordered] != list(range(1, len(ordered) + 1)):
+        return None, ConfirmationState.MISSING
+    if run.status == AgentRunStatus.FAILED:
+        terminal_failures = [event for event in ordered if event.type == "subtask_failed"]
+        attempted_tools = any(
+            event.type in {
+                "tool_started", "tool_completed", "safety_review_required",
+                "safety_review_decided",
+            }
+            for event in ordered
+        )
+        if (
+            run.metadata.get("agent_id") == GENERAL_AGENT_ID
+            and run.metadata.get("executor_kind") == "react"
+            and len(terminal_failures) == 1
+            and not attempted_tools
+            and ordered[-1] == terminal_failures[0]
+        ):
+            return False, ConfirmationState.NOT_REQUIRED
+        return None, ConfirmationState.MISSING
+    if run.status != AgentRunStatus.COMPLETED:
+        return None, ConfirmationState.MISSING
+    if (
+        not isinstance(tool_audit, dict)
+        or tool_audit.get("protocol_version") != "child_tool_audit_v1"
+        or tool_audit.get("complete") is not True
+        or not isinstance(tool_audit.get("invocations"), list)
+    ):
+        return None, ConfirmationState.MISSING
+
+    terminal = [event for event in ordered if event.type == "run_completed"]
+    if len(terminal) != 1:
+        return None, ConfirmationState.MISSING
+    expected_count = terminal[0].payload.get("tool_event_count")
+    if isinstance(expected_count, bool) or not isinstance(expected_count, int) or expected_count < 0:
+        return None, ConfirmationState.MISSING
+
+    started = [event for event in ordered if event.type == "tool_started"]
+    completed = [event for event in ordered if event.type == "tool_completed"]
+    if len(started) != len(completed):
+        return None, ConfirmationState.MISSING
+    started_values = [event.payload.get("tool_name") for event in started]
+    completed_values = [event.payload.get("tool_name") for event in completed]
+    if any(not isinstance(name, str) or not name for name in (*started_values, *completed_values)):
+        return None, ConfirmationState.MISSING
+    started_names = Counter(started_values)
+    completed_names = Counter(completed_values)
+    if started_names != completed_names:
+        return None, ConfirmationState.MISSING
+
+    reviews: dict[str, dict[str, object]] = {}
+    for event in ordered:
+        if event.type not in {"safety_review_required", "safety_review_decided"}:
+            continue
+        review = event.payload.get("review")
+        if isinstance(review, dict) and isinstance(review.get("invocation_id"), str):
+            reviews[str(review["invocation_id"])] = review
+
+    completed_by_invocation: dict[str, dict[str, object]] = {}
+    for event in completed:
+        metadata = event.payload.get("metadata")
+        result = metadata.get("result") if isinstance(metadata, dict) else None
+        if not isinstance(result, dict) or not isinstance(result.get("invocation_id"), str):
+            return None, ConfirmationState.MISSING
+        completed_by_invocation[str(result["invocation_id"])] = result
+
+    classifications: dict[str, dict[str, object]] = {}
+    for item in tool_audit["invocations"]:
+        if (
+            not isinstance(item, dict)
+            or not isinstance(item.get("invocation_id"), str)
+            or not isinstance(item.get("tool_name"), str)
+            or not isinstance(item.get("read_only"), bool)
+            or not isinstance(item.get("status"), str)
+        ):
+            return None, ConfirmationState.MISSING
+        invocation_id = str(item["invocation_id"])
+        if invocation_id in classifications:
+            return None, ConfirmationState.MISSING
+        classifications[invocation_id] = item
+    if (
+        len(classifications) != expected_count
+        or not set(completed_by_invocation).issubset(classifications)
+        or not set(reviews).issubset(classifications)
+    ):
+        return None, ConfirmationState.MISSING
+    for event in completed:
+        metadata = event.payload.get("metadata")
+        result = metadata.get("result") if isinstance(metadata, dict) else None
+        if not isinstance(result, dict):
+            return None, ConfirmationState.MISSING
+        classification = classifications.get(str(result.get("invocation_id")))
+        if (
+            classification is None
+            or classification.get("tool_name") != event.payload.get("tool_name")
+            or classification.get("status") != result.get("status")
+        ):
+            return None, ConfirmationState.MISSING
+
+    rejected_without_execution = sum(
+        1 for invocation_id, review in reviews.items()
+        if invocation_id not in completed_by_invocation
+        and review.get("read_only") in {False, None}
+        and review.get("status") == "rejected"
+    )
+    if expected_count != len(completed) + rejected_without_execution:
+        return None, ConfirmationState.MISSING
+
+    executed_non_readonly: list[str] = []
+    for invocation_id, classification in classifications.items():
+        review = reviews.get(invocation_id)
+        executed = invocation_id in completed_by_invocation
+        if classification["read_only"] is True:
+            if not executed or review is not None:
+                return None, ConfirmationState.MISSING
+            continue
+        if review is None or review.get("read_only") is not False:
+            return None, ConfirmationState.MISSING
+        if not executed and review.get("status") == "rejected":
+            if classification.get("status") != "rejected":
+                return None, ConfirmationState.MISSING
+            continue
+        if review.get("status") != "approved" or not executed:
+            return None, ConfirmationState.MISSING
+        # Once the executor emitted a completion record, a rejected or failed
+        # result still cannot rule out a partial effect inside the tool.
+        executed_non_readonly.append(invocation_id)
+
+    return bool(executed_non_readonly), (
+        ConfirmationState.APPROVED
+        if executed_non_readonly
+        else ConfirmationState.NOT_REQUIRED
+    )
 
 
 def verify_task_result(
@@ -229,7 +382,12 @@ def verify_task_result(
     else:
         contract_state, contract_summary = VerificationStatus.INCONCLUSIVE, "Output contract needs an explicit verifier decision."
         actions.append("verify_output_contract")
-        checks.append(VerificationCheck(check_id="output_contract", status=contract_state, summary=contract_summary))
+    checks.append(VerificationCheck(
+        check_id="output_contract",
+        status=contract_state,
+        summary=contract_summary,
+        required=True,
+    ))
     unresolved_artifacts = [ref for ref in result.artifact_refs if ref not in artifact_map]
     if unresolved_artifacts:
         missing.extend(f"artifact:{ref}" for ref in unresolved_artifacts)
@@ -246,7 +404,17 @@ def verify_task_result(
     could_have_side_effects = step.side_effect_level in {SideEffectLevel.WRITE, SideEffectLevel.EXTERNAL}
     confirmation_required = policy.require_side_effect_confirmation and could_have_side_effects
     side_effect_required = confirmation_required and actual_side_effects is True
-    if not could_have_side_effects or actual_side_effects is False:
+    if actual_side_effects is True and not could_have_side_effects:
+        confirmation_state = VerificationStatus.FAILED
+        confirmation_summary = "Non-read-only tool execution exceeded the step's declared side-effect scope."
+        missing.append("actual_side_effect_scope_mismatch")
+        actions.append("replan_or_abort")
+    elif actual_side_effects is None and policy.require_side_effect_audit:
+        confirmation_state = VerificationStatus.INCONCLUSIVE
+        confirmation_summary = "Child tool audit is missing or incomplete; side effects cannot be ruled out."
+        missing.append("actual_side_effects_unknown")
+        actions.append("inspect_tool_review_records")
+    elif not could_have_side_effects or actual_side_effects is False:
         confirmation_state = VerificationStatus.PASSED
         confirmation_summary = "No non-read-only side effect occurred."
     elif actual_side_effects is None:
@@ -266,7 +434,16 @@ def verify_task_result(
         confirmation_state, confirmation_summary = VerificationStatus.INCONCLUSIVE, "Required side-effect confirmation is pending or missing."
         missing.append("side_effect_confirmation")
         actions.append("await_side_effect_confirmation")
-    checks.append(VerificationCheck(check_id="side_effect_confirmation", status=confirmation_state, summary=confirmation_summary, required=confirmation_required))
+    checks.append(VerificationCheck(
+        check_id="side_effect_confirmation",
+        status=confirmation_state,
+        summary=confirmation_summary,
+        required=(
+            confirmation_required
+            or policy.require_side_effect_audit
+            or (actual_side_effects is True and not could_have_side_effects)
+        ),
+    ))
     if result.status in {TaskResultStatus.FAILED, TaskResultStatus.CANCELLED, TaskResultStatus.TIMED_OUT, TaskResultStatus.BLOCKED}:
         checks.append(VerificationCheck(check_id="task_status", status=VerificationStatus.FAILED, summary=f"Task ended with {result.status.value} status."))
         actions.append("replan_or_abort")

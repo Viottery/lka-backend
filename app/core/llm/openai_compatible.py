@@ -54,8 +54,10 @@ class OpenAICompatibleLLMClient:
         supports_stream: bool = True,
         supports_json_mode: bool = False,
         supports_function_calling: bool = False,
+        supports_required_tool_choice: bool = False,
         function_calling_strict: bool = False,
         supports_reasoning_effort: bool = False,
+        thinking_control: str | None = None,
     ) -> None:
         if not api_key:
             raise LLMClientError(f"Missing API key for LLM client: {name}")
@@ -69,8 +71,10 @@ class OpenAICompatibleLLMClient:
         self.supports_stream = supports_stream
         self.supports_json_mode = supports_json_mode
         self.supports_function_calling = supports_function_calling
+        self.supports_required_tool_choice = supports_required_tool_choice
         self.function_calling_strict = function_calling_strict
         self.supports_reasoning_effort = supports_reasoning_effort
+        self.thinking_control = thinking_control
 
     async def complete(self, request: LLMRequest) -> LLMResponse:
         response_payload, response_headers = await _run_blocking(
@@ -202,7 +206,7 @@ class OpenAICompatibleLLMClient:
         try:
             with urllib.request.urlopen(
                 http_request,
-                timeout=self.timeout_seconds,
+                timeout=self._request_timeout(request),
             ) as response:
                 headers = {str(key).lower(): str(value) for key, value in response.headers.items()}
                 return json.loads(response.read().decode("utf-8")), headers
@@ -216,10 +220,16 @@ class OpenAICompatibleLLMClient:
             raise LLMResponseParseError(f"LLM provider returned invalid JSON: {exc}") from exc
         raise LLMResponseParseError("LLM provider returned no response.")
 
+    def _request_timeout(self, request: LLMRequest) -> float:
+        value = request.metadata.get("network_timeout_seconds")
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 < value <= self.timeout_seconds:
+            return float(value)
+        return self.timeout_seconds
+
     def _open_stream(self, request: LLMRequest):
         http_request = self._build_request(request, stream=True)
         try:
-            return urllib.request.urlopen(http_request, timeout=self.timeout_seconds)
+            return urllib.request.urlopen(http_request, timeout=self._request_timeout(request))
         except urllib.error.HTTPError as exc:
             self._raise_http_error(exc)
         except (TimeoutError, socket.timeout) as exc:
@@ -241,6 +251,10 @@ class OpenAICompatibleLLMClient:
         }
         if request.reasoning_effort is not None:
             payload["reasoning_effort"] = LLMReasoningEffort(request.reasoning_effort).value
+        if request.thinking_enabled is not None:
+            if self.thinking_control != "deepseek":
+                raise LLMClientError(f"LLM client {self.name} does not support thinking control.")
+            payload["thinking"] = {"type": "enabled" if request.thinking_enabled else "disabled"}
         if request.max_output_tokens is not None:
             payload["max_tokens"] = request.max_output_tokens
         if request.require_json and self.supports_json_mode and not request.tools:

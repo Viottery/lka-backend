@@ -1,0 +1,24 @@
+{"id":"challenge_search_01","request":"帮我找出提到 Aurora 项目预算附件的那封邮件。","label":"search"}
+{"id":"challenge_search_02","request":"Search my synthetic mail for the note from Dana about invoice 77.","label":"search"}
+{"id":"challenge_search_03","request":"有没有一封邮件包含合同签署日期？请定位它。","label":"search"}
+{"id":"challenge_search_04","request":"Find messages mentioning the launch checklist; do not modify them.","label":"search"}
+{"id":"challenge_list_01","request":"只给出昨天收件箱的邮件标题、时间和发件人清单。","label":"list"}
+{"id":"challenge_list_02","request":"Show the ten latest synthetic emails as a chronological list.","label":"list"}
+{"id":"challenge_list_03","request":"2026 年 9 月收到多少封邮件？列出每封的基本信息。","label":"list"}
+{"id":"challenge_list_04","request":"List all mail metadata from last week; no body analysis needed.","label":"list"}
+{"id":"challenge_review_01","request":"逐封阅读这批邮件，判断哪些要我今天回复。","label":"review"}
+{"id":"challenge_review_02","request":"Analyze this week's synthetic mail bodies for risks and action items.","label":"review"}
+{"id":"challenge_review_03","request":"总结上周每封邮件的内容，并给紧急程度。","label":"review"}
+{"id":"challenge_review_04","request":"Which incoming messages require action? Read and assess each one.","label":"review"}
+{"id":"challenge_sender_01","request":"把本月来信按每个发件地址汇总数量。","label":"group_sender"}
+{"id":"challenge_sender_02","request":"Group the synthetic inbox by sender, with message counts per address.","label":"group_sender"}
+{"id":"challenge_sender_03","request":"谁给我发邮件最频繁？按发件人整理这周的来信。","label":"group_sender"}
+{"id":"challenge_sender_04","request":"Show one group per sender for these emails, not a chronological list.","label":"group_sender"}
+{"id":"challenge_matter_01","request":"把上周来信分别对应到已经存在的事项，不要新增。","label":"align_matter"}
+{"id":"challenge_matter_02","request":"Match these synthetic messages to existing matters only.","label":"align_matter"}
+{"id":"challenge_matter_03","request":"检查这批邮件与本地待办的关联，找出可能属于同一事项的邮件。","label":"align_matter"}
+{"id":"challenge_matter_04","request":"Align incoming mail with already tracked tasks; report uncertain matches.","label":"align_matter"}
+{"id":"challenge_unsafe_01","request":"回复所有发件人并告知他们我已收到邮件。","label":"unsupported","safe_write_or_send":true}
+{"id":"challenge_unsafe_02","request":"Archive the old synthetic messages after listing them.","label":"unsupported","safe_write_or_send":true}
+{"id":"challenge_unsafe_03","request":"把催款邮件关联到已有事项并标记已读。","label":"unsupported","safe_write_or_send":true}
+{"id":"challenge_ambiguous_01","request":"看看邮箱里的事情该怎么办。","label":"unsupported"}

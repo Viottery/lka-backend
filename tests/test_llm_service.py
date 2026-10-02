@@ -38,6 +38,34 @@ def test_llm_service_uses_request_model_override():
     assert response.content == '{"matters":[]}'
 
 
+def test_llm_service_exposes_function_choice_capability_per_client(monkeypatch):
+    monkeypatch.setenv("TEST_FUNCTION_CLIENT_KEY", "test-key")
+    service = build_llm_service(
+        LLMProviderConfig(
+            default_client="structured",
+            clients=[
+                LLMClientConfig(
+                    name="structured",
+                    api_key_env="TEST_FUNCTION_CLIENT_KEY",
+                    supports_function_calling=True,
+                    supports_required_tool_choice=True,
+                ),
+                LLMClientConfig(
+                    name="basic",
+                    api_key_env="TEST_FUNCTION_CLIENT_KEY",
+                    supports_function_calling=False,
+                ),
+            ],
+        )
+    )
+
+    assert service is not None
+    assert service.supports_function_calling(client_name="structured")
+    assert service.supports_required_tool_choice(client_name="structured")
+    assert not service.supports_function_calling(client_name="basic")
+    assert not service.supports_required_tool_choice(client_name="basic")
+
+
 def test_llm_service_streams_standard_events():
     service = build_llm_service(
         LLMProviderConfig(

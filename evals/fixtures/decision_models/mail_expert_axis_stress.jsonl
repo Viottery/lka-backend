@@ -1,0 +1,12 @@
+{"id":"axis_sender_01","request":"按发件人把关于同一事项的邮件分组，统计每个发件地址的数量。","label":"group_sender"}
+{"id":"axis_sender_02","request":"Group by sender, even if the emails mention different tracked matters.","label":"group_sender"}
+{"id":"axis_sender_03","request":"这些事项的相关来信，请按发信人汇总，而不是按事项。","label":"group_sender"}
+{"id":"axis_sender_04","request":"每个发件人分别有哪些关于待办的邮件？","label":"group_sender"}
+{"id":"axis_sender_05","request":"Find existing matter emails and organize the result by who sent them.","label":"group_sender"}
+{"id":"axis_sender_06","request":"不是按项目归类；我想看每个发件邮箱各有几封。","label":"group_sender"}
+{"id":"axis_matter_01","request":"同一个发件人发来的邮件可能属于不同事项，请按已有事项对应。","label":"align_matter"}
+{"id":"axis_matter_02","request":"Match sender Dana's messages to the existing tracked tasks, not by sender group.","label":"align_matter"}
+{"id":"axis_matter_03","request":"把不同发信人的来信分别归到已有事项下面。","label":"align_matter"}
+{"id":"axis_matter_04","request":"这批邮件的发件人很多；请判断各封对应哪个现有待办。","label":"align_matter"}
+{"id":"axis_matter_05","request":"Group mail by existing matter even when several senders discuss the same one.","label":"align_matter"}
+{"id":"axis_matter_06","request":"不要按发送者整理，按已经记录的任务来对齐邮件。","label":"align_matter"}

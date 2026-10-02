@@ -710,7 +710,8 @@ class KnowledgeService:
             )
         rerank_applied = False
         rerank_warning: str | None = None
-        if _apply_rerank and self._reranker is not None and results:
+        # A time-ordered listing must not be reordered by relevance scores.
+        if _apply_rerank and sort_by != "source_time_desc" and self._reranker is not None and results:
             try:
                 rerank_count = min(len(results), self._reranker.max_candidates)
                 scores = self._reranker.score(

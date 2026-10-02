@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import threading
-from hashlib import sha1
+from datetime import UTC, datetime
+from hashlib import sha1, sha256
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Literal
 from uuid import uuid4
@@ -21,6 +22,7 @@ from app.core.agent_runner import AgentTurnRunner
 from app.core.agent_runs import AgentRunRecord, AgentRunStatus, InMemoryAgentRunManager
 from app.core.agent_storage import SqliteAgentRunStore
 from app.core.agent_turn import AgentTurnLoop, AgentTurnResult
+from app.core.background_jobs import BackgroundJobStore
 from app.core.child_agent import ChildAgentExecutor
 from app.core.codex_app_server import CodexAppServerClient
 from app.core.codex_expert import (
@@ -33,13 +35,18 @@ from app.core.codex_workspace import CodexWorkspaceFactory
 from app.core.config import Settings
 from app.core.context import ContextAssembler
 from app.core.context_driver import ContextViews, EvidenceCandidate
+from app.core.instruction_files import InstructionFiles
 from app.core.llm import LLMResponseMode, MockLLMClient, build_text_llm_client
-from app.core.safety import SafetyReviewMode
+from app.core.llm_workloads import LLMWorkloadController
+from app.core.memory_background import MemoryBackgroundCoordinator
+from app.core.memory_context import MemoryContextProvider, MemoryPreTurnGate
+from app.core.memory_files import MemoryFiles
 from app.core.multi_agent import (
     GENERAL_AGENT_ID,
     ContextSnapshot,
     EvidenceRef,
     ForkPolicy,
+    MemoryReference,
     RuntimeBudget,
     ScopeGrant,
     SideEffectLevel,
@@ -50,8 +57,10 @@ from app.core.multi_agent_scheduler import (
     MultiAgentScheduleResult,
     SchedulerContext,
 )
+from app.core.prompt_tokens import PromptTokenCounter
 from app.core.retrieval import LocalDebugRetrievalProvider
 from app.core.runtime_loop import RuntimeDebugRun, RuntimeLoop
+from app.core.safety import SafetyReviewMode
 from app.core.sessions import (
     AgentSessionDetail,
     AgentSessionList,
@@ -62,6 +71,7 @@ from app.core.sessions import (
 )
 from app.core.tools import MockToolExecutor, ToolExecutor, ToolRegistry
 from app.core.tracing import TraceRecorder
+from app.core.watch_scheduler import WatchScheduler
 from app.domains.knowledge import (
     KnowledgeChunkLoadResult,
     KnowledgeDocumentInput,
@@ -88,7 +98,12 @@ from app.domains.matters import (
     MatterSourceLinkInput,
     MatterUpdateInput,
 )
+from app.domains.memory import MemoryService, MemorySourceInput
+from app.domains.memory_settings import MemorySettingsStore
+from app.domains.projects import ProjectService
+from app.domains.watch import WatchService
 from app.domains.workspace_knowledge import WorkspaceKnowledgeIndexer
+from app.experts.mail import MailExpertExecutor
 from app.integrations.local_reranker import FastEmbedCrossEncoderReranker
 from app.integrations.local_semantic import build_local_semantic_components
 from app.integrations.outlook import (
@@ -99,6 +114,7 @@ from app.integrations.outlook import (
     OutlookServiceError,
     OutlookSyncResult,
 )
+from app.integrations.web_search import BraveSearchQuota
 from app.platform import FilesystemScanner, PathResolver, ScanOptions, detect_platform
 from app.storage.db import connect, get_db_path, init_db
 from app.tool_packages.bash import (
@@ -118,6 +134,14 @@ from app.tool_packages.filesystem import (
     FileAccessPolicy,
     ReadFileTool,
 )
+from app.tool_packages.instructions import (
+    INSTRUCTIONS_PACKAGE,
+    ReadInstructionsTool,
+    ReadProjectInstructionsTool,
+    SearchInstructionsTool,
+    SearchProjectInstructionsTool,
+    UpdateInstructionsTool,
+)
 from app.tool_packages.knowledge import (
     KNOWLEDGE_PACKAGE,
     ListKnowledgeSourcesTool,
@@ -127,10 +151,12 @@ from app.tool_packages.knowledge import (
 )
 from app.tool_packages.mail import (
     MAIL_PACKAGE,
+    ListMailTool,
     LoadMailMessagesTool,
     SearchMailTool,
     SyncMailTool,
 )
+from app.tool_packages.mail_expert_tools import MailBatchLoadTool, MailSnapshotTool
 from app.tool_packages.matter import (
     MATTER_PACKAGE,
     CreateManyMattersTool,
@@ -140,6 +166,9 @@ from app.tool_packages.matter import (
     SearchMattersTool,
     UpdateMatterTool,
 )
+from app.tool_packages.memory import MEMORY_PACKAGE, ReadMemoryTool, SearchMemoryTool
+from app.tool_packages.observation import OBSERVATION_PACKAGE, ObservationReadTool
+from app.tool_packages.web import register_web_tools
 
 
 def _stable_id(prefix: str, text: str) -> str:
@@ -169,6 +198,36 @@ class LocalKnowledgeAgentRuntime:
         self.db_path = get_db_path(settings.data_dir)
         init_db(self.db_path)
         self.local_app_config = settings.load_local_config()
+        self.memory_settings_base = self.local_app_config.model_copy(deep=True)
+        self.memory_settings_store = MemorySettingsStore(self._conn)
+        self.memory_settings_error: str | None = None
+        saved_settings = self.memory_settings_store.read()
+        overrides = saved_settings["overrides"]
+        try:
+            if saved_settings["invalid"]:
+                raise ValueError("invalid_saved_configuration")
+            if not isinstance(overrides, dict) or set(overrides) - {"memory", "background"}:
+                raise ValueError("invalid_saved_configuration")
+            for section in ("memory", "background"):
+                model = type(getattr(self.local_app_config, section))
+                values = overrides.get(section, {})
+                if not isinstance(values, dict) or set(values) - model.model_fields.keys():
+                    raise ValueError("invalid_saved_configuration")
+                merged = {**getattr(self.local_app_config, section).model_dump(), **values}
+                setattr(self.local_app_config, section, model.model_validate(merged, strict=True))
+            memory = self.local_app_config.memory
+            clients = self.local_app_config.llm.client_configs()
+            selected_name = memory.background_client_name or self.local_app_config.llm.default_client
+            selected = next((client for client in clients if client.name == selected_name), None) if selected_name else (clients[0] if clients else None)
+            if (memory.background_client_name and selected is None) or (
+                memory.background_model and (selected is None or memory.background_model not in
+                    [selected.default_model, *selected.available_models])
+            ):
+                raise ValueError("invalid_saved_configuration")
+        except ValueError:
+            # Corrupt overrides must not prevent local recovery/config reset.
+            self.local_app_config = self.memory_settings_base.model_copy(deep=True)
+            self.memory_settings_error = "invalid_saved_configuration"
         if (
             self.local_app_config.agent.multi_agent_planning_enabled
             and self.local_app_config.agent.orchestrator != "langgraph"
@@ -184,9 +243,46 @@ class LocalKnowledgeAgentRuntime:
             wsl_windows_mount_root=settings.wsl_windows_mount_root,
         )
         self.filesystem_scanner = FilesystemScanner(self.platform)
-        self.session_service = SessionService(self._conn)
+        # Session compaction is advisory; use the configured default model's
+        # tokenizer when locally available. The Agent turn's final preflight
+        # remains authoritative for request/model overrides and full prompts.
+        llm_config = self.local_app_config.llm
+        clients = llm_config.client_configs()
+        default_client = next(
+            (client for client in clients if client.name == llm_config.default_client),
+            clients[0] if clients else None,
+        )
+        context_counter = None
+        if default_client is not None:
+            resolved = llm_config.resolve_model_config(
+                default_client.name, default_client.default_model
+            )
+            tokenizer_path = resolved.tokenizer_json_path if resolved else None
+            if tokenizer_path is not None:
+                try:
+                    context_counter = PromptTokenCounter(tokenizer_path)
+                except (FileNotFoundError, ValueError, RuntimeError):
+                    # No tokenizer must never prevent startup; final prompt
+                    # budgeting uses its conservative fallback independently.
+                    pass
+        self.session_service = SessionService(
+            self._conn, context_token_counter=context_counter
+        )
+        self.memory_service = MemoryService(self.db_path)
+        self.memory_service.ensure_schema()
+        self.project_service = ProjectService(self._conn, self.memory_service)
+        self.project_service.ensure_schema()
+        self._backfill_session_projects()
+        self.memory_files = MemoryFiles(self.memory_service, settings.data_dir)
+        self.background_job_store = BackgroundJobStore(self.db_path, max_pending_jobs=self.local_app_config.background.max_pending_jobs)
+        self.background_job_store.ensure_schema()
         self.mail_service = MailService(self._conn)
         self.matter_service = MatterService(self._conn)
+        self.watch_service = WatchService(self._conn)
+        self.watch_service.initialize()
+        self.instruction_files = InstructionFiles(settings.data_dir, settings.parsed_workspace_roots())
+        self.instruction_files.initialize()
+        self.watch_scheduler = WatchScheduler(self, self.watch_service)
         embedding_config = self.local_app_config.embedding
         embedding_provider, semantic_index = build_local_semantic_components(
             conn_factory=self._conn,
@@ -244,9 +340,23 @@ class LocalKnowledgeAgentRuntime:
         self.tool_registry.register_package(KNOWLEDGE_PACKAGE)
         self.tool_registry.register_package(FILESYSTEM_PACKAGE)
         self.tool_registry.register_package(BASH_PACKAGE)
+        self.tool_registry.register_package(OBSERVATION_PACKAGE)
+        self.tool_registry.register_package(INSTRUCTIONS_PACKAGE)
+        if self.local_app_config.memory.enabled:
+            self.tool_registry.register_package(MEMORY_PACKAGE)
+        register_web_tools(
+            self.tool_registry, api_key=self.local_app_config.web_search.resolved_api_key(),
+            quota=BraveSearchQuota(
+                self._conn, self.local_app_config.web_search.monthly_request_limit,
+            ),
+        )
         self.tool_registry.register_tool(SearchMailTool(self.mail_knowledge_mirror))
+        self.tool_registry.register_tool(ListMailTool(self.mail_service, self.mail_knowledge_mirror))
         self.tool_registry.register_tool(LoadMailMessagesTool(self.mail_service))
         self.tool_registry.register_tool(SyncMailTool(self.sync_outlook_mail))
+        if self.local_app_config.agent.mail_expert_enabled:
+            self.tool_registry.register_tool(MailSnapshotTool(self.mail_service, self.mail_knowledge_mirror))
+            self.tool_registry.register_tool(MailBatchLoadTool(self.mail_service))
         self.tool_registry.register_tool(CreateMatterTool(self.matter_service))
         self.tool_registry.register_tool(CreateManyMattersTool(self.matter_service))
         self.tool_registry.register_tool(SearchMattersTool(self.matter_service))
@@ -264,6 +374,14 @@ class LocalKnowledgeAgentRuntime:
         )
         self.tool_registry.register_tool(ReadFileTool(file_policy))
         self.tool_registry.register_tool(EditFileTool(file_policy))
+        self.tool_registry.register_tool(ReadInstructionsTool(self.instruction_files))
+        self.tool_registry.register_tool(ReadProjectInstructionsTool(self.instruction_files))
+        self.tool_registry.register_tool(SearchInstructionsTool(self.instruction_files))
+        self.tool_registry.register_tool(SearchProjectInstructionsTool(self.instruction_files))
+        self.tool_registry.register_tool(UpdateInstructionsTool(self.instruction_files))
+        if self.local_app_config.memory.enabled:
+            self.tool_registry.register_tool(SearchMemoryTool(self.memory_service))
+            self.tool_registry.register_tool(ReadMemoryTool(self.memory_service))
         bash_policy = BashAccessPolicy.from_workspace_roots(
             self.settings.parsed_workspace_roots()
         )
@@ -285,6 +403,7 @@ class LocalKnowledgeAgentRuntime:
         )
         self.tool_executor = ToolExecutor(self.tool_registry)
         self.agent_run_store = SqliteAgentRunStore(self.db_path)
+        self.tool_registry.register_tool(ObservationReadTool(self.agent_run_store))
         self.agent_run_manager = InMemoryAgentRunManager(
             durable_store=self.agent_run_store
         )
@@ -318,6 +437,7 @@ class LocalKnowledgeAgentRuntime:
                     agent_id for agent_id, enabled in (
                         (GENERAL_AGENT_ID, True),
                         ("mock_workflow", self.local_app_config.agent.mock_workflow_agent_enabled),
+                        (MailExpertExecutor.AGENT_ID, self.local_app_config.agent.mail_expert_enabled),
                         (CodexAppServerExpertExecutor.AGENT_ID, self.local_app_config.agent.codex_expert_enabled),
                     ) if enabled
                 ),
@@ -336,6 +456,36 @@ class LocalKnowledgeAgentRuntime:
                 ),
             )
         self.agent_llm_client = build_text_llm_client(self.local_app_config.llm)
+        resources = self.local_app_config.background
+        self.llm_workloads = LLMWorkloadController(
+            self.db_path, max_concurrency=resources.max_llm_concurrency,
+            interactive_reserved=resources.interactive_reserved,
+            memory_concurrency=resources.memory_concurrency, io_concurrency=resources.io_concurrency,
+            hourly_tokens=resources.hourly_token_limit, daily_tokens=resources.daily_token_limit,
+            daily_cost_limit=resources.daily_cost_limit,
+            input_cost_per_million=resources.input_cost_per_million,
+            output_cost_per_million=resources.output_cost_per_million,
+        )
+        if self.agent_llm_client is not None:
+            self.agent_llm_client.workloads = self.llm_workloads
+            self.agent_llm_client.background_timeout_seconds = resources.request_timeout_seconds
+        memory_config = self.local_app_config.memory
+        self.memory_background = MemoryBackgroundCoordinator(
+            db_path=str(self.db_path), memory=self.memory_service,
+            store=self.background_job_store, session_service=self.session_service,
+            llm_client=self.agent_llm_client,
+            allow_remote_extraction=memory_config.allow_remote_extraction,
+            memory_files=self.memory_files,
+            max_job_tokens=memory_config.max_job_tokens,
+            generation_output_tokens=memory_config.generation_output_tokens,
+            recovery_output_tokens=memory_config.recovery_output_tokens,
+            worker_count=memory_config.background_worker_count,
+            debounce_seconds=memory_config.extraction_debounce_seconds,
+            background_client_name=memory_config.background_client_name,
+            background_model=memory_config.background_model,
+        )
+        self.memory_background.initialize_recovery()
+        self.last_background_error: str | None = None
         self.agent_turn_loop = AgentTurnLoop(
             session_service=self.session_service,
             tool_executor=self.tool_executor,
@@ -359,6 +509,24 @@ class LocalKnowledgeAgentRuntime:
                 str(self.settings.parsed_workspace_roots()[0])
                 if self.settings.parsed_workspace_roots()
                 else None
+            ),
+            instruction_files=self.instruction_files,
+            memory_context_provider=(
+                MemoryContextProvider(
+                    self.memory_service, max_items=memory_config.max_recalled_items,
+                    max_chars=memory_config.max_recalled_chars,
+                ) if memory_config.enabled else None
+            ),
+            memory_answer_callback=(
+                self._enqueue_memory_answer
+                if memory_config.enabled and memory_config.background_enabled else None
+            ),
+            background_compaction_callback=(
+                self._enqueue_compaction
+                if memory_config.background_enabled else None
+            ),
+            memory_pre_turn_callback=(
+                MemoryPreTurnGate(self.memory_service) if memory_config.enabled else None
             ),
         )
         self.agent_turn_loop.multi_agent_max_retries = self.local_app_config.agent.multi_agent_max_retries
@@ -396,6 +564,26 @@ class LocalKnowledgeAgentRuntime:
             ),
             MockWorkflowExecutor(self.agent_run_manager),
         )
+        self.mail_expert_executor: MailExpertExecutor | None = None
+        if self.local_app_config.agent.mail_expert_enabled:
+            self.mail_expert_executor = MailExpertExecutor(
+                run_manager=self.agent_run_manager,
+                tool_executor=self.tool_executor,
+                artifact_store=self.agent_run_store,
+                llm_service=self.agent_llm_client,
+                session_service=self.session_service,
+            )
+            self.agent_executor_registry.register(
+                AgentDefinition(
+                    agent_id=MailExpertExecutor.AGENT_ID,
+                    version=MailExpertExecutor.VERSION,
+                    executor_kind="workflow",
+                    scope_mode="registry_tools",
+                    enabled=True,
+                    can_resume=False,
+                ),
+                self.mail_expert_executor,
+            )
         self.codex_expert_executor: CodexAppServerExpertExecutor | None = None
         self.codex_trace_journal: CodexTraceJournal | None = None
         if self.local_app_config.agent.codex_expert_enabled:
@@ -490,15 +678,75 @@ class LocalKnowledgeAgentRuntime:
     def _conn(self) -> sqlite3.Connection:
         return connect(self.db_path)
 
+    def _backfill_session_projects(self) -> None:
+        """Associate legacy folder sessions without changing their order or history."""
+        import json
+
+        conn = self._conn()
+        try:
+            rows = conn.execute("SELECT session_id,metadata FROM agent_sessions WHERE json_valid(metadata) AND json_extract(metadata,'$.project_id') IS NULL").fetchall()
+        finally:
+            conn.close()
+        for row in rows:
+            metadata = json.loads(row["metadata"])
+            if not isinstance(metadata, dict):
+                continue
+            workspace = metadata.get("workspace")
+            path = workspace.get("backend_path") if isinstance(workspace, dict) else None
+            if not isinstance(path, str) or not path:
+                continue
+            try:
+                resolved = self.path_resolver.resolve_workspace(path)
+            except (ValueError, OSError):
+                continue
+            if not self.path_resolver.is_allowed_workspace(resolved):
+                continue
+            project = self.project_service.register(resolved.normalized_path, Path(resolved.normalized_path).name[:120] or "Project")
+            metadata["project_id"] = project["project_id"]
+            conn = self._conn()
+            try:
+                conn.execute("UPDATE agent_sessions SET metadata=? WHERE session_id=? AND metadata=?",
+                             (json.dumps(metadata, ensure_ascii=False), row["session_id"], row["metadata"]))
+                conn.commit()
+            finally:
+                conn.close()
+
+    def _enqueue_memory_answer(self, conn: sqlite3.Connection, message: AgentSessionMessage) -> None:
+        try:
+            self.memory_background.enqueue_answer(conn, message)
+        except Exception as exc:  # noqa: BLE001 - optional outbox must not discard a committed answer
+            # Preserve the completed Agent answer even when the outbox is down.
+            # The startup recovery scan repairs committed answers from this era.
+            self.last_background_error = type(exc).__name__
+
+    def _enqueue_compaction(
+        self, session_id: str, revision: int, target_seq: int,
+        *, conn: sqlite3.Connection,
+    ) -> None:
+        try:
+            self.memory_background.enqueue_compaction(
+                session_id, revision, target_seq, conn=conn,
+            )
+        except Exception as exc:  # noqa: BLE001 - optional compaction must not discard raw context
+            # The raw context tail remains durable. A later exchange can
+            # re-enqueue, and the hard-threshold synchronous path stays live.
+            self.last_background_error = type(exc).__name__
+
     def start(self) -> None:
         """Start runtime services that should run while the API process is alive."""
 
         self._run_startup_mail_sync()
         self._start_background_mail_sync()
+        self.watch_scheduler.start()
+        if self.local_app_config.memory.enabled and self.local_app_config.memory.background_enabled:
+            self.memory_background.start()
 
     def stop(self) -> None:
         """Stop runtime background services."""
 
+        self.watch_scheduler.stop()
+        self.memory_background.stop()
+        self.instruction_files.close()
         self._mail_sync_stop_event.set()
         if self._mail_sync_thread and self._mail_sync_thread.is_alive():
             self._mail_sync_thread.join(timeout=5)
@@ -934,6 +1182,45 @@ class LocalKnowledgeAgentRuntime:
             ))
         return tuple(candidates)
 
+    def _parent_memory_candidates(self, run_id: str) -> tuple[MemoryReference, ...]:
+        """Resolve explicitly requested versions in the parent's authorized scope."""
+        if not self.local_app_config.memory.enabled:
+            return ()
+        parent = self.agent_run_manager.get_run(run_id)
+        if parent is None:
+            return ()
+        raw_plan = parent.metadata.get("multi_agent_plan", {})
+        requested = {ref[7:] for step in raw_plan.get("steps", [])
+                     for ref in step.get("input_refs", []) if isinstance(ref, str) and ref.startswith("memory:")}
+        if not requested:
+            return ()
+        raw_snapshot = parent.metadata.get("context_snapshot")
+        if isinstance(raw_snapshot, dict):
+            inherited = ContextSnapshot.model_validate(raw_snapshot).memory_refs
+            return tuple(ref for ref in inherited
+                         if (ref.memory_id in requested or f"{ref.memory_id}@{ref.version}" in requested)
+                         and self.memory_service.get_active(ref.memory_id) is not None)
+        session = self.session_service.get_session_or_none(session_id=parent.session_id)
+        workspace = session.workspace.backend_path if session and session.workspace else None
+        project_id = self.memory_service.resolve_project(workspace, create=False) if workspace else None
+        references = []
+        for value in sorted(requested):
+            memory_id, _, expected = value.partition("@")
+            record = self.memory_service.get_active(memory_id)
+            if record is None or record.sensitivity not in {"normal", "public"}:
+                continue
+            if record.scope == "project" and (project_id is None or record.project_id != project_id):
+                continue
+            if expected and str(record.version) != expected:
+                continue
+            references.append(MemoryReference(
+                memory_id=record.memory_id, version=record.version, content=record.content[:1000],
+                scope=record.scope, project_id=record.project_id, source_ids=record.source_ids[:8],
+                source_count=len(record.source_ids), content_truncated=len(record.content) > 1000,
+                updated_at=record.updated_at,
+            ))
+        return tuple(references)
+
     async def execute_multi_agent_plan_async(
         self,
         parent_run_id: str,
@@ -979,6 +1266,7 @@ class LocalKnowledgeAgentRuntime:
                 budget=RuntimeBudget(),
                 fork_policy=self._live_fork_policy(),
                 evidence_candidates=evidence_candidates,
+                memory_candidates=self._parent_memory_candidates(parent_run_id),
             )
         return await self.multi_agent_scheduler.execute_plan_async(
             parent_run_id,
@@ -1027,6 +1315,7 @@ class LocalKnowledgeAgentRuntime:
             ),
             budget=RuntimeBudget(),
             evidence_candidates=evidence_candidates,
+            memory_candidates=self._parent_memory_candidates(parent_run_id),
             fork_policy=self._live_fork_policy(),
         )
         return await self.multi_agent_scheduler.retry_child_run_async(
@@ -1351,24 +1640,108 @@ class LocalKnowledgeAgentRuntime:
         title: str | None = None,
         metadata: dict | None = None,
         initial_message: str | None = None,
+        project_id: str | None = None,
     ) -> AgentSessionDetail:
         """Create a persistent agent session for parallel/multi-turn work."""
 
+        metadata = dict(metadata or {})
+        if project_id is not None and metadata.get("project_id") not in (None, project_id):
+            raise ValueError("conflicting project identifiers")
+        if project_id is None:
+            project_id = metadata.get("project_id")
+        if project_id is not None and (not isinstance(project_id, str) or not project_id):
+            raise ValueError("project_id must be a non-empty string")
+        if project_id is not None:
+            project = self.project_service.get(project_id)
+            if not isinstance(project["workspace_path"], str):
+                raise ValueError("project has no active workspace path")
+            workspace = self._resolve_session_workspace(
+                path=project["workspace_path"], platform=self.platform.name,
+            )
+            metadata.update(project_id=project_id, workspace=workspace.model_dump(mode="json"))
+        elif isinstance(metadata.get("workspace"), dict):
+            supplied = metadata["workspace"]
+            workspace = self._resolve_session_workspace(path=supplied.get("path", ""), platform=supplied.get("platform", ""))
+            project = self.project_service.register(workspace.backend_path, Path(workspace.backend_path).name[:120] or "Project")
+            metadata.update(project_id=project["project_id"], workspace=workspace.model_dump(mode="json"))
         return self.session_service.create_session(
             title=title,
             metadata=metadata,
             initial_message=initial_message,
         )
 
-    def list_sessions(self, *, limit: int = 50) -> AgentSessionList:
+    def list_sessions(
+        self, *, limit: int = 50, offset: int = 0, q: str | None = None,
+        project_id: str | None = None,
+    ) -> AgentSessionList:
         """Return recent agent sessions for frontend session switching."""
 
-        return self.session_service.list_sessions(limit=limit)
+        return self.session_service.list_sessions(limit=limit, offset=offset, q=q, project_id=project_id)
+
+    def list_deleted_sessions(
+        self, *, limit: int = 50, offset: int = 0, q: str | None = None
+    ) -> AgentSessionList:
+        """Return soft-deleted sessions for the frontend recycle bin."""
+
+        return self.session_service.list_deleted_sessions(limit=limit, offset=offset, q=q)
 
     def get_session(self, *, session_id: str) -> AgentSessionDetail:
         """Return one session with its ordered message history."""
 
         return self.session_service.get_session(session_id=session_id)
+
+    def rename_session(self, *, session_id: str, title: str) -> AgentSessionDetail:
+        """Persist an explicit session title and its user-customized marker."""
+
+        return self.session_service.rename_session(session_id=session_id, title=title)
+
+    def delete_session(self, *, session_id: str) -> bool:
+        """Hide a session and immediately suppress memories derived from it.
+
+        Raw conversation/audit rows remain available for recycle-bin restore; derived
+        memories stay retracted on restore and require a fresh user confirmation.
+        """
+
+        conn = self._conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                "SELECT status FROM agent_sessions WHERE session_id=?", (session_id,),
+            ).fetchone()
+            if current is None or current["status"] == "deleted":
+                conn.rollback()
+                return False
+            user_messages = conn.execute(
+                "SELECT message_id,content FROM agent_session_messages "
+                "WHERE session_id=? AND role='user'",
+                (session_id,),
+            ).fetchall()
+            for message in user_messages:
+                # Register even if no extractor has run yet. This revoked marker
+                # fences a delayed worker after deletion or later restoration.
+                source_id = self.memory_service.register_source_in_transaction(
+                    conn, MemorySourceInput(
+                        source_type="user_message", source_ref=message["message_id"],
+                        checksum=sha256(message["content"].encode("utf-8")).hexdigest(),
+                    ),
+                )
+                self.memory_service.revoke_source_in_transaction(conn, source_id)
+            conn.execute(
+                "UPDATE agent_sessions SET status='deleted',updated_at=? WHERE session_id=?",
+                (datetime.now(UTC).isoformat(), session_id),
+            )
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def restore_session(self, *, session_id: str) -> bool:
+        """Restore a session from the recycle bin."""
+
+        return self.session_service.restore_session(session_id=session_id)
 
     def set_session_workspace(
         self,
@@ -1377,7 +1750,18 @@ class LocalKnowledgeAgentRuntime:
         path: str,
         platform: str,
     ) -> SessionWorkspace:
-        """Persist a backend-accessible workspace root for one Agent session."""
+        """Persist a workspace and its canonical project identity together."""
+        if self.session_service.get_session_or_none(session_id=session_id) is None:
+            raise KeyError(f"Session not found: {session_id}")
+        workspace = self._resolve_session_workspace(path=path, platform=platform)
+        project = self.project_service.register(workspace.backend_path, Path(workspace.backend_path).name[:120] or "Project")
+        self.session_service.set_workspace(session_id=session_id, workspace=workspace, project_id=project["project_id"])
+        return workspace
+
+    def _resolve_session_workspace(self, *, path: str, platform: str) -> SessionWorkspace:
+        """Validate directories identically for projects and session workspace updates."""
+        if not isinstance(path, str) or not isinstance(platform, str):
+            raise ValueError("workspace path and platform must be strings")  # noqa: TRY004 - API validation contract
 
         normalized_platform = platform.strip().lower()
         if normalized_platform not in {"linux", "windows", "macos"}:
@@ -1409,7 +1793,6 @@ class LocalKnowledgeAgentRuntime:
             platform=normalized_platform,
             backend_path=resolved_workspace.normalized_path,
         )
-        self.session_service.set_workspace(session_id=session_id, workspace=workspace)
         return workspace
 
     def append_session_message(

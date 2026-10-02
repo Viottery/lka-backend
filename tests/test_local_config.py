@@ -288,6 +288,70 @@ available_models = ["mock"]
     ]
 
 
+def test_llm_model_capacity_and_tokenizer_resolution_is_exact_and_optional(tmp_path):
+    config = LLMProviderConfig(
+        default_client="primary",
+        clients=[
+            LLMClientConfig(
+                name="primary",
+                default_model="model-a",
+                available_models=["model-a", "model-b"],
+                context_window_tokens=131072,
+                output_reserve_tokens=4096,
+                tokenizer_json_path=tmp_path / "a" / "tokenizer.json",
+                model_overrides={
+                    "model-b": {
+                        "context_window_tokens": 65536,
+                        "tokenizer_json_path": tmp_path / "b" / "tokenizer.json",
+                    }
+                },
+            )
+        ],
+    )
+
+    assert config.resolve_context_capacity("primary", "model-a") == 131072
+    assert config.resolve_context_capacity("primary", "model-b") == 65536
+    model_b = config.resolve_model_config("primary", "model-b")
+    assert model_b is not None
+    assert model_b.output_reserve_tokens == 4096
+    assert model_b.tokenizer_json_path == tmp_path / "b" / "tokenizer.json"
+    assert config.resolve_context_capacity("primary", "unknown-model") is None
+    assert config.resolve_model_config("primary", "unknown-model") is None
+    assert config.resolve_model_config("other-client", "model-a") is None
+
+
+def test_legacy_llm_capacity_and_tokenizer_are_default_model_only(tmp_path):
+    config = LLMProviderConfig(
+        provider="local",
+        model="legacy-model",
+        context_window_tokens=32768,
+        output_reserve_tokens=2048,
+        tokenizer_json_path=tmp_path / "legacy-tokenizer.json",
+    )
+
+    resolved = config.resolve_model_config("local", "legacy-model")
+    assert resolved is not None
+    assert resolved.context_window_tokens == 32768
+    assert resolved.output_reserve_tokens == 2048
+    assert resolved.tokenizer_json_path == tmp_path / "legacy-tokenizer.json"
+    assert config.resolve_context_capacity("local", "different-model") is None
+    assert config.resolve_model_config("local", "different-model") is None
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("context_window_tokens", 0),
+        ("context_window_tokens", -1),
+        ("output_reserve_tokens", 0),
+        ("output_reserve_tokens", -1),
+    ],
+)
+def test_llm_capacity_and_reserve_must_be_positive(field, value):
+    with pytest.raises(ValidationError):
+        LLMClientConfig(name="invalid", **{field: value})
+
+
 def test_outlook_client_id_can_be_loaded_directly_from_config(tmp_path):
     config_path = tmp_path / "local.toml"
     config_path.write_text(

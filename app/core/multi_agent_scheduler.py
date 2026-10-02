@@ -23,6 +23,7 @@ from app.core.context_driver import (
 from app.core.multi_agent import (
     GENERAL_AGENT_ID,
     ForkPolicy,
+    MemoryReference,
     Plan,
     PlanPatchContext,
     PlanStatus,
@@ -38,8 +39,10 @@ from app.core.multi_agent import (
 )
 from app.core.multi_agent_aggregation import (
     AggregatedTaskResults,
+    ConfirmationState,
     VerificationPolicy,
     aggregate_task_results,
+    derive_child_execution_evidence,
     verify_aggregate,
 )
 from app.core.multi_agent_replan import replay_plan_patch_history
@@ -71,6 +74,7 @@ class SchedulerContext:
     workspace_version: str = "workspace_v1"
     permission_version: str = "permission_v1"
     evidence_candidates: tuple[EvidenceCandidate, ...] = ()
+    memory_candidates: tuple[MemoryReference, ...] = ()
     view_mode: ContextViewMode = ContextViewMode.WORKING
     fork_policy: ForkPolicy | None = None
 
@@ -784,6 +788,7 @@ class MultiAgentScheduler:
                 workspace_version=context.workspace_version,
                 permission_version=context.permission_version,
                 evidence_candidates=context.evidence_candidates,
+                memory_candidates=context.memory_candidates,
                 view_mode=context.view_mode,
             )
         )
@@ -1146,6 +1151,116 @@ class MultiAgentScheduler:
             plan = self._set_step_status(plan, step.step_id, PlanStepStatus.CANCELLED)
         return plan
 
+    def _child_tree_execution_evidence(
+        self,
+        root_run_id: str,
+        *,
+        expected_parent_id: str,
+        expected_plan_id: str,
+        expected_step_id: str,
+        expected_attempt: int,
+        expected_trace_id: str,
+    ) -> tuple[bool | None, ConfirmationState]:
+        """Combine a coordinator child and every descendant audit conservatively."""
+
+        observed: list[tuple[bool | None, Any]] = []
+        visited: set[str] = set()
+        malformed_tree = False
+
+        def visit(
+            run_id: str,
+            expected_parent_id: str | None = None,
+            *,
+            root: bool = False,
+        ) -> None:
+            nonlocal malformed_tree
+            if run_id in visited:
+                malformed_tree = True
+                return
+            visited.add(run_id)
+            child = self.run_manager.get_run(run_id)
+            if child is None or (
+                expected_parent_id is not None and child.parent_run_id != expected_parent_id
+            ) or child.trace_id != expected_trace_id:
+                malformed_tree = True
+                return
+            if not root:
+                parent = self.run_manager.get_run(child.parent_run_id)
+                parent_plan = parent.metadata.get("multi_agent_plan") if parent else None
+                if (
+                    parent is None
+                    or parent.trace_id != child.trace_id
+                    or not isinstance(parent_plan, dict)
+                    or parent_plan.get("plan_id") != child.plan_id
+                ):
+                    malformed_tree = True
+                    return
+            snapshot = child.metadata.get("context_snapshot")
+            if not isinstance(snapshot, dict) or any(
+                snapshot.get(field) != value
+                for field, value in (
+                    ("child_run_id", child.run_id),
+                    ("parent_run_id", child.parent_run_id),
+                    ("plan_id", child.plan_id),
+                    ("step_id", child.step_id),
+                    ("session_id", child.session_id),
+                )
+            ):
+                malformed_tree = True
+                return
+            if root and (
+                child.parent_run_id != expected_parent_id
+                or child.plan_id != expected_plan_id
+                or child.step_id != expected_step_id
+                or child.attempt != expected_attempt
+            ):
+                malformed_tree = True
+                return
+            events = self.run_manager.list_events(run_id)
+            audit_values = []
+            for event in events:
+                if event.type == "child_tool_audit":
+                    value = event.payload.get("audit")
+                elif event.type == "subtask_result":
+                    value = event.payload.get("child_tool_audit")
+                else:
+                    continue
+                if isinstance(value, dict):
+                    audit_values.append(value)
+            evidence = derive_child_execution_evidence(
+                child,
+                events,
+                tool_audit=(
+                    audit_values[0]
+                    if len(audit_values) == 1
+                    else None
+                ),
+            )
+            observed.append(evidence)
+            for descendant_id in child.child_run_ids:
+                visit(descendant_id, child.run_id)
+
+        visit(root_run_id, expected_parent_id, root=True)
+        if malformed_tree:
+            observed.append((None, ConfirmationState.MISSING))
+        actual_values = [actual for actual, _ in observed]
+        if any(actual is True for actual in actual_values):
+            actual: bool | None = True
+        elif any(value is None for value in actual_values):
+            actual = None
+        else:
+            actual = False
+        if actual is False:
+            confirmation = ConfirmationState.NOT_REQUIRED
+        elif any(
+            value is None or state != ConfirmationState.APPROVED
+            for value, state in observed if value is True
+        ) or any(value is None for value in actual_values):
+            confirmation = ConfirmationState.MISSING
+        else:
+            confirmation = ConfirmationState.APPROVED
+        return actual, confirmation
+
     def _result(
         self,
         plan: Plan,
@@ -1178,14 +1293,111 @@ class MultiAgentScheduler:
                         None,
                     )
                     if check is not None:
-                        contract_results[result.step_id] = check.status == VerificationStatus.PASSED
+                        if check.status == VerificationStatus.PASSED:
+                            contract_results[result.step_id] = True
+                        elif check.status == VerificationStatus.FAILED:
+                            contract_results[result.step_id] = False
+            actual_side_effects: dict[str, bool] = {}
+            confirmations = {}
+            attempts_by_step: dict[str, dict[str, int]] = {}
+            result_attempt_refs: dict[str, tuple[str, int]] = {}
+            for attempt in aggregate.attempt_history:
+                if attempt.child_run_id:
+                    result_attempt_refs[attempt.child_run_id] = (
+                        attempt.step_id,
+                        attempt.attempt,
+                    )
+                    attempts_by_step.setdefault(attempt.step_id, {})[
+                        attempt.child_run_id
+                    ] = attempt.attempt
+            parent = self.run_manager.get_run(plan.parent_run_id)
+            parent_plan = parent.metadata.get("multi_agent_plan") if parent is not None else None
+            malformed_parent_tree = (
+                parent is None
+                or parent.session_id != plan.session_id
+                or parent.trace_id != plan.correlation_id
+                or not isinstance(parent_plan, dict)
+                or parent_plan.get("plan_id") != plan.plan_id
+            )
+            if parent is not None:
+                for child_id in parent.child_run_ids:
+                    child = self.run_manager.get_run(child_id)
+                    if child is None:
+                        malformed_parent_tree = True
+                        continue
+                    if child.plan_id != plan.plan_id:
+                        continue
+                    if (
+                        child.parent_run_id != parent.run_id
+                        or child.step_id not in expected
+                        or not isinstance(child.attempt, int)
+                        or child.attempt < 1
+                    ):
+                        malformed_parent_tree = True
+                        continue
+                    result_ref = result_attempt_refs.get(child.run_id)
+                    if result_ref is not None and result_ref != (child.step_id, child.attempt):
+                        malformed_parent_tree = True
+                    attempts_by_step.setdefault(child.step_id, {})[
+                        child.run_id
+                    ] = child.attempt
+            for result in aggregate.task_results:
+                evidence = [
+                    self._child_tree_execution_evidence(
+                        child_run_id,
+                        expected_parent_id=plan.parent_run_id,
+                        expected_plan_id=plan.plan_id,
+                        expected_step_id=result.step_id,
+                        expected_attempt=attempt_number,
+                        expected_trace_id=plan.correlation_id,
+                    )
+                    for child_run_id, attempt_number in attempts_by_step.get(
+                        result.step_id,
+                        {result.child_run_id: result.attempt}
+                        if result.child_run_id
+                        else {},
+                    ).items()
+                ]
+                if malformed_parent_tree:
+                    evidence.append((None, ConfirmationState.MISSING))
+                if not evidence:
+                    evidence.append((None, ConfirmationState.MISSING))
+                values = [actual for actual, _ in evidence]
+                if any(value is True for value in values):
+                    actual: bool | None = True
+                elif any(value is None for value in values):
+                    actual = None
+                else:
+                    actual = False
+                if actual is False:
+                    confirmation = ConfirmationState.NOT_REQUIRED
+                elif any(value is None for value in values) or any(
+                    value is True and state != ConfirmationState.APPROVED
+                    for value, state in evidence
+                ):
+                    confirmation = ConfirmationState.MISSING
+                else:
+                    confirmation = ConfirmationState.APPROVED
+                if actual is not None:
+                    actual_side_effects[result.step_id] = actual
+                confirmations[result.step_id] = confirmation
             verification = verify_aggregate(
                 plan,
                 aggregate,
-                policy=VerificationPolicy(correlation_id=plan.correlation_id),
+                policy=VerificationPolicy(
+                    correlation_id=plan.correlation_id,
+                    require_side_effect_audit=True,
+                ),
                 output_contract_results=contract_results,
+                confirmation_by_step=confirmations,
+                actual_side_effects_by_step=actual_side_effects,
             )
-            replan_required = aggregate.status.value in {"failed", "blocked", "partial", "conflicting"} or verification.status == VerificationStatus.FAILED
+            audit_inconclusive = "actual_side_effects_unknown" in verification.missing_requirements
+            replan_required = (
+                aggregate.status.value in {"failed", "blocked", "partial", "conflicting"}
+                or verification.status == VerificationStatus.FAILED
+                or audit_inconclusive
+            )
             parent = self.run_manager.get_run(plan.parent_run_id)
             if parent is not None:
                 self.run_manager.record_multi_agent_aggregation(

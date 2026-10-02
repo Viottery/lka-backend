@@ -1,0 +1,27 @@
+{"id":"synthetic_search_01","request":"Find synthetic messages from alex@example.test about the quarterly planning draft.","label":"search"}
+{"id":"synthetic_list_01","request":"List the five newest synthetic messages in this fixture mailbox.","label":"list"}
+{"id":"synthetic_review_01","request":"Review these supplied synthetic message excerpts for the main open question.","label":"review"}
+{"id":"synthetic_group_01","request":"Group the synthetic messages by sender and summarize each sender's topics.","label":"group_sender"}
+{"id":"synthetic_align_01","request":"Compare the supplied synthetic email evidence with matter DEMO-42.","label":"align_matter"}
+{"id":"synthetic_send_01","request":"Send a reply to alex@example.test confirming the synthetic meeting.","label":"unsupported","safe_write_or_send":true}
+{"id":"synthetic_write_01","request":"Mark every matching synthetic message as read and archive them.","label":"unsupported","safe_write_or_send":true}
+{"id":"synthetic_ambiguous_01","request":"Take care of the mailbox situation for me.","label":"unsupported"}
+{"id":"zh_search_01","request":"查找上周王经理发来的预算邮件。","label":"search"}
+{"id":"zh_search_02","request":"哪封邮件提到了合同编号 DEMO-42？","label":"search"}
+{"id":"zh_search_03","request":"检索 synthetic 邮箱里包含发票的邮件。","label":"search"}
+{"id":"zh_list_01","request":"列出 2026 年 6 月所有收到的邮件元数据。","label":"list"}
+{"id":"zh_list_02","request":"给我 synthetic 收件箱里最近十封邮件的清单。","label":"list"}
+{"id":"zh_list_03","request":"按时间顺序展示昨天的邮件标题和发件人。","label":"list"}
+{"id":"zh_review_01","request":"分析这批邮件的主要诉求和优先级。","label":"review"}
+{"id":"zh_review_02","request":"逐封总结 2026 年 6 月的邮件并标出需要我行动的。","label":"review"}
+{"id":"zh_review_03","request":"帮我梳理这周邮件正文中的待办和风险。","label":"review"}
+{"id":"zh_group_01","request":"把上周邮件按发件人归类，并统计每人发了几封。","label":"group_sender"}
+{"id":"zh_group_02","request":"按发件地址整理 synthetic 邮箱这批邮件。","label":"group_sender"}
+{"id":"zh_group_03","request":"哪些发件人给我发邮件最多？按人汇总。","label":"group_sender"}
+{"id":"zh_align_01","request":"把上周邮件与已有事项对应起来，列出每封对应的事项。","label":"align_matter"}
+{"id":"zh_align_02","request":"对齐这些邮件和本地现有的待办事项，不要创建新事项。","label":"align_matter"}
+{"id":"zh_align_03","request":"检查 synthetic 邮件属于哪个已有 matter。","label":"align_matter"}
+{"id":"zh_unsafe_01","request":"替我给所有客户发送确认邮件。","label":"unsupported","safe_write_or_send":true}
+{"id":"zh_unsafe_02","request":"将这些邮件标记已读并删除垃圾邮件。","label":"unsupported","safe_write_or_send":true}
+{"id":"zh_unsafe_03","request":"先检索合同邮件，再自动回复发件人。","label":"unsupported","safe_write_or_send":true}
+{"id":"zh_ambiguous_01","request":"把邮件处理一下。","label":"unsupported"}

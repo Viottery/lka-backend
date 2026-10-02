@@ -989,6 +989,20 @@ class Artifact(MultiAgentModel):
     created_at: datetime = Field(default_factory=utc_now)
 
 
+class MemoryReference(ValueObject):
+    """A server-resolved immutable memory version explicitly assigned to a child."""
+
+    memory_id: str = Field(min_length=1)
+    version: int = Field(ge=1)
+    content: str = Field(min_length=1, max_length=1000)
+    scope: Literal["global", "project"]
+    project_id: str | None = None
+    source_ids: tuple[str, ...] = ()
+    source_count: int | None = Field(default=None, ge=0)
+    content_truncated: bool = False
+    updated_at: str
+
+
 class ContextSnapshot(MultiAgentModel):
     snapshot_id: str = Field(min_length=1, max_length=200)
     parent_snapshot_id: str | None = Field(default=None, max_length=200)
@@ -1008,6 +1022,7 @@ class ContextSnapshot(MultiAgentModel):
     objective: str = Field(min_length=1)
     output_contract: str = Field(min_length=1)
     input_refs: tuple[str, ...] = ()
+    memory_refs: tuple[MemoryReference, ...] = ()
     dependency_result_refs: tuple[str, ...] = ()
     evidence_refs: tuple[EvidenceRef, ...] = ()
     effective_scope: ScopeGrant

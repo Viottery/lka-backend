@@ -11,8 +11,10 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 def _is_env_var_name(value: str) -> bool:
-    return bool(value) and (value[0].isalpha() or value[0] == "_") and all(
-        character.isalnum() or character == "_" for character in value
+    return (
+        bool(value)
+        and (value[0].isalpha() or value[0] == "_")
+        and all(character.isalnum() or character == "_" for character in value)
     )
 
 
@@ -45,8 +47,14 @@ class LLMClientConfig(BaseModel):
     supports_stream: bool = True
     supports_json_mode: bool = False
     supports_function_calling: bool = False
+    supports_required_tool_choice: bool = False
     function_calling_strict: bool = False
     supports_reasoning_effort: bool = False
+    thinking_control: Literal["deepseek"] | None = None
+    context_window_tokens: int | None = Field(default=None, gt=0)
+    output_reserve_tokens: int = Field(default=8192, gt=0)
+    tokenizer_json_path: Path | None = None
+    model_overrides: dict[str, LLMModelConfigOverride] = Field(default_factory=dict)
 
     def resolved_api_key(self) -> str | None:
         return _resolved_env_value(self.api_key_env) if self.api_key_env else None
@@ -58,14 +66,100 @@ class LLMProviderConfig(BaseModel):
     api_key_env: str = "OPENAI_API_KEY"
     model: str = "gpt-4.1-mini"
     timeout_seconds: int = 180
+    thinking_control: Literal["deepseek"] | None = None
     default_client: str | None = None
     fallback_client: str | None = None
     default_response_mode: str = "json"
     max_attempts: int = 2
     clients: list[LLMClientConfig] = Field(default_factory=list)
+    context_window_tokens: int | None = Field(default=None, gt=0)
+    output_reserve_tokens: int = Field(default=8192, gt=0)
+    tokenizer_json_path: Path | None = None
+    model_overrides: dict[str, LLMModelConfigOverride] = Field(default_factory=dict)
 
     def resolved_api_key(self) -> str | None:
         return _resolved_env_value(self.api_key_env) if self.api_key_env else None
+
+    def resolve_model_config(
+        self, client_name: str | None, model: str
+    ) -> LLMModelConfigOverride | None:
+        """Resolve capacity, output reserve and tokenizer for an exact client/model.
+
+        Model-specific entries never leak across models. Default-level fields apply only
+        when `model` is that client's configured default model. Unknown overrides return
+        `None`, allowing callers to handle capacity as unknown without guessing.
+        """
+        client = next((item for item in self.client_configs() if item.name == client_name), None)
+        if client is None:
+            return None
+        override = client.model_overrides.get(model)
+        if override is not None:
+            base = self._default_model_config(client) if model == client.default_model else None
+            return LLMModelConfigOverride(
+                context_window_tokens=(
+                    override.context_window_tokens
+                    if override.context_window_tokens is not None
+                    else (base.context_window_tokens if base else None)
+                ),
+                output_reserve_tokens=(
+                    override.output_reserve_tokens
+                    if override.output_reserve_tokens is not None
+                    else (base.output_reserve_tokens if base else client.output_reserve_tokens)
+                ),
+                tokenizer_json_path=(
+                    override.tokenizer_json_path
+                    if override.tokenizer_json_path is not None
+                    else (base.tokenizer_json_path if base else None)
+                ),
+            )
+        if model != client.default_model:
+            return None
+        provider_fields = self.model_overrides.get(model)
+        return self._default_model_config(client, provider_fields)
+
+    def resolve_context_capacity(self, client_name: str | None, model: str) -> int | None:
+        """Return configured context capacity for exactly this client/model, if known."""
+        resolved = self.resolve_model_config(client_name, model)
+        return resolved.context_window_tokens if resolved is not None else None
+
+    def _default_model_config(
+        self,
+        client: LLMClientConfig,
+        override: LLMModelConfigOverride | None = None,
+    ) -> LLMModelConfigOverride | None:
+        values = (
+            override.context_window_tokens if override else None,
+            override.output_reserve_tokens if override else None,
+            override.tokenizer_json_path if override else None,
+        )
+        has_override = any(value is not None for value in values)
+        has_client = (
+            client.context_window_tokens is not None or client.tokenizer_json_path is not None
+        )
+        # Provider-level fields describe only the legacy single-client model.
+        # Named clients must not inherit another model's capacity/tokenizer.
+        has_provider = not self.clients and (
+            self.context_window_tokens is not None or self.tokenizer_json_path is not None
+        )
+        if not (has_override or has_client or has_provider):
+            return None
+        return LLMModelConfigOverride(
+            context_window_tokens=(
+                (override.context_window_tokens if override else None)
+                or client.context_window_tokens
+                or (self.context_window_tokens if not self.clients else None)
+            ),
+            output_reserve_tokens=(
+                (override.output_reserve_tokens if override else None)
+                or client.output_reserve_tokens
+                or (self.output_reserve_tokens if not self.clients else None)
+            ),
+            tokenizer_json_path=(
+                (override.tokenizer_json_path if override else None)
+                or client.tokenizer_json_path
+                or (self.tokenizer_json_path if not self.clients else None)
+            ),
+        )
 
     def is_disabled(self) -> bool:
         if self.clients:
@@ -78,9 +172,7 @@ class LLMProviderConfig(BaseModel):
         if self.provider == "mock":
             return []
         provider_type = (
-            self.provider
-            if self.provider in {"mock", "openai_compatible"}
-            else "openai_compatible"
+            self.provider if self.provider in {"mock", "openai_compatible"} else "openai_compatible"
         )
         client_name = self.default_client or self.provider
         return [
@@ -92,8 +184,23 @@ class LLMProviderConfig(BaseModel):
                 default_model=self.model,
                 available_models=[self.model],
                 timeout_seconds=self.timeout_seconds,
+                thinking_control=self.thinking_control,
+                context_window_tokens=self.context_window_tokens,
+                output_reserve_tokens=self.output_reserve_tokens,
+                tokenizer_json_path=self.tokenizer_json_path,
+                model_overrides=self.model_overrides,
             )
         ]
+
+
+class LLMModelConfigOverride(BaseModel):
+    """Optional model-scoped context and tokenizer metadata."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    context_window_tokens: int | None = Field(default=None, gt=0)
+    output_reserve_tokens: int | None = Field(default=None, gt=0)
+    tokenizer_json_path: Path | None = None
 
 
 class SafetyReviewConfig(BaseModel):
@@ -119,6 +226,8 @@ class AgentConfig(BaseModel):
     multi_agent_planning_enabled: bool = False
     # Test/demo workflow is inert unless explicitly enabled by local config.
     mock_workflow_agent_enabled: bool = False
+    # Read-only mail specialist; automatic root routing is separate.
+    mail_expert_enabled: bool = False
     # External Codex expert is disabled unless a trusted local executable is
     # explicitly selected. It runs in a disposable staged workspace.
     codex_expert_enabled: bool = False
@@ -170,9 +279,7 @@ class OutlookMailConfig(BaseModel):
     client_id: str = ""
     client_id_env: str = "MS_GRAPH_CLIENT_ID"
     tenant_id: str = "consumers"
-    scopes: list[str] = Field(
-        default_factory=lambda: ["User.Read", "Mail.Read", "offline_access"]
-    )
+    scopes: list[str] = Field(default_factory=lambda: ["User.Read", "Mail.Read", "offline_access"])
     token_store_path: Path = Path("./data/secrets/outlook_token.json")
     sync_folder: str = "Inbox"
     download_attachment_content: bool = False
@@ -249,6 +356,55 @@ class QueryRewriteConfig(BaseModel):
     max_total_candidates: int = Field(default=240, ge=30, le=800)
 
 
+class WebSearchConfig(BaseModel):
+    provider: Literal["brave"] = "brave"
+    api_key_env: str = "BRAVE_SEARCH_API_KEY"
+    monthly_request_limit: int = Field(default=900, ge=0, le=1_000_000)
+
+    def resolved_api_key(self) -> str | None:
+        return _resolved_env_value(self.api_key_env) if self.api_key_env else None
+
+
+class MemoryConfig(BaseModel):
+    background_worker_count: int = Field(default=2, ge=1, le=8)
+    enabled: bool = True
+    background_enabled: bool = True
+    # Controls whether background learning spends an additional model call.
+    # Enabling memory/background processing authorizes use of conversation data;
+    # this flag is a workload/quality choice, not a privacy-consent gate.
+    allow_remote_extraction: bool = False
+    max_recalled_items: int = Field(default=8, ge=0, le=30)
+    max_recalled_chars: int = Field(default=2400, ge=0, le=12000)
+    extraction_debounce_seconds: float = Field(default=5, ge=0, le=300)
+    max_job_tokens: int = Field(default=32_768, ge=1000, le=500_000)
+    generation_output_tokens: int = Field(default=4096, ge=256, le=131_072)
+    recovery_output_tokens: int = Field(default=8192, ge=256, le=131_072)
+    background_client_name: str | None = None
+    background_model: str | None = None
+
+
+class BackgroundConfig(BaseModel):
+    request_timeout_seconds: float = Field(default=30, gt=0, le=180)
+    max_pending_jobs: int = Field(default=1024, ge=1, le=100000)
+    max_llm_concurrency: int = Field(default=4, ge=1, le=32)
+    interactive_reserved: int = Field(default=2, ge=1, le=32)
+    memory_concurrency: int = Field(default=1, ge=1, le=8)
+    io_concurrency: int = Field(default=1, ge=1, le=8)
+    hourly_token_limit: int = Field(default=200_000, ge=0)
+    daily_token_limit: int = Field(default=1_000_000, ge=0)
+    daily_cost_limit: float = Field(default=0, ge=0)
+    input_cost_per_million: float = Field(default=0, ge=0)
+    output_cost_per_million: float = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def reservation_fits(self):
+        if self.interactive_reserved >= self.max_llm_concurrency:
+            raise ValueError("interactive_reserved must leave at least one background slot")
+        if self.daily_cost_limit and not (self.input_cost_per_million or self.output_cost_per_million):
+            raise ValueError("cost limit requires configured model prices")
+        return self
+
+
 class LocalAppConfig(BaseModel):
     llm: LLMProviderConfig = Field(default_factory=LLMProviderConfig)
     safety: SafetyReviewConfig = Field(default_factory=SafetyReviewConfig)
@@ -257,6 +413,9 @@ class LocalAppConfig(BaseModel):
     embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
     reranker: RerankerConfig = Field(default_factory=RerankerConfig)
     query_rewrite: QueryRewriteConfig = Field(default_factory=QueryRewriteConfig)
+    web_search: WebSearchConfig = Field(default_factory=WebSearchConfig)
+    memory: MemoryConfig = Field(default_factory=MemoryConfig)
+    background: BackgroundConfig = Field(default_factory=BackgroundConfig)
 
     @model_validator(mode="after")
     def inference_profiles_match_llm_clients(self) -> LocalAppConfig:

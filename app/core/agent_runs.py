@@ -255,8 +255,14 @@ class InMemoryAgentRunManager:
         event_type: str,
         payload: dict[str, Any],
         plan: dict[str, Any] | None = None,
+        reserve_operation_id: bool = True,
     ) -> AgentRunEvent:
-        """Persist the current validated plan and a replayable fork event."""
+        """Persist the plan/event, optionally reserving its executable fork ID.
+
+        A malformed proposal has no executable effect, so its ID must remain
+        available for a corrected proposal. Policy-rejected and validated
+        operations retain the existing idempotency reservation.
+        """
         with self._lock:
             current = self._runs.get(run_id)
             if current is None:
@@ -266,7 +272,7 @@ class InMemoryAgentRunManager:
                 metadata["multi_agent_plan"] = plan
             operations = dict(metadata.get("fork_operations", {}))
             operation_id = str(payload.get("operation_id") or "")
-            if operation_id and operation_id not in operations:
+            if reserve_operation_id and operation_id and operation_id not in operations:
                 operations[operation_id] = payload
                 metadata["fork_operations"] = operations
             updated = current.model_copy(update={"metadata": metadata})

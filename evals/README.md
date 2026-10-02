@@ -1,5 +1,26 @@
 # Local Knowledge Agent OS Eval Benchmarks
 
+## Offline Memory Release Regression Foundation
+
+Run the deterministic, local memory provenance/scope/retraction/injection
+checks without an LLM, network, or live user data:
+
+```bash
+uv run python scripts/eval_memory_release.py
+uv run pytest tests/test_eval_memory_release.py
+```
+
+The anonymous JSONL fixture executes against a temporary SQLite database and
+the real `MemoryService`/`MemoryContextProvider`. Reports show total and
+per-dimension sample counts, pass rates, provenance attribution, cross-project
+scope isolation, post-retraction injection, and external-injection promotion.
+The five-case fixture is only a regression foundation; its report explicitly
+marks production gate eligibility false. It does not evaluate model answer
+quality, baselines without memory/with summaries, task completion, latency,
+backlog, token/cost, worker crash recovery, Safety Gate bypass, or outbound
+privacy policy. Those dimensions require fixed larger labeled sets and runtime
+evidence before a production release decision.
+
 This directory contains reusable, deterministic benchmark tooling for the
 current Agent backend. The first version focuses on directly computable metrics:
 no LLM judge is required.
@@ -138,6 +159,62 @@ and reference membership are structural checks and do not mean that cited
 evidence semantically supports the answer.
 
 ## Multi-Agent Evaluation Foundations
+
+For a small real-LLM selection probe, run the synthetic read-only cases in
+`scripts/probe_multi_agent_selection.py`. It enables multi-Agent planning only
+inside a temporary LangGraph runtime, disables mail sync and external experts,
+and leaves non-read-only tool calls at the manual safety gate. The configured
+LLM provider is used, so these commands incur provider cost:
+
+```bash
+uv run python scripts/probe_multi_agent_selection.py --case forced_compare --output /tmp/forced-compare.json
+uv run python scripts/probe_multi_agent_selection.py --case optional_release_audit --planning both --output /tmp/release-audit-pair.json
+uv run python scripts/probe_multi_agent_selection.py --list-cases
+```
+
+The probe requires explicit `--case` selections; listing never calls a model.
+The synthetic catalog covers explicit two-/three-way forks, optional comparison
+and release review, one-file lookup, a three-child fan-in DAG, strict scope
+language, conflicting sources, an explicit no-fork multi-file task, untrusted
+instructions embedded in a file, missing-evidence abstention, four-child
+capacity/batching, and a missing-child-input replan probe. The last two are
+diagnostic cases, not claimed runtime successes. For a bounded
+cross-section, run only a few different dimensions per session:
+
+```bash
+uv run python scripts/probe_multi_agent_selection.py \
+  --case forced_dag --case conflicting_sources \
+  --case negative_prompt_injection --case missing_evidence \
+  --output /tmp/multi-agent-cross-section.json
+```
+
+`forced_scope_stress` installs a trusted, case-local read-only filesystem fork
+policy. Natural-language wording alone is not treated as a permission grant or
+revocation; other cases retain the normal general-Agent capability scope.
+
+`--planning both` runs the *same prompt* once with fork planning enabled and
+once disabled. Compare child completion, answer evidence, wall time, LLM calls,
+and token counts; answer-term checks are only a coverage smoke signal, not a
+semantic correctness judge. The examples are small and stochastic, so a
+serial answer to a split-friendly case is not automatically a missed fork.
+For fork-format diagnosis, the report also records the first fork schema
+outcome, field-level validation errors, retry feedback, and whether the
+configured client used function calling. It omits raw model output and prompts.
+The report also records Plan dependencies, per-child lifecycle/tool audit and
+effective scope, plus machine-readable `checks`. Those checks verify structure
+and exact answer tokens; they do not prove semantic correctness, honest source
+attribution, or absence of all prompt-injection effects. Inspect the full
+synthetic answer and child trace for failed or ambiguous cases. A missing
+child audit is reported as unknown, never as a read-only pass.
+If a run reaches manual confirmation or a user-question interrupt, the probe
+records its partial parent/child state and exits nonzero; it never approves the
+interrupted operation. Executed read-only tools and effective permission scope
+are reported separately because a harmless observed action does not prove a
+least-privilege grant.
+The child-error/replan case records failed tool outcomes separately from Child
+Run status and checks for a durable PlanPatch event. A child can currently
+answer about a failed read and finish its Agent run; that is not equivalent to
+independent proof that its assigned output contract was satisfied.
 
 `evals/lka_evals/multi_agent_metrics.py` computes selected lifecycle, DAG,
 approval, and latency metrics from caller-supplied durable run/event JSON. It

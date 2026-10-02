@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import base64
+import hmac
 import json
+import os
 import sqlite3
 from collections.abc import Callable
 from datetime import UTC, datetime
-from hashlib import sha1
+from hashlib import sha1, sha256
 
 from pydantic import BaseModel, Field
 
@@ -19,6 +22,16 @@ def _stable_id(prefix: str, *parts: str | None) -> str:
     text = "|".join(part or "" for part in parts)
     digest = sha1(text.encode("utf-8")).hexdigest()[:12]
     return f"{prefix}_{digest}"
+
+
+def _parse_mail_timestamp(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("mail date boundaries must be ISO timestamps with a timezone") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("mail date boundaries must include a timezone")
+    return parsed.astimezone(UTC)
 
 
 class MailAccountInput(BaseModel):
@@ -68,6 +81,61 @@ class MailSearchResultItem(BaseModel):
 class MailSearchResult(BaseModel):
     query: str
     messages: list[MailSearchResultItem]
+    requested_limit: int = 10
+    applied_limit: int = 10
+    returned_count: int = 0
+    possible_more: bool = False
+
+
+class MailListCard(BaseModel):
+    message_id: str
+    subject: str
+    sender: str
+    folder: str
+    received_at: str | None = None
+    subject_truncated: bool = False
+    sender_truncated: bool = False
+    folder_truncated: bool = False
+
+
+class MailListResult(BaseModel):
+    total_matches: int
+    requested_range: dict[str, int]
+    returned_count: int
+    has_more: bool
+    next_range: dict[str, int] | None = None
+    applied_limit: int
+    coverage: dict[str, int]
+    listing_id: str
+    messages: list[MailListCard]
+
+
+_MAIL_LIST_TOKEN_SECRET = os.urandom(32)
+
+
+def _listing_token(payload: dict[str, object]) -> str:
+    body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    signature = hmac.new(_MAIL_LIST_TOKEN_SECRET, body, sha256).digest()
+    return base64.urlsafe_b64encode(body + signature).decode().rstrip("=")
+
+
+def _decode_listing_token(token: str) -> dict[str, object]:
+    try:
+        if len(token) > 2048:
+            raise ValueError
+        raw = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4))
+        if len(raw) <= 32:
+            raise ValueError
+        body, signature = raw[:-32], raw[-32:]
+        expected = hmac.new(_MAIL_LIST_TOKEN_SECRET, body, sha256).digest()
+        if not hmac.compare_digest(signature, expected):
+            raise ValueError
+        payload = json.loads(body)
+        if not isinstance(payload, dict):
+            raise TypeError("listing token payload must be an object")
+        return payload
+    except (ValueError, TypeError, json.JSONDecodeError, base64.binascii.Error) as exc:
+        raise ValueError("Invalid listing_id; start a new listing.") from exc
 
 
 class MailMessageRecord(BaseModel):
@@ -124,6 +192,102 @@ class MailService:
         finally:
             conn.close()
         return tuple(str(row["account_id"]) for row in rows)
+
+    def list_messages(
+        self, *, received_from: str, received_before: str, start_rank: int = 1,
+        end_rank: int | None = None, folder: str | None = None,
+        account_ids: list[str] | None = None, listing_id: str | None = None,
+    ) -> MailListResult:
+        """List a bounded rank page of metadata cards in a half-open date interval."""
+        start = _parse_mail_timestamp(received_from)
+        end = _parse_mail_timestamp(received_before)
+        if end <= start:
+            raise ValueError("received_before must be later than received_from")
+        if end_rank is None and start_rank == 1:
+            last = 20
+        else:
+            last = start_rank + 19 if end_rank is None else end_rank
+        if start_rank < 1 or last < start_rank or last - start_rank + 1 > 20:
+            raise ValueError("rank range must be 1-based, inclusive, and at most 20 messages")
+        # SQLite date functions normalize offsets but have millisecond precision;
+        # leave a small margin and apply exact Python bounds to the reduced rows.
+        filters = [
+            "received_at IS NOT NULL",
+            "julianday(received_at) >= julianday(?) - 0.00002",
+            "julianday(received_at) < julianday(?) + 0.00002",
+        ]
+        params: list[object] = [start.isoformat(), end.isoformat()]
+        if folder is not None:
+            filters.append("lower(folder) = lower(?)")
+            params.append(folder)
+        if account_ids is not None and account_ids:
+            filters.append("account_id IN (" + ",".join("?" for _ in account_ids) + ")")
+            params.extend(account_ids)
+        where = " AND ".join(filters)
+        if account_ids is not None and not account_ids:
+            rows = []
+        else:
+            conn = self._conn_factory()
+            try:
+                rows = conn.execute(
+                    f"SELECT message_id, subject, sender, folder, received_at FROM mail_messages WHERE {where}",
+                    params,
+                ).fetchall()
+            finally:
+                conn.close()
+        eligible = []
+        for row in rows:
+            try:
+                received = _parse_mail_timestamp(str(row["received_at"]))
+            except ValueError:
+                continue
+            if start <= received < end:
+                eligible.append((received, row))
+        eligible.sort(key=lambda item: (item[0], str(item[1]["message_id"])), reverse=True)
+        normalized_filters = {
+            "from": start.isoformat(), "before": end.isoformat(),
+            "folder": folder.casefold() if folder is not None else None,
+            "accounts": sorted(account_ids) if account_ids is not None else None,
+        }
+        fingerprint = sha256(json.dumps({
+            "filters": normalized_filters,
+            "ordered": [(str(row["message_id"]), received.isoformat()) for received, row in eligible],
+        }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        token_payload = {"filters": normalized_filters, "fingerprint": fingerprint}
+        if listing_id is not None:
+            existing = _decode_listing_token(listing_id)
+            if existing != token_payload:
+                raise ValueError("Stale listing: mailbox contents or listing filters changed. Start a new listing.")
+            effective_listing_id = listing_id
+        else:
+            effective_listing_id = _listing_token(token_payload)
+        total = len(eligible)
+        selected = eligible[start_rank - 1:last]
+        cards = [
+            MailListCard(
+                message_id=str(row["message_id"]),
+                subject=str(row["subject"] or "")[:180],
+                sender=str(row["sender"] or "")[:120],
+                folder=str(row["folder"] or "")[:80],
+                received_at=row["received_at"],
+                subject_truncated=len(str(row["subject"] or "")) > 180,
+                sender_truncated=len(str(row["sender"] or "")) > 120,
+                folder_truncated=len(str(row["folder"] or "")) > 80,
+            )
+            for _, row in selected
+        ]
+        returned = len(cards)
+        next_start = start_rank + returned
+        has_more = next_start <= total
+        return MailListResult(
+            total_matches=total, requested_range={"start_rank": start_rank, "end_rank": last},
+            returned_count=returned, has_more=has_more,
+            next_range={"start_rank": next_start, "end_rank": min(next_start + 19, total)} if has_more else None,
+            applied_limit=20,
+            coverage={"start_rank": start_rank if returned else 0, "end_rank": start_rank + returned - 1 if returned else 0},
+            listing_id=effective_listing_id,
+            messages=cards,
+        )
 
     def import_messages(
         self,
@@ -266,6 +430,8 @@ class MailService:
 
     def search_messages(self, *, query: str, limit: int = 10) -> MailSearchResult:
         normalized_query = query.strip()
+        requested_limit = max(1, limit)
+        applied_limit = min(requested_limit, 100)
         conn = self._conn_factory()
         try:
             if normalized_query:
@@ -284,7 +450,7 @@ class MailService:
                     ORDER BY rank
                     LIMIT ?
                     """,
-                    (self._fts_query(normalized_query), limit),
+                    (self._fts_query(normalized_query), applied_limit),
                 ).fetchall()
             else:
                 rows = conn.execute(
@@ -294,13 +460,17 @@ class MailService:
                     ORDER BY received_at DESC, updated_at DESC
                     LIMIT ?
                     """,
-                    (limit,),
+                    (applied_limit,),
                 ).fetchall()
         finally:
             conn.close()
 
         return MailSearchResult(
             query=query,
+            requested_limit=requested_limit,
+            applied_limit=applied_limit,
+            returned_count=len(rows),
+            possible_more=len(rows) >= applied_limit,
             messages=[
                 MailSearchResultItem(
                     message_id=row["message_id"],

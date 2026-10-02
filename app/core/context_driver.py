@@ -14,6 +14,7 @@ from app.core.multi_agent import (
     ContextSnapshot,
     EvidenceRef,
     ForkCallerKind,
+    MemoryReference,
     PlanStep,
     RuntimeBudget,
     ScopeGrant,
@@ -72,6 +73,7 @@ class AgentView(BaseModel):
     evidence_refs: tuple[str, ...] = ()
     evidence_summaries: tuple[str, ...] = ()
     evidence_content: tuple[str, ...] = ()
+    memory_refs: tuple[MemoryReference, ...] = ()
     mode: ContextViewMode
     compression_warnings: tuple[str, ...] = ()
 
@@ -87,6 +89,7 @@ class ToolView(BaseModel):
     allowed_paths: tuple[str, ...] = ()
     allowed_source_ids: tuple[str, ...] = ()
     allowed_account_ids: tuple[str, ...] = ()
+    memory_refs: tuple[MemoryReference, ...] = ()
     full_workspace_authority: bool = False
     full_data_authority: bool = False
     side_effect_level: SideEffectLevel
@@ -169,6 +172,8 @@ class ContextRequest(BaseModel):
     view_mode: ContextViewMode = ContextViewMode.WORKING
     evidence_candidates: tuple[EvidenceCandidate, ...] = ()
     evidence_budget_tokens: int = Field(default=512, ge=0)
+    memory_candidates: tuple[MemoryReference, ...] = ()
+    memory_budget_tokens: int = Field(default=2048, ge=0)
 
 
 class ContextDerivationResult(BaseModel):
@@ -295,6 +300,27 @@ class ContextDriver:
             if result.status != TaskResultStatus.COMPLETED
         ]
         dependency_refs = tuple(result.result_id for result in request.dependency_results)
+        requested_memories = [value[7:] for value in request.plan_step.input_refs if value.startswith("memory:")]
+        selected_memories: list[MemoryReference] = []
+        child_budget = _minimum_budget(request.plan_step.budget, request.budget)
+        memory_remaining = min(request.memory_budget_tokens, child_budget.max_tokens) if child_budget.max_tokens is not None else request.memory_budget_tokens
+        for value in requested_memories:
+            matches = [ref for ref in request.memory_candidates
+                       if value in {ref.memory_id, f"{ref.memory_id}@{ref.version}"}]
+            if len(matches) != 1:
+                return ContextDerivationResult(status=ContextDerivationStatus.SCOPE_DENIED,
+                                               reason="Explicit memory reference is missing, stale or unauthorized.")
+            ref = matches[0]
+            if ref in selected_memories:
+                continue
+            # Provenance and version metadata consume context too. Counting only
+            # content lets repeated-source IDs bypass this child partition.
+            cost = len(ref.model_dump_json().encode("utf-8"))
+            if cost > memory_remaining:
+                return ContextDerivationResult(status=ContextDerivationStatus.BUDGET_EXCEEDED,
+                                               reason="Explicit memory references exceed the child memory budget.")
+            selected_memories.append(ref)
+            memory_remaining -= cost
         if incomplete:
             return ContextDerivationResult(
                 status=ContextDerivationStatus.BLOCKED_DEPENDENCY,
@@ -485,6 +511,7 @@ class ContextDriver:
             objective=request.plan_step.objective,
             output_contract=request.plan_step.output_contract,
             input_refs=request.plan_step.input_refs,
+            memory_refs=tuple(selected_memories),
             dependency_result_refs=dependency_refs,
             evidence_refs=tuple(candidate.evidence for candidate in selected),
             effective_scope=effective_scope,
@@ -524,6 +551,7 @@ class ContextDriver:
                 evidence_refs=evidence_refs,
                 evidence_summaries=evidence_summaries,
                 evidence_content=evidence_content,
+                memory_refs=tuple(selected_memories),
                 mode=request.view_mode,
                 compression_warnings=tuple(warnings),
             ),
@@ -536,6 +564,7 @@ class ContextDriver:
                 allowed_paths=effective_scope.workspace_paths,
                 allowed_source_ids=effective_scope.source_ids,
                 allowed_account_ids=effective_scope.account_ids,
+                memory_refs=tuple(selected_memories),
                 full_workspace_authority=snapshot.full_workspace_authority,
                 full_data_authority=snapshot.full_data_authority,
                 side_effect_level=effective_scope.side_effect_level,

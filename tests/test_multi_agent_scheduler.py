@@ -4,7 +4,12 @@ import asyncio
 
 import pytest
 
-from app.core.agent_runs import AgentRunStatus, InMemoryAgentRunManager
+from app.core.agent_runs import (
+    AgentRunEvent,
+    AgentRunRecord,
+    AgentRunStatus,
+    InMemoryAgentRunManager,
+)
 from app.core.context_driver import ContextDriver
 from app.core.multi_agent import (
     FailureDetail,
@@ -17,7 +22,11 @@ from app.core.multi_agent import (
     SideEffectLevel,
     TaskResult,
     TaskResultStatus,
+    VerificationCheck,
+    VerificationResult,
+    VerificationStatus,
 )
+from app.core.multi_agent_aggregation import ConfirmationState
 from app.core.multi_agent_scheduler import MultiAgentScheduler, SchedulerContext
 
 
@@ -75,11 +84,135 @@ def _active_parent(*steps: PlanStep):
     return manager, parent, plan, context
 
 
+def test_coordinator_side_effect_audit_includes_descendant_runs() -> None:
+    class EventStore:
+        def __init__(self, runs, events) -> None:
+            self.runs = runs
+            self.events = events
+
+        def get_run(self, run_id):
+            return self.runs.get(run_id)
+
+        def list_events(self, run_id):
+            return self.events.get(run_id, [])
+
+    def event(run_id, sequence, event_type, payload):
+        return AgentRunEvent(
+            event_id=f"{run_id}:{sequence}", run_id=run_id, sequence=sequence,
+            type=event_type, message=event_type, payload=payload, created_at="now",
+        )
+
+    coordinator = AgentRunRecord(
+        run_id="coordinator", session_id="session", trace_id="trace",
+        parent_run_id="parent", child_run_ids=("leaf",), status=AgentRunStatus.COMPLETED,
+        user_input="coordinate", created_at="now",
+        plan_id="plan-root", step_id="coordinate", attempt=1,
+        metadata={"context_snapshot": {
+            "child_run_id": "coordinator", "parent_run_id": "parent",
+            "plan_id": "plan-root", "step_id": "coordinate", "session_id": "session",
+        }, "multi_agent_plan": {"plan_id": "plan-nested"}},
+    )
+    leaf = AgentRunRecord(
+        run_id="leaf", session_id="session", trace_id="trace",
+        parent_run_id="coordinator", status=AgentRunStatus.COMPLETED,
+        user_input="write", created_at="now",
+        plan_id="plan-nested", step_id="write", attempt=1,
+        metadata={"context_snapshot": {
+            "child_run_id": "leaf", "parent_run_id": "coordinator",
+            "plan_id": "plan-nested", "step_id": "write", "session_id": "session",
+        }},
+    )
+    events = {
+        "coordinator": [
+            event("coordinator", 1, "run_started", {}),
+            event("coordinator", 2, "run_completed", {"tool_event_count": 0}),
+            event("coordinator", 3, "subtask_result", {"child_tool_audit": {
+                "protocol_version": "child_tool_audit_v1", "complete": True, "invocations": [],
+            }}),
+        ],
+        "leaf": [
+            event("leaf", 1, "run_started", {}),
+            event("leaf", 2, "safety_review_required", {"review": {
+                "invocation_id": "inv-1", "read_only": False, "status": "pending",
+            }}),
+            event("leaf", 3, "safety_review_decided", {"review": {
+                "invocation_id": "inv-1", "read_only": False, "status": "approved",
+            }}),
+            event("leaf", 4, "tool_started", {"tool_name": "matter.create"}),
+            event("leaf", 5, "tool_completed", {"tool_name": "matter.create", "metadata": {
+                "result": {"invocation_id": "inv-1", "status": "rejected"},
+            }}),
+            event("leaf", 6, "run_completed", {"tool_event_count": 1}),
+            event("leaf", 7, "subtask_result", {"child_tool_audit": {
+                "protocol_version": "child_tool_audit_v1", "complete": True,
+                "invocations": [{"invocation_id": "inv-1", "tool_name": "matter.create",
+                                 "read_only": False, "status": "rejected"}],
+            }}),
+        ],
+    }
+    scheduler = MultiAgentScheduler(run_manager=EventStore(
+        {"coordinator": coordinator, "leaf": leaf}, events,
+    ), child_executor=object(), child_runner=lambda **_: None)
+
+    actual, confirmation = scheduler._child_tree_execution_evidence(
+        "coordinator", expected_parent_id="parent", expected_plan_id="plan-root",
+        expected_step_id="coordinate", expected_attempt=1, expected_trace_id="trace",
+    )
+
+    assert actual is True
+    assert confirmation == ConfirmationState.APPROVED
+
+
+def test_incomplete_child_audit_requires_replan_even_for_read_step() -> None:
+    manager, parent, plan, _ = _active_parent(_step("a"))
+    child = manager.create_child_run(
+        parent_run_id=parent.run_id, plan_id=plan.plan_id, step_id="a", attempt=1,
+        user_input="read evidence",
+    )
+    manager.mark_child_running(child.run_id)
+    manager.complete_child_run(child.run_id)
+    result = TaskResult(
+        correlation_id=parent.trace_id, result_id="result:a", child_run_id=child.run_id,
+        plan_id=plan.plan_id, step_id="a", snapshot_id="snapshot:a",
+        status=TaskResultStatus.COMPLETED, summary="done",
+        verification=VerificationResult(
+            correlation_id=parent.trace_id,
+            verification_id="verify:a",
+            status=VerificationStatus.INCONCLUSIVE,
+            summary="Output contract still needs review.",
+            checks=(VerificationCheck(
+                check_id="output_contract",
+                status=VerificationStatus.INCONCLUSIVE,
+                summary="No explicit contract decision.",
+            ),),
+        ),
+    )
+    scheduler = MultiAgentScheduler(
+        run_manager=manager, child_executor=object(), child_runner=lambda **_: None
+    )
+
+    scheduled = scheduler._result(plan, [result], status="completed")
+
+    assert scheduled.verification is not None
+    assert scheduled.verification.status.value == "inconclusive"
+    assert "actual_side_effects_unknown" in scheduled.verification.missing_requirements
+    assert any(
+        check.check_id.endswith(":output_contract")
+        and check.status == VerificationStatus.INCONCLUSIVE
+        for check in scheduled.verification.checks
+    )
+    assert scheduled.replan_required is True
+
+
 class FakeChildExecutor:
-    def __init__(self, manager: InMemoryAgentRunManager, *, results=None, delay=0):
+    def __init__(
+        self, manager: InMemoryAgentRunManager, *, results=None, delay=0,
+        record_uncertain_tool_attempts=False,
+    ):
         self.manager = manager
         self.scripted_results = {key: list(value) for key, value in (results or {}).items()}
         self.delay = delay
+        self.record_uncertain_tool_attempts = record_uncertain_tool_attempts
         self.calls: list[tuple[str, int]] = []
         self.active = 0
         self.max_active = 0
@@ -118,6 +251,11 @@ class FakeChildExecutor:
                 await asyncio.sleep(self.delay)
             if scripted and scripted[0] == "retryable_failure":
                 scripted.pop(0)
+                if self.record_uncertain_tool_attempts:
+                    self.manager.append_event(
+                        child_run_id, "tool_started", "Fake tool execution started.",
+                        stage="tool_execute", payload={"tool_name": "knowledge.search"},
+                    )
                 self.manager.fail_child_run(child_run_id, error_type="ProviderTimeout", error="retry")
                 return self._task_result(
                     child,
@@ -140,6 +278,18 @@ class FakeChildExecutor:
                     ),
                 )
             self.manager.complete_child_run(child_run_id, result_snapshot={"answer": f"result:{child.step_id}"})
+            self.manager.append_event(
+                child_run_id, "run_completed", "Fake child completed.", stage="run",
+                payload={"tool_event_count": 0},
+            )
+            self.manager.append_event(
+                child_run_id, "subtask_result", "Fake child tool audit recorded.", stage="subtask",
+                payload={"child_tool_audit": {
+                    "protocol_version": "child_tool_audit_v1",
+                    "complete": True,
+                    "invocations": [],
+                }},
+            )
             self.completion_order.append(child.step_id)
             return self._task_result(child, TaskResultStatus.COMPLETED, f"result:{child.step_id}")
         finally:
@@ -209,6 +359,23 @@ def test_scheduler_retries_only_retryable_failure_with_bounded_attempts() -> Non
     assert result.verification is not None and result.verification.status.value == "inconclusive"
     children = manager.child_tree(parent.run_id)
     assert [child.attempt for child in children] == [1, 2]
+
+
+def test_retry_cannot_hide_an_earlier_attempt_with_incomplete_tool_audit() -> None:
+    manager, parent, _, context = _active_parent(_step("retry_me"))
+    executor = FakeChildExecutor(
+        manager,
+        results={"retry_me": ["retryable_failure", "ok"]},
+        record_uncertain_tool_attempts=True,
+    )
+    scheduler = MultiAgentScheduler(run_manager=manager, child_executor=executor, max_retries=1)
+
+    result = asyncio.run(scheduler.execute_plan_async(parent.run_id, context=context))
+
+    assert result.status == "completed"
+    assert result.verification is not None
+    assert "actual_side_effects_unknown" in result.verification.missing_requirements
+    assert result.replan_required is True
 
 
 def test_failed_dag_can_be_patched_and_resumed_with_a_new_attempt() -> None:

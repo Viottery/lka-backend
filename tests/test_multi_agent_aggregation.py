@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+from app.core.agent_runs import AgentRunEvent, AgentRunRecord, AgentRunStatus
 from app.core.multi_agent import (
+    GENERAL_AGENT_ID,
     AggregationStatus,
     EvidenceRef,
     FailureDetail,
@@ -17,6 +19,7 @@ from app.core.multi_agent_aggregation import (
     ConfirmationState,
     VerificationPolicy,
     aggregate_task_results,
+    derive_child_execution_evidence,
     verify_aggregate,
     verify_task_result,
 )
@@ -140,6 +143,164 @@ def test_write_capability_alone_does_not_imply_confirmation() -> None:
     )
     assert verification.status == VerificationStatus.INCONCLUSIVE
     assert "actual_side_effects_unknown" in verification.missing_requirements
+
+
+def _audit_run() -> AgentRunRecord:
+    return AgentRunRecord(
+        run_id="child:a", session_id="session", trace_id="trace",
+        status=AgentRunStatus.COMPLETED, user_input="work", created_at="now",
+        metadata={"agent_id": GENERAL_AGENT_ID, "executor_kind": "react"},
+    )
+
+
+def _audit_event(sequence: int, event_type: str, payload: dict) -> AgentRunEvent:
+    return AgentRunEvent(
+        event_id=f"event:{sequence}", run_id="child:a", sequence=sequence,
+        type=event_type, message=event_type, payload=payload, created_at="now",
+    )
+
+
+def test_child_execution_evidence_accepts_complete_read_only_trace() -> None:
+    events = [
+        _audit_event(1, "run_started", {}),
+        _audit_event(2, "tool_started", {"tool_name": "knowledge.search"}),
+        _audit_event(3, "tool_completed", {
+            "tool_name": "knowledge.search",
+            "metadata": {"result": {"invocation_id": "inv-1", "status": "completed"}},
+        }),
+        _audit_event(4, "run_completed", {"tool_event_count": 1}),
+    ]
+
+    actual, confirmation = derive_child_execution_evidence(
+        _audit_run(), events,
+        tool_audit={"protocol_version": "child_tool_audit_v1", "complete": True,
+                    "invocations": [{"invocation_id": "inv-1", "tool_name": "knowledge.search",
+                                    "read_only": True, "status": "completed"}]},
+    )
+
+    assert actual is False
+    assert confirmation == ConfirmationState.NOT_REQUIRED
+
+
+def test_child_execution_evidence_requires_complete_tool_and_safety_audit() -> None:
+    incomplete = [
+        _audit_event(1, "run_started", {}),
+        _audit_event(2, "tool_started", {"tool_name": "knowledge.search"}),
+        _audit_event(3, "run_completed", {"tool_event_count": 1}),
+    ]
+    actual, confirmation = derive_child_execution_evidence(
+        _audit_run(), incomplete,
+        tool_audit={"protocol_version": "child_tool_audit_v1", "complete": True,
+                    "invocations": [{"invocation_id": "inv-1", "tool_name": "knowledge.search",
+                                    "read_only": True, "status": "completed"}]},
+    )
+    assert actual is None
+    assert confirmation == ConfirmationState.MISSING
+
+    writable = [
+        _audit_event(1, "run_started", {}),
+        _audit_event(2, "safety_review_required", {"review": {
+            "invocation_id": "inv-2", "read_only": False, "status": "pending",
+        }}),
+        _audit_event(3, "safety_review_decided", {"review": {
+            "invocation_id": "inv-2", "read_only": False, "status": "approved",
+        }}),
+        _audit_event(4, "tool_started", {"tool_name": "matter.create"}),
+        _audit_event(5, "tool_completed", {
+            "tool_name": "matter.create",
+            "metadata": {"result": {"invocation_id": "inv-2", "status": "rejected"}},
+        }),
+        _audit_event(6, "run_completed", {"tool_event_count": 1}),
+    ]
+    actual, confirmation = derive_child_execution_evidence(
+        _audit_run(), writable,
+        tool_audit={"protocol_version": "child_tool_audit_v1", "complete": True,
+                    "invocations": [{"invocation_id": "inv-2", "tool_name": "matter.create",
+                                    "read_only": False, "status": "rejected"}]},
+    )
+    assert actual is True
+    assert confirmation == ConfirmationState.APPROVED
+
+
+def test_child_execution_evidence_keeps_legacy_run_unknown() -> None:
+    events = [
+        _audit_event(1, "run_started", {}),
+        _audit_event(2, "run_completed", {"tool_event_count": 0}),
+    ]
+
+    actual, confirmation = derive_child_execution_evidence(_audit_run(), events)
+
+    assert actual is None
+    assert confirmation == ConfirmationState.MISSING
+
+
+def test_failed_child_with_complete_zero_tool_trace_proves_no_side_effect() -> None:
+    failed_run = _audit_run().model_copy(update={"status": AgentRunStatus.FAILED})
+    events = [
+        _audit_event(1, "run_started", {}),
+        _audit_event(2, "run_failed", {}),
+        _audit_event(3, "subtask_failed", {}),
+    ]
+
+    actual, confirmation = derive_child_execution_evidence(failed_run, events)
+
+    assert actual is False
+    assert confirmation == ConfirmationState.NOT_REQUIRED
+
+    attempted = [
+        _audit_event(1, "run_started", {}),
+        _audit_event(2, "tool_started", {"tool_name": "matter.create"}),
+        _audit_event(3, "run_failed", {}),
+        _audit_event(4, "subtask_failed", {}),
+    ]
+    actual, confirmation = derive_child_execution_evidence(failed_run, attempted)
+    assert actual is None
+    assert confirmation == ConfirmationState.MISSING
+
+
+def test_audited_verification_does_not_pass_unknown_read_only_scope_or_scope_mismatch() -> None:
+    result = _result("a", TaskResultStatus.COMPLETED)
+    policy = VerificationPolicy(correlation_id="trace_aggregate", require_side_effect_audit=True)
+    unknown = verify_task_result(
+        _step("a"), result, output_contract_satisfied=True,
+        actual_side_effects=None, policy=policy,
+    )
+    assert unknown.status == VerificationStatus.INCONCLUSIVE
+    assert "actual_side_effects_unknown" in unknown.missing_requirements
+
+    mismatch = verify_task_result(
+        _step("a"), result, output_contract_satisfied=True,
+        actual_side_effects=True, confirmation=ConfirmationState.APPROVED, policy=policy,
+    )
+    assert mismatch.status == VerificationStatus.FAILED
+    assert "actual_side_effect_scope_mismatch" in mismatch.missing_requirements
+
+
+def test_output_contract_failure_and_step_mismatch_are_required_verification_checks() -> None:
+    step = _step("expected")
+    failed_contract = verify_task_result(
+        step, _result("expected", TaskResultStatus.COMPLETED),
+        output_contract_satisfied=False,
+    )
+    assert failed_contract.status == VerificationStatus.FAILED
+    assert any(
+        check.check_id == "output_contract"
+        and check.status == VerificationStatus.FAILED
+        and check.required
+        for check in failed_contract.checks
+    )
+
+    mismatched_step = verify_task_result(
+        step, _result("different", TaskResultStatus.COMPLETED),
+        output_contract_satisfied=True,
+    )
+    assert mismatched_step.status == VerificationStatus.FAILED
+    assert any(
+        check.check_id == "output_contract"
+        and check.status == VerificationStatus.FAILED
+        and check.required
+        for check in mismatched_step.checks
+    )
 
 
 def test_verify_aggregate_uses_step_specific_contract_decisions() -> None:
