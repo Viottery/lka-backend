@@ -18,6 +18,24 @@
 
 ## 0. MVP 成功定义
 
+### 维护与收敛（2026-10-03）
+
+当前进入模块整理、回归与安全检查阶段，暂停自动扩展长期路线图。
+模块入口与执行链路见 [当前模块与运行流程](current_module_flows.md)，
+本轮修复、验证和残留问题见 [维护记录](project_maintenance_2026-10-03.md)。
+历史阶段中的未勾选条目不表示对应底层能力全部缺失；后续推进需结合当前实现核对。
+
+### 项目管理接入（2026-10-02）
+
+- [x] 独立目录项目列表、空项目登记、显示名称 revision CAS；复用 memory project 稳定身份。
+- [x] 项目下多个会话、创建时直接指定 project_id、会话列表按项目过滤、目录切换重新关联。
+- [x] 旧 workspace-only 会话启动补关联；不改消息、会话排序或既有项目记忆 ID。
+- [x] 项目/会话/记忆/工作区/Agent 回归验证：106 passed / 107.74s；Ruff 与 diff 检查通过。
+
+API 见 `docs/api_contract.md` 的 10.8。登记不创建文件夹、名称修改不移动文件夹；
+本阶段没有项目删除或文件系统搬迁。迁移使用 metadata CAS 保留并发修改，已发现的旧目录
+可能保留为空项目，而不会为清理列表删除历史记录。
+
 ### 0.0 Urgent 方向调整：邮件处理助手优先
 
 第一版 MVP 的主场景调整为邮件处理助手。本地 workspace 能力继续保留，但在第一版中降级为辅助 context provider。
@@ -112,9 +130,10 @@ Urgent track 的阶段目标：
   `invalid_plain_text_decision`，不能恢复为 `answer`。疑似工具调用的损坏 JSON 必须先尝试
   `decision_repair`，修复失败则记录 `malformed_tool_call` 并停止，避免出现“看起来调用了
   工具、实际没有执行”的假成功。
-- Agent Loop 对 route、decision、decision repair、tool result check 和 answer 阶段不再
-  主动设置 `max_tokens`，避免本地 harness 侧截断模型输出；真实 provider 自身限制仍需
-  通过错误处理和日志观察。
+- Agent Loop 原先对 route、decision、decision repair、tool result check 和 answer 阶段不
+  主动设置 `max_tokens`，以避免无依据的本地截断。后续引入整体 prompt 预算后，已配置
+  context window 的模型会使用其显式 `output_reserve_tokens` 作为请求输出上限，确保输入
+  预算与输出预留一致；未配置模型容量则在发送前报错。见记忆与后台任务 TODO。
 - 多轮追问中，如果当前 session context window 已足够回答，Agent 可以不展开工具包，
   直接进入 `context_answer` LLM 阶段；如果 route LLM 返回不完整 JSON 但明确选择
   `mail`，Agent 会保守恢复该 package 选择并继续执行工具链。

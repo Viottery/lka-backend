@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import http.client
+
 import httpx
 import pytest
 
@@ -218,3 +220,88 @@ def test_search_results_drop_unsafe_provider_urls():
     )
     result = adapter.search("article", limit=3)
     assert [item["url"] for item in result["results"]] == ["https://example.org/article"]
+
+
+def test_native_page_fetch_checks_deadline_between_trickled_fragments(monkeypatch):
+    clock = [0.0]
+    connections = []
+
+    class Response:
+        status = 200
+
+        def getheaders(self):
+            return [("Content-Type", "text/plain")]
+
+        def read(self, size):
+            pytest.fail("read() can fill its buffer past the total request deadline")
+
+        def read1(self, size):
+            clock[0] += 1.0
+            return b"x"
+
+    class Connection:
+        sock = None
+
+        def __init__(self, *args):
+            self.closed = False
+            connections.append(self)
+
+        def request(self, method, path, *, headers):
+            pass
+
+        def getresponse(self):
+            return Response()
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr("app.integrations.web_search.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("app.integrations.web_search._PinnedHTTPSConnection", Connection)
+    with pytest.raises(WebSearchError, match="timed out"):
+        PublicPageFetcher(timeout_seconds=3).open("https://8.8.8.8/page")
+    assert clock[0] == 3.0
+    assert connections[0].closed
+
+
+@pytest.mark.parametrize("failure", [http.client.BadStatusLine("invalid"),
+                                    http.client.IncompleteRead(b"partial")])
+def test_native_page_protocol_errors_become_tool_feedback(monkeypatch, failure):
+    def fail(target):
+        raise failure
+
+    fetcher = PublicPageFetcher()
+    monkeypatch.setattr(fetcher, "_fetch", fail)
+    with pytest.raises(WebSearchError, match="Page fetch failed"):
+        fetcher.open("https://8.8.8.8/page")
+
+
+def test_native_page_fetch_formats_ipv6_host_header(monkeypatch):
+    headers_seen = []
+
+    class Response:
+        status = 200
+
+        def getheaders(self):
+            return [("Content-Type", "text/plain")]
+
+        def read1(self, size):
+            return b""
+
+    class Connection:
+        sock = None
+
+        def __init__(self, *args):
+            pass
+
+        def request(self, method, path, *, headers):
+            headers_seen.append(headers)
+
+        def getresponse(self):
+            return Response()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("app.integrations.web_search._PinnedHTTPSConnection", Connection)
+    PublicPageFetcher().open("https://[2606:4700:4700::1111]/page")
+    assert headers_seen[0]["Host"] == "[2606:4700:4700::1111]"

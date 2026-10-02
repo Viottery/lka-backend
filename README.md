@@ -1,17 +1,25 @@
 # Local Knowledge Agent OS Backend
 
 This repository contains the cross-platform Backend Core for Local Knowledge
-Agent OS. It focuses on a small, working HTTP service with SQLite persistence,
-native Windows/Linux execution support, and a clear path for future expansion.
+Agent OS. It provides a local Agent runtime with SQLite persistence, native
+Windows/Linux execution, mail and knowledge tools, and durable background work.
 
 ## Current Scope
 
-- FastAPI application with the implemented HTTP routes
-- SQLite-backed storage for workspaces
+- FastAPI Agent turns and SSE, persistent runs, safety reviews, and scoped child agents
+- SQLite-backed sessions, projects, mail, matters, knowledge, and global/project memories
+- Asynchronous memory extraction and context compaction with leases and recovery
+- Optional read-only mail expert, public web search, and scheduled watch briefings
+- Workspace files, command tools, instruction files, and shared frontend defaults
 - Local-only default binding for development
 - Native Windows/Linux backend execution
 - Platform support for workspace path resolution and read-only filesystem scanning
 - Documentation for the current architecture and API contract
+
+Start with [current module flows](docs/current_module_flows.md) for the implemented
+system and [the maintenance review](docs/project_maintenance_2026-10-03.md) for
+validation results and remaining issues. The long-term roadmap also contains
+historical stage descriptions; it is not the current feature inventory.
 
 ## Repository Responsibilities
 
@@ -32,13 +40,18 @@ app/
   core/
     config.py        # Application settings
     agent_turn.py    # Main Agent turn loop
-    llm.py           # LLM provider client and error handling
+    llm/             # Async LLM clients, service, and audit/error handling
     tools.py         # Tool registry, specs, and executor contracts
     runtime_context.py # Deterministic runtime context helpers
     runtime.py       # Main runtime orchestration
   domains/
     mail.py          # Mail domain service and models
     matters.py       # Matter domain service and models
+    memory.py        # Versioned memories, sources, and project scope
+    projects.py      # Stable project identities and display names
+    watch.py         # Watch definitions, occurrences, and briefings
+  experts/
+    mail.py          # Optional bounded read-only mail ChildExecutor
   integrations/
     outlook.py       # Microsoft Graph / Outlook sync integration
   tool_packages/

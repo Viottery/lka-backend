@@ -3,7 +3,7 @@ from __future__ import annotations
 from app.core.agent_graph import AgentGraphRunner
 from app.core.agent_runs import AgentRunRecord, AgentRunStatus
 from app.core.agent_turn import AgentTurnLoop
-from app.core.llm import LLMResponse
+from app.core.llm import LLMResponse, LLMResponseMode
 from app.core.multi_agent import ContextSnapshot, RuntimeBudget, ScopeGrant
 
 
@@ -45,6 +45,7 @@ class _Graph:
             prompt_summary="test",
             max_output_tokens=32,
             stage="decision",
+            response_mode=LLMResponseMode.TEXT,
         )
 
 
@@ -95,6 +96,7 @@ def test_graph_runner_uses_frozen_child_profile_in_actual_llm_request() -> None:
     assert llm.request["client_name"] == "profile_client"
     assert llm.request["model"] == "model-v2"
     assert llm.request["reasoning_effort"] is None
+    assert llm.request["response_mode"] == LLMResponseMode.TEXT
     assert llm.request["metadata"] == {
         "stage": "decision",
         "inference_selection_source": "server_profile",

@@ -308,9 +308,8 @@ class WatchScheduler:
                     matter_enabled=matter_enabled,
                     workspace_paths=workspace_paths,
                     knowledge_enabled=knowledge_enabled,
-                    instruction_tools_enabled=bool(
-                        guidance and guidance.get("next_offset") is not None
-                    ),
+                    # The extractive summary may omit rules even in a short file.
+                    instruction_tools_enabled=bool(guidance),
                 )
             finally:
                 heartbeat.cancel()

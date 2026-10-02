@@ -343,6 +343,11 @@ class WatchService:
             raise ValueError("title and goal must not be blank")
         self._validate_schedule(merged["timezone"], merged["daily_time"])
         start, end = merged.get("starts_at"), merged.get("ends_at")
+        # Persisted records expose ISO strings; supplied patch dates are datetimes.
+        if isinstance(start, str):
+            start = datetime.fromisoformat(start)
+        if isinstance(end, str):
+            end = datetime.fromisoformat(end)
         if start and end and _aware(end, "ends_at") < _aware(start, "starts_at"):
             raise ValueError("ends_at must not precede starts_at")
         mapping = {

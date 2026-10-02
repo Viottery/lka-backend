@@ -46,9 +46,10 @@ WATCH_READ_ONLY_TOOL_ALLOWLIST = frozenset(
     }
 )
 # The child budget accounts for prompt input as well as generated tokens. The
-# regular harness includes its package/tool contract in each call, so 10k was
-# insufficient even for one authorized mailbox search/load/finalize cycle.
-WATCH_MAX_TOKENS = 30_000
+# regular harness repeats its package/tool contract and prior watch observations.
+# With conservative tokenizer-free counts, 30k could stop a two-message
+# search/load/finalize cycle before the last decision. Keep a bounded 40k cap.
+WATCH_MAX_TOKENS = 40_000
 WATCH_MAX_LLM_CALLS = 6
 WATCH_MAX_TOOL_CALLS = 8
 WATCH_MAX_WALL_TIME_SECONDS = 120

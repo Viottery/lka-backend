@@ -1365,8 +1365,10 @@ class AgentGraphRunner:
             raise RuntimeError(f"Agent run cannot claim completion: {ws.run_id}")
         final_run = self._run(ws.run_id)
         final_plan = final_run.metadata.get("multi_agent_plan")
-        if isinstance(final_plan, dict) and final_plan.get("status") == "failed":
-            reason = "Multi-Agent plan ended with failed or blocked child steps."
+        if (
+            isinstance(final_plan, dict) and final_plan.get("status") == "failed"
+        ) or self.turn_loop._multi_agent_replan_pending(ws.run_id):
+            reason = "Multi-Agent plan ended with failed, blocked, or unverified child steps."
             try:
                 self.turn_loop.run_manager.flush_events()
             except Exception as exc:

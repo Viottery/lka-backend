@@ -1,8 +1,10 @@
 # 当前系统业务逻辑与代码架构说明
 
-本文档记录 Local Knowledge Agent OS 当前已经实现的业务处理逻辑、模块分层、代码结构、运行链路和已知边界。它描述的是当前代码真实状态，不是远期理想架构。
+本文档保留早期系统业务逻辑与详细设计说明。后续模块增长较快，部分章节仍反映早期实现，
+不应将本页各节当作最新功能清单。2026-10-03 核对后的模块与流程见
+[当前模块与运行流程](current_module_flows.md)，当前 HTTP 行为见 [API Contract](api_contract.md)。
 
-最后更新日期：2026-08-14
+早期说明日期：2026-08-14；本页导航与能力状态核对日期：2026-10-03。
 
 ---
 
@@ -51,6 +53,7 @@ Local Knowledge Agent OS 当前已经从“邮件问答 Demo”推进到一个�
 | Outlook Device Code 登录 | 已实现 | `/mail/outlook/auth/start`, `/mail/outlook/auth/complete` |
 | Outlook 邮件同步 | 已实现 | `POST /mail/outlook/sync` |
 | 邮件本地搜索工具 | 已实现 | `mail.search` |
+| 邮件时间范围/名次清单工具 | 已实现 | `mail.list`（最多 20 张元数据卡片/页） |
 | 邮件原文加载工具 | 已实现 | `mail.load_messages` |
 | 邮件同步工具 | 已实现 | `mail.sync` |
 | 独立事务创建 | 已实现 | `matter.create`, `POST /matters` |
@@ -77,17 +80,17 @@ Local Knowledge Agent OS 当前已经从“邮件问答 Demo”推进到一个�
 
 | 能力 | 当前状态 |
 | --- | --- |
-| 强制确认门 | 未完成 |
-| 高风险工具权限策略 | 未完成 |
-| 严格 JSON-only LLM 输出拒收 | 未强制 |
-| 工具结果分页/压缩 | 未完成 |
+| 强制确认门 | 已实现 mandatory safety review，支持 skip / llm / manual 并保留记录 |
+| 高风险工具权限策略 | 已实现工具 scope、动态只读判定和 child ToolView；bash 非 OS sandbox |
+| 严格结构化决策校验 | 已实现 JSON/native function call 校验与 repair；坏工具调用 fail closed |
+| 工具结果分页/压缩 | 已实现有界预览、run-scoped artifact 与 observation.read |
 | Agent 主动检索历史运行日志 | 未完成 |
 | embedding / semantic search | 已实现 FastEmbed + sqlite-vec V1；无索引时保守降级关键词检索 |
 | 自动邮件触发 LLM 处理 | 未完成 |
 | skill 形成与沉淀 | 未完成 |
-| planner / brain 多 agent 分层 | 延后 |
-| multi-agent 协同执行 | 延后 |
-| 真正的事务提醒调度器 | 未完成 |
+| planner / brain 多 agent 分层 | 已实现 fork_subtasks / plan_patch 与冻结上下文 |
+| multi-agent 协同执行 | 已实现调度、预算、重试、取消、验证聚合；跨进程互斥仍未提供 |
+| 每日关注调度器 | 已实现 occurrence / lease / 独立会话简报；通用事务提醒仍未完成 |
 | 日历集成 | 未完成 |
 | 数据库直接暴露给 LLM 查询 | 未开放 |
 
@@ -782,7 +785,8 @@ MAIL_PACKAGE = ToolPackageSpec(
 - mail package 只处理邮件知识。
 - matter persistence 不属于 mail package。
 - 旧的 `mail.persist_matters` 类还在代码中，但 runtime 不注册它。
-- 当前 Agent 可见邮件工具只有：
+- 当前 Agent 可见邮件工具：
+  - `mail.list`
   - `mail.search`
   - `mail.load_messages`（仅精确查阅，最多三封）
   - `mail.sync`
@@ -813,6 +817,10 @@ MAIL_PACKAGE = ToolPackageSpec(
 ```json
 {
   "query": "NTUSO audition",
+  "requested_limit": 8,
+  "applied_limit": 8,
+  "returned_count": 1,
+  "possible_more": false,
   "messages": [
     {
       "message_id": "...",
@@ -831,8 +839,18 @@ MAIL_PACKAGE = ToolPackageSpec(
 业务含义：
 
 - 常规任务直接使用检索结果中的正文证据，不再把“候选元数据”和正文批量加载拆成两步。
-- 空 query 加 `order_by=source_time_desc` 用于最新邮件列表。
+- 空 query 加 `order_by=source_time_desc` 只能快速查看最近候选；检索最多 100 条，
+  不是穷尽式邮件清单。`possible_more` 只表示候选页已满，不是精确总数。
 - 仅在用户明确要求原文或精确引文且证据片段不足时才调用 `mail.load_messages`。
+
+### 11.2.1 mail.list
+
+工具类：`ListMailTool`。按本地已授权邮件的时间区间、可选文件夹及 1-based
+`start_rank`–`end_rank` 返回最多 20 张不含正文的元数据卡片。默认取前 20 封；
+返回 `total_matches`、当前/下一页范围、`has_more` 和 `listing_id`。后续页复用
+`listing_id`；若符合条件的邮件或授权范围变化，旧 token 拒绝并重开清单；服务重启后
+token 也失效。Agent 要求全量清单时应逐页检查 `has_more`，预算不足时明确说明仅部分覆盖。
+`mail.sync` 的远端增量游标不能替代此本地清单游标。
 
 ### 11.3 mail.load_messages
 

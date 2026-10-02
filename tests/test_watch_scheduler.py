@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
+import pytest
+
 from app.core.agent_runs import InMemoryAgentRunManager
 from app.core.instruction_files import InstructionFiles
 from app.core.multi_agent import TaskResultStatus
@@ -125,7 +127,8 @@ def test_unconfigured_web_provider_fails_watch_instead_of_fabricating_briefing(t
     assert detail.messages[-1].payload["status"] == "failed"
 
 
-def test_watch_run_reads_latest_global_watch_guidance(tmp_path):
+@pytest.mark.parametrize("padding", [0, 20_000])
+def test_watch_run_reads_latest_global_watch_guidance(tmp_path, padding):
     db_path = get_db_path(tmp_path / "data")
     init_db(db_path)
     service = WatchService(lambda: connect(db_path))
@@ -135,7 +138,7 @@ def test_watch_run_reads_latest_global_watch_guidance(tmp_path):
     initial = files.read("watch")
     files.update(
         "watch",
-        content="# Watch\nPrefer primary sources.\n" + "x" * 20_000,
+        content="# Watch\nPrefer primary sources.\n" + "x" * padding,
         expected_sha256=initial["sha256"],
     )
     runtime = SimpleNamespace(
@@ -157,9 +160,11 @@ def test_watch_run_reads_latest_global_watch_guidance(tmp_path):
 
     class CapturingAdapter(_Adapter):
         goal: str | None = None
+        instruction_tools_enabled: bool = False
 
         async def run_async(self, **kwargs):
             self.goal = kwargs["goal"]
+            self.instruction_tools_enabled = kwargs["instruction_tools_enabled"]
             return await super().run_async(**kwargs)
 
     adapter = CapturingAdapter()
@@ -168,6 +173,7 @@ def test_watch_run_reads_latest_global_watch_guidance(tmp_path):
     assert scheduler.run_one(owner="test-worker")
     assert "Prefer primary sources" in adapter.goal
     assert "Guidance continuation:" in adapter.goal
+    assert adapter.instruction_tools_enabled is True
 
 
 def test_watch_updated_after_enqueue_does_not_run_with_old_scope(tmp_path):

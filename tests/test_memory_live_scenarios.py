@@ -5,6 +5,7 @@ These tests verify what is sent to the model, not real-model answer intelligence
 
 import json
 import threading
+import time
 
 import pytest
 
@@ -45,11 +46,22 @@ def _runtime(tmp_path, monkeypatch, orchestrator):
     return runtime, client
 
 
+def _run_when_due(worker, timeout=5):
+    # Queue scheduling uses UTC, which can briefly move backwards on the host.
+    # An idle claim is valid; bound the manual driver with a monotonic deadline.
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if worker.run_one():
+            return True
+        time.sleep(0.01)
+    return False
+
+
 @pytest.mark.parametrize("orchestrator", ["legacy", "langgraph"])
 def test_cross_session_memory_reaches_real_answer_prompt_and_forget_is_immediate(tmp_path, monkeypatch, orchestrator):
     runtime, client = _runtime(tmp_path, monkeypatch, orchestrator)
     runtime.run_agent_turn(session_id="learn", user_input="我希望以后回答先给结论")
-    assert runtime.memory_background.worker.run_one()
+    assert _run_when_due(runtime.memory_background.worker)
     memory = runtime.memory_service.list(scope="global")[0]
     runtime.run_agent_turn(session_id="new-session", user_input="解释一下接口的设计")
     context = client.answer_contexts[-1]
@@ -76,10 +88,10 @@ def test_foreground_turn_finishes_while_background_model_is_still_blocked(tmp_pa
 
     runtime.memory_background.llm_client = SlowBackground()
     runtime.memory_background.allow_remote_extraction = True
-    worker = threading.Thread(target=runtime.memory_background.worker.run_one)
+    worker = threading.Thread(target=_run_when_due, args=(runtime.memory_background.worker,))
     worker.start()
     try:
-        assert entered.wait(timeout=2)
+        assert entered.wait(timeout=5)
         result = runtime.run_agent_turn(session_id="other", user_input="解释一下代码结构")
         assert result.answer == "已经处理"
         assert not release.is_set() and worker.is_alive()

@@ -311,7 +311,7 @@ class PublicPageFetcher:
                 }
         except WebSearchError:
             raise
-        except (httpx.HTTPError, OSError, ssl.SSLError, UnicodeError, LookupError) as exc:
+        except (httpx.HTTPError, http.client.HTTPException, OSError, ssl.SSLError, UnicodeError, LookupError) as exc:
             raise WebSearchError(f"Page fetch failed: {exc}") from exc
         raise WebSearchError("Page fetch did not produce a response.")
 
@@ -341,7 +341,7 @@ class PublicPageFetcher:
         path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
         try:
             conn.request("GET", path, headers={
-                "Host": host, "User-Agent": "LocalKnowledgeAgent/0.1",
+                "Host": parts.netloc, "User-Agent": "LocalKnowledgeAgent/0.1",
                 "Accept": "text/html,text/plain;q=0.9", "Accept-Encoding": "identity",
             })
             response = conn.getresponse()
@@ -365,7 +365,11 @@ class PublicPageFetcher:
                     raise WebSearchError("Page fetch timed out.")
                 if conn.sock is not None:
                     conn.sock.settimeout(remaining)
-                chunk = response.read(min(65_536, self.max_bytes + 1 - len(content)))
+                # read() may perform many receives to fill the requested size,
+                # resetting the socket timeout for each trickled fragment.
+                # read1() returns after one buffered read so we can recheck the
+                # wall-clock deadline between fragments.
+                chunk = response.read1(min(65_536, self.max_bytes + 1 - len(content)))
                 if not chunk:
                     break
                 content.extend(chunk)

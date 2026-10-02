@@ -1116,6 +1116,11 @@ POST /sessions/session_xxx/messages
 
 以下接口只允许本机 loopback 请求，且只读取已绑定到**活动会话**的工作区；已删除、未绑定或不可用的工作区不能浏览。所有 `path` 均为相对工作区的路径，拒绝绝对路径、`..` 路径穿越和符号链接。
 
+工作区必须保持创建绑定时的 canonical 绝对路径；根被替换成符号链接等导致路径改变时
+返回 `403`。POSIX 上预览与列表通过逐层不跟随符号链接的目录描述符打开，避免校验后的
+祖先目录替换竞态；预览只接受普通文件，FIFO 不等待写入者。Windows 保留路径检查，
+尚未提供等价的 native reparse handle 竞态保护。
+
 ```http
 GET /sessions/session_xxx/files?path=notes
 GET /sessions/session_xxx/file?path=notes/todo.md

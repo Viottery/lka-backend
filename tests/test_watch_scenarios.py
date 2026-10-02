@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
+from app.core import watch_execution
 from app.core.config import get_settings
 from app.core.llm.models import LLMResponse
 from app.core.watch_scheduler import WatchScheduler
@@ -355,7 +358,10 @@ class _WatchMailLLM:
         )
 
 
-def test_daily_mail_watch_real_tool_executor_child_and_evidence_flow(tmp_path, monkeypatch):
+@pytest.mark.parametrize("token_budget", [None, 1], ids=["evidence_flow", "token_exhausted"])
+def test_daily_mail_watch_real_tool_executor_child_and_evidence_flow(tmp_path, monkeypatch, token_budget):
+    if token_budget is not None:
+        monkeypatch.setattr(watch_execution, "WATCH_MAX_TOKENS", token_budget)
     monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing.toml"))
     get_settings.cache_clear()
@@ -403,10 +409,33 @@ def test_daily_mail_watch_real_tool_executor_child_and_evidence_flow(tmp_path, m
 
     runtime.run_child_agent_async = capture_view
 
-    def execute(slot):
-        service.create_occurrence(watch["watch_id"], slot)
+    if token_budget == 1:
+        service.create_occurrence(watch["watch_id"], now - timedelta(days=3))
         assert scheduler.run_one(owner="watch-scenario")
-        return service.list_briefings(watch_id=watch["watch_id"], limit=1)[0]
+        occurrence = service.get_occurrence(watch["watch_id"], now - timedelta(days=3))
+        assert occurrence["status"] == "failed"
+        assert service.list_briefings(watch_id=watch["watch_id"]) == []
+        child = runtime.agent_run_manager.get_run(captured_views[0].child_run_id)
+        assert child.status.value == "failed"
+        assert child.error == "Child Agent exceeded its token budget."
+        assert client.requested_tools == []
+        assert client.answer_requests == []
+        assert not any(
+            event.type == "llm_started"
+            for event in runtime.agent_run_manager.list_events(child.run_id)
+        )
+        return
+
+    def execute(slot):
+        occurrence = service.create_occurrence(watch["watch_id"], slot)
+        assert scheduler.run_one(owner="watch-scenario")
+        current = service.get_occurrence(watch["watch_id"], slot)
+        parent = runtime.agent_run_manager.get_run(current["run_id"])
+        assert current["status"] == "succeeded", parent.error if parent else current
+        return next(
+            briefing for briefing in service.list_briefings(watch_id=watch["watch_id"])
+            if briefing["occurrence_id"] == occurrence["occurrence_id"]
+        )
 
     first = execute(now - timedelta(days=3))
     assert len(first["changes"]) == 1

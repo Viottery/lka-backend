@@ -587,6 +587,12 @@ async def _agent_turn_event_stream(
             AgentRunStatus.CANCELLED,
             AgentRunStatus.TIMED_OUT,
         }:
+            # Completion may publish its final events after the first read.
+            # Once terminal status is visible, drain that durable tail before
+            # closing so this stream and a reconnect see the same sequence.
+            for event in run_manager.list_events(run_id, after_sequence=last_sequence):
+                last_sequence = event.sequence
+                yield _sse_event_frame(_public_agent_event(event))
             break
 
         if time.monotonic() - last_sent_at >= 15:

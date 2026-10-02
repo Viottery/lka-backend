@@ -218,9 +218,10 @@ class BatchedExtractionClient:
                     "of exactly one original message. Never merge different messages into a claim."
                 )
                 request.pop("max_output_tokens", None)
-            response = recover_generation(self.client, **request)
-            if inspect.isawaitable(response):
-                response = await response
+            # Recovery bridges async providers with asyncio.run(), so keep it
+            # outside this adapter's running event loop. to_thread also carries
+            # the current workload's token budget into the recovery worker.
+            response = await asyncio.to_thread(recover_generation, self.client, **request)
             if _incomplete(response):
                 raise IncompleteGenerationError("background_extraction_incomplete")
             try:

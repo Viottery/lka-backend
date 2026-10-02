@@ -57,6 +57,23 @@ def test_watch_crud_pause_resume_and_soft_delete(tmp_path):
         service.get(watch["watch_id"])
 
 
+def test_update_watch_validates_persisted_and_patched_date_boundaries(tmp_path):
+    service = _service(tmp_path)
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    end = datetime(2026, 12, 31, tzinfo=UTC)
+    watch = service.create(_payload(starts_at=start, ends_at=end))
+    renamed = service.update(watch["watch_id"], WatchPatch(title="Renamed"))
+    assert renamed["title"] == "Renamed"
+    assert renamed["starts_at"] == start.isoformat()
+    assert renamed["ends_at"] == end.isoformat()
+    extended_end = end + timedelta(days=1)
+    updated = service.update(watch["watch_id"], WatchPatch(ends_at=extended_end))
+    assert updated["ends_at"] == extended_end.isoformat()
+    with pytest.raises(ValueError, match="ends_at must not precede starts_at"):
+        service.update(watch["watch_id"], WatchPatch(starts_at=extended_end + timedelta(days=1)))
+    assert service.get(watch["watch_id"])["starts_at"] == start.isoformat()
+
+
 def test_daily_schedule_is_timezone_aware_and_handles_dst_transition(tmp_path):
     service = _service(tmp_path)
     watch = service.create(

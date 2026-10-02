@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
+
+import pytest
 
 from app.core.agent_runs import AgentRunEvent, AgentRunRecord, AgentRunStatus
 from app.core.multi_agent import (
@@ -232,6 +235,77 @@ def test_child_execution_evidence_keeps_legacy_run_unknown() -> None:
 
     assert actual is None
     assert confirmation == ConfirmationState.MISSING
+
+
+@pytest.mark.parametrize("case", [
+    "read", "staged", "incomplete", "source_applied", "external_unknown",
+    "wrong_snapshot", "wrong_source", "wrong_workspace", "wrong_result", "wrong_executor",
+    "missing_audit", "duplicate_audit", "foreign_event", "unisolated", "event_gap",
+    "invalid_count", "invalid_result_count",
+])
+def test_isolated_workspace_audit_is_complete_and_scope_bound(tmp_path, case):
+    source, isolated = str(tmp_path / "source"), str(tmp_path / "isolated")
+    count = 1 if case == "staged" else 0
+    audit = {
+        "protocol_version": "isolated_workspace_audit_v1", "complete": True,
+        "snapshot_id": "snapshot:a",
+        "source_workspace_sha256": sha256(source.encode()).hexdigest(),
+        "isolated_workspace_sha256": sha256(isolated.encode()).hexdigest(),
+        "staged_change_count": count, "source_applied": False,
+        "external_effects_ruled_out": True,
+    }
+    run = _audit_run().model_copy(update={
+        "metadata": {"agent_id": "another_workspace_executor", "executor_kind": "external_cli",
+                     "context_snapshot": {"snapshot_id": "snapshot:a", "effective_scope": {
+                         "workspace_paths": [source], "side_effect_level": "write",
+                         "allowed_packages": [], "allowed_tools": [],
+                         "source_ids": [], "account_ids": [],
+                     }}},
+        "result_snapshot": {"staged_workspace": isolated, "staged_change_count": count},
+    })
+    if case == "incomplete":
+        audit["complete"] = False
+    elif case == "source_applied":
+        audit["source_applied"] = True
+    elif case == "external_unknown":
+        audit.pop("external_effects_ruled_out")
+    elif case == "wrong_snapshot":
+        audit["snapshot_id"] = "other"
+    elif case == "wrong_workspace":
+        audit["isolated_workspace_sha256"] = "other"
+    elif case == "wrong_source":
+        audit["source_workspace_sha256"] = "other"
+    elif case == "wrong_result":
+        run.result_snapshot["staged_change_count"] = 2
+    elif case == "invalid_count":
+        audit["staged_change_count"] = False
+    elif case == "invalid_result_count":
+        run.result_snapshot["staged_change_count"] = 0.0
+    elif case == "wrong_executor":
+        run.metadata["executor_kind"] = "react"
+    elif case == "unisolated":
+        run.result_snapshot["staged_workspace"] = source
+        audit["isolated_workspace_sha256"] = sha256(source.encode()).hexdigest()
+    values = [("run_started", {})]
+    if case != "missing_audit":
+        values.append(("child_tool_audit", {"audit": audit}))
+    if case == "duplicate_audit":
+        values.append(("child_tool_audit", {"audit": audit}))
+    values.append(("subtask_completed", {}))
+    events = [_audit_event(index, kind, payload) for index, (kind, payload) in enumerate(values, 1)]
+    if case == "foreign_event":
+        events[1] = events[1].model_copy(update={"run_id": "another-child"})
+    elif case == "event_gap":
+        events[-1] = events[-1].model_copy(update={"sequence": 4})
+
+    actual, confirmation = derive_child_execution_evidence(run, events, tool_audit=audit)
+
+    if case == "read":
+        assert actual is False and confirmation == ConfirmationState.NOT_REQUIRED
+    elif case == "staged":
+        assert actual is True and confirmation == ConfirmationState.MISSING
+    else:
+        assert actual is None and confirmation == ConfirmationState.MISSING
 
 
 def test_failed_child_with_complete_zero_tool_trace_proves_no_side_effect() -> None:

@@ -1,17 +1,52 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
 
 from app.api.main import create_app
+from app.api.routes import session_files
 from app.api.routes.session_files import (
     list_session_files,
     preview_session_file,
     preview_session_raw_file,
 )
 from app.core.config import get_settings
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="Named pipes require POSIX")
+@pytest.mark.parametrize("preview", ["preview_session_file", "preview_session_raw_file"])
+def test_session_file_preview_rejects_fifo_without_waiting(tmp_path, preview):
+    fifo = tmp_path / "pipe.pdf"
+    os.mkfifo(fifo)
+    # Keep the regression bounded even if a future change restores blocking open.
+    script = """
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from fastapi import HTTPException
+from app.api.routes import session_files
+root = Path(sys.argv[1])
+session_files._get_workspace = lambda request, session_id: root
+request = SimpleNamespace(client=SimpleNamespace(host='127.0.0.1'))
+try:
+    getattr(session_files, sys.argv[2])('session', request, path='pipe.pdf')
+except HTTPException as exc:
+    assert exc.status_code == 400, exc
+else:
+    raise AssertionError('FIFO was accepted')
+"""
+    subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path), preview],
+        timeout=5,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
 
 
 def _session_with_workspace(tmp_path, monkeypatch):
@@ -33,6 +68,79 @@ def _session_with_workspace(tmp_path, monkeypatch):
 
 def _request(app, host="127.0.0.1"):
     return SimpleNamespace(app=app, client=SimpleNamespace(host=host))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX descriptor-relative opening")
+@pytest.mark.parametrize("preview", [preview_session_file, preview_session_raw_file])
+@pytest.mark.parametrize("replace_root", [False, True])
+def test_session_file_preview_rejects_ancestor_replacement(
+    tmp_path, monkeypatch, preview, replace_root,
+):
+    root = tmp_path / "workspace"
+    folder = root / "nested"
+    folder.mkdir(parents=True)
+    (folder / "note.pdf").write_bytes(b"%PDF-safe")
+    outside = tmp_path / "outside"
+    (outside / "nested").mkdir(parents=True)
+    (outside / "nested" / "note.pdf").write_bytes(b"%PDF-secret")
+    (outside / "note.pdf").write_bytes(b"%PDF-secret")
+    monkeypatch.setattr(session_files, "_get_workspace", lambda request, session_id: root)
+    original = session_files._file_descriptor_no_follow
+
+    def replace_ancestor_then_open(path):
+        ancestor = root if replace_root else folder
+        ancestor.rename(tmp_path / "original")
+        ancestor.symlink_to(outside, target_is_directory=True)
+        return original(path)
+
+    monkeypatch.setattr(session_files, "_file_descriptor_no_follow", replace_ancestor_then_open)
+    request = SimpleNamespace(client=SimpleNamespace(host="127.0.0.1"))
+    with pytest.raises(HTTPException) as response:
+        preview("session", request, path="nested/note.pdf")
+    assert response.value.status_code == 403
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX symbolic links")
+@pytest.mark.parametrize("endpoint", [list_session_files, preview_session_file, preview_session_raw_file])
+def test_session_files_reject_bound_root_replaced_before_request(tmp_path, endpoint):
+    root = tmp_path / "workspace"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "note.pdf").write_bytes(b"%PDF-secret")
+    detail = SimpleNamespace(session=SimpleNamespace(workspace=SimpleNamespace(backend_path=str(root))))
+    runtime = SimpleNamespace(get_session=lambda **kwargs: detail)
+    request = _request(SimpleNamespace(state=SimpleNamespace(runtime=runtime)))
+    root.rename(tmp_path / "original")
+    root.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(HTTPException) as response:
+        endpoint("session", request, path="" if endpoint is list_session_files else "note.pdf")
+    assert response.value.status_code == 403
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX descriptor-relative listing")
+@pytest.mark.parametrize("replace_root", [False, True])
+def test_session_file_listing_rejects_ancestor_replacement(tmp_path, monkeypatch, replace_root):
+    root = tmp_path / "workspace"
+    folder = root / "nested"
+    folder.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    (outside / "nested").mkdir(parents=True)
+    (outside / "secret.txt").write_text("secret")
+    monkeypatch.setattr(session_files, "_get_workspace", lambda request, session_id: root)
+    original = session_files._open_posix_path_no_follow
+
+    def replace_ancestor_then_open(path, flags):
+        ancestor = root if replace_root else folder
+        ancestor.rename(tmp_path / "original")
+        ancestor.symlink_to(outside, target_is_directory=True)
+        return original(path, flags)
+
+    monkeypatch.setattr(session_files, "_open_posix_path_no_follow", replace_ancestor_then_open)
+    request = SimpleNamespace(client=SimpleNamespace(host="127.0.0.1"))
+    with pytest.raises(HTTPException) as response:
+        list_session_files("session", request, path="nested")
+    assert response.value.status_code == 403
 
 
 def test_session_workspace_file_list_and_utf8_preview(tmp_path, monkeypatch):

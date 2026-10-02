@@ -132,7 +132,8 @@ def test_runtime_rejects_codex_state_inside_source_workspace(
 
 
 @pytest.mark.parametrize("staged_write", [False, True])
-def test_codex_expert_runs_through_agent_http_api(tmp_path, monkeypatch, staged_write):
+@pytest.mark.parametrize("omit_audit", [False, True])
+def test_codex_expert_runs_through_agent_http_api(tmp_path, monkeypatch, staged_write, omit_audit):
     source = tmp_path / "source"
     source.mkdir()
     (source / "README.md").write_text("one line\n", encoding="utf-8")
@@ -158,6 +159,14 @@ def test_codex_expert_runs_through_agent_http_api(tmp_path, monkeypatch, staged_
     fake = _EditingFakeCodexClient() if staged_write else _FakeCodexClient()
     assert runtime.codex_expert_executor is not None
     runtime.codex_expert_executor.client_factory = lambda _run_id: fake
+    if omit_audit:
+        real_record = runtime.codex_expert_executor._record
+
+        def without_audit(child, event_type, message, payload=None):
+            if event_type != "child_tool_audit":
+                real_record(child, event_type, message, payload)
+
+        monkeypatch.setattr(runtime.codex_expert_executor, "_record", without_audit)
     loop = runtime.agent_turn_loop
     loop._route = lambda **_kwargs: {"selected_package": "filesystem", "reason": "Inspect workspace."}
     child_failure_codes: list[str] = []
@@ -207,9 +216,14 @@ def test_codex_expert_runs_through_agent_http_api(tmp_path, monkeypatch, staged_
 
     response, snapshot = asyncio.run(exercise())
     assert fake.started
-    if staged_write:
+    if staged_write or omit_audit:
         assert response["answer"].startswith("子任务仍有未解决的失败或阻塞")
-        assert runtime.agent_run_manager.get_run(response["run_id"]).status.value == "failed"
+        parent = runtime.agent_run_manager.get_run(response["run_id"])
+        assert parent.metadata["multi_agent_replan_required"] is True
+        assert parent.status.value == "failed"
+        if omit_audit:
+            assert "actual_side_effects_unknown" in parent.metadata["multi_agent_verification"]["missing_requirements"]
+            assert parent.metadata["multi_agent_plan"]["status"] == "failed"
         assert not (source / "RESULT.txt").exists()
     else:
         assert child_failure_codes == []

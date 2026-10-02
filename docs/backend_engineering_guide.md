@@ -14,7 +14,8 @@ Backend Core 目标是支持 Windows 和 Linux 原生 Python 运行。当前项�
 
 ## 2. 核心职责
 
-Backend Core 目前只负责五个基础动作：
+以下为早期基础服务链路；当前已实现模块与完整前台/后台流程见
+[当前模块与运行流程](current_module_flows.md)。
 
 ```text
 HTTP API
@@ -30,7 +31,7 @@ SQLite 持久化
 Static Capability Catalog
 ```
 
-当前阶段先把服务、索引和能力目录做稳，不再保留基于规则的任务规划或执行闭环。
+该基础链路继续保留；实际 Agent 执行已由结构化决策、LangGraph、工具注册表和安全门承载。
 
 Workspace Index 同时需要记录 workspace 的结构化元数据和文件构成索引。文件构成索引包括目录层级、文件名、扩展名、路径位置、README、配置文件、测试命令和其他高价值元数据，用于在不依赖向量检索时提升效率和准确率。
 
@@ -49,6 +50,8 @@ Mail Tools
   ↓
 MailService / SQLite
 ```
+
+只读邮件专家 `mail_expert@1` 是可选的 ChildExecutor；它在专家内部使用固定的元数据快照、批量正文加载与有界分片分析流程，不把邮件领域逻辑写入通用 Agent core。具体启用方式、覆盖合同和限制见 [邮件专家 Agent 设计](mail_expert_design.md)，实施核对见 [开发 TODO](mail_expert_todolist.md)。
 
 `MailService` 只提供确定性的存储、查询、加载和持久化方法，不调用 LLM，不选择执行步骤。
 LLM 推理、工具选择、观察工具结果和反馈循环属于 Agent Loop。
@@ -99,8 +102,19 @@ message。Agent Loop 必须先执行本地协议校验：工具声明 `output_sc
 执行失败、被拒绝、输出协议不匹配或本地无法确认时，才追加独立 `tool_result_check` LLM
 调用。底层 `ToolResult.status` 已失败时，反馈不能被升级为成功。工具包可以按自身
 metadata 或工具输出提供额外 summary，但这不是 Agent core 的领域特判。
-进入后续 LLM prompt 的 observation 可以是压缩副本；长字符串和长列表应被截断并标记
-`_prompt_compacted=true`。完整工具输入输出必须继续保留在 `tool_events`、session payload
+进入后续 LLM prompt 的 observation 可以是压缩副本。超过通用大小阈值的工具结果进入
+规则 gate：完整 `ToolResult` 保存在当前 run 的本地 artifact 中，模型只看到有结构路径、
+数量/长度和省略标记的预览，以及 `_result_cache.artifact_id`。需要更多信息时展开
+`observation` package，通过只读 `observation.read` 以 JSON Pointer 路径和 offset/limit
+分页查看；读取只接受当前 run 的 `tool_result` artifact，跨 run、跨子 Agent 均拒绝。
+子 Agent 还必须在其不可变 ToolView 中获准使用 `observation` package；未获授权时
+仍以普通工具范围检查拒绝，不能凭 artifact ID 扩权。
+回读页亦有大小上限；工具返回文本视为不可信数据，不能覆盖上层指令。小结果沿用原有
+压缩逻辑：单个字符串超过 4000 字符时保留首尾；列表最多展示前 20 项，
+并在 `_prompt_compaction.truncated_lists` 标明路径、原始/可见/省略条数；多条观察合计
+约 16000 字符预算，超限时优先保留较新的观察并报告较早观察被省略的数量。
+这些压缩后的可见条目不能用于推断完整结果集为空或只有这么多条；清单类工具必须另行
+返回总数、当前页范围和续页状态。完整工具输入输出必须继续保留在 `tool_events`、session payload
 和本地 run log，避免为了节省 token 牺牲审计与可回放性。
 Agent core 只能把工具返回的原始结果、通用反馈和 package metadata 交给 LLM；如果某个领域
 需要状态计数、去重提示、读写边界或业务摘要，应由对应 Tool Package 或 domain service 生成。
@@ -346,7 +360,7 @@ class LocalKnowledgeAgentRuntime:
 
 ## 6. 当前实现与愿景的关系
 
-当前代码实现的是一个轻量骨架，主要覆盖：
+早期轻量骨架覆盖：
 
 - Health Check
 - Workspace index 的基础统计
@@ -355,7 +369,9 @@ class LocalKnowledgeAgentRuntime:
 - SQLite trace / runtime event 持久化
 - 平台识别、workspace 路径解析和只读文件扫描
 
-这意味着：
+现已在该基础上实现通用 Agent、子任务调度、邮件/知识工具、会话与项目、长期记忆、
+异步压缩与关注简报。当前实现边界见 [模块流程](current_module_flows.md)；
+下面的演进说明保留作历史背景：
 
 - 你在愿景里定义的模块没有丢，它们是后续的目标结构。
 - 当前实现只是把最基础的 HTTP 服务和索引先跑起来，避免一开始就陷入复杂度。

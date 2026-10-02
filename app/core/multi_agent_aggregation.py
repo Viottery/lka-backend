@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Iterable
 from enum import Enum
+from hashlib import sha256
+from pathlib import Path
 
 from pydantic import Field
 
@@ -234,6 +236,8 @@ def derive_child_execution_evidence(
         return None, ConfirmationState.MISSING
     if run.status != AgentRunStatus.COMPLETED:
         return None, ConfirmationState.MISSING
+    if isinstance(tool_audit, dict) and tool_audit.get("protocol_version") == "isolated_workspace_audit_v1":
+        return _isolated_workspace_execution_evidence(run, ordered, tool_audit)
     if (
         not isinstance(tool_audit, dict)
         or tool_audit.get("protocol_version") != "child_tool_audit_v1"
@@ -344,6 +348,67 @@ def derive_child_execution_evidence(
         ConfirmationState.APPROVED
         if executed_non_readonly
         else ConfirmationState.NOT_REQUIRED
+    )
+
+
+def _isolated_workspace_execution_evidence(
+    run: AgentRunRecord, events: list[AgentRunEvent], audit: dict[str, object],
+) -> tuple[bool | None, ConfirmationState]:
+    """Reconcile an external executor's staged manifest with its frozen scope.
+
+    An executor without a staged workspace cannot claim a no-effect result through
+    this protocol. Staged changes still need the ordinary approval/apply workflow.
+    """
+    unknown = (None, ConfirmationState.MISSING)
+    snapshot = run.metadata.get("context_snapshot")
+    scope = snapshot.get("effective_scope") if isinstance(snapshot, dict) else None
+    result = run.result_snapshot
+    count = audit.get("staged_change_count")
+    workspaces = scope.get("workspace_paths") if isinstance(scope, dict) else None
+    source = workspaces[0] if isinstance(workspaces, list) and len(workspaces) == 1 else None
+    isolated = result.get("staged_workspace") if isinstance(result, dict) else None
+    if (
+        run.metadata.get("executor_kind") != "external_cli"
+        or audit.get("complete") is not True or audit.get("source_applied") is not False
+        or audit.get("external_effects_ruled_out") is not True
+        or not isinstance(count, int) or isinstance(count, bool) or count < 0
+        or not isinstance(source, str) or not isinstance(isolated, str)
+        or audit.get("source_workspace_sha256") != sha256(source.encode()).hexdigest()
+        or not isinstance(scope, dict)
+        or not isinstance(snapshot.get("snapshot_id"), str) or not snapshot["snapshot_id"]
+        or audit.get("snapshot_id") != snapshot.get("snapshot_id")
+        or scope.get("side_effect_level") != "write"
+        or any(scope.get(key) != [] for key in (
+            "allowed_packages", "allowed_tools", "source_ids", "account_ids",
+        ))
+        or not isinstance(result, dict)
+        or not isinstance(result.get("staged_change_count"), int)
+        or result.get("staged_change_count") != count
+        or isinstance(result.get("staged_change_count"), bool)
+        or audit.get("isolated_workspace_sha256") != sha256(isolated.encode()).hexdigest()
+    ):
+        return unknown
+    source_path, isolated_path = Path(source), Path(isolated)
+    if (
+        not source_path.is_absolute() or not isolated_path.is_absolute()
+        or isolated_path.is_relative_to(source_path)
+        or source_path.is_relative_to(isolated_path)
+    ):
+        return unknown
+    terminals = [event for event in events if event.type == "subtask_completed"]
+    audit_events = [event for event in events if event.type == "child_tool_audit"]
+    if (
+        len(terminals) != 1 or events[-1] != terminals[0]
+        or len(audit_events) != 1 or audit_events[0].payload.get("audit") != audit
+        or any(event.run_id != run.run_id for event in events)
+        or any(
+            event.type in {"tool_started", "tool_completed", "run_completed"}
+            for event in events
+        )
+    ):
+        return unknown
+    return bool(count), (
+        ConfirmationState.MISSING if count else ConfirmationState.NOT_REQUIRED
     )
 
 

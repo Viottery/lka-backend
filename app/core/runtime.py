@@ -1470,7 +1470,9 @@ class LocalKnowledgeAgentRuntime:
             plan = self.multi_agent_scheduler._set_step_status(
                 plan, root.step_id, PlanStepStatus.COMPLETED
             )
-        if any(step.status in {PlanStepStatus.FAILED, PlanStepStatus.BLOCKED} for step in child_steps):
+        if parent.metadata.get("multi_agent_replan_required") or any(
+            step.status in {PlanStepStatus.FAILED, PlanStepStatus.BLOCKED} for step in child_steps
+        ):
             plan = plan.transition_to(PlanStatus.FAILED)
         elif plan.status == PlanStatus.REPLANNING:
             # The Planner chose a final answer after processing its last

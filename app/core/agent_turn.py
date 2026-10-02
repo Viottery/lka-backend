@@ -6020,8 +6020,10 @@ class AgentTurnLoop:
             raise
         current_run = run_manager.get_run(run_id)
         raw_plan = current_run.metadata.get("multi_agent_plan") if current_run else None
-        if isinstance(raw_plan, dict) and raw_plan.get("status") == PlanStatus.FAILED.value:
-            reason = "Multi-Agent plan ended with failed or blocked child steps."
+        if (
+            isinstance(raw_plan, dict) and raw_plan.get("status") == PlanStatus.FAILED.value
+        ) or self._multi_agent_replan_pending(run_id):
+            reason = "Multi-Agent plan ended with failed, blocked, or unverified child steps."
             run_manager.append_event(
                 run_id,
                 "run_failed",

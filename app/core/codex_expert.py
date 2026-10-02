@@ -11,6 +11,7 @@ import inspect
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -459,6 +460,22 @@ class CodexAppServerExpertExecutor:
                                     for change in staged_changes
                                 ]},
                                 thread_id=thread_id, turn_id=active.turn_id,
+                            )
+                            self._record(
+                                child, "child_tool_audit", "Isolated workspace effects audited.",
+                                {"audit": {
+                                    "protocol_version": "isolated_workspace_audit_v1",
+                                    "complete": True,
+                                    "snapshot_id": snapshot.snapshot_id,
+                                    "source_workspace_sha256": sha256(str(lease.source_root).encode()).hexdigest(),
+                                    "isolated_workspace_sha256": sha256(str(lease.cwd).encode()).hexdigest(),
+                                    "staged_change_count": len(staged_changes),
+                                    "source_applied": False,
+                                    "external_effects_ruled_out": (
+                                        not self.route_human_approvals
+                                        or self.approval_guard is staged_file_change_approval_guard
+                                    ),
+                                }},
                             )
                         completed = self.run_manager.complete_child_run(
                             child_run_id,

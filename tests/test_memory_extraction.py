@@ -3,8 +3,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.core.llm.errors import LLMRateLimitError
 from app.core.background_llm import IncompleteGenerationError
+from app.core.llm.errors import LLMRateLimitError
 from app.core.memory_extraction import (
     extract_user_memories,
     preference_conflict_hints,

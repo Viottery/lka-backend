@@ -50,10 +50,13 @@ def _get_workspace(request: Request, session_id: str) -> Path:
     workspace = detail.session.workspace
     if workspace is None or not workspace.backend_path:
         raise HTTPException(status_code=409, detail="Session has no bound workspace.")
+    bound_root = Path(workspace.backend_path)
     try:
-        root = Path(workspace.backend_path).resolve(strict=True)
+        root = bound_root.resolve(strict=True)
     except (OSError, RuntimeError) as exc:
         raise HTTPException(status_code=404, detail="Session workspace is unavailable.") from exc
+    if not bound_root.is_absolute() or root != bound_root:
+        raise HTTPException(status_code=403, detail="Session workspace path changed.")
     if not root.is_dir():
         raise HTTPException(status_code=404, detail="Session workspace is unavailable.")
     return root
@@ -99,18 +102,50 @@ def _resolve_workspace_path(root: Path, relative: str) -> Path:
 
 def _file_descriptor_no_follow(path: Path) -> int:
     flags = os.O_RDONLY
+    # A workspace entry may be a FIFO, including after a path-check race.
+    # Open without waiting for a writer, then verify the opened object below.
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
     if hasattr(os, "O_BINARY"):
         flags |= os.O_BINARY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
-        return os.open(path, flags)
+        if os.name == "posix":
+            descriptor = _open_posix_path_no_follow(path, flags)
+        else:
+            # Windows retains path-based opening. Equivalent protection against
+            # ancestor reparse-point replacement requires native handle APIs.
+            descriptor = os.open(path, flags)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail="Workspace file not found.") from exc
     except OSError as exc:
         raise HTTPException(
             status_code=403, detail="Workspace file cannot be opened safely."
         ) from exc
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise HTTPException(status_code=400, detail="Path is not a regular file.")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _open_posix_path_no_follow(path: Path, flags: int) -> int:
+    """Open an already resolved absolute path without following any symlinks."""
+    if not path.is_absolute():
+        raise OSError("Safe file opening requires an absolute path.")
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    directory = os.open(path.anchor, directory_flags)
+    try:
+        for part in path.parts[1:-1]:
+            child = os.open(part, directory_flags, dir_fd=directory)
+            os.close(directory)
+            directory = child
+        return os.open(path.name or ".", flags, dir_fd=directory)
+    finally:
+        os.close(directory)
 
 
 @router.get("/files")
@@ -128,8 +163,20 @@ def list_session_files(
         raise HTTPException(status_code=400, detail="Path is not a directory.")
 
     entries: list[dict] = []
+    directory_descriptor: int | None = None
     try:
-        with os.scandir(directory) as iterator:
+        scan_target: Path | int = directory
+        if os.name == "posix":
+            try:
+                directory_descriptor = _open_posix_path_no_follow(
+                    directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                )
+            except OSError as exc:
+                raise HTTPException(
+                    status_code=403, detail="Workspace directory cannot be opened safely."
+                ) from exc
+            scan_target = directory_descriptor
+        with os.scandir(scan_target) as iterator:
             for item in iterator:
                 try:
                     metadata = item.stat(follow_symlinks=False)
@@ -168,6 +215,9 @@ def list_session_files(
         raise HTTPException(
             status_code=400, detail="Workspace directory cannot be listed."
         ) from exc
+    finally:
+        if directory_descriptor is not None:
+            os.close(directory_descriptor)
 
     truncated = len(entries) > MAX_DIRECTORY_ENTRIES
     return {

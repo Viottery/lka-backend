@@ -9,6 +9,7 @@ from fastapi import HTTPException
 
 from app.api.main import create_app
 from app.api.routes.agent import (
+    _agent_turn_event_stream,
     _sse_event_frame,
     cancel_agent_child_run,
     cancel_agent_run,
@@ -38,6 +39,46 @@ from app.domains.mail import MailAccountInput, MailMessageInput
 
 async def _is_never_disconnected() -> bool:
     return False
+
+
+@pytest.mark.parametrize("terminal_status", [
+    AgentRunStatus.COMPLETED, AgentRunStatus.FAILED,
+    AgentRunStatus.CANCELLED, AgentRunStatus.TIMED_OUT,
+])
+def test_agent_stream_drains_events_published_before_terminal_status(terminal_status):
+    late_event = AgentRunEvent(
+        event_id="event_late", run_id="run_late", session_id="session_late",
+        trace_id="trace_late", sequence=2, type="tool_completed",
+        message="Tool completed.", stage="tool", created_at="2026-10-03T00:00:00Z",
+        payload={"tool_name": "example.read", "status": "completed", "body": "PRIVATE_BODY"},
+    )
+    cursors = []
+
+    def list_events(run_id, *, after_sequence):
+        assert run_id == "run_late"
+        cursors.append(after_sequence)
+        return [] if len(cursors) == 1 else [late_event]
+
+    manager = SimpleNamespace(
+        list_events=list_events,
+        get_run=lambda run_id: SimpleNamespace(status=terminal_status),
+    )
+    runtime = SimpleNamespace(agent_run_manager=manager)
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(runtime=runtime)),
+        is_disconnected=_is_never_disconnected,
+    )
+
+    async def consume():
+        return "".join([frame async for frame in _agent_turn_event_stream(
+            request=request, run_id="run_late", after_sequence=1,
+        )])
+
+    frames = _parse_sse(_run_async(consume()))
+    assert cursors == [1, 1]
+    assert [frame["data"]["sequence"] for frame in frames] == [2]
+    assert frames[0]["data"]["payload"] == {"tool_name": "example.read", "status": "completed"}
+    assert "PRIVATE_BODY" not in json.dumps(frames)
 
 
 @pytest.mark.parametrize("orchestrator", ["legacy", "langgraph"])

@@ -8,7 +8,13 @@ from types import SimpleNamespace
 from app.api.main import create_app
 from app.core.background_llm import BatchedExtractionClient
 from app.core.config import get_settings
-from app.core.llm_workloads import LLMWorkloadController, UsageTicket, Workload
+from app.core.llm_workloads import (
+    LLMWorkloadController,
+    UsageTicket,
+    Workload,
+    current_workload,
+    workload_scope,
+)
 from app.core.memory_extraction import extract_user_memories
 
 
@@ -46,6 +52,43 @@ def test_batch_drops_evidence_that_matches_multiple_original_messages():
     ]
 
     assert extracted == [[], []]
+    assert client.calls == 1
+
+
+def test_batch_awaits_async_provider_and_reuses_partitioned_results():
+    messages = [
+        "写代码时我倾向先给补丁，之后解释原理",
+        "审阅合同我倾向先列风险，再解释细节",
+    ]
+    claims = ["我倾向先给补丁", "我倾向先列风险"]
+
+    class Client:
+        calls = 0
+
+        async def complete_text(self, **kwargs):
+            self.calls += 1
+            assert current_workload().task_id == "async-batch-job"
+            assert json.loads(kwargs["user_prompt"])["user_messages"] == messages
+            return SimpleNamespace(content=json.dumps({"candidates": [
+                {"claim": claim, "evidence": claim, "kind": "preference",
+                 "explicit": False, "confidence": 0.9}
+                for claim in claims
+            ]}, ensure_ascii=False))
+
+    client = Client()
+    batch = BatchedExtractionClient(client, messages)
+    with workload_scope("background_memory", task_id="async-batch-job", max_tokens=10000):
+        extracted = [
+            extract_user_memories(
+                source_id=f"source-{index}", content=message,
+                llm_client=batch, allow_remote=True,
+            )
+            for index, message in enumerate(messages)
+        ]
+
+    assert [[candidate.claim for candidate in candidates] for candidates in extracted] == [
+        [claim] for claim in claims
+    ]
     assert client.calls == 1
 
 
