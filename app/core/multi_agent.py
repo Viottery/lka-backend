@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 from enum import Enum
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -332,6 +332,15 @@ class PlanStep(MultiAgentModel):
 class PlanPatch(ValueObject):
     """Planner-proposed replan change; authority remains in PlanPatchContext."""
 
+    required_fields_by_operation: ClassVar[dict[PlanPatchOperation, tuple[str, ...]]] = {
+        PlanPatchOperation.RETRY_STEP: ("target_step_id",),
+        PlanPatchOperation.REDUCED_SCOPE: ("target_step_id", "reduced_scope"),
+        PlanPatchOperation.ALTERNATIVE_STEP: ("target_step_id", "alternative_step"),
+        PlanPatchOperation.SKIP_AND_DEGRADE: ("target_step_id", "degradation_note"),
+        PlanPatchOperation.ASK_USER: ("user_question",),
+        PlanPatchOperation.ABORT: (),
+    }
+
     patch_id: str = Field(min_length=1, max_length=200)
     plan_id: str = Field(min_length=1, max_length=200)
     expected_revision: int = Field(ge=0)
@@ -346,14 +355,7 @@ class PlanPatch(ValueObject):
 
     @model_validator(mode="after")
     def operation_fields_are_consistent(self) -> PlanPatch:
-        required = {
-            PlanPatchOperation.RETRY_STEP: ("target_step_id",),
-            PlanPatchOperation.REDUCED_SCOPE: ("target_step_id", "reduced_scope"),
-            PlanPatchOperation.ALTERNATIVE_STEP: ("target_step_id", "alternative_step"),
-            PlanPatchOperation.SKIP_AND_DEGRADE: ("target_step_id", "degradation_note"),
-            PlanPatchOperation.ASK_USER: ("user_question",),
-            PlanPatchOperation.ABORT: (),
-        }[self.operation]
+        required = self.required_fields_by_operation[self.operation]
         for field_name in required:
             if getattr(self, field_name) is None:
                 raise ValueError(f"{self.operation.value} patch requires {field_name}.")

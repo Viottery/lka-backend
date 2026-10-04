@@ -202,14 +202,16 @@ class MailService:
         return tuple(str(row["account_id"]) for row in rows)
 
     def list_messages(
-        self, *, received_from: str, received_before: str, start_rank: int = 1,
+        self, *, received_from: str | None = None, received_before: str | None = None, start_rank: int = 1,
         end_rank: int | None = None, folder: str | None = None,
         account_ids: list[str] | None = None, listing_id: str | None = None,
     ) -> MailListResult:
-        """List a bounded rank page of metadata cards in a half-open date interval."""
-        start = _parse_mail_timestamp(received_from)
-        end = _parse_mail_timestamp(received_before)
-        if end <= start:
+        """List a bounded rank page; omit both boundaries for all local mail."""
+        if (received_from is None) != (received_before is None):
+            raise ValueError("mail interval requires both date boundaries or neither")
+        start = _parse_mail_timestamp(received_from) if received_from is not None else None
+        end = _parse_mail_timestamp(received_before) if received_before is not None else None
+        if start is not None and end is not None and end <= start:
             raise ValueError("received_before must be later than received_from")
         if end_rank is None and start_rank == 1:
             last = 20
@@ -219,12 +221,15 @@ class MailService:
             raise ValueError("rank range must be 1-based, inclusive, and at most 20 messages")
         # SQLite date functions normalize offsets but have millisecond precision;
         # leave a small margin and apply exact Python bounds to the reduced rows.
-        filters = [
-            "received_at IS NOT NULL",
-            "julianday(received_at) >= julianday(?) - 0.00002",
-            "julianday(received_at) < julianday(?) + 0.00002",
-        ]
-        params: list[object] = [start.isoformat(), end.isoformat()]
+        filters = ["1 = 1"]
+        params: list[object] = []
+        if start is not None and end is not None:
+            filters.extend([
+                "received_at IS NOT NULL",
+                "julianday(received_at) >= julianday(?) - 0.00002",
+                "julianday(received_at) < julianday(?) + 0.00002",
+            ])
+            params.extend([start.isoformat(), end.isoformat()])
         if folder is not None:
             filters.append("lower(folder) = lower(?)")
             params.append(folder)
@@ -248,18 +253,22 @@ class MailService:
             try:
                 received = _parse_mail_timestamp(str(row["received_at"]))
             except ValueError:
-                continue
-            if start <= received < end:
+                if start is not None:
+                    continue
+                received = None
+            if start is None or (received is not None and start <= received < end):
                 eligible.append((received, row))
-        eligible.sort(key=lambda item: (item[0], str(item[1]["message_id"])), reverse=True)
+        eligible.sort(key=lambda item: (item[0] or datetime.min.replace(tzinfo=UTC), str(item[1]["message_id"])), reverse=True)
         normalized_filters = {
-            "from": start.isoformat(), "before": end.isoformat(),
+            "from": start.isoformat() if start is not None else None,
+            "before": end.isoformat() if end is not None else None,
             "folder": folder.casefold() if folder is not None else None,
             "accounts": sorted(account_ids) if account_ids is not None else None,
         }
         fingerprint = sha256(json.dumps({
             "filters": normalized_filters,
-            "ordered": [(str(row["message_id"]), received.isoformat()) for received, row in eligible],
+            "ordered": [(str(row["message_id"]), received.isoformat() if received else row["received_at"])
+                        for received, row in eligible],
         }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         token_payload = {"filters": normalized_filters, "fingerprint": fingerprint}
         if listing_id is not None:

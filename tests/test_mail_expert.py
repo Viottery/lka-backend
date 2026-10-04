@@ -197,6 +197,58 @@ async def test_complete_metadata_snapshot(setup, count):
     assert setup[1].load_tool_result_artifact(cached[0]["artifact_id"], "unrelated-run") is None
 
 
+async def test_route_length_exhaustion_recovers_once_with_supported_thinking_control(setup):
+    expert, child, snap, views, _ = _case(setup, 2, "list")
+
+    class TruncatedRouter(FakeLLM):
+        def __init__(self):
+            super().__init__("list")
+            self.requests = []
+
+        def supports_thinking_control(self, *, client_name=None):
+            return True
+
+        async def complete(self, request):
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                return LLMResponse(provider="fake", status="completed", content="",
+                                   prompt_summary=request.prompt_summary, finish_reason="length",
+                                   usage={"prompt_tokens": 100, "completion_tokens": 400, "total_tokens": 500})
+            return await super().complete(request)
+
+    llm = TruncatedRouter()
+    expert.llm_service = llm
+    result = await _execute(expert, child, snap, views)
+    assert result.status == TaskResultStatus.COMPLETED
+    assert len(llm.requests) == 2
+    assert llm.requests[0].thinking_enabled is None
+    assert llm.requests[1].thinking_enabled is False
+    assert llm.requests[1].max_output_tokens > llm.requests[0].max_output_tokens
+
+
+@pytest.mark.parametrize("call_budget,expected_calls", [(1, 1), (4, 2)])
+async def test_repeated_route_truncation_fails_without_accepting_empty_json(setup, call_budget, expected_calls):
+    expert, child, snap, views, _ = _case(
+        setup, 2, "list", budget=RuntimeBudget(max_llm_calls=call_budget, max_tokens=100_000),
+    )
+
+    class AlwaysTruncated:
+        def __init__(self):
+            self.calls = 0
+
+        async def complete(self, request):
+            self.calls += 1
+            return LLMResponse(provider="fake", status="completed", content="",
+                               prompt_summary=request.prompt_summary, finish_reason="length",
+                               usage={"prompt_tokens": 100, "completion_tokens": 400, "total_tokens": 500})
+
+    llm = AlwaysTruncated()
+    expert.llm_service = llm
+    result = await _execute(expert, child, snap, views)
+    assert result.status == TaskResultStatus.FAILED
+    assert llm.calls == expected_calls
+
+
 async def test_review_loads_and_analyzes_every_message(setup):
     expert, child, snap, views, llm = _case(setup, 25, "review")
     result = await _execute(expert, child, snap, views)
@@ -215,6 +267,24 @@ async def test_group_sender_uses_metadata_only(setup):
     assert result.status == TaskResultStatus.COMPLETED
     assert payload["groups"][0]["count"] == 25
     assert payload["coverage"]["sender_groups"] == 1
+    assert llm.stages == ["route"]
+
+
+async def test_sender_handoff_includes_every_group_and_bounded_subject_evidence(setup):
+    expert, child, snap, views, llm = _case(setup, 30, "group_sender")
+    setup[0].import_messages(
+        account=MailAccountInput(email_address="expert@example.com"),
+        messages=[MailMessageInput(
+            external_id=f"msg-{i}", sender=f"team-{i:02d}@example.test",
+            subject=f"Unique topic {i:02d}", received_at="2026-06-01T12:00:00Z",
+        ) for i in range(30)],
+    )
+    result = await _execute(expert, child, snap, views)
+    assert result.status == TaskResultStatus.COMPLETED
+    assert len(result.summary) <= 3500
+    for index in range(30):
+        assert f"team-{index:02d}@example.test" in result.summary
+        assert f"Unique topic {index:02d}" in result.summary
     assert llm.stages == ["route"]
 
 
@@ -342,3 +412,76 @@ def test_runtime_registration_is_explicit_opt_in(tmp_path):
 def test_interval_must_be_explicit_bounded_and_ordered(start, end):
     with pytest.raises(ValueError):
         MailIntent(mode="list", received_from=start, received_before=end)
+
+
+def test_all_local_intent_omits_dates_but_rejects_half_interval():
+    assert MailIntent(mode="group_sender").received_from is None
+    with pytest.raises(ValueError):
+        MailIntent(mode="list", received_from="2026-06-01T00:00:00Z")
+
+
+async def test_router_repairs_wrong_shape_once_without_adopting_final_output_contract(setup):
+    expert, child, snap, views, _ = _case(setup, 2, "group_sender")
+
+    class ShapeRouter(FakeLLM):
+        def __init__(self):
+            super().__init__("group_sender")
+            self.requests = []
+
+        async def complete(self, request):
+            self.requests.append(request)
+            content = '{"type":"group_sender"}' if len(self.requests) == 1 else '{"mode":"group_sender"}'
+            return LLMResponse(provider="fake", status="completed", content=content,
+                               prompt_summary=request.prompt_summary, usage={"total_tokens": 50})
+
+    llm = ShapeRouter()
+    expert.llm_service = llm
+    result = await _execute(expert, child, snap, views)
+    assert result.status == TaskResultStatus.COMPLETED
+    assert len(llm.requests) == 2
+    assert llm.requests[1].metadata["stage"] == "route_repair"
+    first_prompt = json.loads(llm.requests[0].messages[-1].content)
+    assert "routing_schema" in first_prompt
+    assert "output_contract" not in first_prompt
+    assert setup[1].load_artifact(f"mail_expert_{child.run_id}")["coverage"]["enumerated"] == 2
+
+
+async def test_invalid_router_shape_never_retries_unboundedly_or_runs_tools(setup):
+    expert, child, snap, views, _ = _case(setup, 2, "list")
+
+    class InvalidRouter(FakeLLM):
+        async def complete(self, request):
+            self.stages.append(request.metadata["stage"])
+            return LLMResponse(provider="fake", status="completed", content='{"type":"list"}',
+                               prompt_summary=request.prompt_summary, usage={"total_tokens": 50})
+
+    llm = InvalidRouter("list")
+    expert.llm_service = llm
+    result = await _execute(expert, child, snap, views)
+    assert result.status == TaskResultStatus.FAILED
+    assert llm.stages == ["route", "route_repair"]
+    assert not any(event.type == "tool_started" for event in setup[2].list_events(child.run_id))
+
+
+async def test_successful_workflow_records_generic_child_tool_audit_from_executed_tools(setup):
+    expert, child, snap, views, _ = _case(setup, 2, "group_sender")
+    result = await _execute(expert, child, snap, views)
+    assert result.status == TaskResultStatus.COMPLETED
+    audits = [event.payload["audit"] for event in setup[2].list_events(child.run_id)
+              if event.type == "child_tool_audit"]
+    assert len(audits) == 1
+    audit = audits[0]
+    assert audit["protocol_version"] == "child_tool_audit_v1"
+    assert audit["complete"] is True
+    assert len(audit["invocations"]) == 1
+    assert audit["invocations"][0]["tool_name"] == "mail.snapshot"
+    assert audit["invocations"][0]["read_only"] is True
+    assert audit["invocations"][0]["status"] == "completed"
+    assert audit["invocations"][0]["invocation_id"]
+    from app.core.multi_agent_aggregation import ConfirmationState, derive_child_execution_evidence
+
+    effects, confirmation = derive_child_execution_evidence(
+        setup[2].get_run(child.run_id), setup[2].list_events(child.run_id), tool_audit=audit,
+    )
+    assert effects is False
+    assert confirmation == ConfirmationState.NOT_REQUIRED

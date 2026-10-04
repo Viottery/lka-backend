@@ -45,7 +45,8 @@ class MailSnapshotTool:
     spec = ToolSpec(
         name="mail.snapshot", package="mail", type="local_tool",
         description=(
-            "Enumerate chronological metadata cards for a half-open timezone-qualified date interval. "
+            "Enumerate chronological local metadata cards. Omit both date boundaries for all local mail, "
+            "or provide both for a half-open timezone-qualified date interval. "
             "Reads in stable pages of 20 and returns at most 500 messages per invocation (default 300). "
             "Pass next_range.start_rank and the same listing_id to continue; complete means the final rank "
             "was reached, not that earlier ranks were read by this invocation. Cards never include body text."
@@ -53,7 +54,7 @@ class MailSnapshotTool:
         risk="low", requires_confirmation=False, read_only=True,
         side_effects=["read_local_db"], scope_uses_sources=True, scope_uses_accounts=True,
         scope_filtering_required=True,
-        input_schema={"type": "object", "required": ["received_from", "received_before"], "properties": {
+        input_schema={"type": "object", "properties": {
             "received_from": {"type": "string", "format": "date-time"},
             "received_before": {"type": "string", "format": "date-time"},
             "folder": {"type": "string"},
@@ -86,8 +87,8 @@ class MailSnapshotTool:
             while len(messages) < max_messages:
                 end = min(start + 19, first_rank + max_messages - 1)
                 page = self.mail_service.list_messages(
-                    received_from=str(invocation.input["received_from"]),
-                    received_before=str(invocation.input["received_before"]),
+                    received_from=invocation.input.get("received_from"),
+                    received_before=invocation.input.get("received_before"),
                     start_rank=start, end_rank=end,
                     folder=str(invocation.input["folder"]) if invocation.input.get("folder") is not None else None,
                     account_ids=_listing_accounts(self.mail_service, self.mail_knowledge_mirror, context),

@@ -506,6 +506,9 @@ class LocalKnowledgeAgentRuntime:
             ),
             tool_invocation_store=self.agent_run_store,
             fork_policy=fork_policy,
+            agent_catalog_provider=lambda: self.agent_executor_registry.discovery_catalog(
+                fork_policy.allowed_agent_ids if fork_policy is not None else ()
+            ),
             fork_execution=self.execute_multi_agent_plan,
             fork_scope_resolver=self.fork_scope_resolver,
             fork_plan_finalizer=self.finalize_multi_agent_plan,
@@ -584,6 +587,7 @@ class LocalKnowledgeAgentRuntime:
                 AgentDefinition(
                     agent_id=MailExpertExecutor.AGENT_ID,
                     version=MailExpertExecutor.VERSION,
+                    description=MailExpertExecutor.DESCRIPTION,
                     executor_kind="workflow",
                     scope_mode="registry_tools",
                     enabled=True,

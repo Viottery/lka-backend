@@ -6,7 +6,7 @@ import asyncio
 import json
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 from uuid import uuid4
@@ -15,6 +15,7 @@ from pydantic import BaseModel, model_validator
 
 from app.core.agent_runs import AgentRunCancelled, AgentRunStatus, InMemoryAgentRunManager
 from app.core.agent_storage import SqliteAgentRunStore
+from app.core.child_tool_audit import build_child_tool_audit
 from app.core.context_driver import ContextViews
 from app.core.llm import LLMMessage, LLMRequest, LLMResponseMode, LLMService
 from app.core.multi_agent import ContextSnapshot, FailureDetail, TaskResult, TaskResultStatus
@@ -35,6 +36,8 @@ class MailIntent(BaseModel):
     @model_validator(mode="after")
     def check_arguments(self) -> MailIntent:
         if self.mode in {"list", "review", "group_sender", "align_matter"}:
+            if self.received_from is None and self.received_before is None:
+                return self
             if not self.received_from or not self.received_before:
                 raise ValueError("A mail interval requires two timezone-qualified boundaries.")
             try:
@@ -52,10 +55,18 @@ class MailIntent(BaseModel):
 
 
 @dataclass
+class _ToolExecution:
+    tool_name: str
+    input: dict[str, Any]
+    result: dict[str, Any]
+
+
+@dataclass
 class _Usage:
     tool_calls: int = 0
     llm_calls: int = 0
     estimated_tokens: int = 0
+    tool_events: list[_ToolExecution] = field(default_factory=list)
 
 
 class MailExpertExecutor:
@@ -67,6 +78,11 @@ class MailExpertExecutor:
 
     AGENT_ID = "mail_expert"
     VERSION = "1"
+    DESCRIPTION = (
+        "Read-only mail specialist with bounded metadata enumeration, exact sender grouping, "
+        "batch source review, and matter alignment workflows. Suitable for large mailbox "
+        "organization or cross-message evidence checks; reports actual coverage and missing requirements."
+    )
     ANALYSIS_BATCH = 20
 
     def __init__(
@@ -167,6 +183,22 @@ class MailExpertExecutor:
             public = {key: result[key] for key in ("status", "summary", "coverage", "missing_requirements", "usage")
                       if key in result}
             public["artifact_id"] = artifact_id
+            # Workflows must obey the same invocation-time audit contract as
+            # ReAct children. A declared read-only specialist is not evidence
+            # that each actual tool execution was read-only.
+            self.run_manager.append_event(
+                child_run_id, "run_completed", "Workflow execution completed.",
+                stage="mail_expert", payload={"tool_event_count": len(usage.tool_events)},
+                parent_run_id=child.parent_run_id, child_run_id=child_run_id,
+                plan_id=child.plan_id, step_id=child.step_id, attempt=child.attempt,
+            )
+            self.run_manager.append_event(
+                child_run_id, "child_tool_audit", "Child tool side-effect audit recorded.",
+                stage="subtask", payload={"audit": build_child_tool_audit(
+                    usage.tool_events, self.tool_executor.registry,
+                )}, parent_run_id=child.parent_run_id, child_run_id=child_run_id,
+                plan_id=child.plan_id, step_id=child.step_id, attempt=child.attempt,
+            )
             self.run_manager.complete_child_run(child_run_id, result_snapshot=public)
             self._event(child_run_id, "completed", {"status": result["status"], "coverage": result.get("coverage", {})})
         except AgentRunCancelled:
@@ -210,19 +242,36 @@ class MailExpertExecutor:
         )
 
     async def _route(self, snapshot: ContextSnapshot, usage: _Usage, client: str | None, model: str | None) -> MailIntent:
-        prompt = json.dumps({"objective": snapshot.objective, "current_time": current_time_payload(),
-                             "output_contract": snapshot.output_contract}, ensure_ascii=False)
-        response = await self._llm(
-            snapshot, usage, client, model, stage="route", system=(
-                "You are a mail specialist router. Return JSON only: mode is search, list, review, group_sender, align_matter, or unsupported; "
-                "received_from and received_before must be timezone-qualified ISO timestamps for list/review/group_sender/align_matter; "
-                "query is required for search. Choose review when the user wants content summaries or priorities, "
-                "list for exhaustive metadata, group_sender for sender-based organization, align_matter for comparison "
-                "with existing matters, search for a specific question. Never choose sync, send, delete, or write. "
-                "If the time range cannot be inferred safely, choose unsupported."
-            ), user=prompt, max_output_tokens=400,
+        payload = {"objective": snapshot.objective, "current_time": current_time_payload(),
+                   "task_output_requirements": snapshot.output_contract,
+                   "routing_schema": MailIntent.model_json_schema()}
+        system = (
+            "You are a read-only mail specialist router. Return one JSON object matching routing_schema, "
+            "using its exact field names, including required mode. task_output_requirements describe the "
+            "FINAL task deliverable, not this internal routing object; never adopt their output shape here. "
+            "Choose review for body summaries or priorities, list for exhaustive metadata, group_sender for "
+            "sender organization, align_matter for comparison with existing matters, search for a specific "
+            "question (query required). Never choose sync, send, delete, or write. "
+            "For an explicitly all-local-mail request omit both date boundaries; do not invent a date range. "
+            "For a bounded interval supply both timezone-qualified ISO timestamps, positive and at most "
+            "366 days. If a requested time range cannot be safely inferred, choose unsupported."
         )
-        return MailIntent.model_validate(self._json(response))
+        for attempt in range(2):
+            response = await self._llm(
+                snapshot, usage, client, model, stage="route" if attempt == 0 else "route_repair",
+                system=system, user=json.dumps(payload, ensure_ascii=False), max_output_tokens=400,
+            )
+            try:
+                return MailIntent.model_validate(self._json(response))
+            except (ValueError, TypeError) as exc:
+                if attempt:
+                    raise
+                self._event(snapshot.child_run_id, "route_repair", {"error_type": type(exc).__name__})
+                # Repair syntax/schema once; never silently reinterpret aliases
+                # or run tools using an unvalidated routing decision.
+                payload["rejected_routing_output"] = response[:2000]
+                payload["validation_error"] = str(exc)[:2000]
+        raise RuntimeError("Mail routing failed.")
 
     async def _search(self, intent: MailIntent, context: ToolContext, snapshot: ContextSnapshot,
                       usage: _Usage, client: str | None, model: str | None) -> dict[str, Any]:
@@ -266,7 +315,8 @@ class MailExpertExecutor:
             self._check_active(context.run_id or "")
             try:
                 scan = await self._tool(snapshot, usage, context, "mail.snapshot", {
-                    "received_from": intent.received_from, "received_before": intent.received_before,
+                    **({"received_from": intent.received_from, "received_before": intent.received_before}
+                       if intent.received_from is not None else {}),
                     "max_messages": 500, "start_rank": len(cards) + 1,
                     **({"listing_id": listing_id} if listing_id else {}),
                     **({"folder": intent.folder} if intent.folder else {}),
@@ -321,11 +371,34 @@ class MailExpertExecutor:
         if intent.mode == "group_sender":
             groups = group_by_sender(cards)
             coverage["sender_groups"] = len(groups)
-            lines = [f"本地枚举 {len(cards)}/{total} 封；按发件地址分为 {len(groups)} 组；远端同步状态未知。"]
-            lines.extend(f"- {group['sender_label']} ({group['sender_key']}): {group['count']} 封" for group in groups[:15])
-            if len(groups) > 15:
-                lines.append(f"其余 {len(groups) - 15} 组保存在本地产物中。")
-            return {"status": "complete" if scan_complete else "partial", "summary": "\n".join(lines),
+            header = (f"本地枚举 {len(cards)}/{total} 封；按发件地址分为 {len(groups)} 组；远端同步状态未知。"
+                      "主题为标题样例，未读取正文或完整语义审阅。")
+            identities = [f"- {group['sender_key']}: {group['count']} 封" for group in groups]
+            # Preserve identities/counts first. Allocate the remaining compact
+            # handoff space fairly to title evidence rather than hiding all
+            # groups after an arbitrary first fifteen.
+            budget = 3500
+            reserve = 120
+            title_space = max(0, budget - len(header) - sum(len(line) + 1 for line in identities) - reserve)
+            per_group = max(0, title_space // max(1, len(groups)) - len("；主题样例："))
+            lines = [header]
+            used = len(header)
+            shown = 0
+            for identity, group in zip(identities, groups, strict=True):
+                titles = "；".join(group["subject_examples"][:3])
+                if len(titles) > per_group:
+                    titles = titles[:max(0, per_group - 1)] + "…" if per_group else ""
+                line = identity + ("；主题样例：" + titles if titles else "")
+                if used + len(line) + 1 > budget - reserve:
+                    break
+                lines.append(line)
+                used += len(line) + 1
+                shown += 1
+            coverage["sender_groups_shown"] = shown
+            if shown < len(groups):
+                missing.append(f"sender groups absent from bounded handoff: {len(groups) - shown}")
+                lines.append(f"仅展示 {shown}/{len(groups)} 组；未展示组保存在本地产物，不代表已向父 Agent 提供。")
+            return {"status": "complete" if scan_complete and shown == len(groups) else "partial", "summary": "\n".join(lines),
                     "coverage": coverage, "missing_requirements": missing, "groups": groups,
                     "next_range": next_range}
         if intent.mode == "align_matter":
@@ -511,12 +584,19 @@ class MailExpertExecutor:
             raise RuntimeError("Mail expert tool-call budget exhausted.")
         self._check_active(context.run_id or "")
         usage.tool_calls += 1
-        self._event(context.run_id or "", "tool_started", {"tool": name, "call_number": usage.tool_calls})
+        self._event(context.run_id or "", "tool_started", {"tool_name": name, "call_number": usage.tool_calls})
         result = await asyncio.to_thread(
             self.tool_executor.execute, invocation_id=f"mail_expert_{uuid4().hex}",
             tool_name=name, tool_input=tool_input, context=context,
         )
-        self._event(context.run_id or "", "tool_completed", {"tool": name, "status": result.status})
+        usage.tool_events.append(_ToolExecution(
+            tool_name=name, input=dict(tool_input),
+            result={"invocation_id": result.invocation_id, "status": result.status},
+        ))
+        self._event(context.run_id or "", "tool_completed", {
+            "tool_name": name, "status": result.status,
+            "metadata": {"result": {"invocation_id": result.invocation_id, "status": result.status}},
+        })
         self.artifact_store.put_artifact(
             artifact_id=f"tool_result_{result.invocation_id}", run_id=context.run_id or snapshot.child_run_id,
             kind="tool_result", payload=result.model_dump(mode="json"),
@@ -530,33 +610,62 @@ class MailExpertExecutor:
                    *, stage: str, system: str, user: str, max_output_tokens: int, json_mode: bool = True) -> str:
         if self.llm_service is None:
             raise RuntimeError("Mail expert requires an available LLM service.")
-        if snapshot.budget.max_llm_calls is not None and usage.llm_calls >= snapshot.budget.max_llm_calls:
-            raise RuntimeError("Mail expert LLM-call budget exhausted.")
-        estimate = (len(system) + len(user) + 3) // 4 + max_output_tokens
-        if snapshot.budget.max_tokens is not None and usage.estimated_tokens + estimate > snapshot.budget.max_tokens:
-            raise RuntimeError("Mail expert token budget exhausted.")
-        self._check_active(snapshot.child_run_id)
-        usage.llm_calls += 1
-        started = time.monotonic()
-        request = LLMRequest(
-            client_name=client, model=model,
-            response_mode=LLMResponseMode.JSON if json_mode else LLMResponseMode.TEXT,
-            messages=[LLMMessage(role="system", content=system), LLMMessage(role="user", content=user)],
-            prompt_summary=f"mail_expert_{stage}", require_json=json_mode,
-            max_output_tokens=max_output_tokens,
-            metadata={"run_id": snapshot.child_run_id, "stage": stage},
-        )
-        response = await self.llm_service.complete(request)
-        if response.status != "completed" or response.partial:
-            raise RuntimeError(f"Mail expert LLM stage {stage} did not complete.")
-        actual = response.usage.get("total_tokens") if isinstance(response.usage, dict) else None
-        usage.estimated_tokens += actual if isinstance(actual, int) and actual > 0 else estimate
-        self._event(snapshot.child_run_id, "llm_completed", {
-            "stage": stage, "duration_ms": round((time.monotonic() - started) * 1000),
-            "estimated_tokens": actual if isinstance(actual, int) else estimate,
-            "model": response.model, "provider": response.provider,
-        })
-        return response.content
+        # A byte upper bound avoids undercounting Chinese/mixed metadata when
+        # there is no selected tokenizer here. Actual provider usage is charged
+        # after every attempt, including the incomplete attempt.
+        input_estimate = len((system + user).encode("utf-8")) + 128
+        thinking_enabled = None
+        for attempt in range(2):
+            if snapshot.budget.max_llm_calls is not None and usage.llm_calls >= snapshot.budget.max_llm_calls:
+                raise RuntimeError("Mail expert LLM-call budget exhausted.")
+            estimate = input_estimate + max_output_tokens
+            if snapshot.budget.max_tokens is not None and usage.estimated_tokens + estimate > snapshot.budget.max_tokens:
+                raise RuntimeError("Mail expert token budget exhausted.")
+            self._check_active(snapshot.child_run_id)
+            usage.llm_calls += 1
+            started = time.monotonic()
+            request = LLMRequest(
+                client_name=client, model=model,
+                response_mode=LLMResponseMode.JSON if json_mode else LLMResponseMode.TEXT,
+                messages=[LLMMessage(role="system", content=system), LLMMessage(role="user", content=user)],
+                prompt_summary=f"mail_expert_{stage}", require_json=json_mode,
+                max_output_tokens=max_output_tokens, thinking_enabled=thinking_enabled,
+                metadata={"run_id": snapshot.child_run_id, "stage": stage},
+            )
+            response = await self.llm_service.complete(request)
+            tokens = response.usage if isinstance(response.usage, dict) else {}
+            actual = tokens.get("total_tokens")
+            charged = actual if type(actual) is int and actual > 0 else estimate
+            usage.estimated_tokens += charged
+            self._event(snapshot.child_run_id, "llm_completed", {
+                "stage": stage, "attempt": attempt + 1,
+                "duration_ms": round((time.monotonic() - started) * 1000),
+                "estimated_tokens": charged,
+                "input_token_count": tokens.get("prompt_tokens", tokens.get("input_tokens")),
+                "output_token_count": tokens.get("completion_tokens", tokens.get("output_tokens")),
+                "finish_reason": response.finish_reason,
+                "model": response.model, "provider": response.provider,
+            })
+            self._check_active(snapshot.child_run_id)
+            if response.status != "completed":
+                raise RuntimeError(f"Mail expert LLM stage {stage} did not complete.")
+            incomplete = (
+                response.partial or not response.content.strip()
+                or str(response.finish_reason or "").casefold() in {"length", "max_tokens", "partial"}
+            )
+            if not incomplete:
+                return response.content
+            if attempt == 1:
+                break
+            capability = getattr(self.llm_service, "supports_thinking_control", None)
+            if callable(capability) and capability(client_name=client):
+                thinking_enabled = False
+            max_output_tokens = max(512, max_output_tokens * 2)
+            self._event(snapshot.child_run_id, "generation_recovery", {
+                "stage": stage, "thinking_disabled": thinking_enabled is False,
+                "max_output_tokens": max_output_tokens,
+            })
+        raise RuntimeError(f"Mail expert LLM stage {stage} remained incomplete after bounded recovery.")
 
     def _check_active(self, child_run_id: str) -> None:
         run = self.run_manager.get_run(child_run_id)

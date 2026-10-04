@@ -140,6 +140,28 @@ CASES = {
         "files": {}, "synthetic_mail": True, "read_only": True, "children_required": 1,
         "required_agent_id": "mail_expert",
     },
+    "real_mail_specialist_overview": {
+        "goal": "请让邮件专家整理这批本地邮件，逐个发件人报告数量和主要主题，先报告本地总数和实际覆盖范围。不进行远程同步；标题推断与正文证据请区分。",
+        "files": {}, "real_mail": True, "read_only": True, "children_required": 1,
+        "required_agent_id": "mail_expert",
+    },
+    "mail_specialist_review": {
+        "goal": "请邮件专家审阅全部本地邮件，整理需要我行动的事项和当前有效的截止时间；有更新冲突时以最新通知为准，缺失的负责人不要猜测。说明实际读取和分析覆盖范围，不同步远程邮箱。",
+        "files": {}, "read_only": True, "children_required": 1, "required_agent_id": "mail_expert",
+        "setup": {"mail": {"account": {"email_address": "review@example.test"}, "messages": [
+            {"external_id": "old", "subject": "Project notification", "sender": "ops@example.test",
+             "received_at": "2026-10-01T09:00:00Z",
+             "body_text": "旧安排：Cobalt 项目材料截止 2026-10-08 09:00 UTC，负责人尚未确定。"},
+            {"external_id": "new", "subject": "Project notification", "sender": "ops@example.test",
+             "received_at": "2026-10-04T09:00:00Z",
+             "body_text": "本通知取代旧安排：Cobalt 项目材料截止改为 2026-10-09 14:30 UTC，需要提交 budget.csv。负责人仍待确认。"},
+            {"external_id": "security", "subject": "Service notification", "sender": "security@example.test",
+             "received_at": "2026-10-04T12:00:00Z",
+             "body_text": "需要在 2026-10-07 18:00 UTC 之前完成账号复核；工单 ACCOUNT-729，复核联系人 Mira。"},
+            {"external_id": "receipt", "subject": "Service notification", "sender": "billing@example.test",
+             "received_at": "2026-10-04T13:00:00Z", "body_text": "付款收据已确认，无需进一步操作。"},
+        ]}}, "facts": ["2026-10-09", "14:30", "budget.csv", "ACCOUNT-729", "Mira"],
+    },
     "heldout_broken_test_runner": {
         "goal": "这个小项目的名称归一化会让同名项匹配失败。请定位并修复，运行项目已有测试验证，不要安装依赖，不要改写测试来绕过失败。若文档里的测试入口不可用，请利用本地已有能力完成验证。",
         "files": {

@@ -76,6 +76,41 @@ def test_specs_are_read_only_scoped_and_have_expected_caps(services):
     assert batch.input_schema["properties"]["max_chars_per_message"]["maximum"] == 1500
 
 
+def test_snapshot_all_local_scope_is_optional_dates_not_optional_grants(services):
+    service, mirror = services
+    account = add_mail(service, "allowed@example.com", "all", 25)
+    add_mail(service, "denied@example.com", "denied", 3)
+    tool = MailSnapshotTool(service, mirror)
+    context = child_context((account.account_id,), (MailKnowledgeMirror.source_id_for_account(account.account_id),))
+    first = invoke(tool, {"max_messages": 20}, context=context)
+    assert first.status == "completed"
+    assert first.output["total_matches"] == 25
+    second = invoke(tool, {"listing_id": first.output["listing_id"], "start_rank": 21}, context=context)
+    assert second.status == "completed"
+    assert second.output["returned_count"] == 5
+    assert second.output["complete"] is True
+    assert invoke(tool, {}, context=child_context()).status == "rejected"
+    assert invoke(tool, {"received_from": "2026-06-01T00:00:00Z"}, context=context).status == "rejected"
+
+
+def test_all_local_snapshot_includes_unknown_dates_without_inventing_timestamps(services):
+    service, mirror = services
+    service.import_messages(account=MailAccountInput(email_address="dates@example.com"), messages=[
+        MailMessageInput(external_id="known", received_at="2026-06-01T12:00:00Z"),
+        MailMessageInput(external_id="undated", received_at=None),
+        MailMessageInput(external_id="invalid", received_at="unknown"),
+    ])
+    all_local = invoke(MailSnapshotTool(service, mirror), {})
+    assert all_local.status == "completed"
+    assert all_local.output["total_matches"] == 3
+    assert all_local.output["messages"][0]["received_at"] == "2026-06-01T12:00:00Z"
+    assert {row["received_at"] for row in all_local.output["messages"][1:]} == {None, "unknown"}
+    dated = invoke(MailSnapshotTool(service, mirror), {
+        "received_from": "2026-06-01T00:00:00Z", "received_before": "2026-06-02T00:00:00Z",
+    })
+    assert dated.output["total_matches"] == 1
+
+
 def test_snapshot_reads_pages_under_one_listing_and_reports_complete(services):
     service, mirror = services
     add_mail(service, "many@example.com", "m", 45)

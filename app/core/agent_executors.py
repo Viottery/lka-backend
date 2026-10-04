@@ -31,6 +31,7 @@ class AgentDefinition(BaseModel):
     agent_id: str = Field(min_length=1, max_length=100)
     version: str = Field(min_length=1, max_length=100)
     executor_kind: str = Field(min_length=1, max_length=100)
+    description: str = Field(default="", max_length=800)
     # Server-owned scope projection. External workspace workers do not receive
     # registry tools or data-source/account grants from a general Agent plan.
     scope_mode: Literal["registry_tools", "workspace_sandbox"] = "registry_tools"
@@ -376,11 +377,24 @@ class AgentExecutorRegistry:
             and definition.enabled
         )
 
+    def discovery_catalog(self, allowed_agent_ids: tuple[str, ...]) -> list[dict[str, Any]]:
+        """Expose current allowlisted capability descriptions, not executor internals."""
+        catalog = []
+        for agent_id in dict.fromkeys(allowed_agent_ids):
+            try:
+                definition, _ = self.resolve(agent_id)
+            except ValueError:
+                continue
+            catalog.append({key: getattr(definition, key) for key in
+                ("agent_id", "version", "description", "executor_kind", "scope_mode", "can_resume")})
+        return catalog
+
     @classmethod
     def with_general_agent(cls, legacy_executor: Any, run_child: Callable[..., Awaitable[TaskResult]] | None = None) -> AgentExecutorRegistry:
         registry = cls()
         registry.register(
-            AgentDefinition(agent_id=GENERAL_AGENT_ID, version="1", executor_kind="react", can_resume=True),
+            AgentDefinition(agent_id=GENERAL_AGENT_ID, version="1", executor_kind="react", can_resume=True,
+                            description="General bounded evidence gathering and problem solving through registered tools; use for substantial independent investigations without a more suitable specialist."),
             GeneralAgentExecutor(legacy_executor, run_child),
         )
         return registry

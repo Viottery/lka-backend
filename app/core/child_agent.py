@@ -213,6 +213,7 @@ class ChildAgentExecutor:
             summary=summary,
             evidence_refs=evidence_refs,
             failure=failure,
+            missing_requirements=() if result.answer.strip() else ("child_answer_missing",),
             warnings=warnings,
         )
 
@@ -328,6 +329,12 @@ def _child_prompt(views: ContextViews) -> str:
     agent = views.agent
     sections = [
         "Execute only the assigned child task. Do not modify or replan the parent plan.",
+        (
+            "Use the fewest evidence-gathering actions needed for the assigned contract. "
+            "Each model call charges its input again; preserve budget for the final answer. "
+            "Once the evidence suffices, finish. If budget stops further work, report supported "
+            "findings and unfulfilled requirements; unseen evidence is unknown, not verified."
+        ),
         f"Objective:\n{agent.objective}",
         f"Required output contract:\n{agent.output_contract}",
     ]

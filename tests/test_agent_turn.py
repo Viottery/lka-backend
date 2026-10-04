@@ -1855,7 +1855,7 @@ def test_agent_turn_warns_when_final_answer_claims_unsupported_calendar_action(
     assert "verification_warning" not in [event.type for event in response.progress_events]
 
 
-def test_agent_turn_summarizes_context_window_with_llm_when_full(tmp_path, monkeypatch):
+def test_agent_turn_summarizes_context_window_with_llm_when_full_without_background_queue(tmp_path, monkeypatch):
     monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("LKA_LOCAL_CONFIG", str(tmp_path / "missing-local.toml"))
     get_settings.cache_clear()
@@ -1865,6 +1865,9 @@ def test_agent_turn_summarizes_context_window_with_llm_when_full(tmp_path, monke
     fake_llm = _ContextSummarizingLLM()
     app.state.runtime.agent_turn_loop.llm_client = fake_llm
     app.state.runtime.agent_turn_loop.session_context_token_budget = 60
+    # The transactional queue now handles hard overflow off the response path.
+    # This compatibility test explicitly exercises the supported no-queue path.
+    app.state.runtime.agent_turn_loop.background_compaction_callback = None
 
     first = run_agent_turn(
         AgentTurnRequest(
