@@ -155,7 +155,9 @@ def _load_corpus(service: KnowledgeService, dataset: PublicDataset) -> None:
 def evaluate_dataset(dataset: PublicDataset, *, mode: str, top_k: int, sample_limit: int,
                      seed: int, data_dir: Path, embedding_model: str | None = None,
                      embedding_dimensions: int = 512, rerank_model: str | None = None,
-                     model_cache_dir: Path | None = None) -> dict[str, Any]:
+                     model_cache_dir: Path | None = None,
+                     query_details: list[dict[str, Any]] | None = None,
+                     capture_evidence_ids: set[str] | None = None) -> dict[str, Any]:
     queries = list(dataset.queries)
     if sample_limit and len(queries) > sample_limit:
         queries = random.Random(seed).sample(queries, sample_limit)
@@ -175,6 +177,8 @@ def evaluate_dataset(dataset: PublicDataset, *, mode: str, top_k: int, sample_li
                 "failure_count": 0, "failure_rate": 0.0,
                 "latency_ms": {"p50": None, "p95": None}}
 
+    setup_wall_started = time.perf_counter()
+    setup_cpu_started = time.process_time()
     service = _new_service(
         data_dir, embedding_model=embedding_model if requires_semantic else None,
         embedding_dimensions=embedding_dimensions,
@@ -212,6 +216,8 @@ def evaluate_dataset(dataset: PublicDataset, *, mode: str, top_k: int, sample_li
                     "metrics": None, "forbidden_leak_count": None, "fallback_rate": None,
                     "failure_count": 0, "failure_rate": 0.0,
                     "latency_ms": {"p50": None, "p95": None}}
+    setup_wall_ms = (time.perf_counter() - setup_wall_started) * 1000
+    setup_cpu_ms = (time.process_time() - setup_cpu_started) * 1000
     by_title: dict[str, list[str]] = {}
     by_uri = {f"/public/{dataset.dataset}/{doc.document_id}": doc.document_id
               for doc in dataset.documents}
@@ -265,6 +271,20 @@ def evaluate_dataset(dataset: PublicDataset, *, mode: str, top_k: int, sample_li
                 "mode": mode, "source": source_slice, "language": _language(query.question),
                 "metrics": values, "latency_ms": durations[-1], "failed": False,
                 "fallback": float(fell_back), "forbidden_leaks": query_forbidden_leaks})
+            if query_details is not None:
+                detail = {**query_rows[-1], "ranked_document_ids": ranked,
+                          "search": result.model_dump(mode="json")}
+                if capture_evidence_ids and query.query_id in capture_evidence_ids:
+                    try:
+                        loaded = service.load_chunks(
+                            chunk_ids=[item.chunk_id for item in result.results[:top_k]],
+                            max_chars_per_chunk=1800,
+                        )
+                        detail["evidence"] = [chunk.model_dump(mode="json") for chunk in loaded.chunks]
+                        detail["evidence_filtered_count"] = loaded.filtered_count
+                    except Exception as exc:  # noqa: BLE001 - QA loading must not distort rank metrics
+                        detail["evidence_error_type"] = type(exc).__name__
+                query_details.append(detail)
         except Exception:  # noqa: BLE001 - count benchmark query failures
             failures += 1
             durations.append((time.perf_counter() - started) * 1000)
@@ -274,6 +294,8 @@ def evaluate_dataset(dataset: PublicDataset, *, mode: str, top_k: int, sample_li
                 "mode": mode, "source": "unknown", "language": _language(query.question),
                 "metrics": {name: 0.0 for name in accum}, "latency_ms": durations[-1],
                 "failed": True, "fallback": 0.0, "forbidden_leaks": 0})
+            if query_details is not None:
+                query_details.append(dict(query_rows[-1]))
     count = len(queries)
     slices: dict[str, list[dict[str, Any]]] = {}
     for row in query_rows:
@@ -289,6 +311,7 @@ def evaluate_dataset(dataset: PublicDataset, *, mode: str, top_k: int, sample_li
             "failure_count": failures, "failure_rate": failures / count if count else 0.0,
             "latency_ms": {"p50": _percentile(durations, .50), "p95": _percentile(durations, .95)},
             "setup_timing_ms": {"corpus_import": corpus_import_ms, "index_build": index_build_ms,
+                                 "total_wall": setup_wall_ms, "total_cpu": setup_cpu_ms,
                                  "reranker_probe": reranker_probe_ms,
                                  "model_warmup_total": index_build_ms + reranker_probe_ms,
                                  "query_p50": _percentile(durations, .50),
