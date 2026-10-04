@@ -21,6 +21,14 @@ plan and remaining acceptance gates are in [the TODO](memory_background_todolist
    An explicit `这个项目`/`本项目` claim is classified as project-scoped and
    requires a project identity; it is not silently promoted to a global rule.
    Tool, mail, web, RAG and Agent answer text are not extraction sources.
+   Model claims/evidence now share an extractive contract and one production/evaluation
+   validator. Evidence is matched against the original user message; cropped negation,
+   correction, conditional or transient qualifiers are rejected even when the candidate
+   is a literal substring. Full source-faithful negative/conditional statements remain
+   valid. The bounded English/Chinese linguistic guard is conservative, not a semantic
+   entailment model; complex wording can be rejected rather than silently generalized.
+   Malformed candidates are rejected individually, and model `explicit` is never
+   publication authority. Optional raw evaluation diagnostics stay local.
 3. `MemoryService` stores provenance, candidate/active status, scope, versions, expiry,
    correction and retraction. Model-inferred items remain candidates; direct
    `记住：...` requests, low-impact explicit enduring preferences, or user API writes
@@ -36,8 +44,12 @@ plan and remaining acceptance gates are in [the TODO](memory_background_todolist
    configured budget it enqueues a `context_compact` job; publishing uses the captured
    independent summary revision and message watermark, so new turns remain raw tail
    without starving publication during continuous conversation. At the hard window
-   threshold, synchronous compression still runs outside the SQLite write transaction
-   and publishes through the same CAS. Original session messages are retained.
+   threshold, a configured durable callback captures the raw range for background
+   compression and provides a bounded emergency prompt view without claiming semantic
+   coverage. Its enqueue uses a savepoint so committed conversation data survives an
+   enqueue failure; recovery repairs the missing job. Without a background callback,
+   the legacy synchronous fallback runs outside the SQLite write transaction and uses
+   the same CAS. Original session messages are retained.
    When the default model has a valid local tokenizer, this session-window
    estimate uses that tokenizer; otherwise it retains the legacy character-based
    estimate. Session thresholds are advisory, not a full request-capacity check.

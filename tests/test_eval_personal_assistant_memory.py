@@ -1,9 +1,12 @@
 import json
 from typing import ClassVar
 
+import pytest
+
 from scripts.eval_personal_assistant_memory import (
     DEFAULT_FIXTURE,
     _CallBudgetReached,
+    _candidate_rejection_reasons,
     _CountingClient,
     _force_model_extract,
     _state_group,
@@ -143,7 +146,7 @@ def test_force_model_uses_shared_candidate_validators_and_model_explicit_is_not_
         def complete_text(self, **kwargs):
             return Response()
 
-    client = _CountingClient(Service(), max_calls=1)
+    client = _CountingClient(Service(), max_calls=1, diagnostics=True)
     candidates = _force_model_extract("synthetic:model_case", "I prefer concise summaries", client)
     assert len(candidates) == 1
     assert candidates[0].explicit is True  # retained as a model label
@@ -151,6 +154,10 @@ def test_force_model_uses_shared_candidate_validators_and_model_explicit_is_not_
     assert _user_confirmation_authority(True, candidates[0])
     assert client.calls == 1
     assert client.total_tokens == 31
+    validation = client.responses[0]["candidate_validation"]
+    assert validation[0]["rejection_reasons"] == []
+    assert "unsupported_claim_paraphrase" in validation[1]["rejection_reasons"]
+    assert "claim_is_authority_or_action_policy" in validation[1]["rejection_reasons"]
 
 
 def test_force_model_rejects_quoted_external_content_before_provider_call():
@@ -202,3 +209,69 @@ def test_force_model_enforces_call_budget_and_timeout_failures_are_not_accuracy(
     assert timeout_report["recall"] is None
     assert timeout_report["provider_evaluated_cases"] == 0
     assert "TimeoutError" in timeout_report["failed_cases"][0]["error"]
+
+
+@pytest.mark.parametrize("claim,evidence,expected_reasons", [
+    ("以后用中文回答我", "以后请用中文回答我", ["unsupported_claim_paraphrase"]),
+    ("以后默认使用中文", "我希望以后默认使用中文", []),
+    ("偏好简短摘要", "我偏好简短的摘要", []),
+    ("User prefers the assistant to respond in Chinese from now on.", "以后请用中文回答我",
+     ["unsupported_claim_paraphrase"]),
+    ("用户希望以后默认使用中文回复。", "我希望以后默认使用中文", ["unsupported_claim_paraphrase"]),
+    ("invented preference", "invented preference", ["evidence_not_exact_substring"]),
+])
+def test_diagnostics_explain_exact_evidence_and_supported_paraphrases(claim, evidence, expected_reasons):
+    message = "以后请用中文回答我。我希望以后默认使用中文。我偏好简短的摘要。"
+    item = {"claim": claim, "evidence": evidence, "kind": "preference", "confidence": .9}
+    assert _candidate_rejection_reasons(item, message) == expected_reasons
+
+
+def test_raw_diagnostics_distinguish_model_omission_from_filter_rejection(monkeypatch, tmp_path):
+    from app.core.local_config import LLMProviderConfig
+    from scripts import eval_personal_assistant_memory as module
+
+    outputs = [
+        '{"candidates": []}',
+        json.dumps({"candidates": [{"claim": "以后用中文回答我", "evidence": "以后请用中文回答我",
+                                   "kind": "preference", "confidence": .9}]}),
+    ]
+
+    class Service:
+        def complete_text(self, **kwargs):
+            return type("Response", (), {"content": outputs.pop(0), "usage": {}})()
+
+    fixture = tmp_path / "synthetic.jsonl"
+    fixture.write_text("".join(json.dumps({
+        "id": case_id, "category": "preference", "text": "以后请用中文回答我。",
+        "expected_claims": ["以后用中文回答我"],
+    }) + "\n" for case_id in ["omitted", "rejected"]), encoding="utf-8")
+    monkeypatch.setattr(module, "load_local_config", lambda _: type("Config", (), {"llm": LLMProviderConfig()})())
+    monkeypatch.setattr(module, "build_llm_service", lambda _: Service())
+    report = evaluate(fixture, force_model=True, diagnostics=True, max_calls=2)
+    first, second = report["provider_responses"]
+    assert first["case_id"] == "omitted"
+    assert first["raw_output"] == '{"candidates": []}'
+    assert first["raw_candidate_count"] == 0
+    assert first["candidate_validation"] == []
+    assert second["case_id"] == "rejected"
+    assert second["raw_candidate_count"] == 1
+    assert second["candidate_validation"][0]["rejection_reasons"] == ["unsupported_claim_paraphrase"]
+    assert report["recall"] == 0
+
+
+def test_raw_output_is_opt_in_and_captured_before_incomplete_error():
+    from app.core.background_llm import IncompleteGenerationError
+    from app.core.llm import LLMResponse
+
+    class Service:
+        def complete_text(self, **kwargs):
+            return LLMResponse(provider="synthetic", status="completed", content='{"candidates":',
+                               prompt_summary="synthetic", finish_reason="length")
+
+    for diagnostics in [False, True]:
+        client = _CountingClient(Service(), max_calls=1, diagnostics=diagnostics)
+        with pytest.raises(IncompleteGenerationError):
+            client.complete_text(system_prompt="s", user_prompt="synthetic", prompt_summary="test")
+        assert ("raw_output" in client.responses[0]) is diagnostics
+        if diagnostics:
+            assert client.responses[0]["raw_output"] == '{"candidates":'
