@@ -91,3 +91,22 @@ def test_registered_reader_uses_executor_and_rejects_other_runs(tmp_path, monkey
     assert found.status == "completed"
     assert found.output["matches"] == []
     assert found.output["complete"] is True
+    assert runtime.tool_registry.get_tool_or_none("observation.group") is not None
+    runtime.agent_run_store.put_artifact(
+        artifact_id="tool_result_groups", run_id=first.run_id, kind="tool_result",
+        payload={"output": {"rows": [{"team": "a"}, {"team": "a"}, {"team": "b"}]}},
+        summary="group test", created_at=datetime.now(UTC).isoformat(),
+    )
+    grouped = runtime.tool_executor.execute(
+        invocation_id="group-gate", tool_name="observation.group",
+        tool_input={"artifact_id": "tool_result_groups", "path": "/output/rows", "field": "team"},
+        context=ToolContext(session_id="gate-session", run_id=first.run_id),
+    )
+    assert grouped.status == "completed"
+    assert [group["count"] for group in grouped.output["groups"]] == [2, 1]
+    denied_group = runtime.tool_executor.execute(
+        invocation_id="group-other", tool_name="observation.group",
+        tool_input={"artifact_id": "tool_result_groups", "path": "/output/rows", "field": "team"},
+        context=ToolContext(session_id="gate-session", run_id=second.run_id),
+    )
+    assert denied_group.status == "rejected"

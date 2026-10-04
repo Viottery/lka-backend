@@ -10,7 +10,7 @@ from app.core.tools import ToolContext, ToolInvocation, ToolPackageSpec, ToolRes
 
 OBSERVATION_PACKAGE = ToolPackageSpec(
     name="observation",
-    description="Search text and read selected fields or bounded pages from cached results in this run.",
+    description="Search text, count groups, and read selected fields or bounded pages from cached results in this run.",
     risk="low",
     requires_expansion=True,
     routing_hints=["Do not select this package as the initial data source; handles exist only after a tool runs in the current run."],
@@ -18,6 +18,7 @@ OBSERVATION_PACKAGE = ToolPackageSpec(
         "Expand only after an observation provides _result_cache.artifact_id; paths refer to the raw stored ToolResult, not its structural preview wrappers.",
         "Use search to locate literal terms in long cached text, then read its returned path/character offset for more context; a bounded search is not proof of full coverage.",
         "For an array of records, use read with fields to retain the requested shallow keys rather than generic first-key previews. Follow next_offset to cover further records; report incomplete coverage when stopping early.",
+        "For exact counts by a scalar field, use group on the cached raw array instead of adding counts from remembered previews. Group counts cover that entire array before group paging; they do not cover other artifacts or source pages. Follow next_offset to see every group and inspect skipped record counts.",
     ],
 )
 
