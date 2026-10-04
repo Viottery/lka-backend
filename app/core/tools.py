@@ -137,9 +137,13 @@ class ToolRegistry:
 
 
 def effective_tool_read_only(tool: Tool, tool_input: dict[str, Any]) -> bool | None:
-    checker = getattr(tool, "is_read_only_invocation", None)
-    if callable(checker):
-        return bool(checker(tool_input))
+    try:
+        checker = getattr(tool, "is_read_only_invocation", None)
+        if callable(checker):
+            result = checker(tool_input)
+            return result if type(result) is bool else None
+    except Exception:  # noqa: BLE001 - unknown classification cannot grant read-only authority.
+        return None
     return tool.spec.read_only
 
 

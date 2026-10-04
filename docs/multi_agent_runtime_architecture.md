@@ -326,6 +326,10 @@ Tool Executor 和 Safety Gate 校验。配置默认关闭，启用需使用 Lang
 这仅影响 catalog，静态 read_only 保持原值；执行仍用真实参数检查冻结 ToolView、作用域、
 安全门和来源约束。声明不能允许写调用、绕过 NONE/expiry，或将 READ 提升为 EXTERNAL。
 
+动态分类回调只有实际 `bool` 才能决定本次只读属性；字符串、整数、容器、null 或普通
+分类异常视为 unknown（`None`），不能用 truthiness 或静态 true 回退授予 READ。
+unknown 在 READ/NONE child 中被拒绝，顶层有审批的调用仍可走原安全门；取消继续传播。
+
 当前验证结果只对明确机器可检查的 artifact/evidence/side-effect 状态给出确定结论；自然语言合同
 需要外部 verifier outcome，未提供时保持 inconclusive。文件变更范围和测试/lint/schema 结果需由外部
 验证器或调用方提供，内置 aggregator 不会自行运行这些检查。
