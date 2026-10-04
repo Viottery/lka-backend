@@ -772,3 +772,7 @@ Root 最小追加联合 **75 passed /25.99s**。上述不等于实际模型已�
 三次 decision length 加一次 repair 暴露格式生成/推理预算浪费，继续分析通用决策层恢复，
 不增加预算或在 core 注入 Watch 特殊步骤。当前共享账本 **801 calls/USD4.785381568**，
 未知 usage 保守预留仍保留，Brave 仍 7 次。
+
+configured 快路径 P2 已作最小修复：从 registry 获取实际 Tool 再动态分类，缺注册项不
+授予权限；不改成静态属性或取消 ToolView。新 15 个快路径测试原先 12 failed/3 passed，
+Root 快路径/动态分类/拒绝诊断联合 **60 passed /0.36s**；no-ToolView 兼容保留。

@@ -4042,10 +4042,11 @@ class AgentTurnLoop:
             allowed = [
                 spec
                 for spec in registered
-                if tool_view.allows_tool(
+                if (tool := self.tool_executor.registry.get_tool_or_none(spec.name)) is not None
+                and tool_view.allows_tool(
                     tool_name=spec.name,
                     package=spec.package,
-                    read_only=effective_tool_read_only(spec, {}),
+                    read_only=effective_tool_read_only(tool, {}),
                 )
             ]
             workspace_paths = tool_view.allowed_paths
