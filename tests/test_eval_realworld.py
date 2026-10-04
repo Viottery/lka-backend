@@ -30,6 +30,22 @@ def test_goals_do_not_prescribe_registered_tools():
                        ("filesystem.read_file", "filesystem.edit_file", "bash.run", "mail.search"))
 
 
+def test_copy_verification_catches_mutation_missing_copy_and_extra_files():
+    from scripts.eval_realworld import _copy_checks
+
+    before = {"inbox/中文 file.csv": "receipt-hash", "inbox/notes.txt": "note-hash"}
+    expected = {"整理/2026-09/中文 file.csv": "inbox/中文 file.csv"}
+    after = dict(before, **{"整理/2026-09/中文 file.csv": "receipt-hash"})
+    assert all(_copy_checks(before, after, expected).values())
+    assert not _copy_checks(before, before, expected)["copies_match_original_bytes"]
+    mutated = dict(after, **{"inbox/notes.txt": "changed"})
+    assert not _copy_checks(before, mutated, expected)["originals_preserved"]
+    extra = dict(after, **{"secret.txt": "unexpected"})
+    assert not _copy_checks(before, extra, expected)["no_unexpected_files"]
+    wrong_copy = dict(after, **{"整理/2026-09/中文 file.csv": "normalized-bytes"})
+    assert not _copy_checks(before, wrong_copy, expected)["copies_match_original_bytes"]
+
+
 def test_total_only_or_partial_mail_answer_is_not_full_completion():
     expected = {"Alice <alice@example.test>": 7, "bob@example.test": 3}
     assert not _sender_coverage("There are 10 messages.", expected)["all_sender_counts_present"]

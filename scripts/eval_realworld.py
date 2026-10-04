@@ -170,6 +170,22 @@ CASES = {
             "tests/test_names.py": "import unittest\nfrom names import normalize\n\nclass Tests(unittest.TestCase):\n    def test_spaces(self):\n        self.assertEqual(normalize('  Acme  '), 'acme')\n    def test_unicode(self):\n        self.assertEqual(normalize('Straße'), normalize('STRASSE'))\n    def test_empty(self):\n        self.assertEqual(normalize('   '), '')\n    def test_no_mutation(self):\n        original=' X '; normalize(original); self.assertEqual(original,' X ')\n",
         }, "verify_command": ["python", "-m", "unittest", "discover", "-s", "tests"],
     },
+    "heldout_file_organization": {
+        "goal": "请把 inbox 中的收据按内容里的开票月份整理到 整理/YYYY-MM/ 下，保留原文件名。只创建副本，原件和备注都不要修改或删除。文件名可能有中文和空格，不要用文件修改时间或文件名推断月份；完成后说明处理了哪些文件，并验证副本和原件一致。",
+        "files": {
+            "README.md": "Receipts are CSV files under inbox/. The issued_at column contains the authoritative invoice date. Notes are not receipts.\n",
+            "inbox/收据 a.csv": "issued_at,reference,amount,note\n2026-09-30,RCP-731,129.90,\"中文内容,保留逗号\"\n",
+            "inbox/October misleading.csv": "issued_at,reference,amount,note\n2026-09-28,RCP-812,70.00,September invoice despite filename\n",
+            "inbox/收据 b.csv": "issued_at,reference,amount,note\n2026-10-01,RCP-953,44.20,keep original bytes\n",
+            "inbox/备注.txt": "这份备注不是收据，不能修改。\n",
+        },
+        "expected_copies": {
+            "整理/2026-09/收据 a.csv": "inbox/收据 a.csv",
+            "整理/2026-09/October misleading.csv": "inbox/October misleading.csv",
+            "整理/2026-10/收据 b.csv": "inbox/收据 b.csv",
+        },
+        "facts": ["2026-09", "2026-10"],
+    },
 }
 
 
@@ -187,6 +203,17 @@ def _hashes(workspace: Path) -> dict[str, str]:
     return {p.relative_to(workspace).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
             for p in workspace.rglob("*") if p.is_file()
             and not {"__pycache__", ".git"}.intersection(p.relative_to(workspace).parts)}
+
+
+def _copy_checks(before: dict[str, str], after: dict[str, str],
+                 expected: dict[str, str]) -> dict[str, bool]:
+    """Check actual bytes and original preservation independently of the answer."""
+    return {
+        "originals_preserved": all(after.get(path) == digest for path, digest in before.items()),
+        "copies_match_original_bytes": all(source in before and after.get(destination) == before[source]
+                                           for destination, source in expected.items()),
+        "no_unexpected_files": set(after) == set(before) | set(expected),
+    }
 
 
 def _initialize_fixture_repo(workspace: Path) -> None:
@@ -383,6 +410,8 @@ async def run_case(case_id: str, *, output: Path, budget: LiveBudget, planning: 
             checks["all_sender_counts_present"] = report["sender_coverage"]["all_sender_counts_present"]
         if case.get("read_only"):
             checks["files_unchanged"] = _hashes(workspace) == before
+        if case.get("expected_copies"):
+            checks.update(_copy_checks(before, _hashes(workspace), case["expected_copies"]))
         if case.get("verify_command"):
             completed = await asyncio.to_thread(subprocess.run, case["verify_command"],
                 cwd=workspace, capture_output=True, text=True, timeout=15, check=False)
