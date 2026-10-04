@@ -96,20 +96,22 @@ class ToolView(BaseModel):
     expires_at: datetime | None = None
 
     def allows_tool(self, *, tool_name: str, package: str | None, read_only: bool | None) -> bool:
+        return self.denial_reason(tool_name=tool_name, package=package, read_only=read_only) is None
+
+    def denial_reason(self, *, tool_name: str, package: str | None, read_only: bool | None) -> str | None:
+        """Explain only this view's first refusal, never grant execution or retry."""
         if self.expires_at is not None and self.expires_at <= datetime.now(UTC):
-            return False
+            return "context_expired"
         if self.allowed_tools:
             if tool_name not in self.allowed_tools:
-                return False
+                return "tool_not_granted"
             if self.allowed_packages and package not in self.allowed_packages:
-                return False
+                return "package_not_granted"
         elif not package or package not in self.allowed_packages:
-            return False
-        if self.side_effect_level == SideEffectLevel.NONE and read_only is not True:
-            return False
-        return not (
-            self.side_effect_level == SideEffectLevel.READ and read_only is not True
-        )
+            return "package_not_granted"
+        if self.side_effect_level in {SideEffectLevel.NONE, SideEffectLevel.READ} and read_only is not True:
+            return "invocation_not_read_only"
+        return None
 
 
 class PlannerView(BaseModel):

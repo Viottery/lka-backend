@@ -183,16 +183,34 @@ class ToolExecutor:
                 execution_started=False,
             )
         read_only = effective_tool_read_only(tool, tool_input)
-        if tool_view is not None and not tool_view.allows_tool(
-            tool_name=tool_name,
-            package=tool.spec.package,
-            read_only=read_only,
-        ):
+        denial_reason = (
+            tool_view.denial_reason(
+                tool_name=tool_name, package=tool.spec.package, read_only=read_only,
+            )
+            if tool_view is not None else None
+        )
+        if denial_reason is not None:
+            messages = {
+                "context_expired": "The immutable ContextSnapshot ToolView has expired.",
+                "tool_not_granted": "Tool is not granted by the immutable ContextSnapshot ToolView.",
+                "package_not_granted": "Tool package is not granted by the immutable ContextSnapshot ToolView.",
+                "invocation_not_read_only": (
+                    "This invocation was not proven read-only within the immutable ContextSnapshot ToolView. "
+                    "This does not forbid all read-only invocations of the tool; subsequent invocations "
+                    "still pass every original authorization and safety check."
+                ),
+            }
             return ToolResult(
                 invocation_id=invocation_id,
                 tool_name=tool_name,
                 status="rejected",
-                error="Tool is outside the immutable ContextSnapshot ToolView.",
+                output={"authorization_denial": {
+                    "code": denial_reason,
+                    "current_read_only": read_only,
+                    "tool_granted": denial_reason == "invocation_not_read_only",
+                    "allowed_side_effect_level": tool_view.side_effect_level.value,
+                }},
+                error=messages[denial_reason],
                 execution_started=False,
             )
         scope_error = self._check_scope(

@@ -84,6 +84,10 @@ Verifier 按 `VerificationContext` 检查结果是否满足计划中的验收标
 一致的 false + rejected 记录下排除该调用的实际副作用，不能借此把没有证据的子任务升级
 为完成。SQLite 恢复保留原标记且不重新执行。这个判断不改变 ToolView、审批或权限规则。
 
+ToolView 拒绝结果另外携带 `output.authorization_denial`：区分过期、tool/package 未授权
+和本次参数未被证明只读。它解释当前调用，不能授权重试或扩大 scope。一个支持条件只读
+的工具被拒绝一次，不等于所有合法读法都被禁用；后续参数仍经过全部原始检查。
+
 ## 4. Plan 与动态 fork
 
 Plan 是任务图，不是固定工作流。每个 `PlanStep` 至少包含：
