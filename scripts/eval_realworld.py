@@ -18,6 +18,7 @@ from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
+from urllib.parse import urlsplit, urlunsplit
 
 from app.core.config import Settings
 from app.core.llm import LLMResponseMode
@@ -230,7 +231,8 @@ CASES = {
     },
     "heldout_web_multisource": {
         "goal": "请查 Python 官方资料，对照 3.13 和 3.14 的 free-threaded 支持状况：分别是不是默认开启、支持级别有何变化、第三方扩展为什么可能让 GIL 重新启用。至少核对两个相关官方页面，附来源。不要把默认构建与可选构建混为一谈，结论简短。",
-        "files": {}, "web": True, "search_required": True, "read_only": True,
+        "files": {}, "web": True, "search_required": False, "read_only": True,
+        "minimum_page_sources": 2, "source_hosts": ["docs.python.org"],
         "facts": ["3.13", "3.14", "GIL"],
     },
     "heldout_context_reuse": {
@@ -242,7 +244,8 @@ CASES = {
     },
     "heldout_web_sqlite": {
         "goal": "请从 SQLite 官方资料核实 WAL 模式的并发限制：是否允许多个写者同时写，读事务看到哪个时点的数据，以及长读事务会怎样影响 checkpoint。核对至少两个相关官方页面，别只根据搜索摘要回答，结论简短且附来源。",
-        "files": {}, "web": True, "search_required": True, "read_only": True,
+        "files": {}, "web": True, "search_required": False, "read_only": True,
+        "minimum_page_sources": 2, "source_hosts": ["sqlite.org", "www.sqlite.org"],
         "facts": ["WAL", "checkpoint"],
     },
 }
@@ -273,6 +276,45 @@ def _copy_checks(before: dict[str, str], after: dict[str, str],
                                            for destination, source in expected.items()),
         "no_unexpected_files": set(after) == set(before) | set(expected),
     }
+
+
+def _page_evidence_urls(tool_events: list, *, source_hosts: list[str] | None = None) -> set[str]:
+    """Count delivered page evidence, not search candidates or semantic verification.
+
+    Re-reading offsets, fragments or query variants of one static page does not
+    satisfy a multiple-page goal. No-match find results are not page evidence.
+    """
+    pages = set()
+    hosts = {host.casefold() for host in source_hosts} if source_hosts is not None else None
+    for event in tool_events:
+        if event.tool_name not in {"web.open", "web.find"} or event.result.get("status") != "completed":
+            continue
+        output = event.result.get("output", {})
+        if not isinstance(output, dict):
+            continue
+        text = output.get("text")
+        matches = output.get("matches", [])
+        delivered = (
+            isinstance(text, str) and bool(text.strip()) if event.tool_name == "web.open"
+            else isinstance(matches, list) and any(
+                isinstance(match, dict) and isinstance(match.get("snippet"), str)
+                and bool(match["snippet"].strip()) for match in matches
+            )
+        )
+        url = output.get("url")
+        if not delivered or not isinstance(url, str):
+            continue
+        try:
+            parsed = urlsplit(url)
+            host = parsed.hostname
+            if (parsed.scheme != "https" or not host or parsed.username is not None
+                    or parsed.password is not None or parsed.port not in {None, 443}
+                    or (hosts is not None and host not in hosts)):
+                continue
+        except ValueError:
+            continue
+        pages.add(urlunsplit(("https", host, parsed.path.rstrip("/") or "/", "", "")))
+    return pages
 
 
 def _initialize_fixture_repo(workspace: Path) -> None:
@@ -519,8 +561,10 @@ async def run_case(case_id: str, *, output: Path, budget: LiveBudget, planning: 
             checks["tests_not_modified"] = all(_hashes(workspace).get(p) == h
                 for p, h in before.items() if p.startswith("tests/"))
         if case.get("web"):
-            checks["page_evidence_loaded"] = any(e.tool_name == "web.open" and e.result.get("status") == "completed"
-                                                for e in result.tool_events)
+            pages = _page_evidence_urls(result.tool_events, source_hosts=case.get("source_hosts"))
+            checks["page_evidence_loaded"] = bool(pages)
+            if case.get("minimum_page_sources"):
+                checks["required_page_sources_loaded"] = len(pages) >= case["minimum_page_sources"]
         if case.get("search_required"):
             checks["search_executed"] = any(e.tool_name == "web.search" and e.result.get("status") == "completed"
                                              for e in result.tool_events)

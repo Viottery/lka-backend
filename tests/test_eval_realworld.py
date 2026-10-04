@@ -30,6 +30,38 @@ def test_goals_do_not_prescribe_registered_tools():
                        ("filesystem.read_file", "filesystem.edit_file", "bash.run", "mail.search"))
 
 
+def test_multisource_goals_require_delivered_pages_not_a_specific_search_action():
+    for name in ("heldout_web_multisource", "heldout_web_sqlite"):
+        assert not CASES[name]["search_required"]
+        assert CASES[name]["minimum_page_sources"] == 2
+        assert CASES[name]["source_hosts"]
+    assert CASES["web_search_release"]["search_required"]
+
+
+def test_page_coverage_rejects_no_match_search_failure_and_fake_official_hosts():
+    from types import SimpleNamespace
+
+    from scripts.eval_realworld import _page_evidence_urls
+
+    def event(tool, url, *, status="completed", **output):
+        return SimpleNamespace(tool_name=tool, result={"status": status, "output": {"url": url, **output}})
+
+    events = [
+        event("web.open", "https://sqlite.org/wal.html", text="One writer."),
+        event("web.open", "https://sqlite.org/wal.html#checkpoint", text="Checkpoint."),
+        event("web.open", "https://sqlite.org/wal.html?offset=20000", text="Last page."),
+        event("web.find", "https://sqlite.org/isolation.html", matches=[]),
+        event("web.search", "https://sqlite.org/isolation.html", text="Search snippet."),
+        event("web.open", "https://sqlite.org/isolation.html", status="failed", text="No evidence."),
+        event("web.find", "https://sqlite.org.evil.test/isolation.html", matches=[{"snippet": "Snapshot."}]),
+        event("web.open", "https://sqlite.org@evil.test/wal.html", text="Fake host."),
+    ]
+    hosts = CASES["heldout_web_sqlite"]["source_hosts"]
+    assert _page_evidence_urls(events, source_hosts=hosts) == {"https://sqlite.org/wal.html"}
+    events.append(event("web.find", "https://sqlite.org/isolation.html", matches=[{"snippet": "Snapshot."}]))
+    assert len(_page_evidence_urls(events, source_hosts=hosts)) == 2
+
+
 def test_copy_verification_catches_mutation_missing_copy_and_extra_files():
     from scripts.eval_realworld import _copy_checks
 
