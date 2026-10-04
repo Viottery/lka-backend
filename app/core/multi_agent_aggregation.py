@@ -209,8 +209,9 @@ def derive_child_execution_evidence(
     """Derive side-effect evidence from a complete, durable child-run event log.
 
     ``False`` is returned only when the completed run's tool lifecycle events
-    reconcile with its terminal summary and every non-read-only invocation has
-    a durable approved review. Missing or inconsistent audit data stays unknown.
+    reconcile with its terminal summary and no tool execution could have effects.
+    A server-proven pre-invocation rejection is not execution. Missing or
+    inconsistent audit data stays unknown.
     """
 
     ordered = sorted(events, key=lambda event: event.sequence)
@@ -290,6 +291,8 @@ def derive_child_execution_evidence(
             or not isinstance(item.get("tool_name"), str)
             or not isinstance(item.get("read_only"), bool)
             or not isinstance(item.get("status"), str)
+            or (item.get("execution_started") is not None
+                and not isinstance(item.get("execution_started"), bool))
         ):
             return None, ConfirmationState.MISSING
         invocation_id = str(item["invocation_id"])
@@ -312,6 +315,7 @@ def derive_child_execution_evidence(
             classification is None
             or classification.get("tool_name") != event.payload.get("tool_name")
             or classification.get("status") != result.get("status")
+            or classification.get("execution_started") is not result.get("execution_started")
         ):
             return None, ConfirmationState.MISSING
 
@@ -328,6 +332,10 @@ def derive_child_execution_evidence(
     for invocation_id, classification in classifications.items():
         review = reviews.get(invocation_id)
         executed = invocation_id in completed_by_invocation
+        if classification.get("execution_started") is False:
+            if not executed or classification.get("status") != "rejected":
+                return None, ConfirmationState.MISSING
+            continue
         if classification["read_only"] is True:
             if not executed or review is not None:
                 return None, ConfirmationState.MISSING
@@ -340,8 +348,8 @@ def derive_child_execution_evidence(
             continue
         if review.get("status") != "approved" or not executed:
             return None, ConfirmationState.MISSING
-        # Once the executor emitted a completion record, a rejected or failed
-        # result still cannot rule out a partial effect inside the tool.
+        # Entering tool.invoke (or an unmarked legacy completion) cannot rule
+        # out a partial effect even when the result is rejected or failed.
         executed_non_readonly.append(invocation_id)
 
     return bool(executed_non_readonly), (

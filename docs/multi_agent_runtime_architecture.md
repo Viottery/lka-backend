@@ -73,6 +73,15 @@ Aggregator 合并结构化结果、artifact 和 evidence 引用，发现重复�
 
 Verifier 按 `VerificationContext` 检查结果是否满足计划中的验收标准，包括证据充分性、测试结果、文件变化、权限和副作用。验证失败时可以返回补充任务建议，但不能自行扩大范围。
 
+执行审计区分“发起调用”与“进入工具实现”：`ToolResult.execution_started` 是 Executor
+持有的可选标记，进入 `tool.invoke` 前设为 true，并覆盖工具自身返回的同名字段。只在
+实际实现调用前拒绝时标 false；进入后失败/拒绝/异常仍可能产生部分副作用。旧记录缺失
+标记不推断为未执行，工具 output 内的同名数据不作为审计凭据。
+
+聚合时标记必须与持久化 tool completion 和 child audit 的 invocation/status 对齐；只在
+一致的 false + rejected 记录下排除该调用的实际副作用，不能借此把没有证据的子任务升级
+为完成。SQLite 恢复保留原标记且不重新执行。这个判断不改变 ToolView、审批或权限规则。
+
 ## 4. Plan 与动态 fork
 
 Plan 是任务图，不是固定工作流。每个 `PlanStep` 至少包含：

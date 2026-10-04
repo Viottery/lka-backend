@@ -92,6 +92,8 @@ class ToolResult(BaseModel):
     status: str
     output: dict[str, Any] = Field(default_factory=dict)
     error: str | None = None
+    # Server-owned invocation boundary; absent legacy evidence stays unknown.
+    execution_started: bool | None = None
 
 
 class Tool(Protocol):
@@ -178,6 +180,7 @@ class ToolExecutor:
                 tool_name=tool_name,
                 status="rejected",
                 error="Tool is not registered.",
+                execution_started=False,
             )
         read_only = effective_tool_read_only(tool, tool_input)
         if tool_view is not None and not tool_view.allows_tool(
@@ -190,6 +193,7 @@ class ToolExecutor:
                 tool_name=tool_name,
                 status="rejected",
                 error="Tool is outside the immutable ContextSnapshot ToolView.",
+                execution_started=False,
             )
         scope_error = self._check_scope(
             spec=tool.spec,
@@ -203,6 +207,7 @@ class ToolExecutor:
                 tool_name=tool_name,
                 status="rejected",
                 error=scope_error,
+                execution_started=False,
             )
         if read_only is not True and not context.safety_review_approved:
             return ToolResult(
@@ -216,6 +221,7 @@ class ToolExecutor:
                     "side_effects": tool.spec.side_effects,
                 },
                 error="Non-read-only tools require an approved safety review.",
+                execution_started=False,
             )
         guard_failure = self._run_guard(context=context, tool_view=tool_view)
         if guard_failure is not None:
@@ -224,6 +230,7 @@ class ToolExecutor:
                 tool_name=tool_name,
                 status="rejected",
                 error=guard_failure,
+                execution_started=False,
             )
         validation_errors = self._validate_input(
             schema=tool.spec.input_schema,
@@ -237,6 +244,7 @@ class ToolExecutor:
                 status="rejected",
                 output={"validation_errors": validation_errors},
                 error="Tool input failed schema validation.",
+                execution_started=False,
             )
         invocation = ToolInvocation(
             invocation_id=invocation_id,
@@ -245,6 +253,7 @@ class ToolExecutor:
             context_id=context.context_id or "",
             input=tool_input,
         )
+        execution_started = False
         try:
             with self._admit(
                 tool=tool,
@@ -260,14 +269,18 @@ class ToolExecutor:
                         tool_name=tool_name,
                         status="rejected",
                         error=failure,
+                        execution_started=False,
                     )
-                return tool.invoke(invocation=invocation, context=context)
+                execution_started = True
+                result = tool.invoke(invocation=invocation, context=context)
+                return result.model_copy(update={"execution_started": True})
         except Exception as exc:  # noqa: BLE001 - normalize registered tool failures.
             return ToolResult(
                 invocation_id=invocation_id,
                 tool_name=tool_name,
                 status="failed",
                 error=str(exc),
+                execution_started=execution_started,
             )
 
     def _run_guard(self, *, context: ToolContext, tool_view: ToolView | None) -> str | None:
