@@ -119,6 +119,14 @@ def _listing_token(payload: dict[str, object]) -> str:
     return base64.urlsafe_b64encode(body + signature).decode().rstrip("=")
 
 
+def _compact_listing_token(payload: dict[str, object]) -> str:
+    # The current filtered inventory is recomputed for every page already. Sign
+    # that state without embedding it in a token the model must copy verbatim.
+    body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    signature = hmac.new(_MAIL_LIST_TOKEN_SECRET, body, sha256).digest()
+    return "ml_" + base64.urlsafe_b64encode(signature).decode().rstrip("=")
+
+
 def _decode_listing_token(token: str) -> dict[str, object]:
     try:
         if len(token) > 2048:
@@ -255,12 +263,19 @@ class MailService:
         }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         token_payload = {"filters": normalized_filters, "fingerprint": fingerprint}
         if listing_id is not None:
-            existing = _decode_listing_token(listing_id)
-            if existing != token_payload:
-                raise ValueError("Stale listing: mailbox contents or listing filters changed. Start a new listing.")
+            if listing_id.startswith("ml_"):
+                matches = hmac.compare_digest(
+                    listing_id.encode("utf-8"), _compact_listing_token(token_payload).encode("ascii"),
+                )
+            else:
+                # Accept tokens issued before this change within the same
+                # process; tokens still never substitute for account grants.
+                matches = _decode_listing_token(listing_id) == token_payload
+            if not matches:
+                raise ValueError("Stale listing or invalid listing_id: mailbox contents or listing filters changed. Start a new listing.")
             effective_listing_id = listing_id
         else:
-            effective_listing_id = _listing_token(token_payload)
+            effective_listing_id = _compact_listing_token(token_payload)
         total = len(eligible)
         selected = eligible[start_rank - 1:last]
         cards = [

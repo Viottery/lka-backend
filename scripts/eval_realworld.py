@@ -10,8 +10,11 @@ import argparse
 import asyncio
 import hashlib
 import json
+import re
+import sqlite3
 import subprocess
 import time
+from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -67,6 +70,10 @@ CASES = {
         "goal": "核实 Python 3.13 的 free-threaded 模式是不是默认开启，以及扩展模块可能有什么兼容性限制。请查官方资料并引用来源，不要只根据搜索摘要回答。",
         "files": {}, "web": True, "facts": ["3.13"], "read_only": True,
     },
+    "real_mail_overview": {
+        "goal": "把这批本地邮件按发件人整理，每类给出数量和主要主题，先给出本地邮件总数。不要同步远程邮箱。如果只处理了一部分，请说清实际覆盖范围，不要假装完整。",
+        "files": {}, "real_mail": True, "read_only": True,
+    },
 }
 
 
@@ -85,9 +92,50 @@ def _hashes(workspace: Path) -> dict[str, str]:
             for p in workspace.rglob("*") if p.is_file() and "__pycache__" not in p.parts}
 
 
+def _import_readonly_mail_snapshot(runtime, source: Path, *, limit: int = 60) -> dict:
+    """Read committed source rows, never open the production database for writes."""
+    with sqlite3.connect(source.resolve().as_uri() + "?mode=ro", uri=True) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN")
+        rows = conn.execute("SELECT * FROM mail_messages ORDER BY received_at DESC, message_id LIMIT ?",
+                            (limit,)).fetchall()
+        account_rows = {row["account_id"]: dict(row) for row in conn.execute("SELECT * FROM mail_accounts")}
+    from app.domains.mail import MailAccountInput, MailMessageInput
+    for account_id in {row["account_id"] for row in rows}:
+        account = account_rows[account_id]
+        runtime.import_mail(account=MailAccountInput(provider=account["provider"],
+            email_address=account["email_address"], display_name=account["display_name"]), messages=[
+                MailMessageInput(external_id=row["external_id"], folder=row["folder"],
+                    subject=row["subject"], sender=row["sender"], received_at=row["received_at"],
+                    body_text=row["body_text"], to=json.loads(row["recipients"]), cc=json.loads(row["cc"]))
+                for row in rows if row["account_id"] == account_id])
+    return {"selected_count": len(rows), "sender_counts": dict(Counter(row["sender"] for row in rows)),
+            "body_scope": "committed local snapshot; attachment contents not copied",
+            "source_db": str(source.resolve())}
+
+
+def _sender_coverage(answer: str, counts: dict[str, int]) -> dict:
+    """Check enumerated identities and counts, not merely a mentioned total.
+
+    Themes and source support still require trace/semantic review. Exact identity
+    and an explicit count in the same row are necessary, not a quality score.
+    """
+    matched = {}
+    for sender, count in counts.items():
+        address = re.search(r"[\w.+-]+@[\w.-]+", sender)
+        identity = address.group(0) if address else sender
+        rows = [row for row in answer.splitlines() if identity.casefold() in row.casefold()]
+        matched[sender] = any(re.search(rf"(?<!\d){count}(?!\d)", row) for row in rows)
+    return {"expected_groups": len(counts), "matched_groups": sum(matched.values()),
+            "covered_messages": sum(counts[s] for s in counts if matched[s]),
+            "all_sender_counts_present": all(matched.values()), "matches": matched}
+
+
 async def run_case(case_id: str, *, output: Path, budget: LiveBudget, planning: bool = False,
-                   timeout: float = 180) -> dict:
+                   timeout: float = 180, mail_db: Path | None = None) -> dict:
     case = CASES[case_id]
+    if case.get("real_mail") and mail_db is None:
+        raise ValueError("real mail requires an explicit --mail-db read-only source")
     root = output / (case_id + "_" + datetime.now(UTC).strftime("%Y%m%dT%H%M%S%f"))
     workspace = root / "workspace"
     workspace.mkdir(parents=True)
@@ -119,19 +167,29 @@ async def run_case(case_id: str, *, output: Path, budget: LiveBudget, planning: 
     if search_tool:
         search_tool.adapter.quota = _SearchReservation(budget)
     apply_setup(runtime, case.get("setup"))
+    mail_snapshot = _import_readonly_mail_snapshot(runtime, mail_db) if case.get("real_mail") else None
     session = runtime.create_session(title="quality: " + case_id)
     session_id = session.session.session_id
     runtime.set_session_workspace(session_id=session_id, path=str(workspace.resolve()), platform="linux")
     started = time.perf_counter()
+    started_at = datetime.now(UTC)
     report = {"case_id": case_id, "goal": case["goal"], "model": config.llm.model,
               "planning": planning, "session_id": session_id, "private_artifacts": str(root),
-              "budget_before": budget.snapshot(), "test_output_cap_if_unspecified": 16384}
+              "budget_before": budget.snapshot(), "test_output_cap_if_unspecified": 16384,
+              "mail_snapshot": mail_snapshot, "started_at": started_at.isoformat(),
+              "code_hashes": {p: hashlib.sha256(Path(p).read_bytes()).hexdigest() for p in
+                ["app/core/agent_turn.py", "app/core/tool_result_gate.py", "app/core/sessions.py",
+                 "app/integrations/web_search.py"]}}
     try:
         result = await asyncio.wait_for(runtime.run_agent_turn_async(
             session_id=session_id, user_input=case["goal"]), timeout=timeout)
         report["result"] = result.model_dump(mode="json")
         answer = result.answer
         checks = {"fact_coverage": all(s.lower() in answer.lower() for s in case.get("facts", []))}
+        if mail_snapshot:
+            checks["snapshot_total_mentioned"] = str(mail_snapshot["selected_count"]) in answer
+            report["sender_coverage"] = _sender_coverage(answer, mail_snapshot["sender_counts"])
+            checks["all_sender_counts_present"] = report["sender_coverage"]["all_sender_counts_present"]
         if case.get("read_only"):
             checks["files_unchanged"] = _hashes(workspace) == before
         if case.get("verify_command"):
@@ -148,6 +206,18 @@ async def run_case(case_id: str, *, output: Path, budget: LiveBudget, planning: 
         # Coverage and a successful fetch are necessary, not semantic-proof scores.
         report["checks"] = checks
         report["mechanical_pass"] = all(checks.values())
+        first_progress = next((event for event in result.progress_events
+                               if event.type == "assistant_message"), None)
+        report["metrics"] = {"first_agent_progress_seconds":
+            round((datetime.fromisoformat(first_progress.created_at) - started_at).total_seconds(), 3)
+            if first_progress else None,
+            "first_final_token_seconds": None, "response_mode": "text",
+            "llm_calls": len(result.llm_events),
+            "llm_total_duration_ms": sum(event.duration_ms or 0 for event in result.llm_events),
+            "tool_calls": len(result.tool_events),
+            "failed_tools": sum(event.result.get("status") != "completed" for event in result.tool_events),
+            "input_tokens": sum(event.input_token_count or 0 for event in result.llm_events),
+            "output_tokens": sum(event.output_token_count or 0 for event in result.llm_events)}
     except Exception as exc:  # noqa: BLE001 - preserve per-case failure evidence
         report["error"] = {"type": type(exc).__name__, "message": str(exc)}
         report["mechanical_pass"] = False
@@ -166,6 +236,7 @@ def main():
     parser.add_argument("--list", action="store_true")
     parser.add_argument("--planning", action="store_true")
     parser.add_argument("--timeout", type=float, default=180)
+    parser.add_argument("--mail-db", type=Path, help="explicit read-only production mail source for snapshot test")
     parser.add_argument("--output", type=Path, default=Path("data/quality_runs/linux_20261005"))
     args = parser.parse_args()
     if args.list:
@@ -178,7 +249,7 @@ def main():
     budget = LiveBudget(output / "budget.sqlite3")
     for case_id in args.case:
         report = asyncio.run(run_case(case_id, output=output, budget=budget,
-                                     planning=args.planning, timeout=args.timeout))
+                                     planning=args.planning, timeout=args.timeout, mail_db=args.mail_db))
         print(json.dumps({k: report.get(k) for k in
               ("case_id", "task_wall_seconds", "mechanical_pass", "checks", "error", "private_artifacts",
                "budget_after")}, ensure_ascii=False), flush=True)

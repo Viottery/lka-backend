@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 from app.core.agent_turn import AgentTurnResult
 from evals.lka_evals.live_budget import LiveBudget
-from scripts.eval_realworld import CASES, run_case
+from scripts.eval_realworld import CASES, _sender_coverage, run_case
 
 
 def test_fixture_runtime_isolated_and_artifact_retained_without_api(tmp_path):
@@ -27,3 +27,17 @@ def test_goals_do_not_prescribe_registered_tools():
     for case in CASES.values():
         assert not any(tool in case["goal"] for tool in
                        ("filesystem.read_file", "filesystem.edit_file", "bash.run", "mail.search"))
+
+
+def test_total_only_or_partial_mail_answer_is_not_full_completion():
+    expected = {"Alice <alice@example.test>": 7, "bob@example.test": 3}
+    assert not _sender_coverage("There are 10 messages.", expected)["all_sender_counts_present"]
+    partial = _sender_coverage("Total 10.\n| alice@example.test | 7 | updates |", expected)
+    assert partial["matched_groups"] == 1
+    assert partial["covered_messages"] == 7
+    assert not partial["all_sender_counts_present"]
+    complete = _sender_coverage("| Alice <alice@example.test> | 7 | updates |\n"
+                                "| bob@example.test | 3 | tickets |", expected)
+    assert complete["all_sender_counts_present"]
+    wrong = _sender_coverage("| alice@example.test | 17 | updates |", expected)
+    assert wrong["matched_groups"] == 0

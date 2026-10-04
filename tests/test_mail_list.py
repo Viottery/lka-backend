@@ -161,6 +161,32 @@ def test_mail_list_rejects_tampered_listing_id(mail_service):
         )
 
 
+def test_mail_list_token_is_compact_and_binds_filters_and_inventory(mail_service):
+    _add(mail_service, "a@example.com", "a", 25)
+    args = {"received_from": "2026-05-01T00:00:00Z", "received_before": "2026-06-01T00:00:00Z"}
+    first = mail_service.list_messages(**args)
+    assert len(first.listing_id) <= 50
+    second = mail_service.list_messages(**args, start_rank=21, listing_id=first.listing_id)
+    assert second.listing_id == first.listing_id
+    assert len(second.messages) == 5
+    with pytest.raises(ValueError, match="Stale listing"):
+        mail_service.list_messages(**args, folder="Inbox", listing_id=first.listing_id)
+
+
+def test_mail_list_accepts_existing_signed_payload_tokens(mail_service, monkeypatch):
+    from app.domains import mail
+
+    _add(mail_service, "a@example.com", "a", 25)
+    args = {"received_from": "2026-05-01T00:00:00Z", "received_before": "2026-06-01T00:00:00Z"}
+    with monkeypatch.context() as patch:
+        patch.setattr(mail, "_compact_listing_token", mail._listing_token)
+        legacy = mail_service.list_messages(**args).listing_id
+    assert len(legacy) > 50
+    second = mail_service.list_messages(**args, start_rank=21, listing_id=legacy)
+    assert second.listing_id == legacy
+    assert len(second.messages) == 5
+
+
 def test_mail_search_reports_capped_non_exhaustive_retrieval_metadata(mail_service):
     class FakeKnowledgeService:
         def search(self, **kwargs):
