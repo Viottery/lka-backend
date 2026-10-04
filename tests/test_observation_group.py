@@ -157,6 +157,17 @@ def test_rejects_record_group_and_key_length_budgets(tmp_path):
     assert "record limit" in (too_many_records.error or "")
 
 
+def test_output_byte_budget_includes_normal_json_framing(tmp_path):
+    for key_length in range(990, 1020):
+        rows = [{"key": f"{index:02d}-" + "k" * key_length} for index in range(20)]
+        result = _invoke(
+            ObservationGroupTool(_store(tmp_path, rows)), artifact_id="group-artifact",
+            path="/output/rows", field="key", limit=20,
+        )
+        assert result.status == "completed"
+        assert len(json.dumps(result.output, ensure_ascii=False).encode("utf-8")) <= 5_500
+
+
 def test_validates_arguments_and_enforces_current_run_child_scope(tmp_path):
     tool = ObservationGroupTool(_store(tmp_path, [{"v": "ok"}]))
     base = {"artifact_id": "group-artifact", "path": "/output/rows", "field": "v"}

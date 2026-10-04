@@ -245,7 +245,8 @@ def _render_group(group: dict[str, Any], sample_fields: list[str] | None) -> dic
 
 
 def _serialized_size(value: Any) -> int:
-    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    # Include ordinary JSON framing as well as compact transport serialization.
+    return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
 
 
 def _resolve_pointer(root: Any, pointer: str) -> Any:
