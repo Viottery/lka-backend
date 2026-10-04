@@ -67,6 +67,8 @@ class LLMProviderConfig(BaseModel):
     model: str = "gpt-4.1-mini"
     timeout_seconds: int = 180
     thinking_control: Literal["deepseek"] | None = None
+    supports_json_mode: bool = False
+    supports_function_calling: bool = False
     default_client: str | None = None
     fallback_client: str | None = None
     default_response_mode: str = "json"
@@ -185,6 +187,8 @@ class LLMProviderConfig(BaseModel):
                 available_models=[self.model],
                 timeout_seconds=self.timeout_seconds,
                 thinking_control=self.thinking_control,
+                supports_json_mode=self.supports_json_mode,
+                supports_function_calling=self.supports_function_calling,
                 context_window_tokens=self.context_window_tokens,
                 output_reserve_tokens=self.output_reserve_tokens,
                 tokenizer_json_path=self.tokenizer_json_path,

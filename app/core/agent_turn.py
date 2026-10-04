@@ -2997,16 +2997,10 @@ class AgentTurnLoop:
         if response is None:
             return None
         if not response.tool_calls:
-            if require_function_call:
-                return None
-            return {
-                "action": "final_answer",
-                "answer": None,
-                "assistant_message": response.content.strip() or None,
-                "operation": {"type": "final_answer", "reason": "Native tool selection completed."},
-                "reason": "Provider selected no further tool call.",
-                "_raw_output": response.content,
-            }
+            # Finish is an explicit control function in this protocol. Text,
+            # empty content, or a relay's unparsed tool markup is not a stop
+            # signal. Retain its LLM event and use the bounded JSON path instead.
+            return None
         if len(response.tool_calls) != 1:
             return {
                 "action": "malformed_tool_call",

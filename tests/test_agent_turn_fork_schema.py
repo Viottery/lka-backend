@@ -127,7 +127,7 @@ def test_native_decision_uses_one_required_function_for_fork_and_finish() -> Non
     assert finish["reason"] == "Child evidence is sufficient."
 
 
-def test_native_decision_keeps_auto_mode_for_clients_without_required_choice() -> None:
+def test_native_decision_keeps_auto_choice_but_requires_explicit_control() -> None:
     loop = AgentTurnLoop.__new__(AgentTurnLoop)
     loop.fork_policy = None
     loop.llm_client = SimpleNamespace(supports_required_tool_choice=False)
@@ -155,7 +155,9 @@ def test_native_decision_keeps_auto_mode_for_clients_without_required_choice() -
         llm_events=[],
     )
     assert choices == ["auto"]
-    assert decision["action"] == "final_answer"
+    # Auto remains necessary for endpoints without required tool_choice, but
+    # absence of a control call must enter the bounded JSON fallback, not finish.
+    assert decision is None
 
 
 def test_required_native_decision_without_a_function_falls_back_to_json() -> None:

@@ -63,3 +63,27 @@ def test_long_string_preview_exposes_tail_and_exact_omitted_range():
     assert result["omitted_chars"] == len(value) - len(result["head"]) - len(result["tail"])
     assert result["_partial"] is True
     assert result["path"] == "/output/stdout"
+
+
+@pytest.mark.parametrize("content", ["", "I will inspect the evidence next.",
+                                      '<calls><invoke name="example.read" /></calls>'])
+def test_native_response_without_control_call_falls_back_not_finishes(content):
+    loop, calls = _loop([])
+    loop._native_decision_tools = lambda **kwargs: ([object()], {})
+    loop._supports_function_calling = lambda: True
+    loop._supports_required_tool_choice = lambda: False
+    responses = iter([
+        SimpleNamespace(content=content, tool_calls=[]),
+        SimpleNamespace(content='{"operation":{"type":"tool_call",'
+                        '"tool_name":"example.read","tool_input":{"path":"notes.md"}}}', tool_calls=[]),
+    ])
+    def complete(**kwargs):
+        calls.append(kwargs)
+        return next(responses)
+    loop._complete_text_with_retry = complete
+    decision = loop._decide_next_action(user_input="read notes", route={}, context_window={},
+        package_catalog=[], expanded_package_names=[], expanded_tools=[], observations=[], llm_events=[])
+    assert decision["action"] == "call_tool"
+    assert len(calls) == 2
+    assert "tools" in calls[0]
+    assert "tools" not in calls[1]
