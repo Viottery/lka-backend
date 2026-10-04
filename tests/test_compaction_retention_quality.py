@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 
 import pytest
 
@@ -79,7 +80,21 @@ def test_budget_trim_keeps_newer_state_around_long_intervening_noise():
     assert service._context_token_estimate(trimmed, []) <= 180
 
 
-@pytest.mark.parametrize("budget", [0, 1, 2, 4, 8])
+def test_small_excerpt_keeps_opening_fact_and_latest_state():
+    service = _service()
+    text = (
+        "2026-10-01T10:00:00+00:00 user: first user message alpha "
+        + "routine status " * 30
+        + "Latest constraint: retain source."
+    )
+    excerpt = service._bounded_excerpt(text, max_chars=145, tail_fraction=0.6)
+    assert len(excerpt) <= 145
+    assert "alpha" in excerpt
+    assert "retain source" in excerpt
+    assert "omitted" in excerpt
+
+
+@pytest.mark.parametrize("budget", range(9))
 def test_tiny_unicode_budgets_never_publish_an_over_budget_window(tmp_path, budget):
     db_path = tmp_path / "tiny-window.sqlite3"
 
@@ -133,3 +148,131 @@ def test_tiny_unicode_budgets_never_publish_an_over_budget_window(tmp_path, budg
         ).fetchone()[0] == original
     finally:
         conn.close()
+
+
+def _persistent_service(tmp_path):
+    db_path = tmp_path / "sessions.sqlite3"
+
+    def connect():
+        conn = sqlite3.connect(db_path, timeout=10)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    conn = connect()
+    conn.executescript(
+        """
+        CREATE TABLE agent_sessions(session_id TEXT PRIMARY KEY, title TEXT, status TEXT,
+            metadata TEXT, created_at TEXT, updated_at TEXT);
+        CREATE TABLE agent_session_messages(message_id TEXT PRIMARY KEY, session_id TEXT,
+            role TEXT, content TEXT, payload TEXT, created_at TEXT);
+        CREATE TABLE agent_session_context_windows(session_id TEXT PRIMARY KEY,
+            token_budget INTEGER, summary TEXT, recent_messages TEXT,
+            token_estimate INTEGER, updated_at TEXT);
+        CREATE TABLE agent_session_effects(effect_id TEXT PRIMARY KEY, session_id TEXT,
+            effect_type TEXT, created_at TEXT);
+        CREATE TABLE compact_jobs(session_id TEXT, revision INTEGER, target_seq INTEGER);
+        INSERT INTO agent_sessions VALUES('s', 's', 'active', '{}', 't', 't');
+        """
+    )
+    conn.close()
+    return SessionService(connect), connect
+
+
+def test_hard_overflow_queues_transactionally_without_waiting_for_summarizer(tmp_path):
+    service, connect = _persistent_service(tmp_path)
+    summarize_calls = []
+
+    def enqueue(session_id, revision, target_seq, *, conn):
+        conn.execute(
+            "INSERT INTO compact_jobs VALUES(?, ?, ?)",
+            (session_id, revision, target_seq),
+        )
+
+    def slow_summarizer(summary, old, recent, budget):
+        summarize_calls.append((summary, old, recent, budget))
+        time.sleep(0.15)
+        return "semantic summary"
+
+    window = service.record_context_exchange(
+        session_id="s", user_input="current task " + "noise " * 100,
+        agent_answer="still active " + "details " * 100,
+        trace_id="hard-async", token_budget=40,
+        context_summarizer=slow_summarizer,
+        background_enqueue=enqueue,
+    )
+
+    # This checks the cause of frontend stalls without a machine-speed threshold.
+    assert summarize_calls == []
+    assert window.token_estimate <= 40
+    assert window.summary_metadata["emergency_view"] is True
+    conn = connect()
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM compact_jobs").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_over_budget_read_uses_local_view_without_mutating_raw_prefix_or_epoch(tmp_path):
+    service, connect = _persistent_service(tmp_path)
+    originals = []
+    for index in range(3):
+        user = (
+            f"Task {index}: compare the backup restore results. "
+            + "routine diagnostic output. " * 35
+            + f"Constraint {index}: preserve source record {index} and do not overwrite the database."
+        )
+        answer = f"Turn {index} remains open. " + "routine notes. " * 25
+        originals.append((user, answer))
+        service.record_context_exchange(
+            session_id="s", user_input=user, agent_answer=answer,
+            trace_id=f"turn-{index}", token_budget=20_000,
+        )
+
+    conn = connect()
+    try:
+        before = conn.execute(
+            "SELECT summary, recent_messages FROM agent_session_context_windows WHERE session_id='s'"
+        ).fetchone()
+        state_before = conn.execute(
+            "SELECT covered_seq, summary_revision FROM agent_session_context_state WHERE session_id='s'"
+        ).fetchone()
+        raw_before = conn.execute(
+            "SELECT seq, role, content, trace_id FROM agent_session_context_messages "
+            "WHERE session_id='s' ORDER BY seq"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    raw_window = service.get_context_window(session_id="s")
+    window = service.get_prompt_context_window(session_id="s", token_budget=100)
+
+    assert len(raw_window.recent_messages) == 6
+    assert [message.content for message in raw_window.recent_messages if message.role == "user"] == [
+        row[0] for row in originals
+    ]
+    assert window.token_budget == 100
+    assert window.token_estimate <= 100
+    assert window.summary_metadata["emergency_view"] is True
+    assert window.summary_metadata["lossy_fallback_possible"] is True
+    assert window.summary_metadata["raw_interval"] == {"from_seq": 1, "to_seq": 6}
+    assert "Task 2: compare the backup restore results" in window.summary
+    assert "Constraint 2: preserve source record 2 and do not overwrite the database" in window.summary
+
+    conn = connect()
+    try:
+        after = conn.execute(
+            "SELECT summary, recent_messages FROM agent_session_context_windows WHERE session_id='s'"
+        ).fetchone()
+        state_after = conn.execute(
+            "SELECT covered_seq, summary_revision FROM agent_session_context_state WHERE session_id='s'"
+        ).fetchone()
+        raw_after = conn.execute(
+            "SELECT seq, role, content, trace_id FROM agent_session_context_messages "
+            "WHERE session_id='s' ORDER BY seq"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert tuple(before) == tuple(after)
+    assert tuple(state_before) == tuple(state_after)
+    assert [tuple(row) for row in raw_before] == [tuple(row) for row in raw_after]
+    assert [row[2] for row in raw_after if row[1] == "user"] == [row[0] for row in originals]

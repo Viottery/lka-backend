@@ -7,6 +7,7 @@ import json
 import re
 import sqlite3
 import threading
+from datetime import UTC, datetime
 from typing import Any
 
 from app.core.background_jobs import BackgroundJobStore, BackgroundJobWorker
@@ -106,6 +107,59 @@ class MemoryBackgroundCoordinator:
             "context_compact", session_id, f"{revision}:{target_seq}",
             {"revision": revision, "target_seq": target_seq},
             priority=1, conn=conn, watermark_order=target_seq,
+        )
+
+    def recover_missing_compaction(
+        self, session_id: str, revision: int, target_seq: int,
+        *, conn: sqlite3.Connection,
+    ) -> None:
+        """Retain a failed, due enqueue in the existing durable pending outbox.
+
+        Do not materialize jobs on this fallback path. The queue's bounded claim
+        polling drains pending watermarks when capacity returns, also on restart.
+        Only an explicit failed callback may create intent; never scan historical
+        sessions or copy their content into the outbox.
+        """
+        due = conn.execute(
+            "SELECT 1 FROM agent_session_context_windows w "
+            "JOIN agent_session_context_state s ON s.session_id=w.session_id "
+            "JOIN agent_sessions a ON a.session_id=w.session_id "
+            "WHERE w.session_id=? AND a.status='active' "
+            "AND s.covered_seq<? AND s.next_seq>? "
+            "AND w.token_estimate>=CAST(w.token_budget*0.70 AS INTEGER) "
+            "AND NOT EXISTS (SELECT 1 FROM background_watermark_heads h "
+            "WHERE h.kind='context_compact' AND h.scope_id=w.session_id "
+            "AND h.watermark_order>?)",
+            (session_id, target_seq, target_seq, target_seq),
+        ).fetchone()
+        if due is None:
+            return
+        now = datetime.now(UTC).isoformat(timespec="microseconds")
+        watermark_id = f"{revision}:{target_seq}"
+        payload = json.dumps({"revision": revision, "target_seq": target_seq})
+        conn.execute(
+            "INSERT INTO background_watermark_heads "
+            "(kind,scope_id,watermark_order,watermark_id,updated_at) "
+            "VALUES('context_compact',?,?,?,?) "
+            "ON CONFLICT(kind,scope_id) DO UPDATE SET "
+            "watermark_order=excluded.watermark_order,watermark_id=excluded.watermark_id,"
+            "updated_at=excluded.updated_at "
+            "WHERE excluded.watermark_order>=background_watermark_heads.watermark_order",
+            (session_id, target_seq, watermark_id, now),
+        )
+        conn.execute(
+            "INSERT INTO background_pending_watermarks "
+            "(kind,scope_id,watermark_id,payload_json,priority,available_at,"
+            "max_attempts,deadline,watermark_order,updated_at) "
+            "VALUES('context_compact',?,?,?,1,?,3,NULL,?,?) "
+            "ON CONFLICT(kind,scope_id) DO UPDATE SET "
+            "watermark_id=excluded.watermark_id,payload_json=excluded.payload_json,"
+            "priority=excluded.priority,available_at=excluded.available_at,"
+            "max_attempts=excluded.max_attempts,deadline=excluded.deadline,"
+            "watermark_order=excluded.watermark_order,updated_at=excluded.updated_at "
+            "WHERE background_pending_watermarks.watermark_order IS NULL "
+            "OR excluded.watermark_order>=background_pending_watermarks.watermark_order",
+            (session_id, watermark_id, payload, now, target_seq, now),
         )
 
     def _compact(self, job: dict[str, Any]) -> None:

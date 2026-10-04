@@ -534,7 +534,7 @@ class AgentGraphRunner:
                 else self.turn_loop.default_workspace_root,
                 turn_user_input,
             )
-        window = self.turn_loop.session_service.get_context_window(
+        window = self.turn_loop.session_service.get_prompt_context_window(
             session_id=session.session_id, token_budget=self.turn_loop.session_context_token_budget
         ).model_dump(mode="json")
         window["current_time"] = current_time_payload()

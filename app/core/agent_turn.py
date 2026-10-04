@@ -994,7 +994,7 @@ class AgentTurnLoop:
                 _session_workspace_path(session) or self.default_workspace_root,
                 user_input,
             )
-        context_window = self.session_service.get_context_window(
+        context_window = self.session_service.get_prompt_context_window(
             session_id=session.session_id,
             token_budget=self.session_context_token_budget,
         )

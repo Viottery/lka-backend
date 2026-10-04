@@ -730,14 +730,25 @@ class LocalKnowledgeAgentRuntime:
         self, session_id: str, revision: int, target_seq: int,
         *, conn: sqlite3.Connection,
     ) -> None:
+        conn.execute("SAVEPOINT context_compaction_outbox")
         try:
             self.memory_background.enqueue_compaction(
                 session_id, revision, target_seq, conn=conn,
             )
         except Exception as exc:  # noqa: BLE001 - optional compaction must not discard raw context
-            # The raw context tail remains durable. A later exchange can
-            # re-enqueue, and the hard-threshold synchronous path stays live.
+            conn.execute("ROLLBACK TO context_compaction_outbox")
             self.last_background_error = type(exc).__name__
+            try:
+                # Commit a cheap intent with the raw exchange. Worker polling
+                # materializes it even without another turn, including after restart.
+                self.memory_background.recover_missing_compaction(
+                    session_id, revision, target_seq, conn=conn,
+                )
+            except Exception as recovery_exc:  # noqa: BLE001 - preserve the answer on storage failure
+                conn.execute("ROLLBACK TO context_compaction_outbox")
+                self.last_background_error = type(recovery_exc).__name__
+        finally:
+            conn.execute("RELEASE context_compaction_outbox")
 
     def start(self) -> None:
         """Start runtime services that should run while the API process is alive."""

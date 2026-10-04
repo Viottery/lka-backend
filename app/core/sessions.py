@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import sqlite3
 from collections.abc import Callable
@@ -499,12 +500,22 @@ class SessionService:
         token_budget: int | None = None,
     ) -> AgentSessionContextWindow:
         """Return the published summary plus every raw message beyond its watermark."""
+        window, _ = self._get_context_window_snapshot(
+            session_id=session_id, token_budget=token_budget,
+        )
+        return window
+
+    def _get_context_window_snapshot(
+        self, *, session_id: str, token_budget: int | None = None,
+    ) -> tuple[AgentSessionContextWindow, dict[str, Any] | None]:
+        """Read the summary, watermark and raw sequence in one SQLite snapshot."""
 
         self.ensure_session(session_id=session_id)
         budget = token_budget if token_budget is not None else self.default_context_token_budget
         conn = self._conn_factory()
         try:
             self._ensure_context_state_table(conn)
+            conn.execute("BEGIN")
             row = conn.execute(
                 """
                 SELECT session_id, token_budget, summary, recent_messages, token_estimate, updated_at
@@ -513,6 +524,20 @@ class SessionService:
                 """,
                 (session_id,),
             ).fetchone()
+            state_row = conn.execute(
+                "SELECT revision, next_seq, covered_seq, summary_metadata "
+                "FROM agent_session_context_state WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            state = dict(state_row) if state_row else None
+            # Sequenced raw messages are authoritative once a legacy window
+            # has been adopted. Do not deduplicate distinct sequence entries.
+            messages = (
+                self._context_messages_from_connection(
+                    conn, session_id=session_id, after_seq=state["covered_seq"],
+                ) if state else
+                self._recent_messages_from_json(row["recent_messages"]) if row else []
+            )
         finally:
             conn.close()
 
@@ -524,30 +549,82 @@ class SessionService:
                 recent_messages=[],
                 token_estimate=0,
                 updated_at=_now_iso(),
-            )
+            ), state
         summary = row["summary"]
-        messages = self._recent_messages_from_json(row["recent_messages"])
-        state = self._read_context_state(conn_factory=self._conn_factory, session_id=session_id)
-        covered_seq = state["covered_seq"] if state else 0
-        raw_tail = self._messages_after_seq(session_id=session_id, covered_seq=covered_seq)
-        # The JSON recent_messages remains compatible with old windows. The sidecar watermark
-        # prevents a newly committed exchange from disappearing while async work is pending.
-        merged = messages
-        if raw_tail:
-            seen = {(m.role, m.content, m.created_at, m.trace_id) for m in merged}
-            merged.extend(
-                m for m in raw_tail
-                if (m.role, m.content, m.created_at, m.trace_id) not in seen
-            )
         return AgentSessionContextWindow(
             session_id=row["session_id"],
             token_budget=row["token_budget"],
-            summary=row["summary"],
+            summary=summary,
             summary_metadata=json.loads(state["summary_metadata"]) if state else {},
-            recent_messages=merged,
-            token_estimate=self._context_token_estimate(summary, merged),
+            recent_messages=messages,
+            token_estimate=self._context_token_estimate(summary, messages),
             updated_at=row["updated_at"],
+        ), state
+
+    def get_prompt_context_window(
+        self, *, session_id: str, token_budget: int | None = None,
+    ) -> AgentSessionContextWindow:
+        """Return a bounded prompt projection without changing the full raw window."""
+        raw, state = self._get_context_window_snapshot(session_id=session_id)
+        budget = token_budget if token_budget is not None else raw.token_budget
+        if raw.token_estimate <= budget:
+            return raw.model_copy(update={"token_budget": budget})
+
+        summary, recent, estimate = self._fit_context_window(
+            summary=raw.summary, messages=raw.recent_messages, token_budget=budget,
         )
+        if estimate > budget:
+            messages = raw.recent_messages
+            prior = self._summarize_messages_locally(raw.summary, messages[:-2])
+            user_line = ""
+            agent_line = ""
+            if messages:
+                current_user = messages[-2] if len(messages) > 1 else messages[-1]
+                user_line = "user: " + self._compact_text(current_user.content, max_chars=500)
+            if len(messages) > 1:
+                agent_line = "agent: " + self._compact_text(messages[-1].content, max_chars=500)
+
+            user_budget = int(budget * 0.65)
+            agent_budget = int(budget * 0.10)
+            prior_budget = max(0, budget - user_budget - agent_budget - 4)
+            prior = self._trim_summary_for_budget(
+                summary=prior, messages=[], token_budget=prior_budget,
+            )
+            user_line = self._trim_summary_for_budget(
+                summary=user_line, messages=[], token_budget=user_budget,
+            )
+            agent_line = self._trim_summary_for_budget(
+                summary=agent_line, messages=[], token_budget=agent_budget,
+            )
+            summary = "\n".join(part for part in (prior, user_line, agent_line) if part)
+            estimate = self._context_token_estimate(summary, [])
+            if estimate > budget:
+                summary = self._trim_summary_for_budget(
+                    summary=summary, messages=[], token_budget=budget,
+                )
+                estimate = self._context_token_estimate(summary, [])
+            if estimate > budget:
+                summary, estimate = "", 0
+            recent = []
+
+        metadata = {
+            **raw.summary_metadata,
+            "emergency_view": True,
+            "method": "local_emergency_view",
+            "lossy_fallback_possible": True,
+            "raw_interval": {
+                "from_seq": state["covered_seq"] + 1 if state else 1,
+                "to_seq": state["next_seq"] - 1 if state else len(raw.recent_messages),
+            },
+            "input_trace_ids": list(dict.fromkeys(
+                message.trace_id for message in raw.recent_messages if message.trace_id
+            ))[:64],
+        }
+        return raw.model_copy(update={
+            "token_budget": budget, "summary": summary,
+            "summary_metadata": metadata, "recent_messages": recent,
+            "token_estimate": estimate,
+        })
 
     def record_context_exchange(
         self,
@@ -573,9 +650,17 @@ class SessionService:
         insert an idempotent outbox item. Other callbacks are invoked after commit and are
         best effort; durable delivery requires the transactional form. The published summary
         and its covered sequence remain unchanged in background mode, so readers always see
-        the raw tail. Synchronous hard-threshold compaction remains available through
-        `context_summarizer` when the window exceeds budget.
+        the raw tail. Transactional queues also handle hard overflow, with a local prompt
+        projection until publication. Without a transactional queue, hard-threshold
+        compaction remains synchronous through `context_summarizer`.
         """
+        transactional_enqueue = (
+            background_enqueue is not None
+            and self._callback_accepts_connection(background_enqueue)
+        )
+        replay_window = (
+            self.get_prompt_context_window if transactional_enqueue else self.get_context_window
+        )
         if effect_id is not None:
             conn = self._conn_factory()
             try:
@@ -585,7 +670,7 @@ class SessionService:
             finally:
                 conn.close()
             if existing is not None:
-                return self.get_context_window(session_id=session_id, token_budget=token_budget)
+                return replay_window(session_id=session_id, token_budget=token_budget)
         now = _now_iso()
         conn = self._conn_factory()
         post_commit_enqueue: tuple[int, int] | None = None
@@ -597,7 +682,7 @@ class SessionService:
                 "SELECT 1 FROM agent_session_effects WHERE effect_id = ?", (effect_id,)
             ).fetchone():
                 conn.rollback()
-                return self.get_context_window(session_id=session_id, token_budget=token_budget)
+                return replay_window(session_id=session_id, token_budget=token_budget)
             row = conn.execute(
                 "SELECT token_budget, summary, recent_messages, token_estimate FROM agent_session_context_windows WHERE session_id = ?",
                 (session_id,),
@@ -649,16 +734,17 @@ class SessionService:
                 conn, session_id=session_id, after_seq=covered_seq
             )
             estimate = self._context_token_estimate(summary, all_messages)
+            hard_async = estimate > budget and transactional_enqueue
             background_mode = (
                 background_enqueue is not None
                 and estimate >= int(budget * 0.70)
-                and estimate <= budget
+                and (estimate <= budget or hard_async)
             )
             if background_mode or estimate > budget:
                 kept_summary = summary
                 kept_messages = all_messages
                 token_estimate = estimate
-                if estimate > budget:
+                if estimate > budget and not hard_async:
                     target_seq = next_seq - 1 if len(all_messages) > 2 else next_seq + 1
                     sync_compaction = (
                         revision + 1, covered_seq, target_seq,
@@ -687,7 +773,7 @@ class SessionService:
                 )
             if background_mode:
                 target_seq = next_seq + 1
-                if self._callback_accepts_connection(background_enqueue):
+                if transactional_enqueue:
                     self._invoke_enqueue(background_enqueue, session_id, revision + 1, target_seq, conn)
                 else:
                     post_commit_enqueue = (revision + 1, target_seq)
@@ -731,6 +817,8 @@ class SessionService:
                 # can retry; losing an answer is worse than delayed compaction.
                 pass
             return self.get_context_window(session_id=session_id, token_budget=hard_budget)
+        if background_mode and estimate > budget:
+            return self.get_prompt_context_window(session_id=session_id, token_budget=budget)
         return updated
 
     def _ensure_context_state_table(self, conn: sqlite3.Connection) -> None:
@@ -771,21 +859,29 @@ class SessionService:
             conn.close()
 
     def _callback_accepts_connection(self, callback: Callable[..., Any]) -> bool:
-        import inspect
         try:
-            parameters = inspect.signature(callback).parameters
+            signature = inspect.signature(callback)
         except (TypeError, ValueError):
             return False
-        return "conn" in parameters or len(parameters) >= 4
+        try:
+            signature.bind("session", 1, 2, conn=None)
+        except TypeError:
+            try:
+                signature.bind("session", 1, 2, None)
+            except TypeError:
+                return False
+        return True
 
     def _invoke_enqueue(self, callback, session_id, revision, target_seq, conn) -> None:
         if conn is not None:
             try:
-                callback(session_id, revision, target_seq, conn=conn)
-            except TypeError as exc:
-                if "conn" not in str(exc):
-                    raise
+                inspect.signature(callback).bind(session_id, revision, target_seq, conn=conn)
+            except TypeError:
                 callback(session_id, revision, target_seq, conn)
+            else:
+                # A TypeError from inside the callback must roll back, not
+                # invoke the callback a second time with positional arguments.
+                callback(session_id, revision, target_seq, conn=conn)
         else:
             callback(session_id, revision, target_seq)
 
@@ -988,10 +1084,9 @@ class SessionService:
         retained = max(0, max_chars - 32)
         while retained >= 0:
             tail_chars = int(retained * tail_fraction)
-            # Retain a small opening span for older code that records the first
-            # user detail near the start, while giving larger excerpts the
-            # requested tail weighting for newer state.
-            head_chars = max(retained - tail_chars, min(80, retained))
+            # Preserve the opening fact without consuming the whole excerpt:
+            # even small windows reserve at least a quarter for the newest text.
+            head_chars = max(retained - tail_chars, min(80, int(retained * 0.75)))
             tail_chars = retained - head_chars
             omitted = len(text) - retained
             marker = f" [... {omitted} chars omitted ...] "
