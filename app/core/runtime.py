@@ -1635,12 +1635,14 @@ class LocalKnowledgeAgentRuntime:
         *,
         chunk_ids: list[str],
         max_chars_per_chunk: int = 420,
+        offset: int = 0,
     ) -> KnowledgeChunkLoadResult:
         """Load selected privacy-filtered local knowledge chunks."""
 
         return self.knowledge_service.load_chunks(
             chunk_ids=chunk_ids,
             max_chars_per_chunk=max_chars_per_chunk,
+            offset=offset,
         )
 
     def load_knowledge_document(

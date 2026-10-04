@@ -136,6 +136,17 @@ CASES = {
              "title": "unrelated_project", "text": "QuartzElm 项目维护团队 BY-28，政策编号 R8。"},
         ]}]}, "facts": ["Mira Fox", "两名", "R9"], "read_only": True,
     },
+    "heldout_knowledge_long_policy": {
+        "goal": "请核对本地知识资料中的 Nebula 生产发布政策：常规发布和紧急修复分别需要多少人审批，紧急修复还有什么补充要求？不能只看前面的常规条款，请给出资料依据，简短回答。",
+        "files": {}, "setup": {"knowledge": [{"documents": [{
+            "source": {"source_type": "local_document", "display_name": "Nebula release policy",
+                       "sensitivity": "public", "remote_policy": "allow"},
+            "title": "Nebula release policy",
+            "text": "Nebula 生产发布政策：常规发布需要两名维护者批准。\n" +
+                    "归档规范说明：资料编号与归档时间应当保留，历史版本只用于审计，不是当前审批要求。" * 35 +
+                    "\n紧急修复例外：允许一名值班维护者先批准，但须在18小时内补交事件复盘。",
+        }]}]}, "facts": ["两名", "一名", "18"], "read_only": True,
+    },
     "mail_specialist_overview": {
         "goal": "请让邮件专家完整整理这批本地邮件，按发件人逐一列出数量和主要主题，报告总数及实际覆盖范围。不要同步远程邮箱。",
         "files": {}, "synthetic_mail": True, "read_only": True, "children_required": 1,

@@ -72,6 +72,7 @@ def load_knowledge_chunks(
     result = request.app.state.runtime.load_knowledge_chunks(
         chunk_ids=payload.chunk_ids,
         max_chars_per_chunk=payload.max_chars_per_chunk,
+        offset=payload.offset,
     )
     return KnowledgeChunkLoadResponse(**result.model_dump(mode="json"))
 

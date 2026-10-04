@@ -146,6 +146,10 @@ class KnowledgeChunkRecord(BaseModel):
     remote_policy: KnowledgeRemotePolicy
     policy_decision: str
     untrusted_data: bool = True
+    total_chars: int | None = None
+    truncated: bool = False
+    offset: int = 0
+    next_offset: int | None = None
 
 
 class KnowledgeChunkLoadResult(BaseModel):
@@ -1019,10 +1023,13 @@ class KnowledgeService:
         *,
         chunk_ids: list[str],
         max_chars_per_chunk: int = DEFAULT_SNIPPET_CHARS,
+        offset: int = 0,
         tool_name: str | None = None,
         source_ids: list[str] | None = None,
         account_ids: list[str] | None = None,
     ) -> KnowledgeChunkLoadResult:
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ValueError("offset must be a nonnegative character index")
         query_id = _stable_id("knowledge_load", ",".join(chunk_ids), _now_iso())
         if not chunk_ids:
             return KnowledgeChunkLoadResult(query_id=query_id, chunks=[])
@@ -1052,6 +1059,9 @@ class KnowledgeService:
         rows_by_id = {row["chunk_id"]: row for row in rows}
         chunks: list[KnowledgeChunkRecord] = []
         filtered_count = 0
+        # Loading is not a search preview. Keep it bounded by one stored chunk,
+        # but honor requests beyond MAX_SNIPPET_CHARS and disclose partial views.
+        char_limit = min(max(1, max_chars_per_chunk), MAX_CHUNK_CHARS)
         for chunk_id in limited_ids:
             row = rows_by_id.get(chunk_id)
             if row is None:
@@ -1064,6 +1074,8 @@ class KnowledgeService:
             if not decision.allowed:
                 filtered_count += 1
                 continue
+            visible_text = decision.text[offset:offset + char_limit]
+            end = min(len(decision.text), offset + len(visible_text))
             chunks.append(
                 KnowledgeChunkRecord(
                     chunk_id=row["chunk_id"],
@@ -1073,13 +1085,17 @@ class KnowledgeService:
                     source_type=row["source_type"],
                     uri=row["uri"],
                     chunk_index=row["chunk_index"],
-                    text=self._trim(decision.text, max_chars_per_chunk),
-                    char_count=min(row["char_count"], max_chars_per_chunk),
-                    token_estimate=self._estimate_tokens(decision.text[:max_chars_per_chunk]),
+                    text=visible_text,
+                    char_count=len(visible_text),
+                    token_estimate=self._estimate_tokens(visible_text),
                     source_ref=row["source_ref"],
                     sensitivity=row["sensitivity"],
                     remote_policy=row["remote_policy"],
                     policy_decision=decision.policy_decision,
+                    total_chars=len(decision.text),
+                    truncated=len(visible_text) < len(decision.text),
+                    offset=offset,
+                    next_offset=end if end < len(decision.text) else None,
                 )
             )
         self._audit(

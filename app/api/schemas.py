@@ -524,7 +524,8 @@ class MailKnowledgeMirrorSyncResponse(MailKnowledgeMirrorResult):
 
 class KnowledgeChunkLoadRequest(BaseModel):
     chunk_ids: list[str]
-    max_chars_per_chunk: int = Field(default=420, ge=1, le=1200)
+    max_chars_per_chunk: int = Field(default=420, ge=1, le=6000)
+    offset: int = Field(default=0, ge=0)
 
 
 class KnowledgeChunkLoadResponse(KnowledgeChunkLoadResult):

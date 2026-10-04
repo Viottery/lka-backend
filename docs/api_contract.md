@@ -378,9 +378,18 @@ POST /knowledge/chunks/load
 ```json
 {
   "chunk_ids": ["knowledge_chunk_xxx"],
-  "max_chars_per_chunk": 420
+  "max_chars_per_chunk": 420,
+  "offset": 0
 }
 ```
+
+默认仍为每块 420 字符；可请求 1–6000 字符（一个完整知识块的上限），不再暗中受
+搜索摘要 1200 字符上限限制。`chunks[].char_count` 是实际返回字符数，`total_chars`
+是隐私过滤后该块的总字符数，`truncated` 明确是否省略；需要完整依据时可提高读取上限。
+`offset` 为每个块隐私过滤文本的 Unicode 字符偏移；按该块的 `next_offset`、单独该块 ID
+续读直到 next_offset=null，脱敏后扩长的块也可完整读取。每次重新检查来源授权/隐私；
+不是跨请求冻结隐私策略的快照。`truncated=true` 描述本次片段不等于整个块，不代表后面必有内容。
+授权、隐私过滤和最多 20 块的边界不变；长工具结果仍由通用结果 gate 缓存及摘选。
 
 ### 4.6 Load Knowledge Document
 
