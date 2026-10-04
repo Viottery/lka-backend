@@ -69,6 +69,7 @@ def test_registered_reader_uses_executor_and_rejects_other_runs(tmp_path, monkey
         created_at=datetime.now(UTC).isoformat(),
     )
     assert runtime.tool_registry.get_tool_or_none("observation.read") is not None
+    assert runtime.tool_registry.get_tool_or_none("observation.search") is not None
     result = runtime.tool_executor.execute(
         invocation_id="read-gate", tool_name="observation.read",
         tool_input={"artifact_id": "tool_result_gate", "path": "/output/ids", "limit": 5},
@@ -82,3 +83,11 @@ def test_registered_reader_uses_executor_and_rejects_other_runs(tmp_path, monkey
         context=ToolContext(session_id="gate-session", run_id=second.run_id),
     )
     assert denied.status == "rejected"
+    found = runtime.tool_executor.execute(
+        invocation_id="search-gate", tool_name="observation.search",
+        tool_input={"artifact_id": "tool_result_gate", "query": "not in numeric results"},
+        context=ToolContext(session_id="gate-session", run_id=first.run_id),
+    )
+    assert found.status == "completed"
+    assert found.output["matches"] == []
+    assert found.output["complete"] is True

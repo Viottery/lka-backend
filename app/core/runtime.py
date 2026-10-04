@@ -167,7 +167,11 @@ from app.tool_packages.matter import (
     UpdateMatterTool,
 )
 from app.tool_packages.memory import MEMORY_PACKAGE, ReadMemoryTool, SearchMemoryTool
-from app.tool_packages.observation import OBSERVATION_PACKAGE, ObservationReadTool
+from app.tool_packages.observation import (
+    OBSERVATION_PACKAGE,
+    ObservationReadTool,
+    ObservationSearchTool,
+)
 from app.tool_packages.web import register_web_tools
 
 
@@ -404,6 +408,7 @@ class LocalKnowledgeAgentRuntime:
         self.tool_executor = ToolExecutor(self.tool_registry)
         self.agent_run_store = SqliteAgentRunStore(self.db_path)
         self.tool_registry.register_tool(ObservationReadTool(self.agent_run_store))
+        self.tool_registry.register_tool(ObservationSearchTool(self.agent_run_store))
         self.agent_run_manager = InMemoryAgentRunManager(
             durable_store=self.agent_run_store
         )
