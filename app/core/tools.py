@@ -93,7 +93,7 @@ class ToolResult(BaseModel):
     output: dict[str, Any] = Field(default_factory=dict)
     error: str | None = None
     # Server-owned invocation boundary; absent legacy evidence stays unknown.
-    execution_started: bool | None = None
+    execution_started: bool | None = Field(default=None, strict=True)
 
 
 class Tool(Protocol):

@@ -681,3 +681,8 @@ child partial，未发布简报，不能验证 unchanged；第 3 轮读到北楼
 - [ ] R19-W：预算 partial 安全交付、原子摘录输出合同和跨来源同事项 identity 闭环；真实后台再次复测。
 - [ ] R19-P：明确区分已授权工具的参数非只读与真正未授权工具；冻结权限下可恢复，复杂任务再测。
 - [ ] R19-C：本地 semantic/rerank 默认 CPU 并发的可复现诊断，不凭猜测修改线程配置。
+
+执行审计独立 review：P1=0、P2=1，发现 SQLite 经过 Pydantic 非严格 bool 恢复时，
+`0`/`"false"` 能变成合法 False。六个实际 SQLite 反例先红，字段改为 strict bool/null；
+非法持久结果拒绝恢复、不重新执行、不发 recovered/completed 事件。54 项审计/child/
+aggregation 回归通过；旧记录缺失/null 和真实 bool 的恢复继续兼容。

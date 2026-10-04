@@ -4,6 +4,7 @@ from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 
 from app.core.agent_runs import AgentRunEvent, AgentRunRecord, AgentRunStatus
 from app.core.agent_storage import SqliteAgentRunStore
@@ -197,3 +198,26 @@ def test_execution_boundary_survives_real_lifecycle_and_sqlite_recovery(tmp_path
     assert recovered == first
     assert [kind for kind, _ in progress] == ["tool_recovered", "tool_completed"]
     assert progress[-1][1]["result"]["execution_started"] is expected
+
+
+@pytest.mark.parametrize("marker", [0, 1, "false", "true", 0.0, "off"])
+def test_sqlite_recovery_cannot_coerce_invalid_audit_markers_to_trusted_bool(tmp_path, marker):
+    registry = ToolRegistry()
+    tool = EffectTool(tmp_path / "must-not-run.txt")
+    registry.register_tool(tool)
+    store = SqliteAgentRunStore(tmp_path / "invalid-audit.sqlite3")
+    store.claim_tool_invocation(invocation_id="inv", run_id="child", tool_name=tool.spec.name,
+                                tool_input={}, claimed_at="now")
+    store.complete_tool_invocation(invocation_id="inv", completed_at="now", result={
+        "invocation_id": "inv", "tool_name": tool.spec.name, "status": "rejected",
+        "execution_started": marker,
+    })
+    progress = []
+    graph = AgentToolLifecycleGraph(tool_executor=ToolExecutor(registry), artifact_store=store,
+        review_tool_call=lambda *_args: (None, None),
+        append_progress=lambda *args: progress.append(args), raise_if_cancel_requested=lambda: None)
+    with pytest.raises(ValidationError):
+        graph.run(invocation_id="inv", run_id="child", tool_name=tool.spec.name,
+                  tool_input={}, context=ToolContext(session_id="child"))
+    assert not tool.path.exists()
+    assert not progress  # No recovered/completed event can launder malformed evidence.
