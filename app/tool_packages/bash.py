@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import select
 import shlex
 import signal
@@ -27,7 +28,6 @@ DEFAULT_OUTPUT_BYTES = 32_768
 MAX_OUTPUT_BYTES = 131_072
 SESSION_BUFFER_BYTES = 1_000_000
 READ_ONLY_COMMANDS = {
-    "awk",
     "cat",
     "cut",
     "df",
@@ -77,6 +77,7 @@ BASH_PACKAGE = ToolPackageSpec(
     decision_hints=[
         "Prefer read-only commands first, such as pwd, printenv, ls, find, rg, grep, cat, sed, head, tail, wc, git status, git diff, git log, and git show.",
         "Commands outside the read-only whitelist are treated as non-read-only and must pass safety review.",
+        "Read-only classification also checks arguments and shell expansion. Writing options, process hooks, arbitrary programs and executable paths require review; use literal quoted patterns and quoted workspace-root variables for inspection.",
         "Use mode=background for long-running or interactive commands, then poll with bash.read_session.",
         "Use bash.write_session to send stdin to a background terminal, bash.interrupt_session for Ctrl-C, and bash.terminate_session to stop it.",
         "The default cwd is the first configured workspace root. Relative cwd values are resolved inside that workspace root.",
@@ -349,7 +350,7 @@ class BashRunTool:
         type="local_tool",
         description=(
             "Run a bash command in sync or background mode. The command is classified "
-            "per invocation as read_only when every shell segment uses the read-only whitelist; "
+            "per invocation as read_only only for whitelisted commands with safe arguments; "
             "otherwise it is non-read-only and requires safety review."
         ),
         risk="high",
@@ -800,7 +801,7 @@ def _has_unsafe_shell_syntax(command: str) -> bool:
     # TODO: Replace this conservative classifier when read-only parallel execution has
     # a richer command analysis model. It intentionally over-reviews safe shell idioms
     # such as stderr/input redirection for now.
-    return any(
+    return _has_dynamic_shell_expansion(command) or any(
         marker in command
         for marker in [
             "$(",
@@ -814,10 +815,105 @@ def _has_unsafe_shell_syntax(command: str) -> bool:
     )
 
 
+def _has_dynamic_shell_expansion(command: str) -> bool:
+    """Do not classify arguments before shell expansion as proven safe.
+
+    Quoted, server-injected workspace roots are path values, not options. Other
+    variables and unquoted globs/braces can expand into hidden writing flags.
+    Unknown syntax requires review; this is not a general shell sandbox.
+    """
+    root_var = re.compile(r"\$(?:\{(?:workspace_root|WORKSPACE_ROOT|LKA_WORKSPACE_ROOT)\}"
+                          r"|(?:workspace_root|WORKSPACE_ROOT|LKA_WORKSPACE_ROOT)(?![\w]))")
+    quote = None
+    escaped = False
+    for index, char in enumerate(command):
+        if escaped:
+            escaped = False
+            continue
+        if quote == "'":
+            if char == "'":
+                quote = None
+            continue
+        if char == "\\":
+            escaped = True
+        elif char in {"'", '"'}:
+            if quote == char:
+                quote = None
+            elif quote is None:
+                quote = char
+        elif char == "$":
+            if quote != '"' or root_var.match(command, index) is None:
+                return True
+        elif quote is None and char in "*?[]{}":
+            return True
+    return False
+
+
+def _matches_long_option(arg: str, options: tuple[str, ...]) -> bool:
+    name = arg.split("=", 1)[0]
+    # GNU-style option abbreviations can carry the same effect as the full name.
+    return name.startswith("--") and any(option.startswith(name) for option in options)
+
+
 def _segment_is_read_only(segment: list[str]) -> bool:
     command = Path(segment[0]).name
+    if segment[0] != command:
+        # A workspace executable named "cat" is not the standard read utility.
+        return False
+    args = segment[1:]
     if command == "git":
-        return len(segment) >= 2 and segment[1] in READ_ONLY_GIT_SUBCOMMANDS
+        if not args or args[0] not in READ_ONLY_GIT_SUBCOMMANDS:
+            return False
+        if any(_matches_long_option(arg, ("--output", "--ext-diff", "--textconv")) for arg in args[1:]):
+            return False
+        if args[0] == "branch":
+            listing = {"-a", "-r", "-v", "-vv", "-l", "--all", "--remotes", "--verbose",
+                       "--list", "--show-current", "--no-color", "--color=never"}
+            return all(arg in listing or ("--list" in args and not arg.startswith("-"))
+                       for arg in args[1:])
+        return True
+    if command == "sed":
+        # Programmable sed can execute commands or write without -i. Only a
+        # numeric print selection is proven read-only; other programs get review.
+        scripts = args[1:] if args and args[0] == "-n" else args
+        return bool(scripts and re.fullmatch(r"(?:(?:\d+|\$)(?:,(?:\d+|\$))?)?p", scripts[0])
+                    and all(not arg.startswith("-") for arg in scripts[1:]))
+    if command == "find":
+        return not any(arg in {"-delete", "-exec", "-execdir", "-ok", "-okdir",
+                               "-fprint", "-fprint0", "-fprintf", "-fls"} for arg in args)
+    if command == "rg":
+        return not any(_matches_long_option(arg, ("--pre", "--pre-glob", "--hostname-bin")) for arg in args)
+    if command == "sort":
+        return not any(_matches_long_option(arg, ("--output", "--compress-program"))
+                       or (arg.startswith("-") and not arg.startswith("--") and "o" in arg)
+                       for arg in args)
+    if command == "file":
+        return not any(_matches_long_option(arg, ("--compile",))
+                       or (arg.startswith("-") and not arg.startswith("--") and "C" in arg)
+                       for arg in args)
+    if command == "uniq":
+        operands = []
+        index = 0
+        options = True
+        while index < len(args):
+            arg = args[index]
+            if options and arg == "--":
+                options = False
+            elif options and arg in {"-f", "-s", "-w", "--skip-fields", "--skip-chars", "--check-chars"}:
+                index += 1
+                if index >= len(args) or not args[index].isdigit():
+                    return False
+            elif options and arg.startswith("-") and arg != "-":
+                if not (arg in {"-c", "-d", "-u", "-i", "-z", "--count", "--repeated", "--unique",
+                                "--ignore-case", "--zero-terminated"}
+                        or re.fullmatch(r"-(?:f|s|w)\d+", arg)
+                        or re.fullmatch(r"--(?:skip-fields|skip-chars|check-chars)=\d+", arg)):
+                    return False
+            else:
+                operands.append(arg)
+            index += 1
+        # uniq's second positional operand is an output file, not another input.
+        return len(operands) <= 1
     return command in READ_ONLY_COMMANDS
 
 

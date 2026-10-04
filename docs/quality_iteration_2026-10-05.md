@@ -686,3 +686,12 @@ child partial，未发布简报，不能验证 unchanged；第 3 轮读到北楼
 `0`/`"false"` 能变成合法 False。六个实际 SQLite 反例先红，字段改为 strict bool/null；
 非法持久结果拒绝恢复、不重新执行、不发 recovered/completed 事件。54 项审计/child/
 aggregation 回归通过；旧记录缺失/null 和真实 bool 的恢复继续兼容。
+
+新增 Bash 权限反例：仅按命令名的白名单把 `sed -i`、`find -delete/-exec`、`rg --pre`、
+`git show --output`、`uniq input output` 等全部误判只读。隔离 READ executor 实际把测试
+文件 alpha 改成 beta，25 个新增检查先失败，不触及用户资料。收紧参数、shell 展开、
+可执行路径和可编程程序；保留数字/末行 sed print 与普通检索等读法，写命令仍可审核后
+使用，不能获得 READ 授权。追加长选项缩写、输出参数与未知变量/通配展开反例后 80 项
+联合测试通过，工具 metadata 同步说明边界。初版正例中的未加引号 glob 改成 literal
+quoted pattern，因为分类器不能在执行前知道它会展开成哪些选项，而不是放宽安全检查。
+该分类不是完整 shell/OS sandbox，也未证明本机程序或隐式 Git/rg 配置不会产生副作用。

@@ -296,7 +296,11 @@ backend/
 - 目录 listing、全文搜索、测试命令和交互式命令执行使用 `bash` Tool Package。
   `bash.run` 支持同步和后台终端；后台终端通过 `bash.read_session`、`bash.write_session`、
   `bash.interrupt_session` 和 `bash.terminate_session` 继续交互。具体命令按白名单动态判定
-  `read_only`，白名单外一律进入 safety review。`bash.run` 默认工作目录是当前 session
+  `read_only`，同时检查参数和 shell 展开，不按命令名直接放行。原地写入、输出文件、
+  子进程 hook、可编程脚本、可隐藏参数的动态展开与可执行文件路径不视为已证明只读；
+  `sed` 仅保留数字/末行 print 选择，`uniq` 不允许第二个输出文件参数。未知/未证明只读的
+  调用仍可在批准后执行，但不能绕过冻结 READ scope。这是保守分类，不是 OS sandbox，
+  不能证明第三方可执行程序及其隐式本地配置绝无副作用。`bash.run` 默认工作目录是当前 session
   workspace（未设置时为第一个 configured workspace root），相对 `cwd` 在该 root 内解析；命令环境注入 `workspace_root`、
   `WORKSPACE_ROOT`、`LKA_WORKSPACE_ROOT` 和以分号分隔的 `LKA_WORKSPACE_ROOTS`，模型应优先
   使用相对路径或这些变量定位 workspace 文件。
