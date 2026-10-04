@@ -40,6 +40,7 @@ WATCH_READ_ONLY_TOOL_ALLOWLIST = frozenset(
         "knowledge.load_document",
         "web.search",
         "web.open",
+        "web.find",
         "matter.search",
         "matter.list",
         "filesystem.read_file",
@@ -145,7 +146,7 @@ class WatchExecutionAdapter:
                 }
             )
         if not web_enabled:
-            requested_tools.difference_update({"web.search", "web.open"})
+            requested_tools.difference_update({"web.search", "web.open", "web.find"})
         if not matter_enabled:
             requested_tools.difference_update({"matter.search", "matter.list"})
         if not workspace_paths:
@@ -404,16 +405,22 @@ class WatchExecutionAdapter:
                             }
                             metadata_by_ref[message_id] = metadata
                             metadata_by_ref[str(source_ref)] = metadata
-                    if event.get("tool_name") != "web.open" or result.get("status") != "completed":
+                    if event.get("tool_name") not in {"web.open", "web.find"} or result.get("status") != "completed":
                         continue
                     output = result.get("output", {})
                     url = output.get("url") if isinstance(output, dict) else None
                     if isinstance(url, str) and url.startswith("https://"):
                         evidence_pairs.append((f"web_{sha256(url.encode()).hexdigest()[:16]}", url))
-                        metadata_by_ref[url] = {
-                            "fetched_at": output.get("fetched_at"),
-                            "excerpt": str(output.get("text") or "")[:1200],
-                        }
+                        excerpt = str(output.get("text") or "\n".join(
+                            str(match.get("snippet") or "")
+                            for match in output.get("matches", []) if isinstance(match, dict)
+                        ))[:1200]
+                        # No matching literal is not new source evidence. Keep
+                        # the prior excerpt and its own fetch time together.
+                        if excerpt.strip():
+                            metadata_by_ref[url] = {
+                                "fetched_at": output.get("fetched_at"), "excerpt": excerpt,
+                            }
                     if len(evidence_pairs) >= 20:
                         break
                 break

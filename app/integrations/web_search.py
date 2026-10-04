@@ -316,6 +316,29 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
             raise
 
 
+def _page_literal_matches(text: str, folded_query: str):
+    """Return original Unicode offsets even when casefold expands a character."""
+    folded_parts = []
+    source_indexes = []
+    for index, char in enumerate(text):
+        folded = char.casefold()
+        folded_parts.append(folded)
+        source_indexes.extend([index] * len(folded))
+    folded_text = "".join(folded_parts)
+    cursor = 0
+    previous = None
+    while True:
+        start = folded_text.find(folded_query, cursor)
+        if start < 0:
+            return
+        end = start + len(folded_query)
+        source_pair = (source_indexes[start], source_indexes[end - 1] + 1)
+        cursor = end
+        if source_pair != previous:
+            yield source_pair
+            previous = source_pair
+
+
 class PublicPageFetcher:
     """Fetch bounded public HTTPS text with per-hop DNS validation and pinning."""
 
@@ -350,6 +373,51 @@ class PublicPageFetcher:
             raise WebSearchError("offset must be a nonnegative character index.")
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= cap:
             raise WebSearchError(f"max_chars must be an integer from 1 through {cap}.")
+        fetched = self._readable_page(url, expected_text_sha256=expected_text_sha256)
+        text = fetched.pop("text")
+        total = len(text)
+        page = text[offset:offset + limit]
+        end = min(total, offset + len(page))
+        has_more = end < total
+        return {**fetched, "text": page, "truncated": len(page) < total,
+                "offset": offset, "returned_chars": len(page), "total_chars": total,
+                "has_more": has_more, "next_offset": end if has_more else None}
+
+    def find(
+        self, url: str, query: str, *, offset: int = 0, limit: int = 5,
+        expected_text_sha256: str | None = None,
+    ) -> dict[str, Any]:
+        """Locate literals beyond a page preview without sending the query remotely."""
+        if not isinstance(query, str) or not query.strip() or len(query) > 200:
+            raise WebSearchError("query must contain 1 through 200 characters.")
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise WebSearchError("offset must be a nonnegative match index.")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 5:
+            raise WebSearchError("limit must be an integer from 1 through 5.")
+        fetched = self._readable_page(url, expected_text_sha256=expected_text_sha256)
+        text = fetched.pop("text")
+        matches = []
+        total = 0
+        for start, end in _page_literal_matches(text, query.casefold()):
+            if total >= offset:
+                snippet_start = max(0, start - 100)
+                snippet_end = min(len(text), snippet_start + 400)
+                matches.append({"match_start": start, "match_end": end,
+                                "snippet_start": snippet_start, "snippet_end": snippet_end,
+                                "snippet": text[snippet_start:snippet_end]})
+            total += 1
+            if len(matches) > limit:
+                break
+        has_more = len(matches) > limit
+        return {**fetched, "query": query, "matches": matches[:limit], "offset": offset,
+                "offset_unit": "matches", "total_chars": len(text), "has_more": has_more,
+                "next_offset": offset + len(matches[:limit]) if has_more else None,
+                "complete": not has_more, "total_matches": None if has_more else total}
+
+    def _readable_page(
+        self, url: str, *, expected_text_sha256: str | None = None,
+    ) -> dict[str, Any]:
+        """Share the identical network, extraction and revision gate for read/find."""
         if expected_text_sha256 is not None and (
             not isinstance(expected_text_sha256, str)
             or re.fullmatch(r"[0-9a-f]{64}", expected_text_sha256) is None
@@ -384,20 +452,10 @@ class PublicPageFetcher:
                 fingerprint = hashlib.sha256(text.encode("utf-8")).hexdigest()
                 if expected_text_sha256 is not None and expected_text_sha256 != fingerprint:
                     raise WebSearchError("Page extraction changed; restart pagination from offset 0.")
-                total = len(text)
-                page = text[offset:offset + limit]
-                end = min(total, offset + len(page))
-                has_more = end < total
                 return {
                     "url": target,
                     "fetched_at": datetime.now(UTC).isoformat(),
-                    "text": page,
-                    "truncated": len(page) < total,
-                    "offset": offset,
-                    "returned_chars": len(page),
-                    "total_chars": total,
-                    "has_more": has_more,
-                    "next_offset": end if has_more else None,
+                    "text": text,
                     "text_sha256": fingerprint,
                     "snapshot_stable": False,
                     "text_scope": "readable_text_extraction",

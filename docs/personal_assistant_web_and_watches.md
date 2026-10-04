@@ -35,6 +35,13 @@
   has_more、text_sha256；offset 是规范化可读文本的 Unicode 字符索引，不是 HTML 字节。
   每次调用重新抓取（snapshot_stable=false），续页携带前页 SHA-256 时，文本变化会拒绝
   返回，需从零重读；不能将未带版本校验的多次抓取声称为一个稳定快照。
+- `web.find(url, query, offset=0, limit=5, expected_text_sha256?)`：在完整可读抽取中做
+  不区分大小写的字面定位，包括首个 20k 字符之外的内容；不是语义搜索，不执行额外
+  模型调用或 Brave 查询。query 仅在本地处理，不发给网页服务器。最多五个 400 字符
+  片段，返回原 Unicode 匹配与片段偏移、抽取指纹；offset 是命中序号，与 open 的字符
+  偏移不同。用 snippet_start 再 open 可扩读上下文，携带指纹防止混用版本。每次仍
+  重新抓取，沿用 open 的网络/SSRF/类型/字节限制和现有来源约束。无命中不证明网页
+  没有相关语义，也不能覆盖关注项已收集正文的证据及对应抓取时间。
 - Agent 通过 Tool Package Registry 懒展开并经 ToolExecutor 调用；不在 Agent core 里硬编码网络工具。长结果仍进现有 tool-result gate，模型可按需读缓存。网页与邮件/RAG 同为证据，不赋予网页创建事项或执行命令的能力。
 - `observation.search(..., distinct_contexts=true)` 可按不同完整上下文窗口分页，避免近邻
   标签/链接挤占命中数；默认仍按 occurrence 分页。去重窗口不会因单页预算再次缩短，

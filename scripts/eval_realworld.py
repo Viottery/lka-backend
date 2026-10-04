@@ -229,6 +229,11 @@ CASES = {
         "followup_goal": "只再告诉我刚才那个唯一标识，简短即可。",
         "followup_facts": ["willow-739"],
     },
+    "heldout_web_sqlite": {
+        "goal": "请从 SQLite 官方资料核实 WAL 模式的并发限制：是否允许多个写者同时写，读事务看到哪个时点的数据，以及长读事务会怎样影响 checkpoint。核对至少两个相关官方页面，别只根据搜索摘要回答，结论简短且附来源。",
+        "files": {}, "web": True, "search_required": True, "read_only": True,
+        "facts": ["WAL", "checkpoint"],
+    },
 }
 
 

@@ -173,7 +173,7 @@ def test_runtime_registers_web_tools_without_search_key(tmp_path, monkeypatch):
 
     runtime = create_app().state.runtime
     assert {tool.name for tool in runtime.tool_registry.list_tools(package="web")} == {
-        "web.search", "web.open",
+        "web.search", "web.open", "web.find",
     }
     assert all(tool.read_only for tool in runtime.tool_registry.list_tools(package="web"))
 

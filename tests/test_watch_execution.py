@@ -237,6 +237,7 @@ def test_watch_adapter_uses_real_runtime_registry_and_scoped_child(tmp_path, mon
             "web.search",
             "web.open",
             "instructions.read",
+            "web.find",
             "instructions.search",
             "observation.read",
             "observation.search",
@@ -288,6 +289,40 @@ def test_watch_adapter_uses_real_runtime_registry_and_scoped_child(tmp_path, mon
     )
     assert result.summary == "No confirmed change."
     assert result.evidence_sources == ("https://example.org/event",)
+
+
+def test_empty_find_does_not_erase_prior_page_evidence():
+    runtime = _Runtime()
+    runtime.tool_registry.register_tool(type("RegisteredTool", (), {"spec": ToolSpec(
+        name="web.find", package="web", type="local_tool", description="", read_only=True,
+    )})())
+    messages = []
+    runtime.session_service = SimpleNamespace(get_session=lambda **kwargs: SimpleNamespace(messages=messages))
+    original = runtime.run_child_agent_async
+    url = "https://example.org/event"
+
+    async def child(**kwargs):
+        result = await original(**kwargs)
+        messages.append(SimpleNamespace(role="agent", payload={
+            "run_id": kwargs["child_run_id"], "tool_events": [
+                {"tool_name": "web.open", "result": {"status": "completed", "output": {
+                    "url": url, "text": "Confirmed event details", "fetched_at": "original-fetch",
+                }}},
+                {"tool_name": "web.find", "result": {"status": "completed", "output": {
+                    "url": url, "matches": [], "complete": True, "fetched_at": "later-fetch",
+                }}},
+            ],
+        }))
+        return result
+
+    runtime.run_child_agent_async = child
+    parent = runtime.agent_run_manager.create_run(session_id="watch-parent", user_input="check")
+    result = asyncio.run(WatchExecutionAdapter(runtime=runtime).run_async(
+        parent_run_id=parent.run_id, watch_id="watch-event", goal="Check event", web_enabled=True,
+    ))
+    metadata = dict(zip(result.evidence_sources, result.evidence_metadata, strict=True))[url]
+    assert metadata["excerpt"] == "Confirmed event details"
+    assert metadata["fetched_at"] == "original-fetch"
 
 
 def test_watch_adapter_grants_only_requested_workspace_read_and_sets_io_workload():
