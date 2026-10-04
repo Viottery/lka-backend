@@ -86,6 +86,33 @@ def test_explicit_forget_id_applies_before_next_recall(tmp_path):
     assert MemoryContextProvider(service)("s", None, "回答")["items"] == []
 
 
+def test_source_aware_pre_turn_hook_keeps_persisted_identity_and_legacy_contract():
+    from app.core.agent_turn import AgentTurnLoop, _turn_inference_snapshot
+
+    calls = []
+
+    class SourceAware:
+        def __call__(self, workspace, text):
+            raise AssertionError("must use the persisted source callback")
+
+        def on_persisted_user_message(self, workspace, text, message_id):
+            calls.append((workspace, text, message_id))
+
+    loop = AgentTurnLoop.__new__(AgentTurnLoop)
+    loop.memory_pre_turn_callback = SourceAware()
+    loop._apply_memory_pre_turn_gate("workspace", "same text", "exact-user-message")
+    assert calls == [("workspace", "same text", "exact-user-message")]
+    token = _turn_inference_snapshot.set(object())
+    try:
+        loop._apply_memory_pre_turn_gate("workspace", "child text", "child-message")
+    finally:
+        _turn_inference_snapshot.reset(token)
+    assert len(calls) == 1
+    loop.memory_pre_turn_callback = lambda workspace, text: calls.append((workspace, text))
+    loop._apply_memory_pre_turn_gate(None, "legacy", "unused-identity")
+    assert calls[-1] == (None, "legacy")
+
+
 def test_recall_finds_relevant_memory_older_than_recent_pool(tmp_path):
     service = MemoryService(tmp_path / "memory.sqlite3")
     service.ensure_schema()

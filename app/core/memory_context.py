@@ -7,7 +7,12 @@ from datetime import UTC, datetime
 from typing import Any
 
 from app.core.memory_extraction import preference_conflict_hints
-from app.domains.memory import MemoryConflictError, MemoryRecord, MemoryService
+from app.domains.memory import (
+    MemoryConflictError,
+    MemoryRecord,
+    MemoryService,
+    memory_target_matches,
+)
 
 
 class MemoryContextProvider:
@@ -136,16 +141,7 @@ def _opposite_polarity(slot: str, left: str, right: str) -> bool:
 
 
 def _target_matches(target: str, content: str) -> bool:
-    target_terms = _query_terms(target)
-    if not target_terms:
-        return False
-    content_folded = content.casefold()
-    matched = sum(term in content_folded for term in target_terms)
-    # Require a specific lexical anchor and a strong overlap; vague referents
-    # such as “that” or “this memory” must never retract anything.
-    hanzi = "".join(re.findall(r"[\u3400-\u9fff]", target))
-    minimum = 1 if len(hanzi) >= 4 else 2
-    return matched >= minimum and any(len(t) >= 2 for t in target_terms)
+    return memory_target_matches(target, content)
 
 
 class MemoryPreTurnGate:
@@ -155,6 +151,16 @@ class MemoryPreTurnGate:
         self.service = service
 
     def __call__(self, workspace_path: str | None, user_input: str) -> list[str]:
+        return self._apply(workspace_path, user_input, None)
+
+    def on_persisted_user_message(
+        self, workspace_path: str | None, user_input: str, message_id: str,
+    ) -> list[str]:
+        return self._apply(workspace_path, user_input, message_id)
+
+    def _apply(
+        self, workspace_path: str | None, user_input: str, source_message_id: str | None,
+    ) -> list[str]:
         id_matches = list(_FORGET_ID.finditer(user_input))
         targets = [match.group("target") or match.group("target2")
                    for match in _FORGET_WORDING.finditer(user_input)]
@@ -168,12 +174,21 @@ class MemoryPreTurnGate:
         retracted: list[str] = []
         requested_ids = [match.group(1) for match in id_matches]
         correction_hints = preference_conflict_hints(user_input) if correction else ()
+        clauses = [part for part in re.split(r"[，。！？!?；;\n]", user_input)
+                   if correction and re.search(r"(?:不再|不喜欢|不希望|并非|不是|别再|不要)", part)]
+        if targets or clauses or correction_hints:
+            self.service.fence_prior_publication(
+                source_message_id=source_message_id, user_input=user_input, selectors=targets + clauses,
+                hints=[{"slot": h.slot, "polarity": h.polarity, "condition": h.condition}
+                       for h in correction_hints], project_id=project_id,
+            )
         if targets or correction:
-            # Natural-language suppression is deliberately bounded to active
+            # Natural-language suppression is deliberately bounded to active/candidate
             # global/current-project records and needs a strong claim match.
-            candidates = self.service.list(scope="global", limit=1000)
+            candidates = self.service.list(scope="global", statuses=("active", "candidate"), limit=1000)
             if project_id:
-                candidates.extend(self.service.list(scope="project", project_id=project_id, limit=1000))
+                candidates.extend(self.service.list(scope="project", project_id=project_id,
+                                                    statuses=("active", "candidate"), limit=1000))
             for record in candidates:
                 if any(_target_matches(target, record.content) for target in targets):
                     requested_ids.append(record.memory_id)
@@ -202,7 +217,7 @@ class MemoryPreTurnGate:
                 record = self.service.get(memory_id)
             except KeyError:
                 continue
-            if record.status != "active":
+            if record.status not in {"active", "candidate"}:
                 continue
             if record.scope == "project" and record.project_id != project_id:
                 continue

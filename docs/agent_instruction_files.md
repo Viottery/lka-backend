@@ -12,6 +12,11 @@
 
 ## Agent 如何维护
 
+指导文件是用户维护的规则，和后台学习的派生记忆分开。普通偏好表达、纠正或撤回记忆
+不等同于要求改写 `AGENTS.md`；启用后的后台记忆机制负责这类对话学习。只有用户明确
+要求编辑持久指导文件时才使用更新工具，保留无关规则。此区分写在工具包元数据与工具
+描述中，不在 Agent core 硬编码意图；它改善模型决策，不替代执行器的权限与安全检查。
+
 `instructions.search(kind="global"|"watch", query)` 和 `instructions.search_project(path, query)` 查找相关分块并返回偏移量。`instructions.read(kind, offset)` 与 `instructions.read_project(path, offset)` 每次最多返回 16 KiB，按 `next_offset` 续读直到 `truncated=false`；它们不会因源文件总长度而拒绝读取。项目工具只允许读取当前工作区指导文件链中的 `AGENTS.md`。`instructions.read` 还返回完整文件的 SHA；`instructions.update(kind, content, expected_sha256)` 以完整新内容替换，只有 SHA 匹配且单次更新不超过 1 MB 时成功；更新先写临时文件再原子替换。更大的用户文件仍可分页读取，但目前不能通过这个整文件替换工具一次写入。更新工具标记为非只读，经过既有安全审查门并留下工具审计记录。关注任务可使用只读指导检索工具，不能自改指导文件；用户可在普通会话中明确要求 Agent 更新。项目文件继续通过已有 `filesystem.edit_file` 修改，也受工作区和安全审查约束。可直接在本地用编辑器修改这三类文件；下次 turn 或 occurrence 会检测变更并重建索引。
 
 Codex 官方的文件发现方式也是分层注入：从全局目录及仓库路径上的 `AGENTS.md` 读取，按父到子顺序提供给模型；我们的实现借鉴该作用域思想，但加载范围、大小限制和工具权限由本项目代码定义，并非自动继承 Codex CLI 的行为。参考 [OpenAI 官方说明](https://developers.openai.com/api/docs/guides/latest-model?gallery=open&galleryItem=trivia-quiz-game&model=gpt-5.3-codex&translationFallback=de-DE)。

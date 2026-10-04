@@ -521,19 +521,18 @@ class AgentGraphRunner:
             title=turn_user_input[:60] or "Agent Session",
             metadata={"entrypoint": "agent.turn"},
         )
-        self.turn_loop.session_service.append_message(
+        user_message = self.turn_loop.session_service.append_message(
             session_id=session.session_id,
             role="user",
             content=turn_user_input,
             payload={"trace_id": run.trace_id, "entrypoint": "agent.turn"},
             message_id=f"agent_graph_user_{run.run_id}",
         )
-        if self.turn_loop.memory_pre_turn_callback is not None and _turn_inference_snapshot.get() is None:
-            self.turn_loop.memory_pre_turn_callback(
-                session.workspace.backend_path if session.workspace is not None
-                else self.turn_loop.default_workspace_root,
-                turn_user_input,
-            )
+        self.turn_loop._apply_memory_pre_turn_gate(
+            session.workspace.backend_path if session.workspace is not None
+            else self.turn_loop.default_workspace_root,
+            turn_user_input, user_message.message_id,
+        )
         window = self.turn_loop.session_service.get_prompt_context_window(
             session_id=session.session_id, token_budget=self.turn_loop.session_context_token_budget
         ).model_dump(mode="json")

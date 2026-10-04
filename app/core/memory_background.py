@@ -27,7 +27,12 @@ from app.core.llm_workloads import (
 from app.core.memory_extraction import direct_durable_preferences, extract_user_memories
 from app.core.memory_files import MemoryFileError, MemoryFiles
 from app.core.sessions import SessionRecentMessage, SessionService
-from app.domains.memory import MemoryInput, MemoryService, MemorySourceInput
+from app.domains.memory import (
+    MemoryInput,
+    MemoryPublicationSuppressed,
+    MemoryService,
+    MemorySourceInput,
+)
 
 
 class MemoryBackgroundCoordinator:
@@ -486,31 +491,11 @@ class MemoryBackgroundCoordinator:
             if candidate.kind == "project_decision" and project_path is None:
                 continue
             project_id = project_id_for_policy if scope == "project" else None
-            record = self.memory.create(MemoryInput(
-                content=candidate.claim, memory_type=candidate.kind,
-                scope=scope, project_id=project_id, source_id=source_id,
-                confidence=candidate.confidence, sensitivity=candidate.sensitivity,
-                expires_at=candidate.expires_at,
-                dedupe_key=hashlib.sha256(
-                    f"{scope}|{project_id}|{candidate.claim.casefold()}".encode()
-                ).hexdigest(),
-                # Only the deterministic extractor may recognize direct
-                # confirmation (including English remember/future requests).
-                # Model-inferred `explicit` is never publication authority.
-                user_confirmed=used_local and candidate.explicit,
-                extraction_model=(
-                    "local_direct_preference_v1"
-                    if candidate.claim in direct_durable_preferences(user["content"])
-                    else "local_explicit_v1"
-                    if re.match(r"^(?:请)?记住[：:，, ]+", user["content"].strip())
-                    else "local_user_preference_v2" if used_local else "configured_llm_v1"
-                ),
-                metadata={"evidence": candidate.evidence[:500], "conflict_hints": [
-                    {"slot": hint.slot, "polarity": hint.polarity, "condition": hint.condition}
-                    for hint in candidate.conflict_hints
-                ]},
-                publication_lease=(job["job_id"], job["lease_owner"], job["lease_epoch"]),
-            ))
+            try:
+                record = self._publish_candidate(candidate, user, used_local, scope, project_id, source_id, job)
+            except MemoryPublicationSuppressed:
+                # A correction is a terminal skip, not a provider retry/failure.
+                continue
             if record.status == "active":
                 changed_scopes.add((scope, project_id))
         if self.memory_files is not None:
@@ -518,9 +503,34 @@ class MemoryBackgroundCoordinator:
                 try:
                     self.memory_files.generate(scope=scope, project_id=project_id)
                 except (MemoryFileError, OSError) as exc:
-                    # A manually edited view wins; the database memory remains
-                    # published and the conflict is visible to local controls.
+                    # A manually edited view wins; the published database
+                    # memory remains visible through local conflict controls.
                     self.last_file_error = type(exc).__name__
+
+    def _publish_candidate(self, candidate, user, used_local, scope, project_id, source_id, job):
+        return self.memory.create(MemoryInput(
+            content=candidate.claim, memory_type=candidate.kind,
+            scope=scope, project_id=project_id, source_id=source_id,
+            confidence=candidate.confidence, sensitivity=candidate.sensitivity,
+            expires_at=candidate.expires_at,
+            dedupe_key=hashlib.sha256(
+                f"{scope}|{project_id}|{candidate.claim.casefold()}".encode()
+            ).hexdigest(),
+            # Only deterministic extraction supplies publication authority.
+            user_confirmed=used_local and candidate.explicit,
+            extraction_model=(
+                "local_direct_preference_v1"
+                if candidate.claim in direct_durable_preferences(user["content"])
+                else "local_explicit_v1"
+                if re.match(r"^(?:请)?记住[：:，, ]+", user["content"].strip())
+                else "local_user_preference_v2" if used_local else "configured_llm_v1"
+            ),
+            metadata={"evidence": candidate.evidence[:500], "conflict_hints": [
+                {"slot": hint.slot, "polarity": hint.polarity, "condition": hint.condition}
+                for hint in candidate.conflict_hints
+            ]},
+            publication_lease=(job["job_id"], job["lease_owner"], job["lease_epoch"]),
+        ))
 
     def start(self) -> None:
         self.recover_missing_jobs()

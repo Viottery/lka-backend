@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import uuid
 from datetime import UTC, datetime
@@ -79,6 +80,20 @@ def _opposite_hints(left: dict[str, str], right: dict[str, str]) -> bool:
     if allowed is None and left["slot"].startswith("assertion:"):
         allowed = {"positive", "negative"}
     return allowed is not None and {left["polarity"], right["polarity"]} == allowed
+
+
+def memory_target_matches(target: str, content: str) -> bool:
+    terms = re.findall(r"[a-z0-9_+-]{2,}|[\u3400-\u9fff]{2,}", target.casefold())
+    expanded = []
+    for term in terms[:8]:
+        expanded.append(term)
+        if re.fullmatch(r"[\u3400-\u9fff]+", term):
+            expanded.extend(term[i:i + 2] for i in range(len(term) - 1))
+    terms = list(dict.fromkeys(expanded))[:24]
+    # A shared framing bigram (e.g. a preference verb) is not a claim identity.
+    # Require substantial overlap; vague or unrelated selectors fail closed.
+    minimum = max(2, (len(terms) + 1) // 2)
+    return sum(t in content.casefold() for t in terms) >= minimum
 
 
 class MemorySourceInput(BaseModel):
@@ -194,6 +209,11 @@ class MemoryService:
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY(scope, scope_id)
                 );
+                CREATE TABLE IF NOT EXISTS memory_correction_fences(
+                    watermark INTEGER NOT NULL, scope_id TEXT NOT NULL,
+                    selectors TEXT NOT NULL, hints TEXT NOT NULL,
+                    PRIMARY KEY(watermark, scope_id)
+                );
                 """
             )
             try:
@@ -233,6 +253,57 @@ class MemoryService:
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=10000")
         return conn
+
+    def fence_prior_publication(
+        self, *, source_message_id: str | None, user_input: str,
+        selectors: list[str], hints: list[dict[str, str]],
+        project_id: str | None,
+    ) -> None:
+        """Persist a correction before recall; later user sources remain eligible."""
+        if source_message_id is None:
+            # Legacy two-argument gates can retract published state, but lack
+            # authority to fence an unidentified persisted user source.
+            return
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='agent_session_messages'").fetchone():
+                raise ValueError("Persisted correction source is unavailable")
+            row = conn.execute(
+                "SELECT rowid,role,content FROM agent_session_messages WHERE message_id=?",
+                (source_message_id,),
+            ).fetchone()
+            if row is None or row["role"] != "user" or row["content"] != user_input:
+                raise ValueError("Persisted correction source does not match user input")
+            for scope_id in ["global", *([project_id] if project_id else [])]:
+                conn.execute(
+                    "INSERT OR IGNORE INTO memory_correction_fences VALUES(?,?,?,?)",
+                    (row[0], scope_id, _json(selectors), _json(hints)),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _check_correction_fences(self, conn: sqlite3.Connection, source: sqlite3.Row, payload: MemoryInput) -> None:
+        if source["source_type"] != "user_message":
+            return
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='agent_session_messages'").fetchone():
+            return
+        row = conn.execute("SELECT rowid FROM agent_session_messages WHERE message_id=? AND role='user'",
+                           (source["source_ref"],)).fetchone()
+        if row is None:
+            return
+        for fence in conn.execute(
+            # Include the correction's own source: repeating a rejected claim
+            # in a forget instruction is not a new positive assertion.
+            "SELECT selectors,hints FROM memory_correction_fences WHERE scope_id=? AND watermark>=?",
+            (payload.project_id or "global", row[0]),
+        ):
+            if (any(memory_target_matches(t, payload.content) for t in json.loads(fence["selectors"]))
+                    or any(_opposite_hints(old, new)
+                           for old in _valid_conflict_hints(payload.metadata.get("conflict_hints"))
+                           for new in _valid_conflict_hints(json.loads(fence["hints"])))):
+                raise MemoryPublicationSuppressed("Earlier source superseded by user correction")
 
     def set_learning_enabled(
         self, *, scope: MemoryScope, project_id: str | None, enabled: bool,
@@ -441,6 +512,7 @@ class MemoryService:
                 raise KeyError(f"Unknown source: {payload.source_id}")
             if not self._source_valid(source, now):
                 raise ValueError("Source is revoked or expired")
+            self._check_correction_fences(conn, source, payload)
             status: MemoryStatus = "active" if payload.user_confirmed or source["trusted_source"] else "candidate"
             existing = conn.execute("SELECT * FROM memory_entries WHERE memory_id=?", (memory_id,)).fetchone()
             if existing:
@@ -905,6 +977,10 @@ class MemoryService:
     def _record(self,conn: sqlite3.Connection,row: sqlite3.Row) -> MemoryRecord:
         source_ids=[str(r[0]) for r in conn.execute("SELECT source_id FROM memory_entry_sources WHERE memory_id=? ORDER BY source_id",(row["memory_id"],))]
         return MemoryRecord(memory_id=row["memory_id"],memory_type=row["memory_type"],content=row["content"],scope=row["scope"],project_id=row["project_id"],status=row["status"],confidence=row["confidence"],sensitivity=row["sensitivity"],source_ids=source_ids,expires_at=row["expires_at"],version=row["version"],supersedes_id=row["supersedes_id"],created_at=row["created_at"],updated_at=row["updated_at"],metadata=self._effective_metadata(conn, row))
+
+
+class MemoryPublicationSuppressed(ValueError):
+    """An authoritative later user turn rejected this earlier claim."""
 
 
 class MemoryConflictError(RuntimeError):

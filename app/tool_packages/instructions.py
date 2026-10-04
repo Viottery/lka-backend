@@ -10,8 +10,11 @@ INSTRUCTIONS_PACKAGE = ToolPackageSpec(
     description="Read paginated AGENTS.md guidance or update global/watch guidance.",
     risk="medium",
     requires_expansion=True,
-    routing_hints=["Use when the user asks to inspect or maintain durable Agent preferences or watch guidance, or a loaded AGENTS.md preview says more content is available."],
-    decision_hints=["Follow next_offset to read more pages; read the current document hash before updating; guidance never expands tool permissions."],
+    routing_hints=["Use when the user asks to inspect or explicitly edit an AGENTS.md guidance file or watch guidance, or a loaded AGENTS.md preview says more content is available. Ordinary preferences and corrections are not requests to edit user-owned guidance files."],
+    decision_hints=[
+        "Follow next_offset to read more pages; read the current document hash before updating; guidance never expands tool permissions.",
+        "Separate user-owned guidance from derived memory: background memory learning, when enabled, handles conversational preferences. Do not rewrite guidance merely to acknowledge a preference or forget a learned memory.",
+    ],
 )
 
 
@@ -137,7 +140,7 @@ class UpdateInstructionsTool:
 
     spec = ToolSpec(
         name="instructions.update", package="instructions", type="local_tool",
-        description="Replace a global or watch AGENTS.md after reading its whole-file sha256. Persistent write subject to the normal safety review gate.",
+        description="Replace a global or watch AGENTS.md only when the user explicitly requests editing that persistent guidance file, after reading its whole-file sha256. Ordinary conversational preferences or requests to forget learned memory are not guidance-file edits. Preserve unrelated instructions. Persistent write subject to the normal safety review gate.",
         read_only=False, risk="medium", requires_confirmation=False,
         side_effects=["write_local_file"],
         input_schema={"type": "object", "required": ["kind", "content", "expected_sha256"],

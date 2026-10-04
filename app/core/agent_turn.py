@@ -992,6 +992,19 @@ class AgentTurnLoop:
             metadata["inference_profile_id"] = profile_id
         return metadata
 
+    def _apply_memory_pre_turn_gate(
+        self, workspace_path: str | None, user_input: str, source_message_id: str,
+    ) -> None:
+        callback = self.memory_pre_turn_callback
+        if callback is None or _turn_inference_snapshot.get() is not None:
+            return
+        source_callback = getattr(callback, "on_persisted_user_message", None)
+        if callable(source_callback):
+            source_callback(workspace_path, user_input, source_message_id)
+        else:
+            # Preserve the existing two-argument callback contract.
+            callback(workspace_path, user_input)
+
     def _run(
         self,
         *,
@@ -1008,17 +1021,16 @@ class AgentTurnLoop:
             tool_view=self._tool_view_for_run(run_id),
             run_id=run_id,
         )
-        self.session_service.append_message(
+        user_message = self.session_service.append_message(
             session_id=session.session_id,
             role="user",
             content=user_input,
             payload={"trace_id": trace_id, "entrypoint": "agent.turn"},
         )
-        if self.memory_pre_turn_callback is not None and _turn_inference_snapshot.get() is None:
-            self.memory_pre_turn_callback(
-                _session_workspace_path(session) or self.default_workspace_root,
-                user_input,
-            )
+        self._apply_memory_pre_turn_gate(
+            _session_workspace_path(session) or self.default_workspace_root,
+            user_input, user_message.message_id,
+        )
         context_window = self.session_service.get_prompt_context_window(
             session_id=session.session_id,
             token_budget=self.session_context_token_budget,

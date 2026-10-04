@@ -254,6 +254,18 @@ the batch; oversized extraction inputs are bounded in SQL before materializing.
 Direct deterministic confirmations activate; model `explicit` flags do not.
 Independent valid evidence can promote ordinary candidates. Clear in-scope
 forget/correction requests retract before recall, without waiting for a worker.
+The foreground gate receives the exact persisted user message ID, not a lookup
+for the latest matching text. It validates the ID, role and original content and
+persists a global/current-project correction watermark before recall. Publication
+checks matching correction fences inside its existing SQLite transaction, together
+with source validity and the worker lease. A queued or in-flight earlier claim
+cannot be resurrected after withdrawal; a later genuine user source remains eligible.
+The correction's own source is also fenced so a forget request repeating the old
+claim does not reinforce it. Suppressed candidates are terminal skips, not retries.
+Legacy two-argument callbacks remain compatible but cannot create unidentified
+source fences. Lexical targeting requires substantial overlap: generic preference
+verbs must not erase unrelated preferences. This is a conservative linguistic rule,
+not universal semantic matching; source messages and audit history remain local.
 Successfully handled input IDs are checkpointed under the live lease. A later
 batch timeout retries only unfinished inputs, not already published sources.
 Publication and checkpoint are separate transactions: a crash between them can
