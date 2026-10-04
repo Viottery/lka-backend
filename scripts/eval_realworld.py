@@ -182,8 +182,9 @@ def _initialize_fixture_repo(workspace: Path) -> None:
 
 def _child_metrics(child_events: dict[str, list[dict]]) -> dict:
     completed = [event for events in child_events.values() for event in events
-                 if event.get("type") == "llm_completed"]
-    audits = [event.get("payload", {}).get("audit_record") or {} for event in completed]
+                 if event.get("type") == "llm_completed"
+                 or str(event.get("type", "")).endswith(".llm_completed")]
+    audits = [event.get("payload", {}).get("audit_record") or event.get("payload", {}) for event in completed]
     return {
         "llm_calls": len(completed),
         "llm_total_duration_ms": sum(audit.get("duration_ms") or 0 for audit in audits),
@@ -249,7 +250,7 @@ def _import_synthetic_mail_batch(runtime) -> dict:
 
 async def run_case(case_id: str, *, output: Path, budget: LiveBudget, planning: bool = False,
                    timeout: float = 180, mail_db: Path | None = None, protocol: str = "configured",
-                   mail_expert: bool = False) -> dict:
+                   mail_expert: bool = False, full_retrieval: bool = False) -> dict:
     if protocol not in {"configured", "json", "native"}:
         raise ValueError("unsupported protocol experiment")
     case = CASES[case_id]
@@ -283,13 +284,19 @@ async def run_case(case_id: str, *, output: Path, budget: LiveBudget, planning: 
             "imap": config.mail.imap.model_copy(update={"enabled": False})}),
         "memory": config.memory.model_copy(update={"background_enabled": False}),
         "message_history": config.message_history.model_copy(update={"background_enabled": False}),
-        "embedding": config.embedding.model_copy(update={"enabled": False}),
-        "reranker": config.reranker.model_copy(update={"enabled": False}),
+        "embedding": config.embedding.model_copy(update={
+            "enabled": config.embedding.enabled if full_retrieval else False,
+            "local_files_only": True}),
+        "reranker": config.reranker.model_copy(update={
+            "enabled": config.reranker.enabled if full_retrieval else False,
+            "local_files_only": True}),
         # Writes are explicitly authorized inside this synthetic fixture only.
         "safety": config.safety.model_copy(update={"tool_review_mode": "skip"}),
     })
+    initialization_started = time.perf_counter()
     with patch.object(Settings, "load_local_config", return_value=config):
         runtime = LocalKnowledgeAgentRuntime(settings)
+    initialization_seconds = time.perf_counter() - initialization_started
     instrument_service(runtime.agent_llm_client, budget, allowed_model=config.llm.model)
     search_tool = runtime.tool_registry.get_tool_or_none("web.search")
     if search_tool:
@@ -298,14 +305,33 @@ async def run_case(case_id: str, *, output: Path, budget: LiveBudget, planning: 
     mail_snapshot = _import_readonly_mail_snapshot(runtime, mail_db) if case.get("real_mail") else None
     if case.get("synthetic_mail"):
         mail_snapshot = _import_synthetic_mail_batch(runtime)
+    index_result = None
+    index_error = None
+    index_seconds = 0.0
+    if full_retrieval:
+        index_started = time.perf_counter()
+        try:
+            index_result = await asyncio.to_thread(runtime.sync_knowledge_semantic_index,
+                                                   allow_model_download=False)
+        except Exception as exc:  # noqa: BLE001 - retain preparation failures and fallback evidence
+            index_error = {"type": type(exc).__name__, "message": str(exc)}
+        index_seconds = time.perf_counter() - index_started
     session = runtime.create_session(title="quality: " + case_id)
     session_id = session.session.session_id
     runtime.set_session_workspace(session_id=session_id, path=str(workspace.resolve()), platform="linux")
+    evaluation_run = runtime.create_agent_run(session_id=session_id, user_input=case["goal"])
     started = time.perf_counter()
     started_at = datetime.now(UTC)
     report = {"case_id": case_id, "goal": case["goal"], "model": config.llm.model,
               "planning": planning, "protocol": protocol, "session_id": session_id, "private_artifacts": str(root),
               "mail_expert_enabled": mail_expert,
+              "retrieval_config": {"embedding_enabled": config.embedding.enabled,
+                                   "reranker_enabled": config.reranker.enabled},
+              "runtime_initialization_seconds": round(initialization_seconds, 3),
+              "semantic_index_seconds": round(index_seconds, 3),
+              "semantic_index_result": index_result.model_dump(mode="json") if index_result else None,
+              "semantic_index_error": index_error,
+              "evaluation_run_id": evaluation_run.run_id,
               "budget_before": budget.snapshot(), "test_output_cap_if_unspecified": 16384,
               "mail_snapshot": mail_snapshot, "started_at": started_at.isoformat(),
               "code_hashes": {p: hashlib.sha256(Path(p).read_bytes()).hexdigest() for p in
@@ -313,7 +339,7 @@ async def run_case(case_id: str, *, output: Path, budget: LiveBudget, planning: 
                  "app/integrations/web_search.py"]}}
     try:
         result = await asyncio.wait_for(runtime.run_agent_turn_async(
-            session_id=session_id, user_input=case["goal"]), timeout=timeout)
+            session_id=session_id, user_input=case["goal"], existing_run_id=evaluation_run.run_id), timeout=timeout)
         report["result"] = result.model_dump(mode="json")
         answer = result.answer
         parent = runtime.agent_run_manager.get_run(result.run_id)
@@ -373,7 +399,20 @@ async def run_case(case_id: str, *, output: Path, budget: LiveBudget, planning: 
     except Exception as exc:  # noqa: BLE001 - preserve per-case failure evidence
         report["error"] = {"type": type(exc).__name__, "message": str(exc)}
         report["mechanical_pass"] = False
+        if isinstance(exc, TimeoutError):
+            runtime.agent_run_manager.cancel_run(evaluation_run.run_id, reason="isolated evaluation timeout")
     finally:
+        persisted = runtime.agent_run_manager.get_run(evaluation_run.run_id)
+        report["run_snapshot"] = persisted.model_dump(mode="json") if persisted else None
+        report["run_events"] = [event.model_dump(mode="json") for event in
+                                runtime.agent_run_manager.list_events(evaluation_run.run_id)]
+        if persisted and "child_runs" not in report:
+            children = [child for child_id in persisted.child_run_ids
+                        if (child := runtime.agent_run_manager.get_run(child_id)) is not None]
+            report["child_runs"] = [child.model_dump(mode="json") for child in children]
+            report["child_events"] = {child.run_id: [event.model_dump(mode="json") for event in
+                runtime.agent_run_manager.list_events(child.run_id)] for child in children}
+            report["child_metrics"] = _child_metrics(report["child_events"])
         report["task_wall_seconds"] = round(time.perf_counter() - started, 3)
         report["budget_after"] = budget.snapshot()
         (root / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -388,6 +427,8 @@ def main():
     parser.add_argument("--list", action="store_true")
     parser.add_argument("--planning", action="store_true")
     parser.add_argument("--mail-expert", action="store_true", help="isolated opt-in to the existing mail specialist")
+    parser.add_argument("--full-retrieval", action="store_true",
+                        help="use configured cached local embedding/reranker; never download models")
     parser.add_argument("--protocol", choices=["configured", "json", "native"], default="configured",
                         help="isolated capability experiment; does not update persistent config")
     parser.add_argument("--timeout", type=float, default=180)
@@ -405,7 +446,8 @@ def main():
     for case_id in args.case:
         report = asyncio.run(run_case(case_id, output=output, budget=budget,
                                      planning=args.planning, timeout=args.timeout, mail_db=args.mail_db,
-                                     protocol=args.protocol, mail_expert=args.mail_expert))
+                                     protocol=args.protocol, mail_expert=args.mail_expert,
+                                     full_retrieval=args.full_retrieval))
         print(json.dumps({k: report.get(k) for k in
               ("case_id", "task_wall_seconds", "mechanical_pass", "checks", "error", "private_artifacts",
                "budget_after")}, ensure_ascii=False), flush=True)

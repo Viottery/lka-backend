@@ -8,7 +8,7 @@ from scripts.eval_realworld import CASES, _sender_coverage, run_case
 
 
 def test_fixture_runtime_isolated_and_artifact_retained_without_api(tmp_path):
-    async def fake_turn(self, *, session_id, user_input):
+    async def fake_turn(self, *, session_id, user_input, existing_run_id=None):
         return AgentTurnResult(run_id="synthetic", session_id=session_id,
                                trace_id="synthetic", answer="amber citrus-642")
 
@@ -74,3 +74,45 @@ def test_child_metrics_include_usage_and_report_unknown_separately():
     ], "child-b": [{"type": "llm_completed", "payload": {}}]})
     assert metrics == {"llm_calls": 2, "llm_total_duration_ms": 500,
                        "input_tokens": 100, "output_tokens": 20, "calls_missing_usage": 1}
+
+
+def test_timed_out_evaluation_cancels_run_and_keeps_trace(tmp_path):
+    async def stalled_turn(self, *, session_id, user_input, existing_run_id):
+        await asyncio.sleep(1)
+
+    budget = LiveBudget(tmp_path / "budget.sqlite3")
+    with patch("scripts.eval_realworld.LocalKnowledgeAgentRuntime.run_agent_turn_async", stalled_turn):
+        report = asyncio.run(run_case("known_fact", output=tmp_path, budget=budget, timeout=.01))
+    assert report["error"]["type"] == "TimeoutError"
+    assert report["run_snapshot"]["status"] == "cancelled"
+    assert any(event["type"] == "run_cancelled" for event in report["run_events"])
+    assert report["child_runs"] == []
+    assert not report["mechanical_pass"]
+
+
+def test_workflow_expert_usage_is_included_in_child_metrics():
+    from scripts.eval_realworld import _child_metrics
+
+    metrics = _child_metrics({"expert": [{"type": "expert.mail.llm_completed", "payload": {
+        "duration_ms": 800, "input_token_count": 783, "output_token_count": 98,
+    }}]})
+    assert metrics == {"llm_calls": 1, "llm_total_duration_ms": 800,
+                       "input_tokens": 783, "output_tokens": 98, "calls_missing_usage": 0}
+
+
+def test_timeout_cancels_children_and_preserves_their_events(tmp_path):
+    async def stalled_turn(self, *, session_id, user_input, existing_run_id):
+        self.agent_run_manager.create_child_run(
+            parent_run_id=existing_run_id, plan_id="isolated", step_id="waiting",
+            attempt=1, user_input="isolated pending work",
+        )
+        await asyncio.sleep(1)
+
+    budget = LiveBudget(tmp_path / "budget.sqlite3")
+    with patch("scripts.eval_realworld.LocalKnowledgeAgentRuntime.run_agent_turn_async", stalled_turn):
+        report = asyncio.run(run_case("known_fact", output=tmp_path, budget=budget, timeout=.01))
+    assert report["run_snapshot"]["status"] == "cancelled"
+    assert len(report["child_runs"]) == 1
+    assert report["child_runs"][0]["status"] == "cancelled"
+    child_id = report["child_runs"][0]["run_id"]
+    assert any(event["type"] == "run_cancelled" for event in report["child_events"][child_id])
