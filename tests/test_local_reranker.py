@@ -37,6 +37,7 @@ def test_lazy_local_initialization_and_scores_are_input_aligned():
     assert reranker.score("query", ["a", "b", "c"]) == [0.0, 1.0, 2.0]
     assert made == [{
         "model_name": "local/model",
+        "threads": reranker.threads,
         "lazy_load": True,
         "local_files_only": True,
         "cache_dir": "/models",

@@ -7,6 +7,8 @@ import threading
 from collections.abc import Callable, Sequence
 from typing import Any
 
+from app.integrations.onnx_runtime_policy import resolve_onnx_threads
+
 
 class LocalRerankerError(RuntimeError):
     """Recoverable adapter error; callers can continue with the original ranking."""
@@ -36,6 +38,7 @@ class FastEmbedCrossEncoderReranker:
         queue_timeout_ms: int = 25,
         local_files_only: bool = True,
         model_factory: ModelFactory | None = None,
+        threads: int | None = None,
     ) -> None:
         if not model_name:
             raise ValueError("model_name must not be empty")
@@ -52,6 +55,7 @@ class FastEmbedCrossEncoderReranker:
         self.max_query_chars = max_query_chars
         self.max_candidate_chars = max_candidate_chars
         self.local_files_only = local_files_only
+        self.threads = resolve_onnx_threads(threads)
         self.queue_timeout_ms = queue_timeout_ms
         self._model_factory = model_factory
         self._model: Any | None = None
@@ -108,6 +112,7 @@ class FastEmbedCrossEncoderReranker:
                             factory = TextCrossEncoder
                         kwargs: dict[str, Any] = {
                             "model_name": self.model_name,
+                            "threads": self.threads,
                             "lazy_load": True,
                             "local_files_only": self.local_files_only,
                         }

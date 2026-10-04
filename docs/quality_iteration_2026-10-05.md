@@ -680,7 +680,7 @@ child partial，未发布简报，不能验证 unchanged；第 3 轮读到北楼
 - [x] R19-E：网页评测对齐多来源目标；拒绝把搜索候选/无命中/同页分页视作互证。
 - [ ] R19-W：预算 partial 安全交付、原子摘录输出合同和跨来源同事项 identity 闭环；真实后台再次复测。
 - [ ] R19-P：明确区分已授权工具的参数非只读与真正未授权工具；冻结权限下可恢复，复杂任务再测。
-- [ ] R19-C：本地 semantic/rerank 默认 CPU 并发的可复现诊断，不凭猜测修改线程配置。
+- [x] R19-C：本地 semantic/rerank 默认 CPU 并发的可复现诊断，不凭猜测修改线程配置（R20-C）。
 
 执行审计独立 review：P1=0、P2=1，发现 SQLite 经过 Pydantic 非严格 bool 恢复时，
 `0`/`"false"` 能变成合法 False。六个实际 SQLite 反例先红，字段改为 strict bool/null；
@@ -716,4 +716,33 @@ Root 分类/诊断/审计/目录联合 **74 passed /4.46s**，实现者扩展联
 - [x] R20-T：动态分类拒绝非 bool 授权，实际 READ/NONE 零执行及审批路径回归。
 - [ ] R20-S：审查发现 shell 注释和 quoted separator 的解析仍可能绕过参数白名单；先建立真实副作用红例再修复，不宣称完整 shell sandbox。
 - [ ] R20-W：完成预算 partial、完整本地比较与有界模型预览、严格原子摘录和跨来源 identity 的独立审查及真实三轮复测。
-- [ ] R20-C：本地 ONNX 线程策略整合、固定输入性能证据与实际 retrieval 留出复核。
+- [x] R20-C：本地 ONNX 线程策略整合、固定输入性能证据与实际 retrieval 留出复核。
+
+R20-C 本机诊断使用缓存模型、相同四个公开问题与十篇短候选，每个配置先 warm 一轮，再
+串行三轮（12 次 rerank/query embedding）；None/1/2/4 同时改变两模型线程。不下载、不
+调用付费 API；先前失败/超时的脚本尝试保留，不合并为完整样本。结果不是 50 题全链路
+重测，更不能推断答案准确率提高。
+
+| 每个 ONNX session 的 threads | rerank p50 /p95 ms | query embed p50 /p95 ms | 进程 CPU /wall s |
+| --- | ---: | ---: | ---: |
+| 库默认 None（session 0） | 1209.80 /1376.75 | 19.78 /30.62 | 295.44 /23.55 |
+| 1 | 2247.64 /2290.38 | 12.02 /13.35 | 42.32 /41.32 |
+| 2 | 1145.01 /1199.25 | 7.37 /7.74 | 49.11 /22.47 |
+| 4 | 697.84 /813.85 | 5.85 /6.76 | 69.41 /15.24 |
+
+所有固定输入分数、排序与 embedding 向量差异为 0；不是性能/排序的跨机器保证。
+默认改为 available affinity CPU 数上限 4（Windows fallback cpu_count，再 fallback 1），
+显式正整数覆盖保留；无新依赖/下载/配置 API，lazy/local-files-only 不变。实际 adapter
+post-check 两 session 均为 4，归一化向量/分数/排序差异为 0；四问题真实 hybrid+rerank
+检索 p50 1063.41ms /p95 1107.62ms，整次准备与检查 12.17s wall /47.86s CPU。
+post-check rerank 的 title+snippet 输入与直接模型原始文本不相同，因此不伪造严格 A/B。
+Root 线程策略、existing reranker/semantic **73 passed /3.78s**，新策略八例曾先红。
+CPU 诊断/复现与 post-check 原始证据分别留在 ignored 的
+`data/agent_logs/fastembed_threads_20261005_sol_corrected/` 与
+`data/agent_logs/onnx_policy_post_20261005_sol/`。
+独立审查另有 97 项通过，未发现线程策略 P1/P2。四是每个 session 的选项，不是整个
+进程的线程总数上限；两个模型、重叠任务仍可能相加。尚未做真实前台与后台并发负载验收。
+
+同一审查发现 configured fast-path 把 ToolSpec 而非实际注册 Tool 传给只读 helper，带
+ToolView 时会抛 AttributeError。不是刚修的类型判断本体问题；另立修复与快路径权限测试，
+不以“改成静态 read_only”回退绕过动态权限判断。

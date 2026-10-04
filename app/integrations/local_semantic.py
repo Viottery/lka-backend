@@ -16,6 +16,7 @@ from app.domains.knowledge_retrieval import (
     SemanticIndexStatus,
     SemanticVectorRecord,
 )
+from app.integrations.onnx_runtime_policy import resolve_onnx_threads
 
 
 def _now_iso() -> str:
@@ -35,6 +36,7 @@ class FastEmbedEmbeddingProvider(EmbeddingProvider):
         query_prefix: str = "",
         normalized: bool = True,
         local_files_only: bool = True,
+        threads: int | None = None,
     ) -> None:
         self._model_info = EmbeddingModelInfo(
             provider_name="fastembed",
@@ -46,6 +48,7 @@ class FastEmbedEmbeddingProvider(EmbeddingProvider):
         self._batch_size = batch_size
         self._query_prefix = query_prefix
         self._local_files_only = local_files_only
+        self.threads = resolve_onnx_threads(threads)
         self._model = None
         self._model_lock = RLock()
 
@@ -89,6 +92,7 @@ class FastEmbedEmbeddingProvider(EmbeddingProvider):
                     self._model = TextEmbedding(
                         model_name=self._model_info.model_name,
                         cache_dir=self._cache_dir,
+                        threads=self.threads,
                         lazy_load=True,
                         local_files_only=self._local_files_only,
                     )
