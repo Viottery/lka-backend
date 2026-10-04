@@ -170,6 +170,14 @@ class ChildAgentExecutor:
         )
         registry = getattr(getattr(turn_loop, "tool_executor", None), "registry", None)
         child_tool_audit = build_child_tool_audit(result.tool_events, registry)
+        missing_requirements = self._completion_missing_requirements(
+            child_run_id, result.decision_events
+        )
+        if not result.answer.strip():
+            missing_requirements += ("child_answer_missing",)
+        task_status = (
+            TaskResultStatus.PARTIAL if missing_requirements else TaskResultStatus.COMPLETED
+        )
         # AgentGraphRunner records the audit atomically at run finalization,
         # including after a checkpointed safety-review resume. Lightweight
         # adapters persist it here because they do not own the run lifecycle.
@@ -191,11 +199,13 @@ class ChildAgentExecutor:
                 ),
                 "evidence_ids": evidence_ids,
                 "budget": snapshot.budget.model_dump(mode="json"),
+                **({"task_status": task_status.value,
+                    "missing_requirements": missing_requirements}
+                   if status == AgentRunStatus.COMPLETED else {}),
             },
             **refs,
         )
         if status == AgentRunStatus.COMPLETED:
-            task_status = TaskResultStatus.COMPLETED
             failure = None
             summary = result.answer.strip() or "Child Agent completed without a textual answer."
         else:
@@ -213,9 +223,28 @@ class ChildAgentExecutor:
             summary=summary,
             evidence_refs=evidence_refs,
             failure=failure,
-            missing_requirements=() if result.answer.strip() else ("child_answer_missing",),
+            missing_requirements=missing_requirements,
             warnings=warnings,
         )
+
+    def _completion_missing_requirements(
+        self, child_run_id: str, decision_events: Any = (),
+    ) -> tuple[str, ...]:
+        """Classify explicit control termination, never the answer's prose."""
+        missing: list[str] = []
+        for event in self.run_manager.list_events(child_run_id):
+            if event.type == "child_budget_finish":
+                missing.append("child_budget_finish")
+            elif event.type == "subtask_result":
+                missing.extend(event.payload.get("missing_requirements", ()))
+        if decision_events:
+            last = decision_events[-1]
+            action = last.get("action") if isinstance(last, dict) else last.action
+            if action in {
+                "invalid_empty_decision", "invalid_structured_decision", "child_budget_finish",
+            }:
+                missing.append(action)
+        return tuple(dict.fromkeys(missing))
 
     def _context_failure(self, child: Any, snapshot: ContextSnapshot, message: str) -> TaskResult:
         current = self.run_manager.get_run(child.run_id)
@@ -245,6 +274,7 @@ class ChildAgentExecutor:
     ) -> TaskResult:
         current = self.run_manager.get_run(child.run_id)
         status = current.status if current is not None else AgentRunStatus.FAILED
+        missing_requirements: tuple[str, ...] = ()
         if status == AgentRunStatus.CANCELLED:
             result_status = TaskResultStatus.CANCELLED
             failure = None
@@ -281,7 +311,28 @@ class ChildAgentExecutor:
                 recommended_actions=("Answer the pending question, then resume the child run.",),
             )
         elif status == AgentRunStatus.COMPLETED:
-            result_status = TaskResultStatus.COMPLETED
+            data = current.result_snapshot or {}
+            ref = data.get("result_artifact_ref")
+            if isinstance(ref, dict):
+                payload = ref.get("payload")
+                store = getattr(self.runner, "artifact_store", None) or self.run_manager.durable_store
+                if payload is None and store is not None and isinstance(ref.get("artifact_id"), str):
+                    payload = store.load_artifact(ref["artifact_id"])
+                if isinstance(payload, dict) and payload.get("run_id") == child.run_id:
+                    data = payload
+            missing_requirements = self._completion_missing_requirements(
+                child.run_id, data.get("decision_events", ())
+            )
+            answer = data.get("answer")
+            summary = answer.strip() if isinstance(answer, str) else ""
+            if not summary:
+                missing_requirements = tuple(dict.fromkeys(
+                    (*missing_requirements, "child_answer_missing")
+                ))
+                summary = "Child Agent completed without a textual answer."
+            result_status = (
+                TaskResultStatus.PARTIAL if missing_requirements else TaskResultStatus.COMPLETED
+            )
             failure = None
         else:
             result_status = TaskResultStatus.FAILED
@@ -316,11 +367,12 @@ class ChildAgentExecutor:
             summary=(
                 failure.message
                 if failure
-                else str((current.result_snapshot or {}).get("answer", "Child Agent completed."))
-                if result_status == TaskResultStatus.COMPLETED
+                else summary
+                if result_status in {TaskResultStatus.COMPLETED, TaskResultStatus.PARTIAL}
                 else "Child Agent cancelled."
             ),
             failure=failure,
+            missing_requirements=missing_requirements,
             evidence_refs=snapshot.evidence_refs,
         )
 

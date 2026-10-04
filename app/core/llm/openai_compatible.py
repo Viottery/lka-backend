@@ -115,6 +115,7 @@ class OpenAICompatibleLLMClient:
         response = await _run_blocking(self._open_stream, request)
         snapshot = ""
         tool_call_parts: dict[int, dict[str, str]] = {}
+        completion_seen = False
         headers = audit_headers(getattr(response, "headers", {}))
         stream_metadata: dict[str, Any] = {"headers": headers}
         provider_request_id = provider_request_id_from_headers(headers)
@@ -131,6 +132,7 @@ class OpenAICompatibleLLMClient:
                     continue
                 data = text.removeprefix("data:").strip()
                 if data == "[DONE]":
+                    completion_seen = True
                     break
                 try:
                     payload = self._stream_payload(data)
@@ -163,6 +165,8 @@ class OpenAICompatibleLLMClient:
                     return
                 delta, tool_call_deltas, chunk_metadata = self._stream_delta_and_metadata(payload)
                 stream_metadata.update(chunk_metadata)
+                if chunk_metadata.get("finish_reason"):
+                    completion_seen = True
                 for tool_call_delta in tool_call_deltas:
                     index = int(tool_call_delta["index"])
                     part = tool_call_parts.setdefault(
@@ -193,6 +197,10 @@ class OpenAICompatibleLLMClient:
             snapshot,
             metadata={
                 **stream_metadata,
+                "status": "completed" if completion_seen else "incomplete",
+                "partial": not completion_seen,
+                "finish_reason": stream_metadata.get("finish_reason")
+                or ("stream_completed" if completion_seen else "stream_incomplete"),
                 "tool_calls": self._tool_calls_from_parts(tool_call_parts),
             },
         )
@@ -447,6 +455,7 @@ class OpenAICompatibleLLMClient:
 
     def _metadata_from_response(self, response: LLMResponse) -> dict[str, Any]:
         metadata = dict(response.metadata)
+        metadata.update({"status": response.status, "partial": response.partial})
         if response.provider_request_id:
             metadata["provider_request_id"] = response.provider_request_id
         if response.finish_reason:

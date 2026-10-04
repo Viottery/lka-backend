@@ -3094,6 +3094,7 @@ class AgentTurnLoop:
                 "intended patch once, preserving its ID and scope; feedback grants no authority."
             )
         decision_retry: dict[str, Any] | None = None
+        recovery_thinking_enabled: bool | None = None
         for format_attempt in range(1, self.decision_format_max_attempts + 1):
             system_prompt = base_system_prompt
             if decision_retry is not None:
@@ -3113,7 +3114,7 @@ class AgentTurnLoop:
                     package_catalog, expanded_packages=expanded_package_names
                 ),
                 "expanded_package_names": expanded_package_names,
-                "expanded_tools": expanded_tools,
+                "expanded_tools": self._tools_for_prompt(expanded_tools),
                 "agent_catalog": self._agent_catalog_for_prompt() if can_fork else [],
                 "observations": prompt_observations,
                 "completed_tool_calls": self._completed_tool_call_summaries(observations),
@@ -3148,9 +3149,28 @@ class AgentTurnLoop:
                 ),
                 max_output_tokens=control_output_cap,
                 llm_events=llm_events,
+                thinking_enabled=recovery_thinking_enabled,
             )
             if response is None:
                 return None
+            incomplete = (
+                getattr(response, "partial", False) or not response.content.strip()
+                or getattr(response, "status", "completed") != "completed"
+                or str(getattr(response, "finish_reason", "") or "").casefold() in {"length", "max_tokens", "partial"}
+            )
+            if incomplete:
+                if format_attempt < self.decision_format_max_attempts:
+                    recovery_thinking_enabled = self._control_recovery_thinking_flag()
+                    decision_retry = {
+                        "error": "previous_control_generation_incomplete",
+                        "required_response": "Return one complete strict JSON operation; partial or empty output cannot authorize execution.",
+                    }
+                    continue
+                return {
+                    "action": "invalid_empty_decision",
+                    "reason": "Control generation remained incomplete after its bounded repair.",
+                    "_raw_output": response.content,
+                }
             parsed = self._parse_json_object(response.content, strict=True)
             if isinstance(parsed, dict) and parsed:
                 normalized = self._normalize_decision_output(parsed, raw_output=response.content)
@@ -3241,6 +3261,18 @@ class AgentTurnLoop:
         if callable(supports):
             return bool(supports(client_name=_turn_llm_client_name.get()))
         return bool(supports)
+
+    def _control_recovery_thinking_flag(self) -> bool | None:
+        """Use only the selected client's explicit capability for one repair."""
+        supports = getattr(self.llm_client, "supports_thinking_control", None)
+        if not callable(supports):
+            return None
+        client_name, *_ = self._inference_selection()
+        if isinstance(self.llm_client, LLMService) or "client_name" in inspect.signature(supports).parameters:
+            supported = supports(client_name=client_name)
+        else:
+            supported = client_name is None and supports()
+        return False if supported else None
 
     def _can_fork_for_prompt(self) -> bool:
         """Hide unavailable delegation metadata; server validation remains authoritative."""
@@ -3443,7 +3475,7 @@ class AgentTurnLoop:
                     package_catalog, expanded_packages=expanded_package_names
                 ),
                 "expanded_package_names": expanded_package_names,
-                "expanded_tools": expanded_tools,
+                "expanded_tools": self._tools_for_prompt(expanded_tools),
                 "agent_catalog": self._agent_catalog_for_prompt() if can_fork else [],
                 "observations": observations,
                 "completed_tool_calls": completed_tool_calls,
@@ -3474,6 +3506,15 @@ class AgentTurnLoop:
             tool_choice="required" if require_function_call else "auto",
         )
         if response is None:
+            return None
+        if (
+            getattr(response, "partial", False)
+            or getattr(response, "status", "completed") != "completed"
+            or str(getattr(response, "finish_reason", "") or "").casefold()
+            in {"length", "max_tokens", "partial"}
+        ):
+            # Syntactically valid arguments are not authorization when the
+            # provider marks its generation incomplete. Use bounded JSON repair.
             return None
         if not response.tool_calls:
             # Finish is an explicit control function in this protocol. Text,
@@ -3836,7 +3877,7 @@ class AgentTurnLoop:
             {
                 "user_input": user_input,
                 "route_context": self._route_context(route),
-                "expanded_tools": expanded_tools,
+                "expanded_tools": self._tools_for_prompt(expanded_tools),
                 "observations": observations,
                 "malformed_output": raw_output,
             },
@@ -4129,6 +4170,26 @@ class AgentTurnLoop:
             return []
         allowed = set(self.fork_policy.allowed_agent_ids)
         return [entry for entry in provider() if entry.get("agent_id") in allowed]
+
+    @staticmethod
+    def _tools_for_prompt(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Project execution contracts without repeating server-owned plumbing.
+
+        Registry, API results, scope checks and invocation audits retain the full
+        specifications. Nonempty unknown metadata and origin/effect constraints
+        remain visible; this is not a domain-specific schema simplifier.
+        """
+        server_fields = {
+            "resource_lock_fields", "resource_lock_group", "scope_path_fields",
+            "scope_source_fields", "scope_account_fields", "scope_uses_workspace",
+            "scope_uses_sources", "scope_uses_accounts", "scope_filtering_required",
+        }
+        mandatory = {"name", "input_schema", "output_schema", "read_only", "requires_confirmation"}
+        return [{
+            key: value for key, value in tool.items()
+            if key not in server_fields
+            and (key in mandatory or value is not None and value != [] and value != {})
+        } for tool in tools]
 
     def _package_catalog(self, tool_view: ToolView | None = None) -> list[dict[str, Any]]:
         catalog: list[dict[str, Any]] = []
@@ -5692,6 +5753,7 @@ class AgentTurnLoop:
             )
             snapshot = ""
             stream_metadata: dict[str, Any] = {}
+            completed_event_seen = False
             async for event in self.llm_client.stream(request):  # type: ignore[union-attr]
                 stream_metadata.update(
                     {
@@ -5727,6 +5789,9 @@ class AgentTurnLoop:
                         )
                     raise LLMClientError(event.error or "LLM stream failed.")
                 if event.event_type == "llm_completed":
+                    completed_event_seen = True
+                    stream_metadata["status"] = event.metadata.get("status", "completed")
+                    stream_metadata["partial"] = bool(event.metadata.get("partial", False))
                     if event.content_snapshot:
                         snapshot = event.content_snapshot
                     continue
@@ -5750,6 +5815,8 @@ class AgentTurnLoop:
                         "content_snapshot": snapshot,
                     },
                 )
+            if not completed_event_seen:
+                stream_metadata.update({"status": "incomplete", "partial": True})
             return snapshot, stream_metadata
 
         content, stream_metadata = asyncio.run(collect())
@@ -5759,11 +5826,13 @@ class AgentTurnLoop:
             or _turn_llm_client_name.get()
             or "default",
             model=stream_metadata.get("model") or _turn_llm_model.get() or "default",
-            status="completed",
+            status=stream_metadata["status"],
             content=content,
             prompt_summary=prompt_summary,
             response_mode=LLMResponseMode.STREAM,
-            finish_reason=stream_metadata.get("finish_reason") or "stream_completed",
+            finish_reason=stream_metadata.get("finish_reason")
+            or ("stream_incomplete" if stream_metadata["partial"] else "stream_completed"),
+            partial=bool(stream_metadata["partial"]),
             provider_request_id=stream_metadata.get("provider_request_id"),
             usage=stream_metadata.get("usage") or {},
             metadata={"streamed": True, "content_role": content_role},
@@ -5988,6 +6057,18 @@ class AgentTurnLoop:
                     if max_output_tokens is None
                     else min(max_output_tokens, child_output_cap)
                 )
+            # With no provider total, retain the dispatch reservation, including
+            # unseen reasoning/output. This is budget evidence, not actual usage.
+            output_reservation = (
+                max_output_tokens if max_output_tokens is not None
+                else budgeted.output_reserve_tokens
+            )
+            input_reservation = budgeted.input_tokens
+            if child_output_cap is not None:
+                child_budget = self._child_budget_for_prompt()
+                if child_budget is not None:
+                    input_reservation += child_budget["prompt_overhead_tokens"]
+            dispatch_reservation = input_reservation + output_reservation
             started_at = llm_audit_now_iso()
             perf_start = time.perf_counter()
             llm_call_id = stable_llm_call_id(
@@ -6013,6 +6094,8 @@ class AgentTurnLoop:
                     "attempt": attempt,
                     "response_mode": response_mode.value,
                     "input_token_estimate": budgeted.input_tokens,
+                    "output_token_reserve": output_reservation,
+                    "budget_token_reservation": dispatch_reservation,
                     "input_token_limit": budgeted.input_limit,
                     "token_count_method": budgeted.count_method,
                     "token_count_conservative": budgeted.conservative,
@@ -6168,10 +6251,13 @@ class AgentTurnLoop:
                         llm_event.total_token_count
                         if llm_event.total_token_count is not None
                         else max(
-                            (len(system_prompt) + len(user_prompt) + len(response.content) + 3)
-                            // 4,
-                            1,
+                            dispatch_reservation,
+                            (actual_input_tokens or 0) + output_reservation,
                         )
+                    ),
+                    "budget_token_count_method": (
+                        "provider_usage" if llm_event.total_token_count is not None
+                        else "dispatch_reservation"
                     ),
                     "provider_request_id": response.provider_request_id,
                     "finish_reason": response.finish_reason,
@@ -6948,7 +7034,14 @@ class AgentTurnLoop:
 
     def _write_log(self, *, result: AgentTurnResult, user_input: str) -> Path:
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        path = self.log_dir / f"{result.trace_id}.md"
+        # Children share the root trace for correlation, not log-file ownership.
+        manager = _turn_run_manager.get() or self.run_manager
+        run = manager.get_run(result.run_id) if manager is not None else None
+        filename = (
+            f"{result.trace_id}_{result.run_id}.md"
+            if run is not None and run.parent_run_id else f"{result.trace_id}.md"
+        )
+        path = self.log_dir / filename
         sections = [
             "# Agent Turn Log",
             "",

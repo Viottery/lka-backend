@@ -37,7 +37,7 @@ Brave 搜索不超过 3000 次；采用跨运行持久账本，每次发出调�
 ## 当前执行队列
 
 - [x] Q0：持久费用/调用/搜索预留账本，隔离真实运行器，失败也保留 trace；10 项离线验证通过。
-- [ ] Q1：目标式文件查找、长输出读取、原生小代码修复、失败命令恢复基线。
+- [x] Q1：目标式文件查找、长输出读取、原生小代码修复、失败命令恢复和复制整理基线（见 R1/R8/R11/R14）。
 - [ ] Q2：公开网页检索/阅读/多来源综合；页面噪声、遗漏和引用真实性迭代。
 - [ ] Q3：真实邮件只读任务、跨邮件事项变更/数量覆盖/追问重复读取。
 - [ ] Q4：复杂任务拆分、并发、失败反馈与恢复；与单 Agent 比較成本和耗时。
@@ -376,9 +376,21 @@ read_only、确认要求和非空来源/影响约束；完整 registry/API/执�
   记录 `dispatch_reservation`，实际 usage 未知不能当零，也不能冒称精确 token。
 - [x] 邮件专家摘要不再只交付高优先级：低/中优先级但 action_required 的事项仍需交付；
   数量或摘要预算放不下时明确 missing_requirements，不能假装全覆盖。两例先失败后通过。
-- [ ] 子任务 soft-budget/无效决策终止必须 PARTIAL；恢复同样状态，独立 review 已发现空答案
-  恢复窗口与 artifact/快照摘要不一致，修复和 32k 功能集成验证仍在进行。
-- [ ] 子任务共用 trace 仅用于关联，日志文件需 run_id 隔离；已补路径和覆盖回归，待整合提交。
+- [x] 子任务 soft-budget/无效决策终止必须 PARTIAL，不能凭“已验证”文字升级；恢复同样状态。
+  独立 review 的空答案恢复窗口与 artifact/快照摘要不一致已先红后绿；恢复摘要/分类统一
+  使用同一 artifact，缺答案返回明确缺项而非崩溃。17 项 review 专项通过。
+- [x] 子任务共用 trace 仅用于关联，日志文件加入 run_id 隔离，父级保留旧路径兼容。
+  三个同 trace 运行分别写日志，内容均保留，不改 trace 关联协议。
+
+整合子任务/控制/生成边界/前后台专项 52 项通过。32k 并发成功 fixture 使用同一确定性
+本地 tokenizer 做 prompt/模型 usage 两侧计量；原先把 UTF-8 字节上界冒充实际 token 的
+fixture 不再作为成功证据，另保留保守字节计量下读三份、第四份未读 → PARTIAL 的情形。
+没有扩大子任务预算，也没有把 completed 断言改成允许 partial；该 fixture 不是 DeepSeek
+真实并行质量结论。现场复测仍单独记录。
+
+后台 complete-response gate 同样检查 status=incomplete：一例先失败，改后相关 43 项通过，
+避免有完整文本但未完成状态的响应进入记忆发布/压缩。所有新增/改动切片静态检查通过；
+openai_compatible 全文件 Ruff 仍有三处 HEAD 已存在的 UP041/BLE001，未顺手改无关代码。
 
 记忆 forced-model 六例诊断：此前 8 个原始候选全部因 unsupported_claim_paraphrase 被过滤，
 且包括负例候选，不能放宽验证器来“提高准确率”。模型 contract 改为原文 claim/evidence
@@ -394,6 +406,12 @@ read_only、确认要求和非空来源/影响约束；完整 registry/API/执�
 备注保持不变，没有额外文件。模型自行使用 cmp 验证；独立检查原件/副本哈希，不能只根据
 回答声称“已整理”判通过。新增检查器对缺失副本/改原件/多文件/内容归一化均能拒绝。
 评测器相关 9 项通过。此题为小规模静态 CSV，不代表混合月份、碰撞或海量文件性能通过。
+
+前后台资源实测使用真实 Worker/LLMService/admission 与隔离 SQLite、可控提供商：后台
+占槽时前台 5 轮工具式数据库读取、LLM dispatch 与心跳仍可运行，竞争后台不能抢保留槽。
+cancel/deadline 隔离晚返回及 checkpoint 写，槽直到 provider 返回才释放，**不是强制抢占**。
+provider timeout 后重建 store/controller 保留 checkpoint、保守 usage 与任务身份，旧 lease
+不能覆盖新领取结果。相关 52 项通过；尚非完整 Agent/tool-executor 或真实 provider 压测。
 
 截至本轮文件整理，持久账本累计 501 calls/USD3.013260928，Brave 3 queries；其中一项
 此前超时无 usage 的保守预留仍计费，未丢弃。原始数据和诊断只留私有 ignored 目录。

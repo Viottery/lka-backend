@@ -475,10 +475,32 @@ def test_terminal_child_without_answer_explicitly_reports_missing_output():
     assert result.verification is None
 
 
-def test_three_concurrent_tiny_audits_deliver_through_real_child_graph_under_32k(tmp_path):
+@pytest.fixture
+def deterministic_prompt_counter(tmp_path):
+    tokenizers = pytest.importorskip("tokenizers")
+    tokenizer = tokenizers.Tokenizer(
+        tokenizers.models.WordLevel(vocab={"[UNK]": 0}, unk_token="[UNK]")
+    )
+    tokenizer.pre_tokenizer = tokenizers.pre_tokenizers.Whitespace()
+    path = tmp_path / "tokenizer.json"
+    tokenizer.save(str(path))
+    return PromptTokenCounter(path)
+
+
+def test_three_concurrent_tiny_audits_deliver_through_real_child_graph_under_32k(
+    tmp_path, deterministic_prompt_counter,
+):
+    _run_tiny_audits(tmp_path, counter=deterministic_prompt_counter, source_count=3)
+
+
+def test_byte_upper_bound_soft_finish_is_partial_with_exact_reads_and_unknowns(tmp_path):
+    _run_tiny_audits(tmp_path, counter=PromptTokenCounter(), source_count=4)
+
+
+def _run_tiny_audits(tmp_path, *, counter, source_count):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    for index in range(3):
+    for index in range(source_count):
         (workspace / f"fact_{index}.txt").write_text(f"Source {index}: fact {index}.\n")
     runtime = LocalKnowledgeAgentRuntime(
         Settings(
@@ -517,7 +539,6 @@ def test_three_concurrent_tiny_audits_deliver_through_real_child_graph_under_32k
         ToolPackageSpec(name="evidence", description="Evidence.")
     )
     runtime.tool_registry.register_tool(ReadEvidence())
-    counter = PromptTokenCounter()
 
     class ScriptedModel:
         supports_function_calling = False
@@ -532,8 +553,8 @@ def test_three_concurrent_tiny_audits_deliver_through_real_child_graph_under_32k
                         "tool_name": "evidence.read",
                         "tool_input": {"path": f"fact_{read_count}.txt"},
                     }
-                    if read_count < 3
-                    else {"type": "final_answer", "reason": "Three sources read."}
+                    if read_count < source_count
+                    else {"type": "final_answer", "reason": "All assigned sources read."}
                 )
                 content = json.dumps({"operation": operation})
             elif kwargs["metadata"]["stage"] == "answer":
@@ -541,7 +562,13 @@ def test_three_concurrent_tiny_audits_deliver_through_real_child_graph_under_32k
                     o for o in payload["observations"] if o.get("tool_name") == "evidence.read"
                 ]
                 assert len(results) == 3
-                content = "Three cited source findings: fact 0, fact 1, fact 2. No independent verification claimed."
+                assert [o["result"]["output"]["text"] for o in results] == [
+                    f"Source {index}: fact {index}.\n" for index in range(3)
+                ]
+                content = "Cited source findings: fact 0, fact 1, fact 2."
+                if len(results) < source_count:
+                    content += " Unknown/unread: fact 3."
+                content += " No independent verification claimed."
             else:
                 raise AssertionError(f"Unexpected model stage: {kwargs['metadata']['stage']}")
             input_tokens = counter.count_request(
@@ -564,6 +591,10 @@ def test_three_concurrent_tiny_audits_deliver_through_real_child_graph_under_32k
 
     loop = runtime.agent_turn_loop
     loop.llm_client = ScriptedModel()
+    # The deterministic provider and prompt fitter use the exact same units.
+    # A byte upper bound remains a distinct conservative-pressure scenario.
+    loop._prompt_counters[None] = counter
+    loop._selected_session_counter = lambda: counter
     manager = runtime.agent_run_manager
     parent = manager.create_run(session_id="parent", user_input="Three independent audits.")
     manager.mark_running(parent.run_id)
@@ -604,7 +635,10 @@ def test_three_concurrent_tiny_audits_deliver_through_real_child_graph_under_32k
                     correlation_id=parent.trace_id,
                     step_id=f"audit_{index}",
                     agent_kind="leaf",
-                    objective="Read fact_0.txt, fact_1.txt and fact_2.txt; report supported facts.",
+                    objective=(
+                        "Read " + ", ".join(f"fact_{i}.txt" for i in range(source_count))
+                        + "; report supported facts and unread unknowns."
+                    ),
                     output_contract="Concise findings citing each source; list remaining unknowns.",
                     allowed_packages=scope.allowed_packages,
                     allowed_tools=scope.allowed_tools,
@@ -624,14 +658,30 @@ def test_three_concurrent_tiny_audits_deliver_through_real_child_graph_under_32k
             child_run_id=child.run_id, snapshot=derived.snapshot, views=derived.views
         )
         events = manager.list_events(child.run_id)
-        assert result.status.value == "completed", result.failure
+        finishes = [e for e in events if e.type == "child_budget_finish"]
+        if counter.count_text("").conservative:
+            assert result.status.value == "partial"
+            assert result.missing_requirements == ("child_budget_finish",)
+            assert len(finishes) == 1
+            assert finishes[0].payload["control_output_allowance"] < 256
+            assert "Unknown/unread: fact 3." in result.summary
+        else:
+            assert result.status.value == "completed", result.failure
+            assert result.missing_requirements == ()
+            assert finishes == []
+            assert sum(e.stage == "decision" and e.type == "llm_completed" for e in events) == 4
+            assert "Unknown/unread" not in result.summary
         assert "fact 2" in result.summary
         assert result.verification is None
+        assert manager.get_run(child.run_id).metadata["context_snapshot"]["budget"]["max_tokens"] == 32768
         assert (
             sum(e.payload["budget_token_count"] for e in events if e.type == "llm_completed")
             < 32768
         )
         assert sum(e.type == "tool_completed" for e in events) == 3
+        for event in events:
+            if event.type == "llm_completed":
+                assert event.payload["input_token_actual"] == event.payload["input_token_estimate"]
         assert any(e.stage == "answer" and e.type == "llm_completed" for e in events)
         return result
 

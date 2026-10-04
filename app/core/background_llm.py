@@ -65,6 +65,7 @@ def _incomplete(response: Any) -> bool:
         finish_reason = metadata.get("finish_reason")
     return (
         not isinstance(content, str) or not content.strip()
+        or getattr(response, "status", "completed") != "completed"
         or bool(getattr(response, "partial", False))
         or str(finish_reason or "").casefold() in {"length", "max_tokens", "partial"}
     )
