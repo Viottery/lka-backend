@@ -1242,7 +1242,7 @@ class AgentTurnLoop:
             {
                 "user_input": user_input,
                 "session_context_window": self._context_window_for_llm(context_window),
-                "package_catalog": package_catalog,
+                "package_catalog": self._catalog_for_prompt(package_catalog),
             },
             ensure_ascii=False,
             indent=2,
@@ -2702,7 +2702,9 @@ class AgentTurnLoop:
                 "user_input": user_input,
                 "session_context_window": self._context_window_for_llm(context_window),
                 "route_context": self._route_context(route),
-                "package_catalog": package_catalog,
+                "package_catalog": self._catalog_for_prompt(
+                    package_catalog, expanded_packages=expanded_package_names
+                ),
                 "expanded_package_names": expanded_package_names,
                 "expanded_tools": expanded_tools,
                 "observations": prompt_observations,
@@ -2971,7 +2973,9 @@ class AgentTurnLoop:
                 "user_input": user_input,
                 "session_context_window": self._context_window_for_llm(context_window),
                 "route_context": self._route_context(route),
-                "package_catalog": package_catalog,
+                "package_catalog": self._catalog_for_prompt(
+                    package_catalog, expanded_packages=expanded_package_names
+                ),
                 "expanded_package_names": expanded_package_names,
                 "expanded_tools": expanded_tools,
                 "observations": observations,
@@ -3616,6 +3620,23 @@ class AgentTurnLoop:
                     effective_tool_read_only(self.tool_executor.registry.get_tool(tool.name), {})
                 ),
             )
+        ]
+
+    @staticmethod
+    def _catalog_for_prompt(
+        catalog: list[dict[str, Any]], *, expanded_packages: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Discover packages cheaply; load execution guidance only on expansion.
+
+        The registry/audit retains full metadata. Server-side scope and tool
+        schema enforcement are unchanged; this is only the model-visible view.
+        """
+        expanded = set(expanded_packages or [])
+        execution_fields = {"decision_hints", "tool_names", "observation_cache"}
+        return [
+            dict(package) if package.get("name") in expanded
+            else {key: value for key, value in package.items() if key not in execution_fields}
+            for package in catalog
         ]
 
     def _package_catalog(self, tool_view: ToolView | None = None) -> list[dict[str, Any]]:
