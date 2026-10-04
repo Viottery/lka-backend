@@ -238,6 +238,9 @@ def test_watch_adapter_uses_real_runtime_registry_and_scoped_child(tmp_path, mon
             "web.open",
             "instructions.read",
             "instructions.search",
+            "observation.read",
+            "observation.search",
+            "observation.group",
         }
         assert view.side_effect_level.value == "read"
         child = runtime.agent_run_manager.get_run(kwargs["child_run_id"])

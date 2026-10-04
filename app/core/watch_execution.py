@@ -174,6 +174,14 @@ class WatchExecutionAdapter:
             workspace_paths = tuple(path.as_posix() for path in resolved_paths)
         if not requested_tools:
             raise ValueError("Watch has no authorized read-only information source.")
+        if not any(spec.name in requested_tools and spec.read_only is True and spec.package
+                   for spec in registry.list_tools()):
+            raise ValueError("Watch has no registered read-only information source.")
+        # Cache navigation is not a new information source. It only recovers
+        # observations produced in this child run; readers enforce ownership.
+        # Add it after the source-grant check so helpers alone cannot grant a
+        # watch permission to run or expose another occurrence's artifacts.
+        requested_tools.update({"observation.read", "observation.search", "observation.group"})
         if instruction_tools_enabled:
             requested_tools.update({"instructions.read", "instructions.search"})
         registered_read_tools = {

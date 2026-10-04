@@ -437,8 +437,8 @@ provider timeout 后重建 store/controller 保留 checkpoint、保守 usage 与
 
 下一轮局部 TODO：
 
-- [ ] R15-W1：缓存检索可选不同上下文窗口去重，保留边缘新证据、明确分页单位；不按站点硬编码。
-- [ ] R15-W2：网页原文超过 20k 应可继续读取，有全长/位置/完整性/变化说明；保持 SSRF 与字节边界。
+- [x] R15-W1：缓存检索可选不同上下文窗口去重，保留边缘新证据、明确分页单位；不按站点硬编码。
+- [x] R15-W2：网页原文超过 20k 应可继续读取，有全长/位置/完整性/变化说明；保持 SSRF 与字节边界。
 - [ ] R15-W3：聚合观察淘汰后可定位证据，不反复重新检索和丢失已读支持；同题/不同页面复测。
 - [x] R15-M1：共享验证器回看原始消息子句，候选删除否定/纠正/条件或临时限定时拒绝；
   连 evidence 也截短不能绕过。原文完整负向/条件偏好和已有中文正向 paraphrase 保留。
@@ -449,3 +449,62 @@ provider timeout 后重建 store/controller 保留 checkpoint、保守 usage 与
 
 记忆对抗用例 54 项先红后绿，合并相关 139 项通过，另四项 fake-client 集成通过；真实
 模型四个正候选的措辞/支持率仍按 R14 原记录，不把离线对抗回归宣传为新的真实准确率。
+
+### R16：恢复状态、证据交付与真正的后台撤回边界
+
+网页去重/分页后同题仍未完整通过：123.138s、17 calls、10 tools、141982 输入/23288 输出，
+1 次 Brave。模型实际用了 distinct_contexts，取到了支持级别与扩展兼容性证据，但没有继续
+web.open 分页；3.13 实验性质/默认状态的已读片段在最终回答的 16k 观察投影中被淘汰。
+必要关键词检查仍为真，人工语义评估仍判未完整完成；不宣称已解决多来源检索质量。
+
+工具修复不提升默认单页 20k 字符：web.open 支持 Unicode 字符 offset/max_chars，报告
+total_chars/next_offset/has_more、完整可读抽取 SHA-256 和 snapshot_stable=false。续页会重新
+抓取；携带 expected_text_sha256 后抽取变化直接失败，不能把不同版本拼成稳定快照。
+1MB 响应边界、公开 HTTPS、DNS/重定向/SSRF 约束不变。完整可读抽取不是原始 HTML 全文。
+typed 输出合同及变异协议等 65 项通过，独立阅读/分页检查未发现阻断问题。
+
+独立审查发现去重依据的完整 500 字符窗口随后被缩短，10 个窗口中的事实实际 0/10 可见，
+却 complete=true。修复后不缩短去重窗口，而是减少当页窗口数并正确续页；6+4 窗口包含
+10/10 原事实，24 项缓存读取/分页回归通过，旧默认 occurrence 模式保持原语义。
+
+主 Agent 最终综合与决策工作集分开：root answer 可见观察字符上限为 64k，decision 与
+child answer 仍为 16k；不是将模型 token 窗口扩大到 64k。真正 dispatch 前仍使用当前选定
+tokenizer 对整个提示、系统信息和输出预留做原有预算检查。六来源旧投影丢两个来源，新投影
+保留六个；60 条大观察仍有界且保留缓存引用。独立审查又发现第二层 provider 裁剪可能丢失
+第一层省略引用，正在补机器可读引用合并，不以更大的字符投影代替最终预算。
+
+真实并行复测 240.019s 超时：两个子任务实际读取全部五份资料，却因预算收尾返回 PARTIAL；
+父级随后多轮规划，未交付。另一个替代子任务仅输出上下文答案，不能称为独立取证成功。
+确认 scheduler 在 retry/reduced_scope 后复用旧 completed-child/PARTIAL 的状态错误；修复
+还需覆盖 plan-history 已落盘但 patch-event 未落盘的崩溃间隙。先增加 fault-injection 回归，
+不凭正常路径 replay 通过就宣称崩溃恢复完成。
+
+无法完成的父级现在可直接交付有界的已有局部事实和缺口，不调用额外 LLM、不清除 unresolved
+gate、不把 child completed 文字当独立核验。校验 parent/plan/step/attempt/trace 身份，最多
+展示八个子结果，完整内容仍在原记录。review 进一步要求显式披露 canonical 聚合来源冲突、
+重复结果冲突与缺组；三个真实反例先失败后通过，相关交付/规划/证据 40 项通过。
+
+完整 Runtime→Graph→持久答案→真实后台 Worker→新会话记忆测试：普通偏好跨会话强化后召回、
+项目确认与隔离通过；**用户撤回后，旧排队偏好仍可被晚到 Worker 发布并再次注入**。
+这是实际链路问题，不是模型语义推测，正在修复发布与撤回的竞态。测试不直接创建 active
+memory 或伪造会话答案；脚本模型只证明接线/策略，不能作为真实模型学习准确率。
+
+定时关注另确认：授权源工具产生长结果后，原 ToolView 没有缓存读取工具，真实执行器拒绝
+observation.search。现仅在已验证存在授权源后增加当前 child 的只读缓存导航；缓存读取仍
+校验当前 run，不能读其他 occurrence、扩大文件 scope 或写入。独立 review 再发现只有
+requested source、但 registry 仅有 helpers 时也可能启动；新增反例先红后绿，先验证注册
+只读源再增加 helpers。此专项直接验证真实 adapter、ToolLifecycle/cache/executor，不冒称
+全模型定时工作质量已通过。相关 38 项通过；完整脚本 Graph 邮件场景的四次执行分别建立
+独立会话。旧脚本 fixture 不带 usage 且按已替换的 child prompt 文案判 stage；现改按实际
+stage metadata 响应、使用同一 tokenizer 计量请求与脚本 provider usage，不扩大生产 40k
+预算。未知 usage 的保守预留与 1-token 失败负例仍保留。
+
+截至本轮真实复测，账本累计 585 calls/USD3.644180320、Brave 5 queries；583 次有已知 usage，
+另外两次保守预留仍保留。搜索账本中的费用 0 不代表 Brave 免费，只代表此账本按次数限制。
+
+本轮局部 TODO：
+
+- [ ] R16-P：原子/可恢复 patch publication，崩溃、重试、取消不复用旧 partial；真实并行与单 Agent 消融。
+- [ ] R16-E：两层观察裁剪合并省略引用；有界局部交付明示已知冲突；多来源网页再次语义复测。
+- [ ] R16-M：撤回/纠正先于 Worker 与发布途中竞争，不能晚到重新记忆；新会话及项目隔离复核。
+- [x] R16-W：关注长结果可恢复且不扩权；多日变化/不变/取证失败/每次新会话回归。

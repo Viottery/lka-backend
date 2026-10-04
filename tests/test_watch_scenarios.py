@@ -12,6 +12,7 @@ from app.core.watch_scheduler import WatchScheduler
 from app.domains.mail import MailAccountInput, MailMessageInput
 from app.domains.watch import WatchInput
 from app.domains.watch_briefing import normalize_briefing
+from tests.test_child_budget_quality import deterministic_prompt_counter  # noqa: F401
 
 SOURCE = {
     "kind": "source",
@@ -244,16 +245,18 @@ def test_excerpt_support_fails_closed_for_negation_and_token_overlap():
 class _WatchMailLLM:
     """Scripted turn client: it chooses real mail tools, then cites their returned records."""
 
-    def __init__(self):
+    def __init__(self, counter):
+        self.counter = counter
         self.requested_tools: list[str] = []
         self.answer_requests: list[dict] = []
 
     def complete_text(self, *, system_prompt, user_prompt, prompt_summary, **_kwargs):
-        if "Choose at most one tool package" in system_prompt:
+        stage = _kwargs.get("metadata", {}).get("stage")
+        if stage == "route":
             content = json.dumps(
                 {"selected_package": "mail", "reason": "Read the authorized mailbox."}
             )
-        elif "Tool Result Checker" in system_prompt:
+        elif stage == "tool_result_check":
             content = json.dumps(
                 {
                     "status": "accepted",
@@ -261,7 +264,7 @@ class _WatchMailLLM:
                     "remaining_work": "Continue.",
                 }
             )
-        elif "Choose the next single action" in system_prompt:
+        elif stage == "decision":
             observations = json.loads(user_prompt)["observations"]
             if not observations:
                 tool_name = "mail.search"
@@ -301,7 +304,7 @@ class _WatchMailLLM:
             content = json.dumps(
                 {"operation": operation, "assistant_message": "Checking authorized mail."}
             )
-        elif "Final Answer Writer" in system_prompt:
+        elif stage == "answer":
             self.answer_requests.append(
                 {
                     "require_json": _kwargs.get("require_json"),
@@ -349,17 +352,23 @@ class _WatchMailLLM:
                 }
             )
         else:
-            content = "Unexpected prompt stage."
+            raise AssertionError(f"Unexpected prompt stage: {stage}")
+        input_tokens = self.counter.count_request(system_prompt, user_prompt).count
+        output_tokens = self.counter.count_text(content).count
         return LLMResponse(
             provider="watch_scenario_fake",
             status="completed",
             content=content,
             prompt_summary=prompt_summary,
+            usage={"prompt_tokens": input_tokens, "completion_tokens": output_tokens,
+                   "total_tokens": input_tokens + output_tokens},
         )
 
 
 @pytest.mark.parametrize("token_budget", [None, 1], ids=["evidence_flow", "token_exhausted"])
-def test_daily_mail_watch_real_tool_executor_child_and_evidence_flow(tmp_path, monkeypatch, token_budget):
+def test_daily_mail_watch_real_tool_executor_child_and_evidence_flow(
+    tmp_path, monkeypatch, token_budget, deterministic_prompt_counter,  # noqa: F811 - pytest fixture
+):
     if token_budget is not None:
         monkeypatch.setattr(watch_execution, "WATCH_MAX_TOKENS", token_budget)
     monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
@@ -397,8 +406,13 @@ def test_daily_mail_watch_real_tool_executor_child_and_evidence_flow(tmp_path, m
             scope={"source_ids": [source_id], "account_ids": [account_id]},
         )
     )
-    client = _WatchMailLLM()
+    client = _WatchMailLLM(deterministic_prompt_counter)
     runtime.agent_turn_loop.llm_client = client
+    # Scripted provider usage and request estimates must use the same units.
+    # Missing usage is deliberately conservative in production, not a fake
+    # provider's permission to finish an arbitrarily long watch for free.
+    runtime.agent_turn_loop._prompt_counters[None] = deterministic_prompt_counter
+    runtime.agent_turn_loop._selected_session_counter = lambda: deterministic_prompt_counter
     scheduler = WatchScheduler(runtime, service)
     captured_views = []
     original_run_child = runtime.run_child_agent_async
@@ -475,6 +489,7 @@ def test_daily_mail_watch_real_tool_executor_child_and_evidence_flow(tmp_path, m
     runtime.mail_knowledge_mirror.search = original_search
     assert failed["changes"] == []
     assert any("mail.search:failed" in item["reason"] for item in failed["unconfirmed"])
+    assert len({item["session_id"] for item in (first, second, third, failed)}) == 4
 
     assert len(captured_views) == 4
     for view in captured_views:

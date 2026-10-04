@@ -49,7 +49,9 @@ def test_open_prefers_article_content_and_removes_page_chrome_and_hidden_text():
     assert page["url"] == "https://8.8.8.8/example"
     assert page["fetched_at"]
     assert page["truncated"] is False
-    assert set(page) == {"url", "fetched_at", "text", "truncated"}
+    assert {"url", "fetched_at", "text", "truncated"} <= set(page)
+    assert page["total_chars"] == len(text) and page["has_more"] is False
+    assert page["next_offset"] is None and page["snapshot_stable"] is False
 
 
 def test_open_falls_back_to_body_text_when_page_has_no_main_or_article():

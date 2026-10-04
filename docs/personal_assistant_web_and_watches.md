@@ -1,6 +1,8 @@
 # 网络检索与持续关注开发设计
 
-状态：只读网络检索、每日关注后端调度、会话简报已实现；前端推送和真实服务验证待完成。
+状态：只读网络检索、每日关注后端调度、会话简报已实现；网络已做真实 provider 测试，
+持续关注的模型语义质量及前端推送仍需分别验收。真实质量记录见
+[Linux 质量迭代](quality_iteration_2026-10-05.md)，不能将工具连通当任务质量通过。
 
 持续关注的长期全局指导使用 `data/instructions/watches/AGENTS.md`；其加载、维护与权限边界见 [Agent 指导文件](agent_instruction_files.md)。
 
@@ -26,8 +28,18 @@
 ## 阶段 A 网络检索工具包
 
 - `web.search(query, mode=web|news, freshness?, limit?)`：可替换搜索 provider；先提供 Brave Search API 适配器（需用户配置服务端密钥）。返回标题、URL、有限摘要、发布时间/抓取时间（若 provider 有）、查询参数、结果数量和可能仍有更多结果的提示。服务不可用、限额或网络错误与“零结果”严格区分。
-- `web.open(url)`：只读取公开 HTTPS 文本/HTML，不使用用户登录态，不执行 JavaScript；限制响应类型、大小、时间、重定向和页面文字长度。必须拒绝内网、环回、链路本地、保留地址及 DNS 重绑定/重定向 SSRF 风险。返回规范化 URL、抓取时间、截断状态和有界正文，来源可追踪。
+- `web.open(url, offset=0, max_chars=20000, expected_text_sha256?)`：只读取公开 HTTPS
+  文本/HTML，不使用用户登录态、不执行 JavaScript；限制类型、1MB 响应、时间、重定向和
+  单页可读文本字符数。拒绝内网、环回、链路本地、保留地址及 DNS 重绑定/重定向 SSRF。
+  返回规范化 URL、抓取时间、当前 offset/returned_chars、完整抽取 total_chars、续页位置、
+  has_more、text_sha256；offset 是规范化可读文本的 Unicode 字符索引，不是 HTML 字节。
+  每次调用重新抓取（snapshot_stable=false），续页携带前页 SHA-256 时，文本变化会拒绝
+  返回，需从零重读；不能将未带版本校验的多次抓取声称为一个稳定快照。
 - Agent 通过 Tool Package Registry 懒展开并经 ToolExecutor 调用；不在 Agent core 里硬编码网络工具。长结果仍进现有 tool-result gate，模型可按需读缓存。网页与邮件/RAG 同为证据，不赋予网页创建事项或执行命令的能力。
+- `observation.search(..., distinct_contexts=true)` 可按不同完整上下文窗口分页，避免近邻
+  标签/链接挤占命中数；默认仍按 occurrence 分页。去重窗口不会因单页预算再次缩短，
+  放不下时返回较少窗口及 next_offset。缓存的 complete 只描述该缓存内容，不能证明
+  web.open 的其他源页已读；用 web.open 的 next_offset 才能读取未抓入当前结果的部分。
 - 先用 mock HTTP 结果验证解析、分页、限额、超时、SSRF/重定向及截断；没有密钥时必须明确不可用。真实 provider 的连通性只有在用户配置密钥后才能验收。
 
 当前默认 Brave Search。其 [官方价格页](https://brave.com/search/api/) 标示 Search 计划每 1000 次请求 5 美元，每月附带 5 美元额度；[额度说明](https://api-dashboard.search.brave.com/documentation/resources/help-feedback) 允许预付额设为 0，以免费月额度运行，超限请求会被拒绝。本地默认每 UTC 月最多请求 900 次（可配置），相当于按当前价格计的 4.50 美元用量；这只约束此后端产生的请求，建议同时在 Brave 控制台设预付额 0。每个 Agent 任务最多 8 次工具调用，但工具调用数不等于搜索次数预算；要严格保证“搜索 API 花费不超过 LLM 花费”，仍需把两类实际用量统一记账。未配置密钥时 `web.search` 会明确不可用，不会偷偷切换到付费渠道。
@@ -50,7 +62,15 @@
 
 单次关注检查当前最多 40,000 token、6 次 LLM 调用、8 次工具调用、120 秒。token 预算包含输入提示；未配置 tokenizer 时采用保守计数。原 30,000 上限在带先前观察和指导工具的两封短邮件检索/加载流程中可能在最终决策前耗尽，因此提高到仍有界的 40,000；超预算继续失败，不发布新简报。
 
-当前执行适配器使用受限 Child Agent：只开放经注册的只读工具，分别对本地 source/account 与公开 web 明确授权；同一关注项同时读取私密账户与调用外部搜索时，还必须显式设置 `scope.allow_mixed_private_external=true`。网页内容及简报不能提升工具权限。当前简报仅保留 Agent 摘要与已提取的结构化证据引用，尚无专门的事实差异抽取、官方来源优先级和强制引用核验，因此票务/演出信息必须视为待复核。
+当前执行适配器使用受限 Child Agent：只开放经注册的只读工具，分别对本地 source/account
+与公开 web 明确授权；同一关注项同时读取私密账户与调用外部搜索时，还必须显式设置
+`scope.allow_mixed_private_external=true`。网页内容及简报不能提升工具权限。
+当前简报会解析变化/未变/无法确认/需决策，依据实际收集引用和有界原文片段做确定性支持
+检查，并与上次观察去重；重要性阈值、包含/排除关键词和来源时效规则生效。无法解析、
+伪造/缺失引用、片段不支持及检索失败进入 unconfirmed，不算“没有变化”。这是保守的
+字面证据检查，不是完整语义事实验证，也不具备自动官方来源优先级。票务/演出仍需复核。
+已获准源工具之后，watch ToolView 还允许当前 child 的 observation.read/search/group；
+缓存导航不是独立信息源，不能让无注册源工具的任务启动，也不能读其他 occurrence 缓存。
 
 ### 当前使用方式
 
@@ -58,7 +78,11 @@
 2. 向 `POST /watches` 提交例如 `{"title":"演出票务","goal":"每天核查某演出官方票务状态并给出处","timezone":"Asia/Shanghai","daily_time":"09:00","categories":["web","news"],"scope":{"web_enabled":true}}`。响应给出长期 `watch_id`，此时不创建会话。
 3. 到点后后端启动最多两个后台 worker；也可调用 `POST /watches/{watch_id}/run-now`。每个执行记录及简报都有独立 `session_id`；查询 `GET /watches/{watch_id}/runs`、`GET /watches/briefings` 或通用会话接口查看结果，并在该次会话追问。`POST /watches/{watch_id}/pause` 暂停。前端可轮询这些只读接口后自行决定推送；后端不发送外部通知。
 
-当前只有每日时刻与手动运行两类触发，`importance_rules` 只是持久化配置，尚未参与变化判定；Agent 摘要也未被严格解析成“新增/未变化/需决策”的结构化变化事件。因此这是可运行的关注任务骨架，不应直接用于自动购票、库存告警或其他需要高准确率的决策。后续优先做引用核验、变化指纹去重、按事件触发与推送游标，再对真实邮箱和票务/演出样本做评测。
+当前只有每日时刻与手动运行两类触发；结构化变化、引用检查、指纹去重及基础重要性规则
+已有后端实现。隔离邮件的四次真实 Graph/tool-executor 执行覆盖新增、未变、新旧并存和
+检索失败，每次简报创建独立会话；使用脚本模型，只证明接线/规则，不代表真实模型语义
+准确率。不应直接用于自动购票、库存告警或其他需要高准确率的决策。后续仍需事件触发、
+前端推送游标与真实邮箱/票务语义评测，尤其长来源、状态否定及多日变更。
 
 ## 实施顺序与验收
 

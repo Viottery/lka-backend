@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import http.client
 import ipaddress
 import re
@@ -333,7 +334,27 @@ class PublicPageFetcher:
         self.max_redirects = max_redirects
         self.transport = transport
 
-    def open(self, url: str) -> dict[str, Any]:
+    def open(
+        self, url: str, *, offset: int = 0, max_chars: int | None = None,
+        expected_text_sha256: str | None = None,
+    ) -> dict[str, Any]:
+        """Slice this fresh fetch's full readable extraction, not a stable cache.
+
+        Offsets count Unicode characters in the normalized extraction. A caller
+        continuing a page can require the previous extraction's fingerprint;
+        changed text fails closed instead of silently mixing revisions.
+        """
+        cap = min(self.max_text_chars, MAX_PAGE_TEXT_CHARS)
+        limit = cap if max_chars is None else max_chars
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise WebSearchError("offset must be a nonnegative character index.")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= cap:
+            raise WebSearchError(f"max_chars must be an integer from 1 through {cap}.")
+        if expected_text_sha256 is not None and (
+            not isinstance(expected_text_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", expected_text_sha256) is None
+        ):
+            raise WebSearchError("expected_text_sha256 must be a lowercase SHA-256 hex digest.")
         target = _safe_public_https_url(url)
         try:
             for hop in range(self.max_redirects + 1):
@@ -360,11 +381,26 @@ class PublicPageFetcher:
                     text = parser.text()
                 else:
                     text = _clean_text(raw)
+                fingerprint = hashlib.sha256(text.encode("utf-8")).hexdigest()
+                if expected_text_sha256 is not None and expected_text_sha256 != fingerprint:
+                    raise WebSearchError("Page extraction changed; restart pagination from offset 0.")
+                total = len(text)
+                page = text[offset:offset + limit]
+                end = min(total, offset + len(page))
+                has_more = end < total
                 return {
                     "url": target,
                     "fetched_at": datetime.now(UTC).isoformat(),
-                    "text": text[: self.max_text_chars],
-                    "truncated": len(text) > self.max_text_chars,
+                    "text": page,
+                    "truncated": len(page) < total,
+                    "offset": offset,
+                    "returned_chars": len(page),
+                    "total_chars": total,
+                    "has_more": has_more,
+                    "next_offset": end if has_more else None,
+                    "text_sha256": fingerprint,
+                    "snapshot_stable": False,
+                    "text_scope": "readable_text_extraction",
                 }
         except WebSearchError:
             raise

@@ -51,6 +51,94 @@ def test_search_finds_exact_text_in_large_cached_page_and_observation_read_can_r
     assert len(json.dumps(result.output, ensure_ascii=False)) < 6000
 
 
+def test_distinct_contexts_do_not_spend_page_on_repeated_navigation_anchors(tmp_path):
+    # Cached plain text often repeats a term in labels and their adjacent URLs.
+    navigation = "anchor index https://example.invalid/#anchor " * 12
+    near = "anchor settled choice: optional deployment, not the default."
+    far = "anchor mechanism: incompatible components enable the compatibility lock."
+    text = navigation + "x" * 700 + near + "y" * 700 + far
+    tool = ObservationSearchTool(_store(tmp_path, {"output": {"text": text}}))
+    ordinary = _invoke(tool, artifact_id="large-page", query="anchor", limit=5)
+    assert not any("settled choice" in hit["snippet"] for hit in ordinary.output["matches"])
+    diverse = _invoke(tool, artifact_id="large-page", query="anchor", limit=5,
+                      distinct_contexts=True)
+    snippets = [hit["snippet"] for hit in diverse.output["matches"]]
+    assert any(near in snippet for snippet in snippets)
+    assert any(far in snippet for snippet in snippets)
+    assert diverse.output["distinct_contexts"] is True
+    assert diverse.output["complete"] is True
+    from app.tool_packages.observation import ObservationReadTool
+    hit = diverse.output["matches"][-1]
+    read = _invoke(ObservationReadTool(tool.store), artifact_id="large-page",
+                   path=hit["path"], offset=hit["snippet_start"])
+    assert far in read.output["text"]
+
+
+def test_distinct_context_paging_and_output_bounds_remain_explicit(tmp_path):
+    text = ("anchor anchor " + "x" * 800) * 14
+    tool = ObservationSearchTool(_store(tmp_path, {"output": {"text": text}}))
+    first = _invoke(tool, artifact_id="large-page", query="anchor", limit=5,
+                    distinct_contexts=True)
+    second = _invoke(tool, artifact_id="large-page", query="anchor", limit=5,
+                     offset=first.output["next_offset"], distinct_contexts=True)
+    assert first.output["has_more"] is True and first.output["complete"] is False
+    assert second.output["matches"][0]["match_start"] > first.output["matches"][-1]["match_start"]
+    assert len(json.dumps(second.output, ensure_ascii=False)) <= 5500
+    assert _invoke(tool, artifact_id="large-page", query="anchor",
+                   distinct_contexts="yes").status == "rejected"
+
+
+def test_distinct_context_keeps_boundary_hit_followed_by_new_body_evidence(tmp_path):
+    text = "anchor " + "x" * 470 + "anchor mechanism is explicitly documented here." + "y" * 600
+    tool = ObservationSearchTool(_store(tmp_path, {"output": {"text": text}}))
+    result = _invoke(tool, artifact_id="large-page", query="anchor", distinct_contexts=True)
+    assert len(result.output["matches"]) == 2
+    assert "mechanism is explicitly documented here" in result.output["matches"][1]["snippet"]
+
+
+def test_distinct_context_budget_pages_full_windows_without_losing_suppressed_neighbor_facts(tmp_path):
+    rows = {}
+    for i in range(10):
+        # Second hit and its fact are inside the original 500-char window,
+        # but outside the shorter window produced by the legacy budget shrink.
+        rows[f"long-{i}-" + "k" * 180] = (
+            "x" * 250 + "anchor" + "y" * 74 + "anchor" + "y" * 104 + f"FACT-{i}" + "z" * 54
+        )
+    tool = ObservationSearchTool(_store(tmp_path, {"output": rows}))
+    offset = 0
+    visible_facts = set()
+    pages = 0
+    while True:
+        page = _invoke(tool, artifact_id="large-page", query="anchor", limit=10,
+                       offset=offset, distinct_contexts=True).output
+        pages += 1
+        assert len(json.dumps(page, ensure_ascii=False)) <= 5500
+        for hit in page["matches"]:
+            source = rows[hit["path"].split("/")[-1]]
+            assert hit["snippet"] == source[hit["snippet_start"]:hit["snippet_end"]]
+            assert len(hit["snippet"]) == 500
+            visible_facts.update(i for i in range(10) if f"FACT-{i}" in hit["snippet"])
+        if page["has_more"] is False:
+            assert page["complete"] is True and page["next_offset"] is None
+            break
+        assert page["has_more"] is True and page["complete"] is False
+        assert page["next_offset"] == offset + len(page["matches"])
+        offset = page["next_offset"]
+        assert pages <= 10
+    assert pages > 1 and visible_facts == set(range(10))
+
+
+def test_legacy_default_search_still_shrinks_dense_output(tmp_path):
+    rows = {f"long-{i}-" + "k" * 180: "x" * 250 + "anchor" + "y" * 250 for i in range(10)}
+    tool = ObservationSearchTool(_store(tmp_path, {"output": rows}))
+    default = _invoke(tool, artifact_id="large-page", query="anchor", limit=10).output
+    explicit = _invoke(tool, artifact_id="large-page", query="anchor", limit=10,
+                       distinct_contexts=False).output
+    assert default == explicit
+    assert len(default["matches"]) == 10
+    assert all(len(hit["snippet"]) < 500 for hit in default["matches"])
+
+
 def test_search_no_match_and_nested_json_pointer_escaping(tmp_path):
     tool = ObservationSearchTool(_store(tmp_path, {
         "output": {"a/b~c": [{"body": "prefix TARGET suffix and a.* literal"}]}

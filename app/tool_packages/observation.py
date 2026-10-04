@@ -17,6 +17,7 @@ OBSERVATION_PACKAGE = ToolPackageSpec(
     decision_hints=[
         "Expand only after an observation provides _result_cache.artifact_id; paths refer to the raw stored ToolResult, not its structural preview wrappers.",
         "Use search to locate literal terms in long cached text, then read its returned path/character offset for more context; a bounded search is not proof of full coverage.",
+        "When repeated labels or links crowd search hits, use distinct_contexts=true to page through different text windows, then read from snippet_start. complete describes the cached text only, not an upstream truncated source.",
         "For an array of records, use read with fields to retain the requested shallow keys rather than generic first-key previews. Follow next_offset to cover further records; report incomplete coverage when stopping early.",
         "For exact counts by a scalar field, use group on the cached raw array instead of adding counts from remembered previews. Group counts cover that entire array before group paging; they do not cover other artifacts or source pages. Follow next_offset to see every group and inspect skipped record counts.",
     ],
@@ -230,6 +231,8 @@ class ObservationSearchTool:
         description=(
             "Search cached tool_result text from the current run using a case-insensitive literal. "
             "Returns JSON Pointer paths and character offsets for follow-up with observation.read. "
+            "Use distinct_contexts=true to skip nearby hits well covered by the preceding snippet "
+            "in the same string; offset/limit then count context windows rather than occurrences. "
             "Search is bounded; inspect complete and scan_limited before treating no matches as conclusive."
         ),
         risk="low",
@@ -242,6 +245,7 @@ class ObservationSearchTool:
             "properties": {
                 "artifact_id": {"type": "string"},
                 "query": {"type": "string", "minLength": 1, "maxLength": 200},
+                "distinct_contexts": {"type": "boolean", "default": False},
                 "path": {"type": "string", "default": ""},
                 "offset": {"type": "integer", "minimum": 0, "default": 0},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 10, "default": 5},
@@ -274,6 +278,7 @@ class ObservationSearchTool:
             return rejected("The child view and current run do not match.")
         artifact_id = invocation.input.get("artifact_id")
         query = invocation.input.get("query")
+        distinct_contexts = invocation.input.get("distinct_contexts", False)
         path = invocation.input.get("path", "")
         offset = invocation.input.get("offset", 0)
         limit = invocation.input.get("limit", 5)
@@ -281,6 +286,8 @@ class ObservationSearchTool:
             return rejected("artifact_id must be a non-empty string.")
         if not isinstance(query, str) or not query or len(query) > 200:
             return rejected("query must be a non-empty string of at most 200 characters.")
+        if not isinstance(distinct_contexts, bool):
+            return rejected("distinct_contexts must be a boolean.")
         if not isinstance(path, str):
             return rejected("path must be a JSON Pointer string.")
         if len(path) > _SEARCH_MAX_PATH_CHARS or len(json.dumps(path, ensure_ascii=False)) > 512:
@@ -323,7 +330,8 @@ class ObservationSearchTool:
                     break
                 scanned_text = value[:remaining]
                 chars_scanned += len(scanned_text)
-                for match in _literal_matches(scanned_text, folded_query, value_path):
+                for match in _literal_matches(scanned_text, folded_query, value_path,
+                                              distinct_contexts=distinct_contexts):
                     if total_matches >= offset:
                         matches.append(match)
                     total_matches += 1
@@ -381,6 +389,7 @@ class ObservationSearchTool:
         output = {
             "path": path,
             "query": query,
+            "distinct_contexts": distinct_contexts,
             "matches": matches[:limit],
             "offset": offset,
             "next_offset": offset + len(matches[:limit]) if has_more is True else None,
@@ -391,7 +400,11 @@ class ObservationSearchTool:
             "chars_scanned": chars_scanned,
             "total_matches": total_matches if complete else None,
         }
-        while len(json.dumps(output, ensure_ascii=False)) > 5_500 and any(
+        # Distinct-context suppression was based on these full windows. Shrink
+        # them afterwards and skipped neighbors can lose their only visible
+        # context. Page fewer intact windows instead; legacy occurrence mode
+        # retains its existing shrink behavior.
+        while not distinct_contexts and len(json.dumps(output, ensure_ascii=False)) > 5_500 and any(
             len(match["snippet"]) > match["match_end"] - match["match_start"]
             for match in output["matches"]
         ):
@@ -405,6 +418,9 @@ class ObservationSearchTool:
             output["matches"].pop()
             output["has_more"] = True
             output["next_offset"] = offset + len(output["matches"])
+            if distinct_contexts:
+                output["complete"] = False
+                output["total_matches"] = None
         return ToolResult(
             invocation_id=invocation.invocation_id,
             tool_name=self.spec.name,
@@ -435,7 +451,7 @@ def _shrink_snippet(match: dict[str, Any]) -> None:
     match["snippet"] = match["snippet"][new_start - start:new_end - start]
 
 
-def _literal_matches(text: str, folded_query: str, path: str):
+def _literal_matches(text: str, folded_query: str, path: str, *, distinct_contexts: bool = False):
     """Map casefolded literal hits back to stable offsets in the original string."""
     folded_parts: list[str] = []
     source_indexes: list[int] = []
@@ -445,6 +461,7 @@ def _literal_matches(text: str, folded_query: str, path: str):
         source_indexes.extend([index] * len(folded_char))
     folded_text = "".join(folded_parts)
     cursor = 0
+    covered_end = -1
     while True:
         start = folded_text.find(folded_query, cursor)
         if start < 0:
@@ -454,9 +471,15 @@ def _literal_matches(text: str, folded_query: str, path: str):
             break
         source_start = source_indexes[start]
         source_end = source_indexes[folded_end - 1] + 1
+        cursor = max(start + 1, folded_end)
+        # Keep boundary hits: their following assertion may lie beyond the
+        # preceding window even when the query token itself was visible there.
+        if distinct_contexts and source_end + (_SEARCH_SNIPPET_CHARS // 4) <= covered_end:
+            continue
         snippet_start = max(0, source_start - (_SEARCH_SNIPPET_CHARS // 2))
         snippet_end = min(len(text), snippet_start + _SEARCH_SNIPPET_CHARS)
         snippet_start = max(0, snippet_end - _SEARCH_SNIPPET_CHARS)
+        covered_end = snippet_end
         yield {
             "path": path,
             "match_start": source_start,
@@ -465,7 +488,6 @@ def _literal_matches(text: str, folded_query: str, path: str):
             "snippet_end": snippet_end,
             "snippet": text[snippet_start:snippet_end],
         }
-        cursor = max(start + 1, folded_end)
 
 
 def _resolve_pointer(root: dict[str, Any], pointer: str) -> Any:
