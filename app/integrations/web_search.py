@@ -161,38 +161,95 @@ def _clean_text(value: Any) -> str:
 
 
 class _PlainTextParser(HTMLParser):
-    _SKIP: ClassVar[set[str]] = {"script", "style", "noscript", "template", "svg", "iframe", "object"}
+    _SKIP: ClassVar[set[str]] = {
+        "head", "script", "style", "noscript", "template", "svg", "iframe", "object",
+        "nav", "form",
+    }
     _BLOCK: ClassVar[set[str]] = {
         "address", "article", "br", "dd", "div", "dt", "h1", "h2", "h3", "h4",
-        "li", "p", "pre", "section",
+        "li", "main", "p", "pre", "section",
+    }
+    _VOID: ClassVar[set[str]] = {
+        "area", "base", "br", "col", "embed", "hr", "img", "input", "link",
+        "meta", "param", "source", "track", "wbr",
     }
 
-    def __init__(self) -> None:
+    def __init__(self, *, base_url: str = "") -> None:
         super().__init__(convert_charrefs=True)
+        self.base_url = base_url
         self.parts: list[str] = []
-        self.skip_depth = 0
+        self.article_parts: list[str] = []
+        self.title_parts: list[str] = []
+        self.stack: list[tuple[str, bool, str | None]] = []
+        self.title_depth = 0
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag in self._SKIP:
-            self.skip_depth += 1
-        elif not self.skip_depth and tag in self._BLOCK:
-            self.parts.append("\n")
+        attr_map = {key.lower(): value or "" for key, value in attrs}
+        hidden_style = re.search(
+            r"(?:^|;)\s*(?:display\s*:\s*none|visibility\s*:\s*hidden)\b",
+            attr_map.get("style", "").lower(),
+        )
+        in_article = any(parent in {"main", "article"} for parent, _, _ in self.stack)
+        hidden = (
+            tag in self._SKIP
+            or (tag in {"header", "footer"} and not in_article)
+            or "hidden" in attr_map
+            or attr_map.get("aria-hidden", "").lower() == "true"
+            or hidden_style is not None
+            or any(parent_hidden for _, parent_hidden, _ in self.stack)
+        )
+        href = attr_map.get("href") if tag == "a" else None
+        if tag in self._VOID:
+            if not hidden and tag in self._BLOCK:
+                self._append_text("\n")
+            return
+        self.stack.append((tag, hidden, href))
+        if tag == "title":
+            self.title_depth += 1
+        if not hidden and tag in self._BLOCK:
+            self._append_text("\n")
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.handle_starttag(tag, attrs)
+        self.handle_endtag(tag)
 
     def handle_endtag(self, tag: str) -> None:
-        if tag in self._SKIP and self.skip_depth:
-            self.skip_depth -= 1
-        elif not self.skip_depth and tag in self._BLOCK:
-            self.parts.append("\n")
+        if tag in self._VOID:
+            return
+        if tag == "title" and self.title_depth:
+            self.title_depth -= 1
+        link_href = None
+        link_hidden = True
+        for index in range(len(self.stack) - 1, -1, -1):
+            if self.stack[index][0] == tag:
+                _, link_hidden, link_href = self.stack[index]
+                del self.stack[index:]
+                break
+        if not any(parent_hidden for _, parent_hidden, _ in self.stack) and tag in self._BLOCK:
+            self._append_text("\n")
+        if tag == "a" and link_href and not link_hidden:
+            self._append_text(f" ({urljoin(self.base_url, link_href)})")
 
     def handle_data(self, data: str) -> None:
-        if not self.skip_depth:
-            self.parts.append(data)
+        if self.title_depth:
+            self.title_parts.append(data)
+        if not any(parent_hidden for _, parent_hidden, _ in self.stack):
+            self._append_text(data)
 
     def text(self) -> str:
-        value = "".join(self.parts)
+        article_value = "".join(self.article_parts)
+        value = article_value if article_value.strip() else "".join(self.parts)
+        title = " ".join("".join(self.title_parts).split())
+        if title:
+            value = f"{title}\n\n{value}" if value else title
         value = re.sub(r"[ \t\xa0]+", " ", value)
         value = re.sub(r" *\n *", "\n", value)
         return re.sub(r"\n{3,}", "\n\n", value).strip()
+
+    def _append_text(self, value: str) -> None:
+        self.parts.append(value)
+        if any(tag in {"main", "article"} and not hidden for tag, hidden, _ in self.stack):
+            self.article_parts.append(value)
 
 
 def _safe_public_https_url(url: str) -> str:
@@ -296,7 +353,7 @@ class PublicPageFetcher:
                 charset_match = re.search(r"charset=([^;\s]+)", content_type, flags=re.IGNORECASE)
                 charset = charset_match.group(1).strip('"\'') if charset_match else "utf-8"
                 raw = content.decode(charset, errors="replace")
-                parser = _PlainTextParser()
+                parser = _PlainTextParser(base_url=target)
                 if media_type != "text/plain":
                     parser.feed(raw)
                     parser.close()
