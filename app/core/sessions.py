@@ -501,7 +501,7 @@ class SessionService:
         """Return the published summary plus every raw message beyond its watermark."""
 
         self.ensure_session(session_id=session_id)
-        budget = token_budget or self.default_context_token_budget
+        budget = token_budget if token_budget is not None else self.default_context_token_budget
         conn = self._conn_factory()
         try:
             self._ensure_context_state_table(conn)
@@ -606,7 +606,10 @@ class SessionService:
                 "SELECT revision, next_seq, covered_seq FROM agent_session_context_state WHERE session_id = ?",
                 (session_id,),
             ).fetchone()
-            budget = token_budget or (row["token_budget"] if row else self.default_context_token_budget)
+            budget = (
+                token_budget if token_budget is not None
+                else row["token_budget"] if row else self.default_context_token_budget
+            )
             summary = row["summary"] if row else ""
             existing = self._recent_messages_from_json(row["recent_messages"]) if row else []
             revision = state["revision"] if state else 0
@@ -826,7 +829,7 @@ class SessionService:
                 return False
             tail_rows = conn.execute("SELECT role, content, created_at, trace_id FROM agent_session_context_messages WHERE session_id = ? AND seq > ? ORDER BY seq", (session_id, target_seq)).fetchall()
             tail = [SessionRecentMessage(role=r["role"], content=r["content"], created_at=r["created_at"], trace_id=r["trace_id"]) for r in tail_rows]
-            budget = token_budget or self.default_context_token_budget
+            budget = token_budget if token_budget is not None else self.default_context_token_budget
             estimate = self._context_token_estimate(summary, tail)
             metadata = summary_metadata or {"method": "synchronous_or_local", "lossy_fallback_possible": True}
             encoded_metadata = json.dumps(metadata, ensure_ascii=False)
@@ -955,6 +958,8 @@ class SessionService:
         summary: str,
         messages: list[SessionRecentMessage],
     ) -> int:
+        if not summary and not messages:
+            return 0
         text = summary + "\n" + "\n".join(message.content for message in messages)
         counter = self._active_context_token_counter()
         if counter is not None:
@@ -968,7 +973,36 @@ class SessionService:
         compact = " ".join(text.split())
         if len(compact) <= max_chars:
             return compact
-        return compact[: max_chars - 3].rstrip() + "..."
+        return self._bounded_excerpt(compact, max_chars=max_chars)
+
+    @staticmethod
+    def _bounded_excerpt(
+        text: str, *, max_chars: int, tail_fraction: float = 0.5,
+    ) -> str:
+        """Keep bounded excerpts from both ends and disclose the omitted span."""
+        if max_chars <= 0:
+            return ""
+        if len(text) <= max_chars:
+            return text
+        tail_fraction = min(1.0, max(0.0, tail_fraction))
+        retained = max(0, max_chars - 32)
+        while retained >= 0:
+            tail_chars = int(retained * tail_fraction)
+            # Retain a small opening span for older code that records the first
+            # user detail near the start, while giving larger excerpts the
+            # requested tail weighting for newer state.
+            head_chars = max(retained - tail_chars, min(80, retained))
+            tail_chars = retained - head_chars
+            omitted = len(text) - retained
+            marker = f" [... {omitted} chars omitted ...] "
+            if head_chars + len(marker) + tail_chars <= max_chars:
+                head = text[:head_chars].rstrip()
+                tail = text[len(text) - tail_chars:].lstrip() if tail_chars else ""
+                return f"{head}{marker}{tail}"
+            retained -= 1
+        # A very small budget cannot fit the counted marker; retain an explicit
+        # omission signal instead of returning a misleading raw prefix.
+        return "…"
 
     def _trim_summary_for_budget(
         self,
@@ -981,24 +1015,28 @@ class SessionService:
         available_summary_tokens = max(token_budget - message_tokens, 0)
         if available_summary_tokens <= 0:
             return ""
-        if self._active_context_token_counter() is not None:
-            if self._context_token_estimate(summary, messages) <= token_budget:
-                return summary
-            # Keep the newest suffix, and measure the actual combined window:
-            # tokenization is not generally additive across a text boundary.
-            low, high = 0, len(summary)
-            while low < high:
-                middle = (low + high + 1) // 2
-                candidate = summary[-middle:]
-                if self._context_token_estimate(candidate, messages) <= token_budget:
-                    low = middle
-                else:
-                    high = middle - 1
-            return summary[-low:].lstrip() if low else ""
-        max_summary_chars = available_summary_tokens * 4
-        if len(summary) <= max_summary_chars:
+        if self._context_token_estimate(summary, messages) <= token_budget:
             return summary
-        return summary[-max_summary_chars:].lstrip()
+
+        # Preserve the beginning for durable context and favor the ending, where
+        # later summaries normally carry the newest state. Measure each excerpt
+        # with the active counter because tokenization is not additive at joins.
+        low, high = 0, len(summary)
+        while low < high:
+            middle = (low + high + 1) // 2
+            candidate = self._bounded_excerpt(
+                summary, max_chars=middle, tail_fraction=0.6,
+            )
+            if self._context_token_estimate(candidate, messages) <= token_budget:
+                low = middle
+            else:
+                high = middle - 1
+        if low == 0:
+            return ""
+        result = self._bounded_excerpt(summary, max_chars=low, tail_fraction=0.6)
+        # Tokenizers need not be monotonic in character length. Never publish
+        # a candidate that fails the final exact measurement.
+        return result if self._context_token_estimate(result, messages) <= token_budget else ""
 
     def _recent_messages_from_json(self, value: str) -> list[SessionRecentMessage]:
         try:
