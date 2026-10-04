@@ -44,7 +44,7 @@ def test_new_and_unchanged_event_fingerprints_are_stable_and_state_sensitive():
                 {
                     "event_id": "ticket-status",
                     "claim": "Tickets are available",
-                    "current_observation": "available",
+                    "current_observation": "Tickets are available",
                     "evidence_refs": [SOURCE["ref"]],
                 }
             ]
@@ -60,7 +60,7 @@ def test_new_and_unchanged_event_fingerprints_are_stable_and_state_sensitive():
                 {
                     "event_id": "ticket-status",
                     "claim": "Tickets are available",
-                    "current_observation": "available",
+                    "current_observation": "Tickets are available",
                     "evidence_refs": [SOURCE["ref"]],
                 }
             ]
@@ -76,7 +76,7 @@ def test_new_and_unchanged_event_fingerprints_are_stable_and_state_sensitive():
                 {
                     "event_id": "ticket-status",
                     "claim": "Tickets sold out",
-                    "current_observation": "sold_out",
+                    "current_observation": "Tickets sold out",
                     "evidence_refs": [SOURCE["ref"]],
                 }
             ]
@@ -88,9 +88,9 @@ def test_new_and_unchanged_event_fingerprints_are_stable_and_state_sensitive():
     )
     assert len(first["changes"]) == 1
     assert len(second["changes"]) == 0
-    assert second["unchanged"][0]["previous_observation"] == "available"
+    assert second["unchanged"][0]["previous_observation"] == "Tickets are available"
     assert len(third["changes"]) == 1
-    assert third["changes"][0]["previous_observation"] == "available"
+    assert third["changes"][0]["previous_observation"] == "Tickets are available"
     assert first["fingerprint"] != third["fingerprint"]
 
 
@@ -168,7 +168,7 @@ def test_prior_and_new_items_in_one_batch_keep_their_own_classification():
                 {
                     "event_id": "old",
                     "claim": "Tickets are available",
-                    "current_observation": "available",
+                    "current_observation": "Tickets are available",
                     "evidence_refs": [SOURCE["ref"]],
                 }
             ]
@@ -183,7 +183,7 @@ def test_prior_and_new_items_in_one_batch_keep_their_own_classification():
                 {
                     "event_id": "old",
                     "claim": "Tickets are available",
-                    "current_observation": "available",
+                    "current_observation": "Tickets are available",
                     "evidence_refs": [SOURCE["ref"]],
                 },
                 {

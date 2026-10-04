@@ -13,12 +13,15 @@ from zoneinfo import ZoneInfo
 from app.core.multi_agent import TaskResultStatus
 from app.core.watch_execution import WatchExecutionAdapter
 from app.domains.watch import BriefingInput, WatchService
-from app.domains.watch_briefing import normalize_briefing
+from app.domains.watch_briefing import is_complete_briefing_payload, normalize_briefing
 
 
 def _merge_previous_observations(
     briefings: list[dict[str, Any]],
+    *,
+    for_comparison: bool = False,
 ) -> dict[str, list[dict[str, Any]]]:
+    """Keep prompt previews bounded; full comparison text never enters the goal."""
     latest: dict[str, dict[str, Any]] = {}
     for briefing in reversed(briefings):
         for category in ("changes", "unchanged"):
@@ -29,10 +32,13 @@ def _merge_previous_observations(
                 if not isinstance(event_key, str) or not event_key:
                     continue
                 latest[event_key] = {
-                    key: str(item[key])[:240] if isinstance(item.get(key), str) else item.get(key)
+                    key: (item[key] if for_comparison and key in {
+                        "claim", "current_observation", "previous_observation",
+                    } else str(item[key])[:240]) if isinstance(item.get(key), str) else item.get(key)
                     for key in (
                         "event_key",
                         "event_id",
+                        "subject_key",
                         "title",
                         "claim",
                         "current_observation",
@@ -250,6 +256,7 @@ class WatchScheduler:
                 if item["occurrence_id"] != occurrence["occurrence_id"]
             ]
             previous_briefing = _merge_previous_observations(previous)
+            comparison_briefing = _merge_previous_observations(previous, for_comparison=True)
             prior = json.dumps(previous_briefing, ensure_ascii=False, separators=(",", ":"))
             guidance = (
                 self.runtime.instruction_files.for_watch()
@@ -314,7 +321,13 @@ class WatchScheduler:
             finally:
                 heartbeat.cancel()
                 await asyncio.gather(heartbeat, return_exceptions=True)
-            if result.status != TaskResultStatus.COMPLETED:
+            budget_partial = (
+                result.status == TaskResultStatus.PARTIAL
+                and result.missing_requirements == ("child_budget_finish",)
+                and result.failure_category is None
+                and is_complete_briefing_payload(result.summary)
+            )
+            if result.status != TaskResultStatus.COMPLETED and not budget_partial:
                 raise RuntimeError(result.failure_category or result.status.value)
             evidence = []
             for index, (ref, source) in enumerate(
@@ -335,10 +348,19 @@ class WatchScheduler:
             normalized = normalize_briefing(
                 summary=result.summary,
                 evidence=evidence,
-                previous=previous_briefing,
+                previous=comparison_briefing,
                 importance_rules=watch["importance_rules"],
                 retrieval_failures=result.retrieval_failures,
+                coverage_incomplete=budget_partial,
             )
+            if budget_partial:
+                self.runtime.agent_run_manager.append_event(
+                    parent_run_id, "watch_partial_delivery",
+                    "Deliver strictly normalized evidence with incomplete coverage; child remains partial.",
+                    stage="watch", payload={"child_run_id": result.child_run_id,
+                        "task_status": result.status.value,
+                        "missing_requirements": result.missing_requirements},
+                )
             persisted_evidence = [
                 {key: value for key, value in item.items() if key != "excerpt"} for item in evidence
             ]
@@ -370,12 +392,14 @@ class WatchScheduler:
                     "unchanged": normalized["unchanged"],
                     "unconfirmed": normalized["unconfirmed"],
                     "decisions": normalized["decisions"],
+                    "child_task_status": result.status.value,
+                    "missing_requirements": list(result.missing_requirements),
                 },
                 message_id=f"watch_message_{occurrence['occurrence_id']}",
             )
             self.runtime.agent_run_manager.complete_run(
                 parent_run_id,
-                result_snapshot={"answer": normalized["summary"]},
+                result_snapshot={"answer": normalized["summary"], "child_task_status": result.status.value},
             )
         except Exception as exc:  # noqa: BLE001 - persist one occurrence failure.
             if parent_run_id is not None:

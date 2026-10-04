@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from datetime import UTC, datetime
 from typing import Any
@@ -28,19 +29,27 @@ def _rule_terms(value: Any) -> list[str]:
 
 
 def _normalized_text(value: str) -> str:
-    return " ".join(re.findall(r"[\w\u3400-\u9fff]+", value.replace("_", " ").casefold()))
+    # Signs, currency, fractions, filenames and punctuation can carry facts.
+    # Only formatting whitespace/case may vary; do not erase those distinctions.
+    return " ".join(value.casefold().split())
 
 
 def _excerpt_supports(claim: str, excerpt: str) -> bool:
     normalized_claim = _normalized_text(claim)
-    normalized_excerpt = _normalized_text(excerpt)
-    if not normalized_claim or not normalized_excerpt:
+    if not normalized_claim or not _normalized_text(excerpt):
         return False
-    # Token-overlap heuristics can falsely verify negation, reversed relations,
-    # or unrelated claims that share names and dates. This deterministic gate
-    # accepts only a normalized contiguous claim excerpt; paraphrases remain
-    # unconfirmed until a stronger verifier is available.
-    return normalized_claim in normalized_excerpt
+    # Require a whole source line/sentence/clause, not a substring that can
+    # remove qualifiers or turn "unapproved" into "approved". This verifies
+    # literal attribution, NOT entailment or the truth of quoted source text.
+    # A period inside a number/version/path, or an ellipsis, is not a sentence
+    # boundary: cutting there can silently change the quoted value/qualification.
+    candidates = [excerpt, *excerpt.splitlines(),
+                  *re.split(r"[;。；\r\n]+|(?<!\.)\.(?!\.)(?=\s|$)", excerpt)]
+    return any(
+        normalized_claim == _normalized_text(candidate)
+        and bool(re.search(r"[?？]", claim)) == bool(re.search(r"[?？]", candidate))
+        for candidate in candidates
+    )
 
 
 def _briefing_summary(
@@ -67,6 +76,15 @@ def _briefing_summary(
             lines.append("- 无")
             continue
         for item in items[:4]:
+            refs = item.get("evidence_refs", [])
+            refs = [refs] if isinstance(refs, str) else refs
+            refs = [ref for ref in refs if isinstance(ref, str)] if isinstance(refs, list) else []
+            item_title = item.get("title")
+            title_supported = isinstance(item_title, str) and any(
+                any(ref in (source.get("ref"), source.get("evidence_id")) for ref in refs)
+                and _excerpt_supports(item_title, str(source.get("excerpt") or ""))
+                for source in evidence
+            )
             conclusion = str(
                 item.get("current_observation")
                 or item.get("claim")
@@ -74,15 +92,13 @@ def _briefing_summary(
                 or item.get("note")
                 or "待核实信息"
             )
-            subject = str(item.get("title") or item.get("claim") or "关注项")
+            subject = str((item_title if title_supported else None) or item.get("claim") or "关注项")
             if subject != conclusion:
                 conclusion = f"{subject}：{conclusion}"
             if item.get("importance_filtered"):
                 conclusion += "（按重要性规则折叠）"
             if item.get("reason"):
                 conclusion += f"；说明：{item['reason']}"
-            refs = item.get("evidence_refs", [])
-            refs = [refs] if isinstance(refs, str) else refs
             source_by_ref = {
                 str(value): str(source.get("ref") or value)
                 for source in evidence
@@ -90,9 +106,8 @@ def _briefing_summary(
                 if value
             }
             source = (
-                ", ".join(source_by_ref.get(str(ref), str(ref)) for ref in refs[:2])
-                if item.get("evidence_check")
-                not in {"citation_mismatch", "unsupported_or_excerpt_missing"}
+                ", ".join(source_by_ref[ref] for ref in refs[:2] if ref in source_by_ref)
+                if item.get("evidence_check") == "excerpt_match"
                 else "声明引用未通过来源/摘录核验"
             )
             line = f"- {conclusion[:260]}" + (f"；来源：{source[:240]}" if source else "")
@@ -112,6 +127,50 @@ def _parse_summary(summary: str) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+def _optional_metadata_is_typed(item: dict[str, Any]) -> bool:
+    if any(key in item and not isinstance(item[key], str)
+           for key in ("event_id", "event_key", "title", "status", "note")):
+        return False
+    if "importance" in item:
+        score = item["importance"]
+        if (isinstance(score, bool) or not isinstance(score, (int, float))
+                or isinstance(score, float) and not math.isfinite(score)):
+            return False
+    return True
+
+
+def is_complete_briefing_payload(summary: str) -> bool:
+    """Admission for budget-partial delivery; this does not verify its claims."""
+    parsed = _parse_summary(summary)
+    sections = ("changes", "unchanged", "unconfirmed", "decisions")
+    if (parsed is None or set(parsed) != {"summary", *sections}
+            or not isinstance(parsed["summary"], str) or not parsed["summary"].strip()):
+        return False
+    for section in sections:
+        items = parsed[section]
+        if not isinstance(items, list):
+            return False
+        for item in items:
+            if (not isinstance(item, dict) or not isinstance(item.get("claim"), str)
+                    or not item["claim"].strip() or not isinstance(item.get("evidence_refs"), list)
+                    or any(not isinstance(ref, str) or not ref.strip() for ref in item["evidence_refs"])
+                    or section != "unconfirmed" and not item["evidence_refs"]):
+                return False
+            if not _optional_metadata_is_typed(item):
+                return False
+            if "subject_key" in item and (
+                not isinstance(item["subject_key"], str)
+                or not item["subject_key"].strip() or len(item["subject_key"]) > 200
+            ):
+                return False
+            if "current_observation" in item and (
+                not isinstance(item["current_observation"], str)
+                or not item["current_observation"].strip()
+            ):
+                return False
+    return any(parsed[section] for section in sections)
+
+
 def normalize_briefing(
     *,
     summary: str,
@@ -119,6 +178,7 @@ def normalize_briefing(
     previous: dict[str, Any] | None,
     importance_rules: dict[str, Any],
     retrieval_failures: list[str] | tuple[str, ...] = (),
+    coverage_incomplete: bool = False,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Accept only structured, cited claims; classify all other conclusions as unconfirmed."""
@@ -168,6 +228,14 @@ def normalize_briefing(
                     )
                     continue
                 item = dict(value)
+                # These are normalization outputs, never model display authority.
+                for key in ("reason", "freshness", "importance_filtered", "previous_observation"):
+                    item.pop(key, None)
+                if not _optional_metadata_is_typed(item):
+                    item["evidence_check"] = "invalid_metadata"
+                    item["reason"] = "Optional metadata has an invalid type or nonfinite importance."
+                    unconfirmed.append(item)
+                    continue
                 refs = item.get("evidence_refs", [])
                 if isinstance(refs, str):
                     refs = [refs]
@@ -183,18 +251,33 @@ def normalize_briefing(
                     unconfirmed.append(item)
                     continue
                 text = _item_text(item)
-                key_material = (
-                    str(item.get("event_id") or item.get("event_key") or text).casefold().strip()
-                )
-                key = hashlib.sha256(key_material.encode("utf-8")).hexdigest()
+                subject_key = item.get("subject_key")
+                if "subject_key" in item and (
+                    not isinstance(subject_key, str) or not subject_key.strip()
+                    or len(subject_key) > 200
+                ):
+                    item["evidence_check"] = "invalid_identity"
+                    item["reason"] = "subject_key must be a nonempty raw identity of at most 200 characters."
+                    unconfirmed.append(item)
+                    continue
+                # Identity is grouping metadata, never source/permission authority.
+                canonical = item.get("event_key")
+                if subject_key is not None:
+                    key_material = subject_key.casefold().strip()
+                    key = hashlib.sha256(key_material.encode("utf-8")).hexdigest()
+                elif (not item.get("event_id") and isinstance(canonical, str)
+                      and re.fullmatch(r"[0-9a-f]{64}", canonical)
+                      and canonical in prior_by_key):
+                    key = canonical
+                else:
+                    key_material = str(item.get("event_id") or canonical or text).casefold().strip()
+                    key = hashlib.sha256(key_material.encode("utf-8")).hexdigest()
                 item["event_key"] = key
                 if section in {"changes", "unchanged"}:
-                    item["current_observation"] = (
-                        item.get("current_observation")
-                        or item.get("claim")
-                        or item.get("title")
-                        or item.get("status")
-                    )
+                    if "current_observation" not in item:
+                        item["current_observation"] = (
+                            item.get("claim") or item.get("title") or item.get("status")
+                        )
                     prior_item = prior_by_key.get(key)
                     if prior_item is not None:
                         old_value = (
@@ -213,13 +296,8 @@ def normalize_briefing(
                         else:
                             item_target = changed
                 item["evidence_check"] = "excerpt_match"
-                claim_to_check = str(
-                    item.get("claim")
-                    or item.get("observation")
-                    or item.get("current_observation")
-                    or item.get("title")
-                    or ""
-                )
+                claim_to_check = item.get("claim", item.get("observation")
+                    or item.get("current_observation") or item.get("title") or "")
                 refs = item.get("evidence_refs", [])
                 refs = [refs] if isinstance(refs, str) else refs
                 cited_evidence = [
@@ -228,16 +306,29 @@ def normalize_briefing(
                     if any(ref in {record.get("ref"), record.get("evidence_id")} for ref in refs)
                 ]
                 excerpts = [str(record.get("excerpt") or "") for record in cited_evidence]
-                if not any(
+                claim_supported = isinstance(claim_to_check, str) and any(
                     _excerpt_supports(claim_to_check, excerpt) for excerpt in excerpts if excerpt
-                ):
+                )
+                observation = item.get("current_observation")
+                observation_supported = "current_observation" not in item or (
+                    isinstance(observation, str) and any(
+                    _excerpt_supports(observation, excerpt)
+                    for excerpt in excerpts if excerpt
+                ))
+                if not claim_supported or not observation_supported:
                     item["evidence_check"] = "unsupported_or_excerpt_missing"
                     item["reason"] = (
-                        "Citation identifies a read source, but the claim could not be matched to its available excerpt."
+                        "Citation identifies a read source, but the claim or current observation could not be matched to its available excerpt."
                     )
                     unconfirmed.append(item)
                     continue
                 item_target.append(item)
+
+    if coverage_incomplete:
+        unconfirmed.append({
+            "claim": "Evidence collection stopped at the child budget; coverage is incomplete and unchecked information remains unknown.",
+            "reason": "child_budget_finish", "evidence_refs": [], "task_status": "partial",
+        })
 
     for failure in retrieval_failures:
         unconfirmed.append(

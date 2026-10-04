@@ -72,6 +72,7 @@ class WatchExecutionResult(BaseModel):
     retrieval_failures: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
     failure_category: str | None = None
+    missing_requirements: tuple[str, ...] = ()
 
 
 class WatchExecutionAdapter:
@@ -223,6 +224,18 @@ class WatchExecutionAdapter:
                 "decision needed. Return one JSON object with keys summary, changes, unchanged, "
                 "unconfirmed, decisions. Each array item must include a concise claim and "
                 "evidence_refs containing exact collected evidence IDs or source URLs. "
+                "Verified claim and current_observation must each be an atomic contiguous literal "
+                "excerpt from cited evidence, not paraphrases, combined quotes, analysis, negation "
+                "added outside a quote, or coverage inference. "
+                "Quote a complete source sentence, line or clause and retain all qualifiers, "
+                "negation and question punctuation, not isolated tokens. Literal attribution "
+                "alone does not establish semantic entailment or the truth of a source. "
+                "Do not invent quotes. Put unknowns and unsupported analysis under unconfirmed; unknowns without evidence may use "
+                "empty evidence_refs and must never imply verified absence. "
+                "Use a stable raw subject_key (1-200 characters) for the same tracked matter across "
+                "different sources. Reuse prior subject_key, not its hashed event_key. subject_key "
+                "is grouping metadata, not a source reference or permission grant; event_id may "
+                "retain a source's external ID independently. "
                 "Do not claim completeness from bounded search results; zero search results "
                 "mean unconfirmed, never unchanged. Include event_id for stable external IDs "
                 "and importance when a numeric score is justified.\n\n"
@@ -241,10 +254,19 @@ class WatchExecutionAdapter:
                                         "type": "object",
                                         "required": ["claim", "evidence_refs"],
                                         "properties": {
-                                            "claim": {"type": "string", "minLength": 1},
+                                            "claim": {"type": "string", "minLength": 1,
+                                                "description": "For verified items, a complete literal source sentence/line/clause retaining qualifiers and negation. Unknowns belong under unconfirmed, without invented quotes."},
+                                            "current_observation": {
+                                                "type": "string", "minLength": 1,
+                                                "description": "Complete literal source sentence/line/clause retaining qualifiers and negation; independently checked for literal attribution, not entailment.",
+                                            },
+                                            "subject_key": {
+                                                "type": "string", "minLength": 1, "maxLength": 200,
+                                                "description": "Stable raw tracked-matter identity, separate from source IDs and permissions.",
+                                            },
                                             "evidence_refs": {
                                                 "type": "array",
-                                                "minItems": 1,
+                                                "minItems": 0 if section == "unconfirmed" else 1,
                                                 "items": {"type": "string", "minLength": 1},
                                             },
                                         },
@@ -440,4 +462,5 @@ class WatchExecutionAdapter:
             retrieval_failures=tuple(dict.fromkeys(retrieval_failures)),
             warnings=task_result.warnings,
             failure_category=(task_result.failure.category if task_result.failure else None),
+            missing_requirements=task_result.missing_requirements,
         )
