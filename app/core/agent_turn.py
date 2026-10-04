@@ -2728,9 +2728,29 @@ class AgentTurnLoop:
             )
             if response is None:
                 return None
-            parsed = self._parse_json_object(response.content)
+            parsed = self._parse_json_object(response.content, strict=True)
             if isinstance(parsed, dict) and parsed:
-                return self._normalize_decision_output(parsed, raw_output=response.content)
+                normalized = self._normalize_decision_output(parsed, raw_output=response.content)
+                if normalized.get("action") in {
+                    "call_tool", "expand_package", "final_answer", "request_confirmation", "no_op",
+                    "fork_subtasks", "fork_subtasks_invalid", "plan_patch", "plan_patch_invalid",
+                }:
+                    return normalized
+                # A permissive JSON extractor can recover a tool's parameter
+                # object from surrounding provider text. That object is data,
+                # not an executable decision or an intentional stop signal.
+                if format_attempt < self.decision_format_max_attempts:
+                    decision_retry = {
+                        "error": "previous_json_had_no_supported_decision_operation",
+                        "invalid_output": response.content,
+                        "required_response": "Return a valid operation-first decision envelope, not bare tool arguments.",
+                    }
+                    continue
+                return {
+                    "action": "invalid_structured_decision",
+                    "reason": "Rejected JSON without a supported decision operation after the format retry.",
+                    "_raw_output": response.content,
+                }
             if self._looks_like_tool_operation(response.content):
                 repaired = self._repair_malformed_decision_output(
                     raw_output=response.content,
@@ -3345,7 +3365,7 @@ class AgentTurnLoop:
         )
         if response is None:
             return None
-        parsed = self._parse_json_object(response.content)
+        parsed = self._parse_json_object(response.content, strict=True)
         if not isinstance(parsed, dict) or not parsed:
             return None
         normalized = self._normalize_decision_output(
@@ -6227,7 +6247,7 @@ class AgentTurnLoop:
         path.write_text("\n".join(sections), encoding="utf-8")
         return path
 
-    def _parse_json_object(self, content: str) -> Any:
+    def _parse_json_object(self, content: str, *, strict: bool = False) -> Any:
         clean_content = content.strip()
         if clean_content.startswith("```"):
             clean_content = clean_content.strip("`").strip()
@@ -6236,6 +6256,8 @@ class AgentTurnLoop:
         try:
             return json.loads(clean_content)
         except json.JSONDecodeError:
+            if strict:
+                return {}
             start = clean_content.find("{")
             end = clean_content.rfind("}")
             if start == -1 or end == -1 or end <= start:

@@ -19,7 +19,9 @@ def preview(value: Any, *, path: str = "", depth: int = 0) -> Any:
             return value
         return {
             "_type": "string", "path": path, "total_chars": len(value),
-            "head": value[:500], "omitted_chars": len(value) - 500,
+            "head": value[:350], "tail": value[-150:],
+            "head_range": [0, 350], "tail_range": [len(value) - 150, len(value)],
+            "omitted_chars": len(value) - 500, "_partial": True,
         }
     if isinstance(value, list):
         if depth >= 4:
