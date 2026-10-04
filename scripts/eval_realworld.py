@@ -200,6 +200,23 @@ CASES = {
              "received_at": "2026-10-04T11:00:00Z", "body_text": "你提交的旧周报已确认收到，此事已完成，没有后续任务。"},
         ]}}, "facts": ["contact-card.csv", "CARD-846", "2026-11-15"],
     },
+    "heldout_file_collision": {
+        "goal": "请把 inbox 下各子目录的收据按 CSV 内容中的 issued_at 月份创建副本到 整理/YYYY-MM/，副本以 reference.csv 命名。同名原件可能不是同一张收据，不要覆盖或遗漏；日期缺失的先保留原位并说明不能归类。不要修改或删除任何原件、备注。验证有效收据副本逐字节一致。",
+        "files": {
+            "README.md": "Nested CSV receipts use issued_at and reference as authoritative fields. Never infer dates from folders or filenames.\n",
+            "inbox/来源 A/收据.csv": "issued_at,reference,amount\r\n2026-08-31,RCP-274,73.00\r\n",
+            "inbox/来源 B/收据.csv": "issued_at,reference,amount\n2026-08-29,RCP-936,129.00\n",
+            "inbox/2026-08 misleading/收据.csv": "issued_at,reference,amount\n2026-09-01,RCP-581,10.50\n",
+            "inbox/未知日期/收据.csv": "issued_at,reference,amount\n,RCP-611,33.00\n",
+            "inbox/备注.txt": "The undated receipt must stay unclassified. Original bytes are authoritative.\n",
+        },
+        "expected_copies": {
+            "整理/2026-08/RCP-274.csv": "inbox/来源 A/收据.csv",
+            "整理/2026-08/RCP-936.csv": "inbox/来源 B/收据.csv",
+            "整理/2026-09/RCP-581.csv": "inbox/2026-08 misleading/收据.csv",
+        },
+        "facts": ["2026-08", "2026-09", "RCP-611"],
+    },
     "heldout_web_multisource": {
         "goal": "请查 Python 官方资料，对照 3.13 和 3.14 的 free-threaded 支持状况：分别是不是默认开启、支持级别有何变化、第三方扩展为什么可能让 GIL 重新启用。至少核对两个相关官方页面，附来源。不要把默认构建与可选构建混为一谈，结论简短。",
         "files": {}, "web": True, "search_required": True, "read_only": True,

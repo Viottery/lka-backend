@@ -68,7 +68,7 @@ class PromptBudgeter:
                 reason="the prompt has no safely trimmable structured sections",
             )
 
-        omitted: dict[str, Any] = {}
+        omitted = self._existing_budget_omissions(payload.get("_prompt_budget"))
 
         def recount() -> None:
             nonlocal user_prompt, counted
@@ -92,13 +92,19 @@ class PromptBudgeter:
                     # into an apparent absence of evidence.
                     break
             old = observations.pop(0)
-            omitted["older_observations"] = omitted.get("older_observations", 0) + 1
-            if isinstance(old, dict):
+            projection = self._projection_omissions(old)
+            old_count, old_refs = projection if projection is not None else (1, [])
+            omitted["older_observations"] = omitted.get("older_observations", 0) + old_count
+            if projection is None and isinstance(old, dict):
                 cache = old.get("_result_cache")
                 if isinstance(cache, dict) and isinstance(cache.get("artifact_id"), str):
-                    refs = omitted.setdefault("observation_artifact_ids", [])
-                    if len(refs) < 20:
-                        refs.append(cache["artifact_id"])
+                    old_refs = [cache["artifact_id"]]
+            for artifact_id in old_refs:
+                refs = omitted.setdefault("observation_artifact_ids", [])
+                if len(refs) >= 20:
+                    break
+                if artifact_id not in refs:
+                    refs.append(artifact_id)
             recount()
 
         window = payload.get("session_context_window")
@@ -154,6 +160,52 @@ class PromptBudgeter:
             user_prompt, counted.count, input_limit, counted.method,
             counted.conservative, omitted, output_reserve_tokens,
         )
+
+    @staticmethod
+    def _existing_budget_omissions(value: Any) -> dict[str, Any]:
+        """Carry bounded server counters forward only when another trim is needed."""
+        counters = {
+            "older_observations", "compacted_fork_results", "lower_ranked_memories",
+            "older_context_messages", "instruction_previews",
+        }
+        if not isinstance(value, dict) or set(value) - (counters | {"observation_artifact_ids"}):
+            return {}
+        if any(type(value[key]) is not int or value[key] <= 0 for key in counters & value.keys()):
+            return {}
+        refs = value.get("observation_artifact_ids", [])
+        if (
+            not isinstance(refs, list) or len(refs) > 20
+            or any(not isinstance(ref, str) or not 1 <= len(ref) <= 200 for ref in refs)
+        ):
+            return {}
+        result = dict(value)
+        if "observation_artifact_ids" in result:
+            result["observation_artifact_ids"] = list(dict.fromkeys(refs))
+        return result
+
+    @staticmethod
+    def _projection_omissions(observation: Any) -> tuple[int, list[str]] | None:
+        """Read only the server projection envelope, never tool data or prose.
+
+        Tool observations have tool_name/result and control observations have
+        action; neither can impersonate this exact top-level envelope. Handles
+        remain continuation hints, not permissions or evidence endorsements.
+        """
+        if not isinstance(observation, dict) or set(observation) != {
+            "_prompt_compacted", "summary", "omitted_observation_count", "omitted_result_artifacts",
+        }:
+            return None
+        count = observation["omitted_observation_count"]
+        refs = observation["omitted_result_artifacts"]
+        if (
+            observation["_prompt_compacted"] is not True
+            or not isinstance(observation["summary"], str)
+            or not isinstance(count, int) or isinstance(count, bool) or count <= 0
+            or not isinstance(refs, list) or len(refs) > 20
+            or any(not isinstance(ref, str) or not 1 <= len(ref) <= 200 for ref in refs)
+        ):
+            return None
+        return count, refs
 
     @staticmethod
     def _fork_status_summary(observation: dict[str, Any]) -> dict[str, Any]:

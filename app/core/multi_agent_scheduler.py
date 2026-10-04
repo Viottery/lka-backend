@@ -26,6 +26,7 @@ from app.core.multi_agent import (
     MemoryReference,
     Plan,
     PlanPatchContext,
+    PlanPatchOperation,
     PlanStatus,
     PlanStep,
     PlanStepStatus,
@@ -710,6 +711,10 @@ class MultiAgentScheduler:
                 raise ValueError("Persisted Child Run Agent does not match its PlanStep.")
             if latest.metadata.get("agent_version") not in {None, resolved_version}:
                 raise ValueError("Persisted Child Run Agent version is unavailable.")
+            if latest.status in {AgentRunStatus.COMPLETED, AgentRunStatus.CANCELLED}:
+                force_new_attempt = force_new_attempt or self._has_unconsumed_recovery_patch(
+                    parent_run_id, plan, step.step_id, latest.run_id,
+                )
             if latest.status in {AgentRunStatus.WAITING_CONFIRMATION, AgentRunStatus.WAITING_USER}:
                 return int(latest.attempt or 1), latest, None, None
             if latest.status in {AgentRunStatus.QUEUED, AgentRunStatus.RUNNING} or (
@@ -797,6 +802,34 @@ class MultiAgentScheduler:
             self.run_manager.fail_child_run(child.run_id, error_type="context", error=message)
             return next_attempt, child, None, None
         return next_attempt, child, derived.snapshot, derived.views
+
+    def _has_unconsumed_recovery_patch(
+        self, parent_run_id: str, plan: Plan, step_id: str, child_run_id: str,
+    ) -> bool:
+        """A validated reset after this attempt's creation requires fresh context.
+
+        Use the durable parent journal rather than answer text or wall-clock
+        ordering. Child creation is atomic with its journal entry, so a queued
+        replacement consumes the patch even if context attachment is interrupted.
+        Ordinary resume and rejected/other-step patches do not create attempts.
+        """
+        recovery_ids = {
+            record.patch.patch_id for record in plan.patch_history
+            if record.patch.target_step_id == step_id
+            and record.patch.operation in {
+                PlanPatchOperation.RETRY_STEP, PlanPatchOperation.REDUCED_SCOPE,
+            }
+        }
+        if not recovery_ids:
+            return False
+        for event in reversed(self.run_manager.list_events(parent_run_id)):
+            if event.type == "subtask_created" and event.child_run_id == child_run_id:
+                return False
+            if event.type == "multi_agent_plan_patched" and event.payload.get("plan_id") == plan.plan_id:
+                patch = event.payload.get("patch")
+                if isinstance(patch, dict) and patch.get("patch_id") in recovery_ids:
+                    return True
+        return False
 
     @staticmethod
     def _execution_step(step: PlanStep, definition: Any | None) -> PlanStep:

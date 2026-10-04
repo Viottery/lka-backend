@@ -80,6 +80,7 @@ from app.core.multi_agent import (
     objective_fingerprint,
     validate_fork_subtasks,
 )
+from app.core.multi_agent_aggregation import AggregationConflict
 from app.core.multi_agent_fast_path import (
     FastPathDisposition,
     FastPathEvent,
@@ -1946,12 +1947,99 @@ class AgentTurnLoop:
         })
         return recovery
 
-    @staticmethod
-    def _unresolved_multi_agent_answer() -> str:
-        return (
+    def _unresolved_multi_agent_answer(self) -> str:
+        """Return bounded available results without clearing the unresolved gate."""
+        notice = (
             "子任务仍有未解决的失败或阻塞，当前无法将多 Agent 计划报告为完成。"
             "本次运行已停止；请查看子任务状态并重试或调整任务。"
         )
+        manager = _turn_run_manager.get() or getattr(self, "run_manager", None)
+        run_id = _turn_run_id.get()
+        run = manager.get_run(run_id) if manager is not None and run_id else None
+        if run is None:
+            return notice
+        aggregate = run.metadata.get("multi_agent_aggregate")
+        plan = run.metadata.get("multi_agent_plan")
+        if not isinstance(aggregate, dict) or not isinstance(plan, dict):
+            return notice
+        if not plan.get("plan_id") or aggregate.get("plan_id") != plan["plan_id"]:
+            return notice
+        if any(value.get("correlation_id") not in {None, run.trace_id}
+               for value in (aggregate, plan)):
+            return notice
+        raw_results = aggregate.get("task_results")
+        if not isinstance(raw_results, list):
+            return notice
+        latest: dict[str, TaskResult] = {}
+        conflicting: set[str] = set()
+        for raw in raw_results[:64]:
+            try:
+                result = TaskResult.model_validate(raw)
+            except (ValidationError, ValueError):
+                continue
+            child = manager.get_run(result.child_run_id)
+            if (
+                child is None or child.parent_run_id != run.run_id
+                or child.run_id not in run.child_run_ids
+                or child.plan_id != plan["plan_id"] or result.plan_id != plan["plan_id"]
+                or child.step_id != result.step_id or child.attempt != result.attempt
+                or result.correlation_id != run.trace_id
+            ):
+                continue
+            previous = latest.get(result.step_id)
+            if previous is None or result.attempt > previous.attempt:
+                latest[result.step_id] = result
+                conflicting.discard(result.step_id)
+            elif result.attempt == previous.attempt and result != previous:
+                conflicting.add(result.step_id)
+        entries = [result for step_id, result in latest.items() if step_id not in conflicting]
+        lines = [notice]
+        raw_conflicts = aggregate.get("conflicts")
+        if isinstance(raw_conflicts, list):
+            shown_conflicts = 0
+            for raw in raw_conflicts[:64]:
+                try:
+                    conflict = AggregationConflict.model_validate(raw)
+                except (ValidationError, ValueError):
+                    continue
+                if conflict.correlation_id != run.trace_id:
+                    continue
+                lines.append(
+                    f"已知冲突 {conflict.conflict_id[:100]}：{conflict.summary[:180]}"
+                )
+                shown_conflicts += 1
+                if shown_conflicts == 4:
+                    break
+            if len(raw_conflicts) > shown_conflicts:
+                lines.append("其他冲突详情未展示；请查看完整聚合记录。")
+        missing = aggregate.get("missing_step_ids")
+        if isinstance(missing, list):
+            missing_ids = [value[:80] for value in missing[:8] if isinstance(value, str)]
+            if missing_ids:
+                lines.append("未取得结果的子任务：" + "、".join(missing_ids))
+            if len(missing) > 8:
+                lines.append(f"另有 {len(missing) - 8} 项缺组未展示；请查看完整聚合记录。")
+        if conflicting:
+            lines.append("同次尝试有冲突结果，未选取任何一份：" + "、".join(
+                step_id[:80] for step_id in sorted(conflicting)[:8]
+            ))
+        if entries:
+            lines.append("已有局部结果（任务未完成，以下子结果未通过独立核验）：")
+        shown = 0
+        for result in entries[:8]:
+            excerpt = result.summary[:480]
+            if len(result.summary) > 480:
+                excerpt += "…（摘要截取）"
+            line = f"- {result.step_id[:80]} [{result.status.value}]：{excerpt}"
+            if result.missing_requirements:
+                line += "；未完成：" + "、".join(result.missing_requirements)[:160]
+            if sum(len(value) + 1 for value in lines) + len(line) > 5500:
+                break
+            lines.append(line)
+            shown += 1
+        if shown < len(entries) or len(raw_results) > 64 or conflicting:
+            lines.append("部分子结果或冲突已省略；完整内容仍保留在原始子运行记录中。")
+        return "\n".join(lines)
 
     def _fork_caller_kind_for_run(self, run: AgentRunRecord) -> ForkCallerKind:
         """Resolve child fork authority from immutable server-owned lineage.
@@ -3162,7 +3250,10 @@ class AgentTurnLoop:
                 if format_attempt < self.decision_format_max_attempts:
                     recovery_thinking_enabled = self._control_recovery_thinking_flag()
                     decision_retry = {
-                        "error": "previous_control_generation_incomplete",
+                        "error": (
+                            "previous_decision_output_was_empty" if not response.content.strip()
+                            else "previous_control_generation_incomplete"
+                        ),
                         "required_response": "Return one complete strict JSON operation; partial or empty output cannot authorize execution.",
                     }
                     continue
@@ -4612,11 +4703,12 @@ class AgentTurnLoop:
     def _observations_within_prompt_budget(
         self,
         observations: list[dict[str, Any]],
+        *, max_chars: int = LLM_OBSERVATION_MAX_TOTAL_CHARS,
     ) -> list[dict[str, Any]]:
         """Keep recent actionable observations without allowing aggregate prompt growth."""
 
         kept_reversed: list[dict[str, Any]] = []
-        remaining = LLM_OBSERVATION_MAX_TOTAL_CHARS
+        remaining = max_chars
         omitted = 0
         omitted_cache_refs: list[str] = []
         for observation in reversed(observations):
@@ -4650,9 +4742,28 @@ class AgentTurnLoop:
                         "to preserve the context budget. Full results remain in the run log."
                     ),
                     "omitted_result_artifacts": omitted_cache_refs[:20],
+                    "omitted_observation_count": omitted,
                 },
             )
         return bounded
+
+    def _observations_for_answer_prompt(
+        self, observations: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Give root synthesis more evidence room than its decision working set.
+
+        Delivery no longer includes tool/planning schemas. Its exact selected
+        model whole-prompt gate remains authoritative; this bounded view never
+        enlarges a model window or child runtime budget.
+        """
+        manager = _turn_run_manager.get() or getattr(self, "run_manager", None)
+        run_id = _turn_run_id.get()
+        run = manager.get_run(run_id) if manager is not None and run_id else None
+        if run is not None and run.parent_run_id is not None:
+            return self._observations_within_prompt_budget(observations)
+        return self._observations_within_prompt_budget(
+            observations, max_chars=4 * LLM_OBSERVATION_MAX_TOTAL_CHARS,
+        )
 
     @staticmethod
     def _planner_feedback_summary(observation: dict[str, Any]) -> dict[str, Any]:
@@ -5502,7 +5613,7 @@ class AgentTurnLoop:
             )
         else:
             system_prompt += " Do not wrap the answer in JSON."
-        prompt_observations = self._observations_within_prompt_budget(observations)
+        prompt_observations = self._observations_for_answer_prompt(observations)
         answer_payload = {
             "user_input": user_input,
             "route_context": self._route_context(route),

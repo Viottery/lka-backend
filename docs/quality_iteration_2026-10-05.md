@@ -471,13 +471,18 @@ typed 输出合同及变异协议等 65 项通过，独立阅读/分页检查未
 child answer 仍为 16k；不是将模型 token 窗口扩大到 64k。真正 dispatch 前仍使用当前选定
 tokenizer 对整个提示、系统信息和输出预留做原有预算检查。六来源旧投影丢两个来源，新投影
 保留六个；60 条大观察仍有界且保留缓存引用。独立审查又发现第二层 provider 裁剪可能丢失
-第一层省略引用，正在补机器可读引用合并，不以更大的字符投影代替最终预算。
+第一层省略引用，现 producer 提供机器计数，provider fit 合并两层引用；再次以更小上限
+fit 时也累计既有计数/引用，不覆盖旧层。均有真实先红后绿反例，不能根据 display 文案
+解析引用，不能将嵌套工具文本升级成预算元数据。引用有界到 20，不能当权限或已读证明。
 
 真实并行复测 240.019s 超时：两个子任务实际读取全部五份资料，却因预算收尾返回 PARTIAL；
 父级随后多轮规划，未交付。另一个替代子任务仅输出上下文答案，不能称为独立取证成功。
 确认 scheduler 在 retry/reduced_scope 后复用旧 completed-child/PARTIAL 的状态错误；修复
-还需覆盖 plan-history 已落盘但 patch-event 未落盘的崩溃间隙。先增加 fault-injection 回归，
-不凭正常路径 replay 通过就宣称崩溃恢复完成。
+还需覆盖 plan-history 已落盘但 patch-event 未落盘的崩溃间隙。新增真实 SQLite INSERT
+中断反例，plan/history、执行 ID reservation、journal 改为既有 CAS 原子事务同批提交，
+提交成功后才发布内存缓存。崩溃回滚、提交后重启、新 attempt 幂等、取消替代 child/parent
+均有回归；独立审查通过。既有已孤立 history 不自动修写。本轮整合 147 项通过，真实
+并行和单 Agent 消融正在执行；尚不将恢复接线正确等同复杂任务足够快。
 
 无法完成的父级现在可直接交付有界的已有局部事实和缺口，不调用额外 LLM、不清除 unresolved
 gate、不把 child completed 文字当独立核验。校验 parent/plan/step/attempt/trace 身份，最多
@@ -498,6 +503,11 @@ requested source、但 registry 仅有 helpers 时也可能启动；新增反例
 独立会话。旧脚本 fixture 不带 usage 且按已替换的 child prompt 文案判 stage；现改按实际
 stage metadata 响应、使用同一 tokenizer 计量请求与脚本 provider usage，不扩大生产 40k
 预算。未知 usage 的保守预留与 1-token 失败负例仍保留。
+
+文件整理的进一步留出题 29.746s、8 calls/4 Bash、44526 输入/5018 输出 token。
+三份同名不同目录收据按内容日期跨月份复制，以票号消歧；缺日期收据保留原位、不推断月份。
+原件及备注完整，三份目标与原件逐字节相同（包括 CRLF），无额外文件。模型自身也调用 cmp
+验证；独立哈希验证全部通过。尚未覆盖同一个票号对应两种不同内容和复制中外部并发修改。
 
 截至本轮真实复测，账本累计 585 calls/USD3.644180320、Brave 5 queries；583 次有已知 usage，
 另外两次保守预留仍保留。搜索账本中的费用 0 不代表 Brave 免费，只代表此账本按次数限制。

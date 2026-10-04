@@ -77,7 +77,7 @@ def planner():
     loop.decision_format_max_attempts = 2
     loop.llm_generation_token_budget = 512
     loop.llm_client = SimpleNamespace(supports_function_calling=False)
-    loop._observations_within_prompt_budget = lambda observations: observations
+    loop._observations_within_prompt_budget = lambda observations, **kwargs: observations
     loop._route_context = lambda route: route
     loop._context_window_for_llm = lambda window: window
     loop._agent_catalog_for_prompt = list

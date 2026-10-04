@@ -257,7 +257,7 @@ class InMemoryAgentRunManager:
         plan: dict[str, Any] | None = None,
         reserve_operation_id: bool = True,
     ) -> AgentRunEvent:
-        """Persist the plan/event, optionally reserving its executable fork ID.
+        """Atomically persist the plan/event and executable fork ID reservation.
 
         A malformed proposal has no executable effect, so its ID must remain
         available for a corrected proposal. Policy-rejected and validated
@@ -276,15 +276,16 @@ class InMemoryAgentRunManager:
                 operations[operation_id] = payload
                 metadata["fork_operations"] = operations
             updated = current.model_copy(update={"metadata": metadata})
-            self._runs[run_id] = updated
-            self._persist_run(updated)
-            return self.append_event(
+            event = self._control_event(
                 run_id,
                 event_type,
                 "Planner fork operation recorded.",
                 stage="planner",
                 payload=payload,
+                pending=[],
             )
+            self._commit_control_updates([current], [updated], [event])
+            return event
 
     def record_multi_agent_aggregation(
         self,
