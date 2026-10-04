@@ -1,4 +1,5 @@
 import asyncio
+import subprocess
 from unittest.mock import patch
 
 from app.core.agent_turn import AgentTurnResult
@@ -41,3 +42,35 @@ def test_total_only_or_partial_mail_answer_is_not_full_completion():
     assert complete["all_sender_counts_present"]
     wrong = _sender_coverage("| alice@example.test | 17 | updates |", expected)
     assert wrong["matched_groups"] == 0
+
+
+def test_fixture_git_isolation_and_source_only_hashes(tmp_path):
+    from scripts.eval_realworld import _hashes, _initialize_fixture_repo
+
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    subprocess.run(["git", "init", "--quiet", str(outer)], check=True)
+    workspace = outer / "nested" / "workspace"
+    workspace.mkdir(parents=True)
+    (workspace / "README.md").write_text("fixture-only\n")
+    _initialize_fixture_repo(workspace)
+    root = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=workspace,
+                          check=True, capture_output=True, text=True).stdout.strip()
+    assert root == str(workspace.resolve())
+    assert not any(path.startswith(".git/") for path in _hashes(workspace))
+    assert _hashes(workspace)["README.md"]
+    status = subprocess.run(["git", "status", "--porcelain"], cwd=workspace,
+                            check=True, capture_output=True, text=True).stdout
+    assert status == ""
+
+
+def test_child_metrics_include_usage_and_report_unknown_separately():
+    from scripts.eval_realworld import _child_metrics
+
+    metrics = _child_metrics({"child-a": [
+        {"type": "llm_started", "payload": {}},
+        {"type": "llm_completed", "payload": {"audit_record": {
+            "input_token_count": 100, "output_token_count": 20, "duration_ms": 500}}},
+    ], "child-b": [{"type": "llm_completed", "payload": {}}]})
+    assert metrics == {"llm_calls": 2, "llm_total_duration_ms": 500,
+                       "input_tokens": 100, "output_tokens": 20, "calls_missing_usage": 1}

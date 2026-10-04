@@ -115,7 +115,38 @@ CASES = {
                   "logs/service.log": "ERROR startup database connection refused at localhost:5444. Actual database listens on5432.\n",
                   "config/service.env": "DB_PORT=5444\n"},
         "facts": ["2026-10-10", "16:00", "Nora", "BACKUP_419", "5444", "5432"],
-        "read_only": True, "children_required": True,
+        "read_only": True, "children_required": 2,
+    },
+    "knowledge_policy": {
+        "goal": "根据本地知识资料，生产发布需要哪些审批？紧急修复还有什么补充要求？请给出资料依据。",
+        "files": {}, "setup": {"knowledge_fixtures": ["retrieval_benchmark"]},
+        "facts": ["两名", "24", "复盘"], "read_only": True,
+    },
+    "knowledge_multihop": {
+        "goal": "CobaltMoss 项目的紧急发布最终需要谁负责升级处理，以及至少几个人批准？请从本地资料核对，说明依据和不能确认的部分。",
+        "files": {}, "setup": {"knowledge": [{"documents": [
+            {"source": {"source_type": "local_document", "display_name": "project_registry", "sensitivity": "public", "remote_policy": "allow"},
+             "title": "project_registry", "text": "CobaltMoss 项目的维护团队是 AX-17，适用的紧急发布例外政策编号 R9。旧负责人记录已废止。"},
+            {"source": {"source_type": "local_document", "display_name": "team_directory", "sensitivity": "public", "remote_policy": "allow"},
+             "title": "team_directory", "text": "AX-17 团队的升级处理负责人为 Mira Fox；BY-28 团队负责人为 Owen Gray。两者不得混用。"},
+            {"source": {"source_type": "local_document", "display_name": "exception_rules", "sensitivity": "public", "remote_policy": "allow"},
+             "title": "exception_rules", "text": "R9 例外要求两名不同值班操作员批准。R8 允许一名操作员批准。资料没有记录 CobaltMoss 当前实际批准人员。"},
+            {"source": {"source_type": "local_document", "display_name": "unrelated_project", "sensitivity": "public", "remote_policy": "allow"},
+             "title": "unrelated_project", "text": "QuartzElm 项目维护团队 BY-28，政策编号 R8。"},
+        ]}]}, "facts": ["Mira Fox", "两名", "R9"], "read_only": True,
+    },
+    "mail_specialist_overview": {
+        "goal": "请让邮件专家完整整理这批本地邮件，按发件人逐一列出数量和主要主题，报告总数及实际覆盖范围。不要同步远程邮箱。",
+        "files": {}, "synthetic_mail": True, "read_only": True, "children_required": 1,
+        "required_agent_id": "mail_expert",
+    },
+    "heldout_broken_test_runner": {
+        "goal": "这个小项目的名称归一化会让同名项匹配失败。请定位并修复，运行项目已有测试验证，不要安装依赖，不要改写测试来绕过失败。若文档里的测试入口不可用，请利用本地已有能力完成验证。",
+        "files": {
+            "README.md": "# Name keys\nPure Python, no dependencies. Legacy test entry: python -m old_project_test_runner\nThe test source is in tests/. The old runner is no longer distributed.\n",
+            "names.py": "def normalize(value):\n    return value.lower()\n",
+            "tests/test_names.py": "import unittest\nfrom names import normalize\n\nclass Tests(unittest.TestCase):\n    def test_spaces(self):\n        self.assertEqual(normalize('  Acme  '), 'acme')\n    def test_unicode(self):\n        self.assertEqual(normalize('Straße'), normalize('STRASSE'))\n    def test_empty(self):\n        self.assertEqual(normalize('   '), '')\n    def test_no_mutation(self):\n        original=' X '; normalize(original); self.assertEqual(original,' X ')\n",
+        }, "verify_command": ["python", "-m", "unittest", "discover", "-s", "tests"],
     },
 }
 
@@ -132,7 +163,35 @@ class _SearchReservation:
 
 def _hashes(workspace: Path) -> dict[str, str]:
     return {p.relative_to(workspace).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
-            for p in workspace.rglob("*") if p.is_file() and "__pycache__" not in p.parts}
+            for p in workspace.rglob("*") if p.is_file()
+            and not {"__pycache__", ".git"}.intersection(p.relative_to(workspace).parts)}
+
+
+def _initialize_fixture_repo(workspace: Path) -> None:
+    """Stop Git discovery at the fixture boundary, never at the user's repository."""
+    template = workspace.parent / "empty-git-template"
+    template.mkdir()
+    subprocess.run(["git", "init", "--quiet", f"--template={template.resolve()}"],
+                   cwd=workspace, check=True, capture_output=True)
+    subprocess.run(["git", "add", "--all"], cwd=workspace, check=True, capture_output=True)
+    subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false",
+                    "-c", "user.name=LKA Quality Fixture", "-c", "user.email=fixture@example.test",
+                    "commit", "--quiet", "--allow-empty", "-m", "isolated fixture baseline"],
+                   cwd=workspace, check=True, capture_output=True)
+
+
+def _child_metrics(child_events: dict[str, list[dict]]) -> dict:
+    completed = [event for events in child_events.values() for event in events
+                 if event.get("type") == "llm_completed"]
+    audits = [event.get("payload", {}).get("audit_record") or {} for event in completed]
+    return {
+        "llm_calls": len(completed),
+        "llm_total_duration_ms": sum(audit.get("duration_ms") or 0 for audit in audits),
+        "input_tokens": sum(audit.get("input_token_count") or 0 for audit in audits),
+        "output_tokens": sum(audit.get("output_token_count") or 0 for audit in audits),
+        "calls_missing_usage": sum(audit.get("input_token_count") is None
+                                   or audit.get("output_token_count") is None for audit in audits),
+    }
 
 
 def _import_readonly_mail_snapshot(runtime, source: Path, *, limit: int = 60) -> dict:
@@ -203,6 +262,7 @@ async def run_case(case_id: str, *, output: Path, budget: LiveBudget, planning: 
         path = workspace / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
+    _initialize_fixture_repo(workspace)
     before = _hashes(workspace)
     settings = Settings(LKA_DATA_DIR=root / "data", LKA_WORKSPACE_ROOTS=str(workspace))
     config = settings.load_local_config()
@@ -262,9 +322,13 @@ async def run_case(case_id: str, *, output: Path, budget: LiveBudget, planning: 
         report["child_runs"] = [child.model_dump(mode="json") for child in children]
         report["child_events"] = {child.run_id: [event.model_dump(mode="json") for event in
             runtime.agent_run_manager.list_events(child.run_id)] for child in children}
+        report["child_metrics"] = _child_metrics(report["child_events"])
         checks = {"fact_coverage": all(s.lower() in answer.lower() for s in case.get("facts", []))}
         if case.get("children_required"):
-            checks["multiple_children_executed"] = len(children) >= 2
+            checks["required_children_executed"] = len(children) >= case["children_required"]
+        if case.get("required_agent_id"):
+            checks["required_specialist_executed"] = any(
+                child.metadata.get("agent_id") == case["required_agent_id"] for child in children)
         if mail_snapshot:
             checks["snapshot_total_mentioned"] = str(mail_snapshot["selected_count"]) in answer
             report["sender_coverage"] = _sender_coverage(answer, mail_snapshot["sender_counts"])
@@ -298,8 +362,14 @@ async def run_case(case_id: str, *, output: Path, budget: LiveBudget, planning: 
             "llm_total_duration_ms": sum(event.duration_ms or 0 for event in result.llm_events),
             "tool_calls": len(result.tool_events),
             "failed_tools": sum(event.result.get("status") != "completed" for event in result.tool_events),
+            "nonzero_command_exits": sum(
+                isinstance(event.result.get("output"), dict)
+                and type(event.result["output"].get("exit_code")) is int
+                and event.result["output"]["exit_code"] != 0 for event in result.tool_events),
             "input_tokens": sum(event.input_token_count or 0 for event in result.llm_events),
             "output_tokens": sum(event.output_token_count or 0 for event in result.llm_events)}
+        report["total_agent_metrics"] = {key: report["metrics"][key] + report["child_metrics"][key]
+            for key in ("llm_calls", "llm_total_duration_ms", "input_tokens", "output_tokens")}
     except Exception as exc:  # noqa: BLE001 - preserve per-case failure evidence
         report["error"] = {"type": type(exc).__name__, "message": str(exc)}
         report["mechanical_pass"] = False

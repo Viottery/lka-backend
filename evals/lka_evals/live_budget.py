@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import re
 import sqlite3
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -20,6 +22,29 @@ from app.core.prompt_tokens import PromptTokenCounter
 
 class LiveBudgetExceeded(LLMClientError):
     """No external dispatch is allowed after a reservation is refused."""
+
+
+class ProtectedEvaluationContent(LLMClientError):
+    """Credential content is never authorized as model-visible test input."""
+
+
+def _protected_credential_values(env_file: Path = Path(".env")) -> tuple[str, ...]:
+    pairs = list(os.environ.items())
+    full_env_text = ""
+    if env_file.is_file():
+        full_env_text = env_file.read_text(encoding="utf-8").strip()
+        for line in full_env_text.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            name, value = stripped.removeprefix("export ").split("=", 1)
+            pairs.append((name.strip(), value.strip().strip('"').strip("'")))
+    credentials = {value for name, value in pairs
+        if re.search(r"(?:^|_)(?:API_KEY|TOKEN|SECRET|PASSWORD|PASSWD)(?:$|_)", name.upper())
+        and not name.upper().endswith(("_ENV", "_PATH", "_FILE")) and len(value) >= 8}
+    if full_env_text:
+        credentials.add(full_env_text)
+    return tuple(sorted(credentials))
 
 
 class LiveBudget:
@@ -98,13 +123,19 @@ class LiveBudget:
 class MeteredClient:
     """Wrap the provider boundary, covering every consumer of the LLM service."""
 
-    def __init__(self, client, budget: LiveBudget, *, allowed_model: str) -> None:
+    def __init__(self, client, budget: LiveBudget, *, allowed_model: str,
+                 protected_values: tuple[str, ...] | None = None) -> None:
         self.client, self.budget, self.allowed_model = client, budget, allowed_model
+        self.protected_values = (_protected_credential_values() if protected_values is None
+                                 else protected_values)
 
     def __getattr__(self, name):
         return getattr(self.client, name)
 
     def _reserve(self, request: LLMRequest) -> tuple[LLMRequest, str]:
+        payload = json.dumps(request.model_dump(mode="json"), ensure_ascii=False)
+        if any(value and value in payload for value in self.protected_values):
+            raise ProtectedEvaluationContent("protected credential content refused before dispatch")
         if (request.model or self.client.default_model) != self.allowed_model:
             raise LiveBudgetExceeded("unpriced model refused by evaluation ledger")
         # Bound only absent caps; this live probe limit is not a production setting.

@@ -56,14 +56,25 @@ class CountingClient:
         return response
 
 
-def evaluate(*, remote=False, config_path=None):
+def evaluate(*, remote=False, config_path=None, budget_ledger=None):
     config = load_local_config(config_path or ROOT / "config/local.toml").llm if remote else None
+    if config is not None and not config.is_disabled():
+        if budget_ledger is None:
+            raise ValueError("Remote evaluation requires --budget-ledger")
+        if config.model != "deepseek-flash":
+            raise ValueError("unpriced model refused: evaluation pricing covers deepseek-flash only")
     if config is not None:
         config = config.model_copy(update={"timeout_seconds": 30, "clients": [
             client.model_copy(update={"timeout_seconds": 30}) for client in config.clients]})
     service = build_llm_service(config) if config is not None else None
     if remote and service is None:
         raise RuntimeError("Remote evaluation requires a configured LLM service")
+    live_budget = None
+    if service is not None and budget_ledger is not None:
+        from evals.lka_evals.live_budget import LiveBudget, instrument_service
+
+        live_budget = LiveBudget(budget_ledger, usd_limit=50)
+        instrument_service(service, live_budget, allowed_model="deepseek-flash")
     client = CountingClient(service) if service else None
     with tempfile.TemporaryDirectory(prefix="lka-compaction-eval-") as directory:
         db = str(Path(directory) / "eval.sqlite3")
@@ -99,12 +110,20 @@ def evaluate(*, remote=False, config_path=None):
                 "cases": len(results), "passed": sum(result["passed"] for result in results),
                 "provider_calls": client.calls if client else 0,
                 "provider_usage_available": remote and all(result["provider_error"] is None for result in results),
-                "provider_tokens": client.tokens if client else {"input": 0, "output": 0}, "results": results}
+                "provider_tokens": client.tokens if client else {"input": 0, "output": 0},
+                "budget_ledger_path": str(budget_ledger) if live_budget is not None else None,
+                "budget_ledger": live_budget.snapshot() if live_budget is not None else None,
+                "results": results}
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--remote", action="store_true")
     parser.add_argument("--config", type=Path)
+    parser.add_argument(
+        "--budget-ledger", type=Path,
+        help="Persistently meter remote provider calls with the shared USD 50 evaluation budget",
+    )
     arguments = parser.parse_args()
-    print(json.dumps(evaluate(remote=arguments.remote, config_path=arguments.config), ensure_ascii=False, indent=2))
+    print(json.dumps(evaluate(remote=arguments.remote, config_path=arguments.config,
+                              budget_ledger=arguments.budget_ledger), ensure_ascii=False, indent=2))

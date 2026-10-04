@@ -16,7 +16,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from app.core.background_llm import complete_text_in_worker
+from app.core.background_llm import IncompleteGenerationError, _incomplete, complete_text_in_worker
 from app.core.llm import LLMService, build_llm_service
 from app.core.local_config import load_local_config
 from app.core.memory_extraction import (
@@ -64,6 +64,7 @@ class _CountingClient:
         self.completion_tokens = 0
         self.total_tokens = 0
         self.budget_blocked = False
+        self.responses: list[dict[str, Any]] = []
 
     def complete_text(self, **kwargs: Any) -> Any:
         if self.service is None:
@@ -86,6 +87,16 @@ class _CountingClient:
         self.prompt_tokens += prompt
         self.completion_tokens += completion
         self.total_tokens += int(usage.get("total_tokens", prompt + completion) or 0)
+        payload = _json_payload(getattr(response, "content", ""))
+        self.responses.append({
+            "finish_reason": getattr(response, "finish_reason", None),
+            "partial": bool(getattr(response, "partial", False)),
+            "content_chars": len(getattr(response, "content", "") or ""),
+            "prompt_tokens": prompt, "completion_tokens": completion,
+            "candidates_json_valid": payload is not None and isinstance(payload.get("candidates"), list),
+        })
+        if _incomplete(response):
+            raise IncompleteGenerationError("memory evaluation received incomplete generation")
         return response
 
 
@@ -141,9 +152,11 @@ def _force_model_extract(source_id: str, content: str, client: _CountingClient) 
         prompt_summary="background_memory_extract_eval_force_model",
         temperature=0.0, max_output_tokens=600,
     )
+    if _incomplete(response):
+        raise IncompleteGenerationError("forced memory evaluation received incomplete generation")
     payload = _json_payload(getattr(response, "content", ""))
     if payload is None or not isinstance(payload.get("candidates"), list):
-        return []
+        raise ValueError("forced memory evaluation received invalid candidates JSON")
     candidates: list[MemoryCandidate] = []
     for item in payload["candidates"][:3]:
         if not isinstance(item, dict):
@@ -174,6 +187,7 @@ def evaluate(
     *,
     remote: bool = False,
     config_path: Path | None = None,
+    budget_ledger: Path | None = None,
     max_cases: int | None = None,
     max_calls: int | None = None,
     force_model: bool = False,
@@ -185,8 +199,14 @@ def evaluate(
     if max_cases is not None:
         cases = cases[:max(0, max_cases)]
     service = None
+    live_budget = None
     if remote or force_model:
         config = load_local_config(config_path or ROOT / "config/local.toml")
+        if not config.llm.is_disabled():
+            if budget_ledger is None:
+                raise ValueError("Remote evaluation requires --budget-ledger")
+            if config.llm.model != "deepseek-flash":
+                raise ValueError("unpriced model refused: evaluation pricing covers deepseek-flash only")
         bounded = config.llm.model_copy(update={"timeout_seconds": timeout_seconds, "clients": [
             client.model_copy(update={"timeout_seconds": timeout_seconds}) for client in config.llm.clients]})
         service = build_llm_service(bounded)
@@ -195,6 +215,11 @@ def evaluate(
         # build_llm_service returns a fresh service for this evaluation; keep
         # the bounded network timeout local to it, not in persistent config.
         service.background_timeout_seconds = timeout_seconds
+        if budget_ledger is not None:
+            from evals.lka_evals.live_budget import LiveBudget, instrument_service
+
+            live_budget = LiveBudget(budget_ledger, usd_limit=50)
+            instrument_service(service, live_budget, allowed_model="deepseek-flash")
     llm = _CountingClient(service, max_calls if (remote or force_model) else None)
 
     rows: list[dict[str, Any]] = []
@@ -233,6 +258,7 @@ def evaluate(
                                            "missing_terms": missing})
             started = time.perf_counter()
             calls_before = llm.calls
+            responses_before = len(llm.responses)
             llm.budget_blocked = False
             try:
                 source_id = f"synthetic:{case['id']}"
@@ -249,6 +275,9 @@ def evaluate(
                     )
                 else:
                     candidates = local_candidates
+                if any(not response["candidates_json_valid"]
+                       for response in llm.responses[responses_before:]):
+                    raise ValueError("memory evaluation received invalid candidates JSON")
             except Exception as exc:  # noqa: BLE001 - per-case provider/error reporting boundary
                 if isinstance(exc, _CallBudgetReached) or llm.budget_blocked:
                     skipped.append(case["id"])
@@ -448,6 +477,7 @@ def evaluate(
             counts["provider_cases"] += 1
             provider_exact = expected_normalized == predicted_normalized
             counts["provider_exact_cases"] += int(provider_exact)
+            split_values["provider_exact_cases"] += int(provider_exact)
             provider_values["tp"] += tp
             provider_values["fp"] += fp
             provider_values["fn"] += fn
@@ -522,6 +552,9 @@ def evaluate(
         "local_rule_cases": sum(not row["provider_called"] for row in rows),
         "provider_tokens": {"prompt": llm.prompt_tokens, "completion": llm.completion_tokens,
                             "total": llm.total_tokens},
+        "provider_responses": llm.responses,
+        "budget_ledger_path": str(budget_ledger) if live_budget is not None else None,
+        "budget_ledger": live_budget.snapshot() if live_budget is not None else None,
         "precision": tp / (tp + fp) if tp + fp else (None if not any(
             row.get("quality_scored", True) for row in rows
         ) else 1.0),
@@ -563,13 +596,18 @@ def main() -> None:
     parser.add_argument("--force-model", action="store_true",
                         help="Call configured LLM directly for every eligible case, bypassing local extraction")
     parser.add_argument("--config", type=Path, help="Local TOML provider config (default: config/local.toml)")
+    parser.add_argument(
+        "--budget-ledger", type=Path,
+        help="Persistently meter remote provider calls with the shared USD 50 evaluation budget",
+    )
     parser.add_argument("--max-cases", type=int, help="Maximum fixture cases to process")
     parser.add_argument("--max-calls", type=int, help="Maximum actual provider calls")
     parser.add_argument("--timeout-seconds", type=float, default=30.0,
                         help="Bound each background provider request (default: 30 seconds)")
     args = parser.parse_args()
     report = evaluate(args.fixture, remote=args.remote, force_model=args.force_model,
-                      config_path=args.config, max_cases=args.max_cases, max_calls=args.max_calls,
+                      config_path=args.config, budget_ledger=args.budget_ledger,
+                      max_cases=args.max_cases, max_calls=args.max_calls,
                       timeout_seconds=args.timeout_seconds)
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
