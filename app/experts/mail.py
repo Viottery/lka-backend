@@ -711,13 +711,33 @@ class MailExpertExecutor:
                         coverage: dict[str, Any], missing: list[str]) -> str:
         high = [item for item in analyses if item["priority"] == "high"]
         medium = [item for item in analyses if item["priority"] == "medium"]
+        actions = [item for item in analyses if item["action_required"]]
+        priority_rank = {"high": 0, "medium": 1, "low": 2}
+        important = sorted(
+            (item for item in analyses if item["action_required"] or item["priority"] == "high"),
+            key=lambda item: (not item["action_required"], priority_rank[item["priority"]]),
+        )
         lines = [
             (f"本地命中 {coverage['local_total']} 封；元数据枚举 {len(cards)}，正文读取 {coverage['body_loaded']}，"
              f"语义分析 {len(analyses)}。远端同步是否完整：未知。"),
-            f"已分析部分：高优先级 {len(high)}，中优先级 {len(medium)}。",
+            f"已分析部分：高优先级 {len(high)}，中优先级 {len(medium)}；需要行动 {len(actions)} 项。",
         ]
-        for item in high[:12]:
-            lines.append(f"- [高] id={item['message_id']} {item['summary']}；原因：{item['reason']}")
+        shown = []
+        labels = {"high": "高", "medium": "中", "low": "低"}
+        size = sum(len(line) + 1 for line in lines)
+        for item in important[:12]:
+            line = (f"- [{labels[item['priority']]}{'/需行动' if item['action_required'] else ''}] "
+                    f"id={item['message_id']} {item['summary']}；原因：{item['reason']}")
+            if size + len(line) + 1 > 3200:
+                break
+            lines.append(line)
+            shown.append(item)
+            size += len(line) + 1
+        coverage["action_required_total"] = len(actions)
+        coverage["action_items_shown"] = sum(item["action_required"] for item in shown)
+        coverage["important_items_shown"] = len(shown)
+        if len(shown) != len(important):
+            missing.append(f"important items omitted from bounded handoff: {len(important) - len(shown)}")
         if missing:
-            lines.append("未完成范围：" + "；".join(missing[:4]))
-        return "\n".join(lines)
+            lines.append("未完成范围：" + "；".join(missing[:4])[:250])
+        return "\n".join(lines)[:3500]

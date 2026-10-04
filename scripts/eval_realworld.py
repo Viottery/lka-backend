@@ -20,6 +20,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.core.config import Settings
+from app.core.llm import LLMResponseMode
 from app.core.runtime import LocalKnowledgeAgentRuntime
 from evals.lka_evals.fixtures import apply_setup
 from evals.lka_evals.live_budget import LiveBudget, instrument_service
@@ -186,6 +187,31 @@ CASES = {
         },
         "facts": ["2026-09", "2026-10"],
     },
+    "heldout_mail_routine_actions": {
+        "goal": "请邮件专家阅读全部本地邮件，整理我确实需要采取的行动，包括不紧急的例行事项；不要把纯通知当待办。不做远程同步，说明实际覆盖范围。",
+        "files": {}, "read_only": True, "children_required": 1, "required_agent_id": "mail_expert",
+        "setup": {"mail": {"account": {"email_address": "routine@example.test"}, "messages": [
+            {"external_id": "optional", "subject": "Monthly information", "sender": "updates@example.test",
+             "received_at": "2026-10-04T09:00:00Z", "body_text": "本月资讯已发布，仅供参考，无需回复或采取行动。"},
+            {"external_id": "routine", "subject": "Profile maintenance", "sender": "office@example.test",
+             "received_at": "2026-10-04T10:00:00Z",
+             "body_text": "例行维护：请在 2026-11-15 前更新 contact-card.csv，归档编号 CARD-846。距离截止还有一个多月，不紧急，但需要本人完成。"},
+            {"external_id": "receipt", "subject": "Acknowledgment", "sender": "office@example.test",
+             "received_at": "2026-10-04T11:00:00Z", "body_text": "你提交的旧周报已确认收到，此事已完成，没有后续任务。"},
+        ]}}, "facts": ["contact-card.csv", "CARD-846", "2026-11-15"],
+    },
+    "heldout_web_multisource": {
+        "goal": "请查 Python 官方资料，对照 3.13 和 3.14 的 free-threaded 支持状况：分别是不是默认开启、支持级别有何变化、第三方扩展为什么可能让 GIL 重新启用。至少核对两个相关官方页面，附来源。不要把默认构建与可选构建混为一谈，结论简短。",
+        "files": {}, "web": True, "search_required": True, "read_only": True,
+        "facts": ["3.13", "3.14", "GIL"],
+    },
+    "heldout_context_reuse": {
+        "goal": "请查看这个项目资料，告诉我当前状态和唯一标识。",
+        "files": {"README.md": "Project status: jade. Unique marker: willow-739.\n"},
+        "facts": ["jade", "willow-739"], "read_only": True,
+        "followup_goal": "只再告诉我刚才那个唯一标识，简短即可。",
+        "followup_facts": ["willow-739"],
+    },
 }
 
 
@@ -244,6 +270,39 @@ def _child_metrics(child_events: dict[str, list[dict]]) -> dict:
     }
 
 
+async def _followup_probe(runtime, *, session_id: str, case: dict, timeout: float) -> dict:
+    """Reuse the actual persisted session, not a manually fabricated summary."""
+    goal = case["followup_goal"]
+    run = runtime.create_agent_run(session_id=session_id, user_input=goal)
+    started = time.perf_counter()
+    report = {"run_id": run.run_id, "goal": goal}
+    try:
+        result = await asyncio.wait_for(runtime.run_agent_turn_async(
+            session_id=session_id, user_input=goal, existing_run_id=run.run_id), timeout=timeout)
+        report["result"] = result.model_dump(mode="json")
+        report["checks"] = {
+            "fact_coverage": all(fact.casefold() in result.answer.casefold()
+                                 for fact in case["followup_facts"]),
+            "no_redundant_tools": not result.tool_events,
+        }
+        report["metrics"] = {
+            "llm_calls": len(result.llm_events), "tool_calls": len(result.tool_events),
+            "input_tokens": sum(event.input_token_count or 0 for event in result.llm_events),
+            "output_tokens": sum(event.output_token_count or 0 for event in result.llm_events),
+        }
+        report["mechanical_pass"] = all(report["checks"].values())
+    except Exception as exc:  # noqa: BLE001 - preserve follow-up failure independently
+        report["error"] = {"type": type(exc).__name__, "message": str(exc)}
+        report["mechanical_pass"] = False
+        if isinstance(exc, TimeoutError):
+            runtime.agent_run_manager.cancel_run(run.run_id, reason="isolated follow-up timeout")
+    finally:
+        report["task_wall_seconds"] = round(time.perf_counter() - started, 3)
+        report["run_events"] = [event.model_dump(mode="json")
+                                for event in runtime.agent_run_manager.list_events(run.run_id)]
+    return report
+
+
 def _import_readonly_mail_snapshot(runtime, source: Path, *, limit: int = 60) -> dict:
     """Read committed source rows, never open the production database for writes."""
     with sqlite3.connect(source.resolve().as_uri() + "?mode=ro", uri=True) as conn:
@@ -299,9 +358,12 @@ def _import_synthetic_mail_batch(runtime) -> dict:
 
 async def run_case(case_id: str, *, output: Path, budget: LiveBudget, planning: bool = False,
                    timeout: float = 180, mail_db: Path | None = None, protocol: str = "configured",
-                   mail_expert: bool = False, full_retrieval: bool = False) -> dict:
+                   mail_expert: bool = False, full_retrieval: bool = False,
+                   response_mode: str = "text") -> dict:
     if protocol not in {"configured", "json", "native"}:
         raise ValueError("unsupported protocol experiment")
+    if response_mode not in {"text", "stream"}:
+        raise ValueError("unsupported response mode experiment")
     case = CASES[case_id]
     if case.get("real_mail") and mail_db is None:
         raise ValueError("real mail requires an explicit --mail-db read-only source")
@@ -372,7 +434,8 @@ async def run_case(case_id: str, *, output: Path, budget: LiveBudget, planning: 
     started = time.perf_counter()
     started_at = datetime.now(UTC)
     report = {"case_id": case_id, "goal": case["goal"], "model": config.llm.model,
-              "planning": planning, "protocol": protocol, "session_id": session_id, "private_artifacts": str(root),
+              "planning": planning, "protocol": protocol, "response_mode": response_mode,
+              "session_id": session_id, "private_artifacts": str(root),
               "mail_expert_enabled": mail_expert,
               "retrieval_config": {"embedding_enabled": config.embedding.enabled,
                                    "reranker_enabled": config.reranker.enabled},
@@ -387,8 +450,10 @@ async def run_case(case_id: str, *, output: Path, budget: LiveBudget, planning: 
                 ["app/core/agent_turn.py", "app/core/tool_result_gate.py", "app/core/sessions.py",
                  "app/integrations/web_search.py"]}}
     try:
+        mode_options = {"llm_response_mode": LLMResponseMode.STREAM} if response_mode == "stream" else {}
         result = await asyncio.wait_for(runtime.run_agent_turn_async(
-            session_id=session_id, user_input=case["goal"], existing_run_id=evaluation_run.run_id), timeout=timeout)
+            session_id=session_id, user_input=case["goal"], existing_run_id=evaluation_run.run_id,
+            **mode_options), timeout=timeout)
         report["result"] = result.model_dump(mode="json")
         answer = result.answer
         parent = runtime.agent_run_manager.get_run(result.run_id)
@@ -431,10 +496,17 @@ async def run_case(case_id: str, *, output: Path, budget: LiveBudget, planning: 
         report["mechanical_pass"] = all(checks.values())
         first_progress = next((event for event in result.progress_events
                                if event.type == "assistant_message"), None)
+        answer_delta = next((event for event in runtime.agent_run_manager.list_events(result.run_id)
+                             if event.type == "llm_delta" and event.stage == "answer"
+                             and event.payload.get("content_role") == "final_answer"
+                             and str(event.payload.get("delta", "")).strip()), None)
         report["metrics"] = {"first_agent_progress_seconds":
             round((datetime.fromisoformat(first_progress.created_at) - started_at).total_seconds(), 3)
             if first_progress else None,
-            "first_final_token_seconds": None, "response_mode": "text",
+            "first_final_token_seconds":
+                round((datetime.fromisoformat(answer_delta.created_at) - started_at).total_seconds(), 3)
+                if answer_delta else None,
+            "response_mode": response_mode,
             "llm_calls": len(result.llm_events),
             "llm_total_duration_ms": sum(event.duration_ms or 0 for event in result.llm_events),
             "tool_calls": len(result.tool_events),
@@ -447,6 +519,13 @@ async def run_case(case_id: str, *, output: Path, budget: LiveBudget, planning: 
             "output_tokens": sum(event.output_token_count or 0 for event in result.llm_events)}
         report["total_agent_metrics"] = {key: report["metrics"][key] + report["child_metrics"][key]
             for key in ("llm_calls", "llm_total_duration_ms", "input_tokens", "output_tokens")}
+        if case.get("followup_goal"):
+            report["initial_turn_seconds"] = round(time.perf_counter() - started, 3)
+            report["followup"] = await _followup_probe(runtime, session_id=session_id, case=case, timeout=timeout)
+            checks["followup_fact_and_reuse"] = report["followup"]["mechanical_pass"]
+            if case.get("read_only"):
+                checks["files_unchanged"] = _hashes(workspace) == before
+            report["mechanical_pass"] = all(checks.values())
     except Exception as exc:  # noqa: BLE001 - preserve per-case failure evidence
         report["error"] = {"type": type(exc).__name__, "message": str(exc)}
         report["mechanical_pass"] = False
@@ -482,6 +561,8 @@ def main():
                         help="use configured cached local embedding/reranker; never download models")
     parser.add_argument("--protocol", choices=["configured", "json", "native"], default="configured",
                         help="isolated capability experiment; does not update persistent config")
+    parser.add_argument("--response-mode", choices=["text", "stream"], default="text",
+                        help="measure first final-answer delta from persisted backend events; not frontend/network TTFT")
     parser.add_argument("--timeout", type=float, default=180)
     parser.add_argument("--mail-db", type=Path, help="explicit read-only production mail source for snapshot test")
     parser.add_argument("--output", type=Path, default=Path("data/quality_runs/linux_20261005"))
@@ -498,7 +579,7 @@ def main():
         report = asyncio.run(run_case(case_id, output=output, budget=budget,
                                      planning=args.planning, timeout=args.timeout, mail_db=args.mail_db,
                                      protocol=args.protocol, mail_expert=args.mail_expert,
-                                     full_retrieval=args.full_retrieval))
+                                     full_retrieval=args.full_retrieval, response_mode=args.response_mode))
         print(json.dumps({k: report.get(k) for k in
               ("case_id", "task_wall_seconds", "mechanical_pass", "checks", "error", "private_artifacts",
                "budget_after")}, ensure_ascii=False), flush=True)

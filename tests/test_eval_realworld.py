@@ -116,6 +116,45 @@ def test_workflow_expert_usage_is_included_in_child_metrics():
                        "input_tokens": 783, "output_tokens": 98, "calls_missing_usage": 0}
 
 
+def test_stream_metric_uses_final_answer_delta_not_reasoning(tmp_path):
+    async def fake_turn(self, *, session_id, user_input, existing_run_id, llm_response_mode):
+        from app.core.llm import LLMResponseMode
+
+        assert llm_response_mode == LLMResponseMode.STREAM
+        self.agent_run_manager.append_event(existing_run_id, "llm_delta", "reasoning",
+            stage="answer", payload={"delta": "reasoning", "content_role": "reasoning"})
+        self.agent_run_manager.append_event(existing_run_id, "llm_delta", "answer",
+            stage="answer", payload={"delta": "amber", "content_role": "final_answer"})
+        return AgentTurnResult(run_id=existing_run_id, session_id=session_id,
+                               trace_id="synthetic", answer="amber citrus-642")
+
+    budget = LiveBudget(tmp_path / "budget.sqlite3")
+    with patch("scripts.eval_realworld.LocalKnowledgeAgentRuntime.run_agent_turn_async", fake_turn):
+        report = asyncio.run(run_case("known_fact", output=tmp_path, budget=budget, response_mode="stream"))
+    assert report["metrics"]["response_mode"] == "stream"
+    assert report["metrics"]["first_final_token_seconds"] is not None
+
+
+def test_followup_reuses_same_session_and_keeps_its_timeout_trace(tmp_path):
+    sessions = []
+
+    async def fake_turn(self, *, session_id, user_input, existing_run_id):
+        sessions.append(session_id)
+        if len(sessions) == 2:
+            await asyncio.sleep(1)
+        return AgentTurnResult(run_id=existing_run_id, session_id=session_id,
+                               trace_id="synthetic", answer="jade willow-739")
+
+    budget = LiveBudget(tmp_path / "budget.sqlite3")
+    with patch("scripts.eval_realworld.LocalKnowledgeAgentRuntime.run_agent_turn_async", fake_turn):
+        report = asyncio.run(run_case("heldout_context_reuse", output=tmp_path, budget=budget, timeout=.01))
+    assert sessions == [report["session_id"]] * 2
+    assert report["followup"]["run_id"] != report["evaluation_run_id"]
+    assert report["followup"]["error"]["type"] == "TimeoutError"
+    assert any(event["type"] == "run_cancelled" for event in report["followup"]["run_events"])
+    assert not report["mechanical_pass"]
+
+
 def test_timeout_cancels_children_and_preserves_their_events(tmp_path):
     async def stalled_turn(self, *, session_id, user_input, existing_run_id):
         self.agent_run_manager.create_child_run(
