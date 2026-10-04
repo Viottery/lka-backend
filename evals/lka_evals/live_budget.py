@@ -23,7 +23,7 @@ class LiveBudgetExceeded(LLMClientError):
 
 
 class LiveBudget:
-    def __init__(self, path: Path, *, usd_limit: float = 5, call_limit: int = 400,
+    def __init__(self, path: Path, *, usd_limit: float = 50, call_limit: int = 2000,
                  search_limit: int = 3000) -> None:
         if not math.isfinite(usd_limit) or usd_limit <= 0 or call_limit < 1 or search_limit < 0:
             raise ValueError("invalid live evaluation budget")
