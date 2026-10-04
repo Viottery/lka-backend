@@ -74,6 +74,49 @@ CASES = {
         "goal": "把这批本地邮件按发件人整理，每类给出数量和主要主题，先给出本地邮件总数。不要同步远程邮箱。如果只处理了一部分，请说清实际覆盖范围，不要假装完整。",
         "files": {}, "real_mail": True, "read_only": True,
     },
+    "synthetic_mail_overview": {
+        "goal": "把这批本地邮件按发件人整理，每类给出数量和主要主题，先给出本地邮件总数。不要同步远程邮箱。如果只处理了一部分，请说清实际覆盖范围，不要假装完整。",
+        "files": {}, "synthetic_mail": True, "read_only": True,
+    },
+    "heldout_unknown_path": {
+        "goal": "这份工作区里，生产环境当前生效的标识和区域是什么？不要把历史备份当成当前配置。",
+        "files": {"README.md": "Current deployment metadata is stored under operations/live/.\n",
+                  "operations/archive/environment.txt": "Superseded: region north; deployment cedar-111.\n",
+                  "operations/live/environment.txt": "Effective: region south; deployment olive-912.\n"},
+        "facts": ["south", "olive-912"], "read_only": True,
+    },
+    "heldout_log_middle": {
+        "goal": "运维说日志结尾全是正常心跳，所以部署没问题。请核对事件记录，指出最新一次部署的真实结果、版本和原因。",
+        "files": {"README.md": "Deployment event stream: logs/events.log\n",
+                  "logs/events.log": "2026-10-01 release v4.0 SUCCESS\n" +
+                  "INFO ordinary heartbeat\n" * 900 +
+                  "2026-10-04 release v4.2 FAILED: signature validation rejected SIG_729\n" +
+                  "INFO ordinary heartbeat\n" * 900},
+        "facts": ["v4.2", "SIG_729"], "read_only": True,
+    },
+    "heldout_mutable_default": {
+        "goal": "这个模块连续独立调用时会串数据。定位问题并修复，验证独立调用和显式传入容器的行为都正确。",
+        "files": {
+            "README.md": "# Tag demo\nPure Python. Tests: python -m unittest discover -s tests\n",
+            "tags.py": "def tag(value, labels=[]):\n    labels.append(value)\n    return labels\n",
+            "tests/test_tags.py": "import unittest\nfrom tags import tag\n\nclass Tests(unittest.TestCase):\n    def test_independent(self):\n        a=tag('a'); b=tag('b')\n        self.assertEqual(a,['a']); self.assertEqual(b,['b']); self.assertIsNot(a,b)\n    def test_explicit(self):\n        labels=['x']; self.assertIs(tag('y',labels),labels); self.assertEqual(labels,['x','y'])\n    def test_empty(self):\n        self.assertEqual(tag(''),[''])\n",
+        }, "verify_command": ["python", "-m", "unittest", "discover", "-s", "tests"],
+    },
+    "web_search_release": {
+        "goal": "联网搜索 uv 当前最新稳定版本，并核实该版本发布时间与两项发布变化。尽量用项目官方发布记录；如果搜索结果和页面不一致，说明以哪个为准。给出可追溯来源，控制篇幅。",
+        "files": {}, "web": True, "search_required": True, "read_only": True,
+        "facts": ["uv"],
+    },
+    "parallel_audit": {
+        "goal": "请用多个 Agent 独立核查这个服务的发布安排、数据备份状况和启动错误，再综合给出能否上线的结论、证据和仍未解决的问题。不同核查可以并行，不要修改文件。",
+        "files": {"README.md": "Independent evidence: docs/release.txt, backups/status.txt, logs/service.log and config/service.env.\n",
+                  "docs/release.txt": "Final release window 2026-10-10 16:00 UTC. Supersedes 2026-10-08. Approval pending: owner Nora.\n",
+                  "backups/status.txt": "Backup created 2026-10-04. Restore check FAILED: missing segment BACKUP_419. No verified recovery yet.\n",
+                  "logs/service.log": "ERROR startup database connection refused at localhost:5444. Actual database listens on5432.\n",
+                  "config/service.env": "DB_PORT=5444\n"},
+        "facts": ["2026-10-10", "16:00", "Nora", "BACKUP_419", "5444", "5432"],
+        "read_only": True, "children_required": True,
+    },
 }
 
 
@@ -131,8 +174,25 @@ def _sender_coverage(answer: str, counts: dict[str, int]) -> dict:
             "all_sender_counts_present": all(matched.values()), "matches": matched}
 
 
+def _import_synthetic_mail_batch(runtime) -> dict:
+    from app.domains.mail import MailAccountInput, MailMessageInput
+    counts = [1] * 18 + [2] * 5 + [3] * 3 + [4, 5, 7, 7]
+    topics = ["purchase receipts", "release notices", "meeting invitations", "travel reservations"]
+    messages = [MailMessageInput(external_id=f"batch-{group}-{number}",
+        sender=f"sender-{group:02}@example.test", received_at="2026-09-12T10:30:00Z",
+        subject=f"{topics[group % len(topics)]} update {number}",
+        body_text=f"Update {number} for {topics[group % len(topics)]}.")
+        for group, count in enumerate(counts) for number in range(count)]
+    runtime.import_mail(account=MailAccountInput(email_address="owner@example.test"), messages=messages)
+    return {"selected_count": len(messages), "sender_counts": dict(Counter(m.sender for m in messages)),
+            "body_scope": "synthetic 60-message batch; no private information"}
+
+
 async def run_case(case_id: str, *, output: Path, budget: LiveBudget, planning: bool = False,
-                   timeout: float = 180, mail_db: Path | None = None) -> dict:
+                   timeout: float = 180, mail_db: Path | None = None, protocol: str = "configured",
+                   mail_expert: bool = False) -> dict:
+    if protocol not in {"configured", "json", "native"}:
+        raise ValueError("unsupported protocol experiment")
     case = CASES[case_id]
     if case.get("real_mail") and mail_db is None:
         raise ValueError("real mail requires an explicit --mail-db read-only source")
@@ -146,9 +206,17 @@ async def run_case(case_id: str, *, output: Path, budget: LiveBudget, planning: 
     before = _hashes(workspace)
     settings = Settings(LKA_DATA_DIR=root / "data", LKA_WORKSPACE_ROOTS=str(workspace))
     config = settings.load_local_config()
+    if protocol != "configured":
+        # Explicit evaluation-only capability experiment, never infer capabilities
+        # from a model name or mutate the user's persistent configuration.
+        clients = [client.model_copy(update={"supports_json_mode": True,
+                    "supports_function_calling": protocol == "native"})
+                   for client in config.llm.client_configs()]
+        config = config.model_copy(update={"llm": config.llm.model_copy(update={"clients": clients})})
     config = config.model_copy(update={
         "agent": config.agent.model_copy(update={"orchestrator": "langgraph",
             "checkpoint_backend": "sqlite", "multi_agent_planning_enabled": planning,
+            "mail_expert_enabled": mail_expert,
             "codex_expert_enabled": False, "max_decision_steps": 12}),
         "mail": config.mail.model_copy(update={
             "outlook": config.mail.outlook.model_copy(update={"enabled": False}),
@@ -168,13 +236,16 @@ async def run_case(case_id: str, *, output: Path, budget: LiveBudget, planning: 
         search_tool.adapter.quota = _SearchReservation(budget)
     apply_setup(runtime, case.get("setup"))
     mail_snapshot = _import_readonly_mail_snapshot(runtime, mail_db) if case.get("real_mail") else None
+    if case.get("synthetic_mail"):
+        mail_snapshot = _import_synthetic_mail_batch(runtime)
     session = runtime.create_session(title="quality: " + case_id)
     session_id = session.session.session_id
     runtime.set_session_workspace(session_id=session_id, path=str(workspace.resolve()), platform="linux")
     started = time.perf_counter()
     started_at = datetime.now(UTC)
     report = {"case_id": case_id, "goal": case["goal"], "model": config.llm.model,
-              "planning": planning, "session_id": session_id, "private_artifacts": str(root),
+              "planning": planning, "protocol": protocol, "session_id": session_id, "private_artifacts": str(root),
+              "mail_expert_enabled": mail_expert,
               "budget_before": budget.snapshot(), "test_output_cap_if_unspecified": 16384,
               "mail_snapshot": mail_snapshot, "started_at": started_at.isoformat(),
               "code_hashes": {p: hashlib.sha256(Path(p).read_bytes()).hexdigest() for p in
@@ -185,7 +256,15 @@ async def run_case(case_id: str, *, output: Path, budget: LiveBudget, planning: 
             session_id=session_id, user_input=case["goal"]), timeout=timeout)
         report["result"] = result.model_dump(mode="json")
         answer = result.answer
+        parent = runtime.agent_run_manager.get_run(result.run_id)
+        children = [child for child_id in (parent.child_run_ids if parent else ())
+                    if (child := runtime.agent_run_manager.get_run(child_id)) is not None]
+        report["child_runs"] = [child.model_dump(mode="json") for child in children]
+        report["child_events"] = {child.run_id: [event.model_dump(mode="json") for event in
+            runtime.agent_run_manager.list_events(child.run_id)] for child in children}
         checks = {"fact_coverage": all(s.lower() in answer.lower() for s in case.get("facts", []))}
+        if case.get("children_required"):
+            checks["multiple_children_executed"] = len(children) >= 2
         if mail_snapshot:
             checks["snapshot_total_mentioned"] = str(mail_snapshot["selected_count"]) in answer
             report["sender_coverage"] = _sender_coverage(answer, mail_snapshot["sender_counts"])
@@ -203,6 +282,9 @@ async def run_case(case_id: str, *, output: Path, budget: LiveBudget, planning: 
         if case.get("web"):
             checks["page_evidence_loaded"] = any(e.tool_name == "web.open" and e.result.get("status") == "completed"
                                                 for e in result.tool_events)
+        if case.get("search_required"):
+            checks["search_executed"] = any(e.tool_name == "web.search" and e.result.get("status") == "completed"
+                                             for e in result.tool_events)
         # Coverage and a successful fetch are necessary, not semantic-proof scores.
         report["checks"] = checks
         report["mechanical_pass"] = all(checks.values())
@@ -235,6 +317,9 @@ def main():
     parser.add_argument("--case", action="append", choices=sorted(CASES))
     parser.add_argument("--list", action="store_true")
     parser.add_argument("--planning", action="store_true")
+    parser.add_argument("--mail-expert", action="store_true", help="isolated opt-in to the existing mail specialist")
+    parser.add_argument("--protocol", choices=["configured", "json", "native"], default="configured",
+                        help="isolated capability experiment; does not update persistent config")
     parser.add_argument("--timeout", type=float, default=180)
     parser.add_argument("--mail-db", type=Path, help="explicit read-only production mail source for snapshot test")
     parser.add_argument("--output", type=Path, default=Path("data/quality_runs/linux_20261005"))
@@ -249,7 +334,8 @@ def main():
     budget = LiveBudget(output / "budget.sqlite3")
     for case_id in args.case:
         report = asyncio.run(run_case(case_id, output=output, budget=budget,
-                                     planning=args.planning, timeout=args.timeout, mail_db=args.mail_db))
+                                     planning=args.planning, timeout=args.timeout, mail_db=args.mail_db,
+                                     protocol=args.protocol, mail_expert=args.mail_expert))
         print(json.dumps({k: report.get(k) for k in
               ("case_id", "task_wall_seconds", "mechanical_pass", "checks", "error", "private_artifacts",
                "budget_after")}, ensure_ascii=False), flush=True)

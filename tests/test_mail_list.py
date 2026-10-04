@@ -187,6 +187,13 @@ def test_mail_list_accepts_existing_signed_payload_tokens(mail_service, monkeypa
     assert len(second.messages) == 5
 
 
+@pytest.mark.parametrize("token", ["ml_" + "x" * 3000, "ml_" + "界" * 43, "ml_short"])
+def test_compact_listing_rejects_unbounded_or_non_ascii_tokens(mail_service, token):
+    with pytest.raises(ValueError, match="Invalid listing_id"):
+        mail_service.list_messages(received_from="2026-05-01T00:00:00Z",
+                                   received_before="2026-06-01T00:00:00Z", listing_id=token)
+
+
 def test_mail_search_reports_capped_non_exhaustive_retrieval_metadata(mail_service):
     class FakeKnowledgeService:
         def search(self, **kwargs):

@@ -264,6 +264,8 @@ class MailService:
         token_payload = {"filters": normalized_filters, "fingerprint": fingerprint}
         if listing_id is not None:
             if listing_id.startswith("ml_"):
+                if len(listing_id) != 46 or not listing_id.isascii():
+                    raise ValueError("Invalid listing_id; start a new listing.")
                 matches = hmac.compare_digest(
                     listing_id.encode("utf-8"), _compact_listing_token(token_payload).encode("ascii"),
                 )
