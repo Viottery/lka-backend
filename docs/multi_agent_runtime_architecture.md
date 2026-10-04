@@ -306,6 +306,11 @@ fork 的权限来自 requested scope 与 parent effective、session、workspace�
 planner 的 package/tool 选择仅作为路由约束，不作为权限授予。child 工具调用再次由 ToolView、
 Tool Executor 和 Safety Gate 校验。配置默认关闭，启用需使用 LangGraph orchestrator。
 
+工具发现与调用授权分开：`ToolSpec.supports_read_only_invocations` 默认 false，支持按参数
+分类只读的工具可明确声明 true，让 READ 子 Agent 看到工具而不拿空参数误判隐藏。
+这仅影响 catalog，静态 read_only 保持原值；执行仍用真实参数检查冻结 ToolView、作用域、
+安全门和来源约束。声明不能允许写调用、绕过 NONE/expiry，或将 READ 提升为 EXTERNAL。
+
 当前验证结果只对明确机器可检查的 artifact/evidence/side-effect 状态给出确定结论；自然语言合同
 需要外部 verifier outcome，未提供时保持 inconclusive。文件变更范围和测试/lint/schema 结果需由外部
 验证器或调用方提供，内置 aggregator 不会自行运行这些检查。

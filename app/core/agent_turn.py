@@ -4238,6 +4238,8 @@ class AgentTurnLoop:
         tools = self.tool_executor.registry.list_tools(package=package_name)
         if tool_view is None:
             return tools
+        # Conditional readers can be discovered at READ without empty inputs
+        # proving read-only. ToolExecutor still checks the actual arguments.
         return [
             tool
             for tool in tools
@@ -4245,7 +4247,10 @@ class AgentTurnLoop:
                 tool_name=tool.name,
                 package=tool.package,
                 read_only=(
-                    effective_tool_read_only(self.tool_executor.registry.get_tool(tool.name), {})
+                    True
+                    if tool_view.side_effect_level == SideEffectLevel.READ
+                    and tool.supports_read_only_invocations
+                    else effective_tool_read_only(self.tool_executor.registry.get_tool(tool.name), {})
                 ),
             )
         ]

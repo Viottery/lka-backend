@@ -355,6 +355,7 @@ class BashRunTool:
         risk="high",
         requires_confirmation=False,
         read_only=False,
+        supports_read_only_invocations=True,
         side_effects=["execute_local_process", "read_local_files", "write_local_files"],
         scope_uses_workspace=True,
         input_schema={

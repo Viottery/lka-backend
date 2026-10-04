@@ -50,6 +50,9 @@ class ToolSpec(BaseModel):
     risk: str = "low"
     requires_confirmation: bool = False
     read_only: bool | None = None
+    # Discovery only: some inputs may be read-only even when the tool is not.
+    # Execution must still classify and authorize the actual invocation input.
+    supports_read_only_invocations: bool = False
     side_effects: list[str] = Field(default_factory=list)
     resource_lock_group: str | None = None
     resource_lock_fields: tuple[str, ...] = ()
