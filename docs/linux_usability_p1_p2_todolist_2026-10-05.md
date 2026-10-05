@@ -279,6 +279,13 @@ child token 预算。原预算不是上下文窗口；child run completed 不等
   是否自动修复答案属于新行为，先通过内部开关验证，不能悄悄改变现有 warning-only API。
 - [ ] package metadata 表达网页读取 / find 的覆盖边界；core 只消费通用来源和
   完整性，不写 Python、SQLite、uv 事实，不用测试正确答案作提示。
+- [x] 工具侧先修复命中摘录漏相邻条件：保留有界完整可读块、原文区间/hash和
+  局部缺失标记；放不下用原续读协议恢复，不能把匹配分页完成当语义取证完成。
+- [x] 返回本次实际 redirect/选定响应头；缓存来源及搜索摘要差异原因仍明确未知。
+  元数据/描述/schema同步，保持原能力API的flat spec形状与只读/公网安全边界。
+- [x] 修复嵌套元数据耗尽delivery遍历额度导致正文无binding：累计节点与记录数
+  分开有界，原宽容器≤24及receipt≤24不变；实际provider边界显示partial而非伪完整。
+  这不替代上面的任务claim coverage/语义核对验收，三个原语义案例仍open。
 
 ### 8.2 UX-05A：Python 多来源条件
 

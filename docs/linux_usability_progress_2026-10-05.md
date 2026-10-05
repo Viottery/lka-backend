@@ -297,3 +297,45 @@ ToolResult 的类型敏感 JSON；其已有 gate/续读行为不变。追加已 
 子 Agent、不更改用户并行开发的消息/Windows 模块、不重启后端。共享账本累计
 $6.500170496、1147 dispatch（7 条历史未知预留），搜索仍 8。评测状态计数维持
 41 项：4 baseline / 17 bounded live / 12 offline / 8 open，focus 仍 20。
+
+## 能力续轮 UX-05：限定条件、网络事实与正文交付
+
+用户要求暂停开销优化，改进能力表现。本轮不改变窗口、预算、模型、角色或 route，
+优先修网页“命中声明但漏掉条件”和“猜测搜索摘要为什么不同”。不把 case/gold、
+Python/SQLite 的事实写入 core，也不新增默认 LLM reviewer/自动改写回答。
+
+工具根因：原 `web.find` 只保留命中前约100、合计400字符，同段末尾或下一段条件会
+遗漏。新逻辑按可读提取中的空行分块，优先完整保留命中块及前后各一块，最多1200
+字符。放不下时退到命中完整块，再退到有界片段；始终完整包含实际命中，并返回
+`context_start/end`、`context_complete`、`snippet_scope`，让模型按同一提取 hash 续读。
+这些是局部范围，不是 HTML 语义结构或 claim 的支持证明；`complete` 仍只表示匹配
+分页结束。抓取 URL、hash、时间沿用原协议，SSRF/单跳公网校验/字节/时限不放宽。
+
+open/find 新增这次请求实际的 `network_observations`：原 URL、真正经过的 redirect
+跳数/状态/目标、最终状态、选定响应头前512字符。无跳转就是0，不能把 URL 名字不同
+当发生过跳转；即使有 Age/Cache-Control，`cache_origin` 仍 not_determined，不能用
+这个页面的响应头诊断搜索服务的摘要来源。同步工具描述/包 metadata/输出 schema，
+旧输入参数和输出字段不移除，能力 API 的 flat schema 形式保留。
+
+兼容检查发现初版将 flat 输出 schema 改为标准 object，两个原 API/spec 检查失败；
+改回 flat 表达，不更改旧断言。三个相关模块 **63 passed / 1.88s**。独立 Luna 审查
+另发现旧 casefold 匹配可能将 `s` 对上半个 `ß→ss`，再把整个原字符当成 literal；
+增加折叠字符左右边界校验，保留完整 STRASSE/ß 匹配及准确 Unicode 原文区间。
+
+真实 harness 缺口：普通 delivery binding 把“最多24条元数据”同时作为整树24节点
+遍历预算，嵌套 metadata/匹配数组在到正文前就耗尽，返回空 binding。拆为累计256
+节点遍历和最多24 binding/receipt，并继续每个 dict/list 最多枚举24；权限、原件
+身份/精确片段核验与最终重新拟合不变。初版扩大宽容器枚举触发原≤24断言，保留
+宽度限制后修复，不放宽旧测试。五个完整抓取的局部片段经普通 gate 后确实丢掉中间
+条件，新的 receipt 正确报告 partial/upstream unknown，而非“模型已完整读过”。
+
+新增12个边界实例：条件在下一块/上一块、邻居过长续读及版本变化拒绝、200字符
+query 折叠后400字符仍完整命中、真实mock HTTP两次跳转/直连/未知缓存来源、四个
+字段伪造反例、普通gate中间条件丢失、Unicode半字符误命中、实际SQLite artifact→
+answer拟合→假provider的最终覆盖状态。新模块与既有delivery模块合计
+**35 passed / 3.12s**，provider链路没有额外调用。只证明确定性范围与交付，不把
+假provider的回答文案当模型语义成功。三个网页语义旧案例仍 open，等单次原任务重放。
+
+最终五个相关模块 **98 passed / 4.89s**，Ruff 与 diff check 通过。独立审查确认总树
+遍历、单容器宽度与绑定条数都仍有界，认证不扩权。工作区另有用户的两处 web 工具
+权限属性改动，单独构造本轮diff暂存，原属性改动保持未暂存，未纳入本轮提交。

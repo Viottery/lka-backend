@@ -24,6 +24,7 @@ MAX_SEARCH_RESULTS = 10
 MAX_PAGE_BYTES = 1_000_000
 MAX_PAGE_TEXT_CHARS = 20_000
 MAX_REDIRECTS = 3
+MAX_FIND_CONTEXT_CHARS = 1_200
 
 
 class WebSearchError(RuntimeError):
@@ -334,9 +335,45 @@ def _page_literal_matches(text: str, folded_query: str):
         end = start + len(folded_query)
         source_pair = (source_indexes[start], source_indexes[end - 1] + 1)
         cursor = end
+        # A folded substring must cover whole original characters. For example,
+        # "s" is only half of the folded "ß" and cannot cite that as a literal.
+        if ((start > 0 and source_indexes[start - 1] == source_indexes[start])
+                or (end < len(source_indexes) and source_indexes[end - 1] == source_indexes[end])):
+            continue
         if source_pair != previous:
             yield source_pair
             previous = source_pair
+
+
+def _find_context(text: str, start: int, end: int) -> dict[str, Any]:
+    """Keep nearby extraction blocks intact when bounded, never infer support.
+
+    Blank lines delimit readable blocks, not authenticated HTML paragraphs.
+    The requested span includes one neighbor on either side; a large span is
+    explicitly partial rather than silently dropping a distant qualification.
+    """
+    before = text.rfind("\n\n", 0, start)
+    block_start = before + 2 if before >= 0 else 0
+    after = text.find("\n\n", end)
+    block_end = after if after >= 0 else len(text)
+    previous = text.rfind("\n\n", 0, max(0, block_start - 2))
+    context_start = previous + 2 if previous >= 0 else 0
+    following = text.find("\n\n", min(len(text), block_end + 2))
+    context_end = following if following >= 0 else len(text)
+    if context_end - context_start <= MAX_FIND_CONTEXT_CHARS:
+        snippet_start, snippet_end = context_start, context_end
+        scope = "adjacent_readable_blocks"
+    elif block_end - block_start <= MAX_FIND_CONTEXT_CHARS:
+        snippet_start, snippet_end = block_start, block_end
+        scope = "matched_readable_block"
+    else:
+        snippet_start = max(block_start, start - 100)
+        snippet_end = max(end, min(block_end, snippet_start + 400))
+        scope = "bounded_fragment"
+    return {"snippet_start": snippet_start, "snippet_end": snippet_end,
+            "snippet": text[snippet_start:snippet_end], "snippet_scope": scope,
+            "context_start": context_start, "context_end": context_end,
+            "context_complete": snippet_start == context_start and snippet_end == context_end}
 
 
 def _find_recovery_preview(text: str, query: str) -> list[dict[str, Any]]:
@@ -433,11 +470,8 @@ class PublicPageFetcher:
         total = 0
         for start, end in _page_literal_matches(text, query.casefold()):
             if total >= offset:
-                snippet_start = max(0, start - 100)
-                snippet_end = min(len(text), snippet_start + 400)
                 matches.append({"match_start": start, "match_end": end,
-                                "snippet_start": snippet_start, "snippet_end": snippet_end,
-                                "snippet": text[snippet_start:snippet_end]})
+                                **_find_context(text, start, end)})
             total += 1
             if len(matches) > limit:
                 break
@@ -449,6 +483,7 @@ class PublicPageFetcher:
                 "next_offset": offset + len(matches[:limit]) if has_more else None,
                 "complete": not has_more, "total_matches": None if has_more else total,
                 "match_status": match_status, "recovery_preview": recovery_preview,
+                "coverage_scope": "literal_match_page_not_semantic_verification",
                 "recovery_preview_scope": "non_phrase_nonsemantic_excerpt",
                 "query_tokenization": "unicode_word_runs_no_cjk_segmentation"}
 
@@ -462,6 +497,8 @@ class PublicPageFetcher:
         ):
             raise WebSearchError("expected_text_sha256 must be a lowercase SHA-256 hex digest.")
         target = _safe_public_https_url(url)
+        requested_url = target
+        redirects = []
         try:
             for hop in range(self.max_redirects + 1):
                 status, headers, content = self._fetch(target)
@@ -469,7 +506,9 @@ class PublicPageFetcher:
                     location = headers.get("location")
                     if not location or hop >= self.max_redirects:
                         raise WebSearchError("Page fetch exceeded the redirect limit or had no redirect target.")
-                    target = _safe_public_https_url(urljoin(target, location))
+                    next_target = _safe_public_https_url(urljoin(target, location))
+                    redirects.append({"url": target, "status": status, "target": next_target})
+                    target = next_target
                     continue
                 if status != 200:
                     raise WebSearchError(f"Page fetch returned HTTP {status}.")
@@ -497,6 +536,15 @@ class PublicPageFetcher:
                     "text_sha256": fingerprint,
                     "snapshot_stable": False,
                     "text_scope": "readable_text_extraction",
+                    "network_observations": {
+                        "requested_url": requested_url, "redirects": redirects,
+                        "redirect_count": len(redirects), "final_http_status": status,
+                        "response_headers": {key: headers[key][:512] for key in (
+                            "date", "age", "cache-control", "etag", "last-modified") if key in headers},
+                        "cache_origin": "not_determined",
+                        "response_headers_scope": "selected_headers_first_512_chars",
+                        "scope": "this_fetch_only_not_search_provider_diagnostics",
+                    },
                 }
         except WebSearchError:
             raise

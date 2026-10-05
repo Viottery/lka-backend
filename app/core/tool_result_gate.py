@@ -8,6 +8,7 @@ from itertools import islice
 from typing import Any
 
 _DELIVERY_LIMIT = 24
+_DELIVERY_WALK_LIMIT = 256
 _MISSING = object()
 
 
@@ -80,7 +81,7 @@ def bind_context_delivery(
     view_result = view_payload.get("result", _MISSING) if isinstance(view_payload, dict) else _MISSING
     stack = [(raw_payload, view_result, "", "/result")]
     visited = 0
-    while stack and visited < _DELIVERY_LIMIT:
+    while stack and visited < _DELIVERY_WALK_LIMIT and len(bindings) < _DELIVERY_LIMIT:
         raw, view, path, view_path = stack.pop()
         visited += 1
         if len(path) > 512 or len(view_path) > 1024:
@@ -107,7 +108,7 @@ def bind_context_delivery(
                 binding["projection_unknown"] = True
             bindings.append(binding)
         elif isinstance(raw, dict):
-            room = _DELIVERY_LIMIT - visited - len(stack)
+            room = min(_DELIVERY_LIMIT, _DELIVERY_WALK_LIMIT - visited - len(stack))
             children = [
                 (item, view.get(key, _MISSING) if isinstance(view, dict) else _MISSING,
                  pointer(path, key), pointer(view_path, key))
@@ -115,7 +116,7 @@ def bind_context_delivery(
             ]
             stack.extend(reversed(children))
         elif isinstance(raw, list):
-            room = _DELIVERY_LIMIT - visited - len(stack)
+            room = min(_DELIVERY_LIMIT, _DELIVERY_WALK_LIMIT - visited - len(stack))
             if isinstance(view, list):
                 items, items_path = view, view_path
             elif (
