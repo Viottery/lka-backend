@@ -32,3 +32,19 @@ mixed/all-skipped recovery 也携带独立 historical_task_results，不作为�
 
 状态：implemented / offline_verified；未进行真实远程模型重放，不标 live_verified。
 持久原件、失败状态、用户改动均保留。后续独立审查发现问题在本记录继续追加。
+
+## UX-02：可回退的统一入口
+
+改进：legacy / LangGraph 可直接由首个正常 ReAct 动作选择展开包、回答或按需委派，
+取消额外的模型 route 阶段。不预先展开全体 schema，不跳过 ToolView / executor。
+首个实际展开包成为 initial_package；没有包但有 fork 观察时仍将观察交给回答阶段。
+保留已校验 child 单授权包的确定性快捷路径；统一入口的进度事件和检查点保持可观察。
+
+配置：`[agent] unified_entry_enabled = true`。**默认 false**，先作为可配对验证的
+回退开关，不修改用户本地配置或已运行进程；取消入口 route 不等于冷启动少一次调用，
+因为第一次动态展开包也需要选择。
+
+本地真实 runtime + 脚本 provider：改名文件读取为 4 次调用（展开/读取/结束/回答），
+上下文回答为 2 次；最终回答保持独立 writer。双执行器 + 现有 child 路由 / fork 修复
+检查共 9 项通过，原批次 5.74s；独立低成本代码审查未发现新增具体缺陷。
+这些只证明控制流程，不代表真实模型选择准确率或测得端到端加速。

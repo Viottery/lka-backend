@@ -494,6 +494,7 @@ class LocalKnowledgeAgentRuntime:
         self.memory_background.initialize_recovery()
         self.last_background_error: str | None = None
         self.agent_turn_loop = AgentTurnLoop(
+            unified_entry_enabled=self.local_app_config.agent.unified_entry_enabled,
             session_service=self.session_service,
             tool_executor=self.tool_executor,
             llm_client=self.agent_llm_client,

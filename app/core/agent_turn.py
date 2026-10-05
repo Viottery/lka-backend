@@ -691,6 +691,7 @@ class AgentTurnLoop:
         fork_execution: Callable[[str], Any] | None = None,
         fork_plan_finalizer: Callable[[str], Any] | None = None,
         fast_path_single_agent_enabled: bool = False,
+        unified_entry_enabled: bool = False,
         default_workspace_root: str | None = None,
         instruction_files: Any | None = None,
         memory_context_provider: Callable[[str, str | None, str], dict[str, Any]] | None = None,
@@ -699,6 +700,7 @@ class AgentTurnLoop:
         memory_pre_turn_callback: Callable[[str | None, str], list[str]] | None = None,
     ) -> None:
         self.session_service = session_service
+        self.unified_entry_enabled = unified_entry_enabled
         self.tool_executor = tool_executor
         self.llm_client = llm_client
         self.log_dir = log_dir
@@ -1078,23 +1080,28 @@ class AgentTurnLoop:
         llm_events: list[AgentTurnLLMEvent] = []
         decision_events: list[AgentTurnDecisionEvent] = []
         progress_events: list[AgentTurnProgressEvent] = []
-        route = self._route(
-            user_input=user_input,
-            package_catalog=package_catalog,
-            context_window=context_window_payload,
-            llm_events=llm_events,
-            decision_events=decision_events,
+        unified_entry = self.unified_entry_enabled and self.llm_client is not None
+        route = (
+            {"selected_package": None, "entry_mode": "unified",
+             "reason": "The first ReAct operation selects capabilities on demand."}
+            if unified_entry else self._route(
+                user_input=user_input, package_catalog=package_catalog,
+                context_window=context_window_payload,
+                llm_events=llm_events, decision_events=decision_events,
+            )
         )
         selected_package = route.get("selected_package")
         self._append_progress(
             progress_events,
-            type="package_selected" if isinstance(selected_package, str) else "no_package",
+            type=("entry_ready" if unified_entry else
+                  "package_selected" if isinstance(selected_package, str) else "no_package"),
             stage="route",
             package_name=selected_package if isinstance(selected_package, str) else None,
             status="completed",
             message=(
                 f"Selected `{selected_package}` package."
                 if isinstance(selected_package, str)
+                else "Capabilities will be selected by the first operation." if unified_entry
                 else "No tool package selected; answering from context if possible."
             ),
             metadata={"reason": route.get("reason")},
@@ -1103,14 +1110,14 @@ class AgentTurnLoop:
         expanded_tools: list[dict[str, Any]] = []
         answer = ""
 
-        if isinstance(selected_package, str):
+        if isinstance(selected_package, str) or unified_entry:
             expanded_tools = [
                 tool.model_dump(mode="json")
                 for tool in self._tools_for_package(
                     selected_package,
                     tool_view=context.tool_view,
                 )
-            ]
+            ] if isinstance(selected_package, str) else []
             answer = self._run_package_tools(
                 user_input=user_input,
                 route=route,
@@ -1166,6 +1173,11 @@ class AgentTurnLoop:
             tool_events=tool_events,
         )
         self._complete_configured_fast_path(run_id=run_id, answer=answer)
+        if unified_entry:
+            selected_package = next(
+                (event.package_name for event in progress_events
+                 if event.type == "package_expanded" and event.package_name), None,
+            )
         for warning in verification_warnings:
             self._append_progress(
                 progress_events,
@@ -1399,7 +1411,7 @@ class AgentTurnLoop:
         decision_events: list[AgentTurnDecisionEvent],
         progress_events: list[AgentTurnProgressEvent],
         expanded_tools: list[dict[str, Any]],
-        selected_package: str,
+        selected_package: str | None,
     ) -> str:
         if self.llm_client is not None:
             answer = self._run_llm_decision_loop(
@@ -1441,14 +1453,14 @@ class AgentTurnLoop:
         decision_events: list[AgentTurnDecisionEvent],
         progress_events: list[AgentTurnProgressEvent],
         expanded_tools: list[dict[str, Any]],
-        selected_package: str,
+        selected_package: str | None,
     ) -> str | None:
         observations: list[dict[str, Any]] = []
         successful_call_fingerprints: set[str] = set()
         fork_format_repair_used = False
         observations.extend(self._cached_tool_observations_from_context_window(context_window))
         package_catalog = self._package_catalog(context.tool_view)
-        expanded_package_names = {selected_package}
+        expanded_package_names = {selected_package} if selected_package else set()
         allowed_tool_names = {
             str(tool.get("name")) for tool in expanded_tools if isinstance(tool.get("name"), str)
         }

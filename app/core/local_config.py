@@ -225,6 +225,8 @@ class AgentInferenceProfile(BaseModel):
 
 class AgentConfig(BaseModel):
     max_decision_steps: int = 10
+    # Opt-in rollout: choose the first operation in ReAct, without a separate route call.
+    unified_entry_enabled: bool = False
     orchestrator: Literal["legacy", "langgraph"] = "legacy"
     checkpoint_backend: Literal["memory", "sqlite"] = "sqlite"
     multi_agent_planning_enabled: bool = False

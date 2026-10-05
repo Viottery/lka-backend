@@ -134,7 +134,8 @@ class AgentGraphRunner:
         builder.add_edge("initialize_run", "prepare_context")
         builder.add_edge("prepare_context", "route_package")
         builder.add_conditional_edges(
-            "route_package", self._after_route, {"expand": "expand_package", "answer": "answer"}
+            "route_package", self._after_route,
+            {"expand": "expand_package", "answer": "answer", "decide": "decide_next_operation"}
         )
         builder.add_edge("expand_package", "decide_next_operation")
         builder.add_edge("decide_next_operation", "validate_operation")
@@ -634,6 +635,12 @@ class AgentGraphRunner:
             self.turn_loop._record_route_decision(
                 decisions, source="local", route=route, raw_output=None
             )
+        elif (
+            getattr(self.turn_loop, "unified_entry_enabled", False)
+            and self.turn_loop.llm_client is not None
+        ):
+            route = {"selected_package": None, "entry_mode": "unified",
+                     "reason": "The first ReAct operation selects capabilities on demand."}
         else:
             route = self.turn_loop._route(
                 user_input=ws.user_input,
@@ -648,19 +655,22 @@ class AgentGraphRunner:
         progress = self._models(data["progress_events"], AgentTurnProgressEvent)
         self.turn_loop._append_progress(
             progress,
-            type="package_selected" if isinstance(selected, str) else "no_package",
+            type=("entry_ready" if route.get("entry_mode") == "unified" else
+                  "package_selected" if isinstance(selected, str) else "no_package"),
             stage="route",
             package_name=selected if isinstance(selected, str) else None,
             status="completed",
             message=f"Selected `{selected}` package."
             if isinstance(selected, str)
+            else "Capabilities will be selected by the first operation."
+            if route.get("entry_mode") == "unified"
             else "No tool package selected; answering from context if possible.",
             metadata={"reason": route.get("reason")},
         )
         data["progress_events"] = self._dump(progress)
         ws.route = route
         ws.initial_package = selected if isinstance(selected, str) else None
-        return self._save(s, ws, data, "routed")
+        return self._save(s, ws, data, "entry_ready" if route.get("entry_mode") == "unified" else "routed")
 
     def _expand_package(self, s: AgentGraphState) -> AgentGraphState:
         self.turn_loop._raise_if_cancel_requested()
@@ -700,6 +710,8 @@ class AgentGraphRunner:
             tools = self.turn_loop._tool_payloads_for_package(package, tool_view=tool_view)
             data["expanded_tools"].extend(tools)
             ws.expanded_packages.append(package)
+            if ws.initial_package is None:
+                ws.initial_package = package
             names = [str(t["name"]) for t in tools if isinstance(t.get("name"), str)]
             if not is_initial_expansion:
                 data["observations"].append(
@@ -1265,7 +1277,7 @@ class AgentGraphRunner:
                     context_window=data["context_window"],
                     llm_events=llm,
                 )
-                if ws.initial_package is None
+                if ws.initial_package is None and not data["observations"]
                 else self.turn_loop._answer_with_llm(
                     user_input=ws.user_input,
                     route=ws.route,
@@ -1556,6 +1568,8 @@ class AgentGraphRunner:
         }
 
     def _after_route(self, s: AgentGraphState) -> str:
+        if s.get("phase") == "entry_ready":
+            return "decide"
         return "expand" if self._ws(s).initial_package else "answer"
 
     @staticmethod

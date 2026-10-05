@@ -155,11 +155,11 @@ package catalog、当前目标、必要会话上下文与通用动作：展开�
 
 - [ ] 先在实际 trace 中按 route / decision / repair / tool / answer 拆分调用与输入
   token，定位重复选择；禁止把总延迟变化全归因目录大小。
-- [ ] 在现有 Agent turn / LangGraph 入口设计可回退的 unified-entry 开关。
+- [x] 在现有 Agent turn / LangGraph 入口设计可回退的 unified-entry 开关。
   复用完整动作协议、ToolView 与懒展开；不建立第二套 Agent Loop。
 - [ ] 复用当前 fast-path 的通用上下文充分性 / capability 约束，不启用关键词分类器，
   不新增 README→filesystem 等核心映射。Metadata 改进放在真实包的描述里。
-- [ ] 进入 `context_answer` 仍经过独立 answer stage；保留 route 兼容审计，但明确
+- [x] 进入 `context_answer` 仍经过独立 answer stage；保留 route 兼容审计，但明确
   `initial_package` 的实际展开来源，不能伪造一次并未发出的 route LLM 调用。
 - [ ] 目录按角色 / 阶段投影，保留能力区分说明，剔除尚未使用的执行细则与重复字段。
   目录缓存按 registry / scope / workspace / 配置版本失效，缓存不替用户选工具。
