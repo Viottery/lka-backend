@@ -113,6 +113,17 @@ metadata 或工具输出提供额外 summary，但这不是 Agent core 的领域
 分页查看；读取只接受当前 run 的 `tool_result` artifact，跨 run、跨子 Agent 均拒绝。
 子 Agent 还必须在其不可变 ToolView 中获准使用 `observation` package；未获授权时
 仍以普通工具范围检查拒绝，不能凭 artifact ID 扩权。
+最终 `answer` 的 provider 发送边界还会生成有界 `context_delivery`：它描述最终拟合
+prompt 中保留的缓存字符串区间，单位为 Unicode codepoints，按 artifact/hash/path
+合并；不是工具扫描量或上游来源完整性的证明。`coverage=complete` 仅表示这个版本
+的 cached value 完整进入本次 prompt，`upstream_coverage` 保持 unknown。元数据加入
+后重新拟合并核对，不能稳定或挤占 child 回答预留时放弃可选元数据，保留原安全 prompt。
+原始工具 JSON 中的 `_delivery_view` 等字段只作描述，不具备认证权限。需要把分页文本
+映回原缓存的 registered tool 可提供 `context_delivery_bindings(result_payload=...,
+view_payload=..., context=..., check_cancel=...)` 后端 callback；它必须重验当前 run、
+ToolView、artifact/hash、路径与原文，逐次 I/O 前后检查取消。Core 不识别具体包名，
+未注册 callback 时使用有界通用精确文本/规则预览映射。未知投影与重复 observation ID
+不能得到完整性认证；此机制不增加 LLM 调用，也不保证自由回答的语义正确。
 回读页亦有大小上限；工具返回文本视为不可信数据，不能覆盖上层指令。小结果沿用原有
 压缩逻辑：单个字符串超过 4000 字符时保留首尾；列表最多展示前 20 项，
 并在 `_prompt_compaction.truncated_lists` 标明路径、原始/可见/省略条数；多条观察合计

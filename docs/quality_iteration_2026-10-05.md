@@ -1153,3 +1153,32 @@ web/parallel source fingerprint补入本轮receipt/replan实际改动；paid运�
 R24-C 独立7 GREEN/0.31s且限定差异无P1/P2；web case选择独立review保持原目标和
 secret/shared-budget边界。Root校准与两种有界入口联合50 GREEN/6.14s。实现先提交再
 真实派发，后续仍记录不遵从/部分完成，不根据离线结果预填实际成功。
+
+R25-V 同SQLite新真实（`runtime_web_sqlite_20261005T030605621092`）：82.537s、
+12 knowncalls/0search、77631input/13087output/$0.064845920，8tools均completed。
+两官方页面和三事实有证据，source/goal均未改；raw SHA
+42aae5a96c2377ba9c3905f2b229bf1086af9973008f3570095bee3bec0c58bb。
+实际answer provider收到三个partial cached-value receipts：2540/14507、2000/20000、
+500/16649，upstream全unknown。回答不再声称整页“阅读”，说正文分页“抓取覆盖全文”，
+但仍明显冗长，且checkpoint增长表述需独立语义复核。与同时parallel共用远端账号，
+不作严格延迟AB、不能归因新metadata导致更慢。mechanical全true不等于质量全面通过。
+
+R25-P 新真实（`parallel-quality-20261005T030601206991-35ea89bb`）：116.249s、
+32 actualdispatch全known/无pending、118571input/22445output/52480cache/$0.125536480。
+raw SHA 8322e42e3b2b6abf29834dd20c8bf3cb1671d118a0f76b2dcd382c9454a0614d，source/goal
+均未改。混合生命周期metrics33不等于付费33；parent FAILED，原children partial，
+backup重试失败，输出为有界已有局部结果，不是综合验收成功。六字符串/readonly/children
+mechanical全true不能覆盖实际failed；本轮无control timeout/cooldown事件，不称新cooldown
+现场被证明。历史未知限定更清楚，但没有实际“能否上线”的成功聚合交付。保留失败。
+
+- [ ] R26-K：R25-P 四child的full_data_authority=true、empty显式source IDs，core
+  discovery/executor允许，但knowledge旧guard忽略full flag且总intersect empty，仍拒绝。
+  修复应只对server已确认full、empty IDs使用域服务当前workspace/session已授权集合；
+  full=false空grant继续拒，非空显式IDs始终相交，禁止跨project/source扩权。先真实
+  registry+工具RED矩阵、边界回归、独立review，再同parallel32复测，不改fixture/预算。
+
+R25-S 单次新搜索（`runtime_web_search_release_20261005T030946490153`）：38.999s、
+10 knowncalls/1Brave query、53294input/4968output/$0.032340928，6tools均completed，
+source/goal不变，raw SHA 4d7ff12265f35bb2649e0f87c8607bd939fca33ece1e175b6c764a6fb4ac8c57。
+模型以官方页面校对搜索中旧版本，使用分段release text并披露取样时点/非全文阅读。
+官方“Latest”与redirect等具体声明尚需独立核对，先不填语义pass；raw不改。
