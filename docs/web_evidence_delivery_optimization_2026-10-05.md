@@ -122,3 +122,114 @@
 - `data/quality_runs/linux_20261005/runtime_web_search_release_20261005T123724975916/web_search_release_20261005T123724981410/`
 
 真实复测沿用原报告的三条付费命令。本轮不为刷到更好答案自动追加付费重试。
+
+## 第二轮：query接线与连续证据窗口
+
+本轮新发现的实际原因：WebResources.open按输入中是否含max_chars隐式选page，
+导致模型传query+max_chars=6000时query完全被忽略。上一轮改善的词法排序因此未在这些
+真实调用上执行。这是模式选择bug，不是单纯“模型选错关键词”。
+
+修复与兼容边界：
+
+- query+max_chars且无显式view/offset → 自动相关概要；max_chars只控制摘选预算。
+- 显式offset（包括0）/view=page仍连续分页；仅max_chars也维持原page行为。
+- 增加view_mode/query_status；page里的query明确not_applied_page，不伪称执行。
+- 保留工具原始返回与存储。新增registry拥有的output_preview_text_mode，web.open和
+  observation.read注册contiguous_pages；未知/MCP保持head_tail默认，正文同名字段无效。
+  长字符串不再只取首350/尾150，按叶子上限给最多4个连续原文块；size-pressure下减块数，
+  剩余部分带准确next_offset/省略标记，原7000 gate上限不扩张。不是默认读完整网页。
+- fragment offset指该原始cached value，不是source整页；网页分页须加output.offset。
+  observation.read的callback重读同run原缓存并验证body/offset/hash，再把每个fragment映回
+  原字符区间；通用receipt同样核验实际文本，最终拟合缺失/变更不能得到complete。
+
+新增测试test_web_read_efficiency覆盖：实际query+预算路由、显式page/offset优先、中部限定
+经过SQLite→gate→provider完整交付、7k/Unicode窗口、篡改fragment拒绝、未知tool策略不升级、
+observation.read非零offset映射。定向 **152 passed，25.10s**；原9个离线对抗判据仍9通过。
+Ruff与diff检查通过。不跑全量，原Python与SQLite各实测一次，结果完成后补齐。
+
+### 明确缺口却结束：本轮调查结论
+
+低成本只读子agent复核上一轮Pythontrace：decision未提交answer_checks就宣称足够，
+之后answer才承认3.13来源未读取。普通Graph的final_answer只拦未解决的多agent计划，
+answer→verify→finalize不把结构化剩余工作回送decision；自由答案verification目前不判语义。
+因此run completed/机械检查通过不表示用户要求完成。不是缓存receipt可修复的语义错误。
+
+后续独立局部TODO（尚未实施，不能宣传本轮已修复）：
+
+- [ ] 在既有调用内建立有界、稳定ID的要求覆盖与缺口交接，不新增每轮planner或独立LLM审查。
+- [ ] 使用版本化结构化remaining_work，而非扫描“待核/缺口”等正文关键词。
+- [ ] 可继续缺口且仍有预算才返回现有decision；权限/超时/预算/无增量时只交付明确部分结果。
+- [ ] 与用户JSON输出和stream delta终态兼容：不能直接强迫所有answer输出私有JSON，
+  更不能先发送final_answer再静默重启；旧checkpoint/reason-only finish必须兼容。
+- [ ] 离线回归补证后一次终态、缺口未覆盖不能被receipt清除、预算耗尽不循环、
+  无工具直接短答、严格JSON、取消/恢复、子agent预算与旧协议。
+
+本轮先消除明确的读取接线问题，不为简单任务增加一轮LLM，也不修改推理开关或模型配置。
+
+### 第二轮真实结果与新故障（不得丢弃失败样本）
+
+| case | 上一轮wall/模型/工具 | 本次首次wall/模型/工具 | 复核 |
+| --- | --- | --- | --- |
+| SQLite | 114.271s／16／11 | 40.156s／8／5 | 两官方正文支撑三个核心结论；951字符仍偏长 |
+| Python | 74.812s／12／7 | 14.580s／4／0 | **失败**：没有检索证据；不能把早停的短耗时算提速 |
+
+SQLite新输入/输出62165/5369tokens，缓存输入34048，LLM $0.040219168；新增1次search。
+其query+max_chars=6000/8000调用现在确实产生相关概要，最后1600字符本地分页也完整进入
+answer request；真实receipt涉及1600字符连续页和多个原文片段，不只是工具扫描到了。
+本次相比上一轮模型调用约减半、wall降低约65%；只有一次样本，非严格因果A/B或统计提速。
+仍有长引文/覆盖说明，尚未完整解决简洁性与完成判断。
+
+Python首次input/output12441/1870tokens，缓存1664，LLM $0.014632224，search0。
+trace显示初始decision混入推理与重复JSON；独立repair调用生成了完整operation但尾部多一个
+`}`。strict parser失败后没有任何工具dispatch，最后answer说“未取到官方页”，并问是否重跑。
+网络未执行，不能称抓取失败或把这次作为检索质量验证；mechanical page checks为false。
+
+针对这项新缺陷新增局部修复：**仅在decision_repair阶段**，若strict解析失败，用JSONDecoder
+从头读取一个完整非空对象；仅余一个多余闭合`}`才本地恢复。嵌套重复key、多对象、前缀、
+夹带文本、两/更多尾括号、截断控制输出仍拒绝。记录decision_repair_suffix_normalized事件，
+保留原始/修复输出；所有工具仍经过schema/范围/safety gate。普通decision和用户输出合同
+的strict parser不放宽。不修改模型/推理参数，不新增付费repair调用。
+
+独立审查指出force_gate小结果连续分块会让5984字符膨胀超过7k，已修复：超限退回保留
+全部结构的head/tail字符串投影，不删除status/gap/list条目；新增20状态字段与缺口回归。
+repair新测试初次也发现strict parser失败返回{}而非None，已修正入口/夹具，后续安全与
+legacy测试实际通过，不拿未走到gate的测试作安全证明。
+
+新修复后只增加一次Python验证，既有失败样本保留；不是原样重试刷好结果。
+原始产物均仅本地：
+
+- SQLite：`data/quality_runs/linux_20261005/runtime_web_sqlite_20261005T125344834441/heldout_web_sqlite_20261005T125344839874/`
+- Python首次失败：`data/quality_runs/linux_20261005/runtime_heldout_web_multisource_20261005T125344549312/heldout_web_multisource_20261005T125344554484/`
+
+### 第二轮最终验收
+
+最终定向集成 **164 passed（27.56s）**、无xfail；包含上面的152项基础组、新增force_gate
+夹具、9条repair边界测试与既有malformed-call/repeated-successful-call两条回归。
+Ruff／diff检查通过。独立审查已确认本轮最终hunk无剩余中高风险；未运行全套或重启生产。
+
+Python修复后的验证：**37.357秒、7模型／4工具、1次搜索、0工具失败**，新输入/输出
+54117/5796tokens，缓存29696，LLM $0.038559136，回答1027字符（上一有效样本1445）。
+本次实际读取3.13 What's New、3.14 What's New及free-threading HOWTO，覆盖此前缺失的
+3.13侧来源；三个请求项——默认/可选、实验性到官方支持、扩展重新启用GIL——均得到回答。
+关键限定原文进入最终request，receipt有1134/767/720字符完整交付的缓存字段。
+模型还输出了未要求的性能数字及覆盖说明，简洁性仍未完全解决。
+
+这次rerun没有触发多余尾括号恢复（事件0）：因此只能用新增回归证明该恢复边界，不能
+声称真实模型已稳定复现并经此规则恢复。新的有效回答与首次失败均保留，算入全部成本；
+禁止删除失败样本并把14.580秒早停写作提速。Python来源缺口在本样本消除，
+不表示通用任务完成判断机制已实现。
+
+| 有效任务对比上一轮 | wall秒 | 模型／工具 | 输入tokens | 输出tokens | LLM美元 | 回答字符 |
+| --- | --- | --- | --- | --- | --- | --- |
+| Python | 74.812→37.357 | 12／7→7／4 | 99182→54117 | 12216→5796 | 0.081005504→0.038559136 | 1445→1027 |
+| SQLite | 114.271→40.156 | 16／11→8／5 | 154131→62165 | 18477→5369 | 0.122621408→0.040219168 | 1249→951 |
+
+本轮实际总预算含失败：**19模型调用、2 Brave查询、LLM $0.093410528**；共享累计
+$7.126661088→$7.220071616，搜索14→16。搜索账本未定价（不是免费），按此前$5/1000的
+项目估算约$0.01，非发票费用。text模式仍没有首个最终token TTFT。所有本轮runner指纹与
+场景指纹前后相同；测试使用当前含用户未提交工作的隔离runtime，不宣称纯HEAD部署验收。
+两个有效任务都是单样本，不能外推“系统平均提速50%/65%”或统计准确率；uv本轮未复测。
+
+Python最终产物：
+`data/quality_runs/linux_20261005/runtime_heldout_web_multisource_20261005T125958977266/heldout_web_multisource_20261005T125958987072/`。
+原report中的pending_root_review是原生成状态，本节是随后根agent复核，不改原产物/hash。

@@ -131,16 +131,20 @@ class WebOpenTool:
     spec = ToolSpec(
         name="web.open", package="web", type="local_tool",
         output_preview_max_string_chars=1200,
+        output_preview_text_mode="contiguous_pages",
         output_preview_priority_fields=["text", "excerpts", "snapshot_id", "text_sha256", "url",
                                         "offset", "returned_chars", "total_chars", "has_more",
-                                        "next_offset", "context_complete", "fetched_at"],
+                                        "next_offset", "context_complete", "fetched_at", "view_mode", "query_status"],
         description=(
             "Fetch a public HTTPS page and return bounded plain text. DNS resolves to public addresses "
             "and the connection is pinned to a validated address while TLS verifies the original domain. "
             "Provide exactly one URL, search ref_id, or snapshot_id. Initially returns a bounded overview; "
-            "query optionally selects relevant original paragraphs locally. view=page or offset/max_chars "
+            "query optionally selects relevant original paragraphs locally; max_chars only sets its budget. "
+            "Explicit view=page or offset (or max_chars without query) "
             "returns a contiguous slice. snapshot_id continuation never refetches. URL refresh=true creates "
             "a new version; max_age_seconds controls URL reuse. expected_text_sha256 rejects changed text."
+            " Long cached text previews may be consecutive fragments with exact raw-value offsets. "
+            "They are not whole-page coverage; follow fragment next_offset only for missing needed text."
             " Returned network observations describe only this fetch, not search-provider cache causes."
         ),
         risk="low", requires_confirmation=False, read_only=True,

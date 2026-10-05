@@ -23,6 +23,19 @@
 本轮工程问题已修复，但真实性能／篇幅尚未改善：Python 扩展 GIL 条款恢复，3.13来源仍缺；
 SQLite与uv模型调用增加，详见新报告。后续未闭合项不能用这些勾选自动关闭。
 
+## G. 读取效率第二轮
+
+- [x] 修复 query+max_chars 被隐式page忽略的实际接线错误；显式offset/page保持原分页优先。
+- [x] 输出实际view_mode/query_status，page模式不伪称query已执行。
+- [x] 注册长文本连续短块预览，减少4000字符页仅交付首尾500字符的情况；保留7k上限。
+- [x] 补齐最终provider文本区间与observation.read非零offset映射；结果正文不能改变策略。
+- [x] 定向离线回归与只读调查完成；answer阶段才出现的缺口机制详见报告，不用文本关键词猜缺口。
+- [x] Python／SQLite原任务实测，记录质量／延迟／tokens；保留Python新协议失败，实际修复后再验证一次。
+- [x] 独立审查、报告与本轮Git管理；不重启生产。
+
+第二轮SQLite114.3→40.2秒、Python有效任务74.8→37.4秒；Python首次0工具失败不能算提速。
+两个样本均非总体性能结论，简洁性／通用缺口终态协议仍待后续。
+
 ## 约束与验收原则
 
 - 保留 web.search/open/find、ToolExecutor 校验、安全门及来源角色；core 不编码网页策略。

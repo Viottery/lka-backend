@@ -8,7 +8,7 @@ from hashlib import sha256
 from itertools import islice
 from typing import Any
 
-from app.core.tool_result_gate import preview
+from app.core.tool_result_gate import contiguous_preview_fragments, preview
 from app.core.tools import ToolContext, ToolInvocation, ToolPackageSpec, ToolResult, ToolSpec
 
 OBSERVATION_PACKAGE = ToolPackageSpec(
@@ -83,6 +83,11 @@ def _projected_text_fragments(
                 for field, (start, end) in (
                     ("head", (0, 350)), ("tail", (len(raw_text) - 150, len(raw_text))),
                 )], False
+    fragments = contiguous_preview_fragments(raw_text, view, path=raw_path)
+    if fragments is not None:
+        return [{"view_path": f"{view_path}/fragments/{index}/text",
+                 "start": source_start + fragment["start"], "end": source_start + fragment["end"],
+                 "text": fragment["text"]} for index, fragment in enumerate(fragments)], False
     return [], True
 
 
@@ -259,6 +264,7 @@ class ObservationReadTool:
         read_only=True,
         side_effects=["read_local_db"],
         output_preview_max_string_chars=1200,
+        output_preview_text_mode="contiguous_pages",
         output_preview_priority_fields=["text", "items", "entries", "path", "value_type", "has_more",
                                         "next_offset", "total", "projected_fields", "_delivery_view",
                                         "value", "keys"],

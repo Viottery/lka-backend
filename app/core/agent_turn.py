@@ -4341,6 +4341,27 @@ class AgentTurnLoop:
         if response is None or self._control_generation_incomplete(response):
             return None
         parsed = self._parse_json_object(response.content, strict=True)
+        if not parsed:
+            # A repair must contain exactly one complete object. Accept only a
+            # single redundant closing brace, not prose, prefixes or competing
+            # operations. Do not loosen ordinary decision/output-contract JSON.
+            try:
+                def unique_object(pairs):
+                    result = {}
+                    for key, value in pairs:
+                        if key in result:
+                            raise ValueError("Ambiguous duplicate repair key")
+                        result[key] = value
+                    return result
+
+                candidate, end = json.JSONDecoder(object_pairs_hook=unique_object).raw_decode(response.content.strip())
+                if isinstance(candidate, dict) and candidate and response.content.strip()[end:].strip() == "}":
+                    parsed = candidate
+                    self._append_run_event(type="decision_repair_suffix_normalized", stage="decision_repair",
+                        message="Removed one redundant closing brace from a single repair object.",
+                        payload={"removed_closing_braces": 1})
+            except (ValueError, TypeError):
+                pass
         if not isinstance(parsed, dict) or not parsed:
             return None
         normalized = self._normalize_decision_output(
@@ -4992,12 +5013,21 @@ class AgentTurnLoop:
             tool = resolve(tool_name) if callable(resolve) and tool_result.tool_name == tool_name else None
             leaf_limit = getattr(getattr(tool, "spec", None), "output_preview_max_string_chars", 700)
             priorities = getattr(getattr(tool, "spec", None), "output_preview_priority_fields", ())
+            text_mode = getattr(getattr(tool, "spec", None), "output_preview_text_mode", "head_tail")
             if type(leaf_limit) is not int or not 700 <= leaf_limit <= 1200:
                 leaf_limit = 700
-            compacted_result = (tool_result_gate.preview_text_fields(result_payload, max_string_chars=leaf_limit)
+            compacted_result = (tool_result_gate.preview_text_fields(result_payload, max_string_chars=leaf_limit,
+                                                                     text_mode=text_mode)
                                 if force_gate and not needs_gate(result_payload)
                                 else bounded_preview(result_payload, max_string_chars=leaf_limit,
-                                                     output_priority_fields=priorities))
+                                                     output_priority_fields=priorities, text_mode=text_mode))
+            if force_gate and not needs_gate(result_payload) and len(
+                json.dumps(compacted_result, ensure_ascii=False, default=str)
+            ) > 7000:
+                # Small control results retain all structure/status fields. A
+                # text projection must not expand them past the global cap.
+                compacted_result = tool_result_gate.preview_text_fields(result_payload,
+                    max_string_chars=leaf_limit, text_mode="head_tail")
             compacted = True
         else:
             compacted_result, compacted = self._compact_for_decision_prompt(result_payload)

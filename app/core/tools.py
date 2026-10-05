@@ -7,7 +7,7 @@ from contextlib import ExitStack
 from datetime import UTC, datetime
 from pathlib import Path
 from time import monotonic
-from typing import Annotated, Any, ClassVar, Protocol
+from typing import Annotated, Any, ClassVar, Literal, Protocol
 
 from pydantic import BaseModel, Field
 
@@ -69,6 +69,7 @@ class ToolSpec(BaseModel):
     # Registered producer metadata, never a value read from ToolResult.output.
     # Preserve bounded evidence leaves without changing the overall gate cap.
     output_preview_max_string_chars: int = Field(default=700, strict=True, ge=700, le=1200)
+    output_preview_text_mode: Literal["head_tail", "contiguous_pages"] = "head_tail"
     # Ordered top-level output fields, trusted only from the registered producer.
     # Persisted JSON key order is not a delivery policy. Unknown tools opt out.
     output_preview_priority_fields: list[

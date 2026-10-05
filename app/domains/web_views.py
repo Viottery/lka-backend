@@ -103,6 +103,7 @@ def build_page_view(
     result = {key: deepcopy(value) for key, value in page.items() if key != "text"}
     total = len(source)
     chosen_view = "page" if view == "page" or (view == "auto" and offset > 0) else "overview"
+    result["view_mode"] = chosen_view
     excerpts: list[dict] = []
     outline: list[dict] = []
 
@@ -115,7 +116,8 @@ def build_page_view(
             result["outline"] = deepcopy(supplied_outline[:12])
             result["outline_omitted_count"] = max(0, len(supplied_outline) - 12)
         result.update(text=selected, offset=start, returned_chars=len(selected),
-                      has_more=end < total, next_offset=end if end < total else None)
+                      has_more=end < total, next_offset=end if end < total else None,
+                      query_status="not_applied_page" if query else "not_requested")
         excerpts = []
     else:
         paras = _paragraphs(source)

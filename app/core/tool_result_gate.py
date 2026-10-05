@@ -104,6 +104,11 @@ def bind_context_delivery(
                         ("head", (0, 350)), ("tail", (len(raw) - 150, len(raw))),
                     )
                 ]
+            elif (fragments := contiguous_preview_fragments(raw, view, path=path)) is not None:
+                binding["fragments"] = [
+                    {"view_path": f"{view_path}/fragments/{index}/text", **fragment}
+                    for index, fragment in enumerate(fragments)
+                ]
             elif view is not _MISSING:
                 binding["projection_unknown"] = True
             bindings.append(binding)
@@ -251,13 +256,50 @@ def pointer(parent: str, part: str | int) -> str:
     return f"{parent}/{escaped}"
 
 
+def contiguous_preview_fragments(raw: str, view: Any, *, path: str) -> list[dict[str, Any]] | None:
+    """Recognize only exact bounded server-style text windows, never claims."""
+    if (not isinstance(view, dict) or view.get("_type") != "string"
+        or view.get("preview_mode") != "contiguous_pages" or view.get("path") != path
+        or type(view.get("total_chars")) is not int or view["total_chars"] != len(raw)):
+        return None
+    fragments = view.get("fragments")
+    if not isinstance(fragments, list) or not 1 <= len(fragments) <= 4:
+        return None
+    cursor = 0
+    for fragment in fragments:
+        if not isinstance(fragment, dict) or set(fragment) != {"start", "end", "text"}:
+            return None
+        start, end, text = (fragment[key] for key in ("start", "end", "text"))
+        if (type(start) is not int or type(end) is not int or start != cursor
+            or not 0 <= start < end <= len(raw) or end - start > 1200
+            or not isinstance(text, str) or text != raw[start:end]):
+            return None
+        cursor = end
+    if (view.get("visible_chars") != cursor or view.get("omitted_chars") != len(raw) - cursor
+        or view.get("next_offset") != (cursor if cursor < len(raw) else None)
+        or view.get("_partial") is not (cursor < len(raw))):
+        return None
+    return fragments
+
+
 def preview(value: Any, *, path: str = "", depth: int = 0, max_string_chars: int = 700,
             output_priority_fields: tuple[str, ...] = (), max_items: int = 4,
-            priority_only: bool = False) -> Any:
+            priority_only: bool = False, text_mode: str = "head_tail") -> Any:
     """Expose structure and stable paths without pretending a sample is complete."""
     if isinstance(value, str):
         if len(value) <= max_string_chars:
             return value
+        if text_mode == "contiguous_pages":
+            end = min(len(value), max_items * max_string_chars)
+            return {
+                "_type": "string", "path": path, "total_chars": len(value),
+                "preview_mode": "contiguous_pages",
+                "fragments": [{"start": start, "end": min(start + max_string_chars, end),
+                               "text": value[start:min(start + max_string_chars, end)]}
+                              for start in range(0, end, max_string_chars)],
+                "visible_chars": end, "omitted_chars": len(value) - end,
+                "next_offset": end if end < len(value) else None, "_partial": end < len(value),
+            }
         return {
             "_type": "string", "path": path, "total_chars": len(value),
             "head": value[:350], "tail": value[-150:],
@@ -274,7 +316,7 @@ def preview(value: Any, *, path: str = "", depth: int = 0, max_string_chars: int
             "_partial": len(value) > visible,
             "items": [preview(item, path=pointer(path, i), depth=depth + 1, max_string_chars=max_string_chars,
                               output_priority_fields=output_priority_fields, max_items=max_items,
-                              priority_only=priority_only)
+                              priority_only=priority_only, text_mode=text_mode)
                       for i, item in enumerate(value[:visible])],
         }
     if isinstance(value, dict):
@@ -287,7 +329,7 @@ def preview(value: Any, *, path: str = "", depth: int = 0, max_string_chars: int
         shown = keys[:16 if path == "/output" and output_priority_fields else 12]
         result = {key: preview(value[key], path=pointer(path, key), depth=depth + 1, max_string_chars=max_string_chars,
                               output_priority_fields=output_priority_fields, max_items=max_items,
-                              priority_only=priority_only)
+                              priority_only=priority_only, text_mode=text_mode)
                   for key in shown}
         if len(value) > len(shown):
             result["_omitted_keys"] = len(value) - len(shown)
@@ -308,7 +350,7 @@ def needs_gate(value: Any) -> bool:
     return isinstance(value, str) and len(value) > 4_000
 
 
-def preview_text_fields(value: Any, *, max_string_chars: int = 700) -> Any:
+def preview_text_fields(value: Any, *, max_string_chars: int = 700, text_mode: str = "head_tail") -> Any:
     """Preview long strings without sampling structural/status fields.
 
     For previously accepted small results in a control working set, arrays and
@@ -335,7 +377,7 @@ def preview_text_fields(value: Any, *, max_string_chars: int = 700) -> Any:
                             "exact_text_ref": first_path,
                             "note": "Original text is identical to the referenced field; its preview appears there. This path remains independently readable."}
                 seen_text[item] = path
-            return preview(item, path=path, max_string_chars=max_string_chars)
+            return preview(item, path=path, max_string_chars=max_string_chars, text_mode=text_mode)
         if isinstance(item, dict):
             return {key: visit(child, pointer(path, key), depth + 1) for key, child in item.items()}
         if isinstance(item, list):
@@ -346,14 +388,16 @@ def preview_text_fields(value: Any, *, max_string_chars: int = 700) -> Any:
 
 
 def bounded_preview(value: Any, *, max_string_chars: int = 700,
-                    output_priority_fields: tuple[str, ...] = ()) -> Any:
+                    output_priority_fields: tuple[str, ...] = (), text_mode: str = "head_tail") -> Any:
     if type(max_string_chars) is not int or not 700 <= max_string_chars <= 1200:
         raise ValueError("registered preview leaf limit must be 700 through 1200")
+    if text_mode not in ("head_tail", "contiguous_pages"):
+        raise ValueError("unknown registered text preview mode")
     if (not isinstance(output_priority_fields, (tuple, list)) or len(output_priority_fields) > 16
         or any(not isinstance(key, str) or not 0 < len(key) <= 64 for key in output_priority_fields)):
         raise ValueError("registered preview priorities must be at most 16 bounded output fields")
     result = preview(value, max_string_chars=max_string_chars,
-                     output_priority_fields=output_priority_fields)
+                     output_priority_fields=output_priority_fields, text_mode=text_mode)
     if len(json.dumps(result, ensure_ascii=False, default=str)) <= 7_000:
         return result
     if output_priority_fields:
@@ -362,7 +406,7 @@ def bounded_preview(value: Any, *, max_string_chars: int = 700,
         for max_items in (4, 3, 2, 1):
             result = preview(value, max_string_chars=max_string_chars,
                              output_priority_fields=output_priority_fields,
-                             max_items=max_items, priority_only=True)
+                             max_items=max_items, priority_only=True, text_mode=text_mode)
             if len(json.dumps(result, ensure_ascii=False, default=str)) <= 7_000:
                 return result
     # Adversarially wide/nested output must not evict the cache handle itself.

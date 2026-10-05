@@ -578,6 +578,9 @@ audit record 和本地日志路径均不属于正常 HTTP 响应；它们只保�
 - 如果 decision 阶段返回疑似工具调用的损坏 JSON，Agent 会先进入 `decision_repair`
   阶段尝试修复；修复失败时记录 `malformed_tool_call` 并停止执行，不会把该残片恢复为
   `answer`。
+- decision_repair 的单个完整对象若仅多一个尾闭合括号，可本地确定性恢复并记录
+  decision_repair_suffix_normalized；多对象、夹带文本、重复键或更大修复仍拒绝。
+  普通decision严格解析与ToolExecutor schema/safety gate不因此放宽。
 - 每个真实 `tool_event` 都包含 `feedback`。反馈至少包含执行成功 / 失败状态和可读
   message。Agent 会先做本地协议校验：工具声明 `output_schema` 时按该 schema 校验
   `ToolResult.output`；未声明时只检查 `ToolResult` 是完整 JSON 对象形状。只有工具执行
@@ -1598,7 +1601,9 @@ Agent 可展开 `web` 包，再调用只读 `web.search`（参数 `query`、`mod
   `ref_id`；整体附 `queried_at/search_id/cache_hit`。`web.search(search_id=..., view=full)`
   只读本地标准化响应，不能同时传 query/filter；无新 provider 请求。
 - open/find 恰好传一个 `url/ref_id/snapshot_id`。首次 open 默认概要，可选 query 本地
-  选择原文，附位置／有界 outline／省略范围；显式 offset/max_chars 或 view=page 为连续页。
+  选择原文，附位置／有界 outline／省略范围；query+max_chars 仍为相关概要，后者只设预算。
+  显式 offset（含0）／view=page 或仅 max_chars 为连续页；page 模式的 query_status 明确
+  为 not_applied_page，不会假装执行了 query；view_mode 说明实际视图。
   open offset 是 Unicode 字符，find offset 是匹配序号，二者不混用。
 - `snapshot_id` 是不可变的有界可读正文，不代表完整 HTML、模型全文阅读或语义核验。
   同快照 find／续页不再联网；expected_text_sha256 校验版本。
@@ -1612,6 +1617,12 @@ Agent 可展开 `web` 包，再调用只读 `web.search`（参数 `query`、`mod
   优先保留证据／续读／版本信息，JSON 持久化排序不影响优先级；未知工具保持默认。
   此元数据只从实际 ToolSpec 读取，结果正文无法授权。超限先舍弃诊断，再减少预览条数，
   整体 gate 仍≤7000字符；原始结果与当前 run 的缓存访问边界不变。
+- 注册生产者可选 `output_preview_text_mode=contiguous_pages`：过长字符串展示最多4个
+  连续短原文fragment（每段不超过注册叶子上限，最多1200），附缓存值内的字符区间、
+  next_offset、省略量；超额仍按原7k上限减少预览。web.open与observation.read启用，
+  未知工具/MCP默认仍head_tail；工具正文无授权。fragment区间是该cached value内的
+  Unicode位置，不能直接当网页绝对offset；网页续读还须加output.offset。
+  最终context_delivery重新核验原文与拟合后的fragment，仅证明缓存值交付，不认证语义。
 
 详情与离线验证见 [渐进检索 TODO／报告](web_progressive_retrieval_todolist.md)。
 

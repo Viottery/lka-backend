@@ -191,7 +191,10 @@ class WebResources:
             raise ValueError("Invalid offset or max_chars.")
         if query is not None and (not isinstance(query, str) or not query.strip() or len(query) > 400):
             raise ValueError("query must contain 1 through 400 characters.")
-        view = inputs.get("view", "page" if "offset" in inputs or "max_chars" in inputs else "auto")
+        # A size budget must not silently disable a requested local query.
+        # Explicit offsets/pages still win and preserve contiguous paging.
+        default_view = "page" if "offset" in inputs or ("max_chars" in inputs and query is None) else "auto"
+        view = inputs.get("view", default_view)
         if view not in {"auto", "overview", "page"}:
             raise ValueError("view must be auto, overview, or page.")
         page = self.page(fetcher, inputs, context, "web.open")
