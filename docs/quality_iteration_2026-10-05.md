@@ -1035,3 +1035,16 @@ partial renderer预算仍5500，能容纳则原样交付，超限公平分配hea
 GREEN；Root跨生成恢复、child、交付、scope共84 GREEN（6.45s），Ruff通过。
 旧失败raw离线回放5296字符，三子摘要原样可见，release_v2原3685字完整保留；这是
 确定性交付修复，不是新模型端到端成功。真实并行复测仍独立保留失败和预算指标。
+
+R23-B 记忆离线修复：同一fenced publication事务内，唯一旧候选仅在claim为A或A+“。”、
+literal evidence两边完全等于A+“。”时兼容旧identity；scope/project/type/remote origin
+相同，来源必须是真实persisted user_message、checksum与证据匹配。不改历史ID/display，
+新claim/evidence只写有界audit；内部标点、否定、数字、版本、路径和引号不归一。
+tombstone优先抑制，多个旧候选ambiguous不迁移/不搬来源/不创建第三条；同源不晋升、
+correction和lease fence仍优先。原真实偏好两种提取顺序的行为回归2 RED→GREEN。
+新28例全通过（23.48s）；相关147例（含当时25个新增）通过84.38s，后补3例单独通过，
+未宣称合并150例重跑。Root新增alias/grounding/extractive/runtime目标104 GREEN
+（40.42s），独立review无P1/P2并轻量13检查通过，Ruff和owned diff检查通过；新真实BG仍待。
+另发现coordinator把publication_lease误放MemoryInput未知extra，被Pydantic忽略；现传给
+MemoryService.create的真正关键词。直接coordinator stale-owner回归确保零发布，不只
+测service helper。离线合成provider零付费；不通过弱化真实晋升判据掩盖原失败。

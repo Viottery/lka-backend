@@ -486,6 +486,54 @@ class MemoryService:
         self._refresh_conflict_metadata(conn)
         return changed
 
+    @staticmethod
+    def _literal_alias_source(conn: sqlite3.Connection, source: sqlite3.Row, evidence: str) -> bool:
+        if source["source_type"] != "user_message" or source["trusted_source"]:
+            return False
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='agent_session_messages'").fetchone():
+            return False
+        message = conn.execute("SELECT content FROM agent_session_messages WHERE message_id=? AND role='user'",
+                               (source["source_ref"],)).fetchone()
+        return bool(message and evidence in message[0]
+                    and source["checksum"] == hashlib.sha256(message[0].encode("utf-8")).hexdigest())
+
+    def _publication_alias(
+        self, conn: sqlite3.Connection, payload: MemoryInput, source: sqlite3.Row,
+    ) -> sqlite3.Row | None:
+        """Only one terminal Chinese sentence mark, proven by identical literal evidence.
+
+        Called within the fenced publication transaction, never a migration or
+        semantic merge. Both original strings and legacy IDs remain untouched.
+        """
+        evidence = payload.metadata.get("evidence")
+        if (payload.extraction_model != "configured_llm_v1" or payload.user_confirmed
+                or not isinstance(evidence, str) or not 2 <= len(evidence) <= 500
+                or not evidence.endswith("。") or evidence.endswith("。。")
+                or payload.content not in (evidence, evidence[:-1])
+                or not self._literal_alias_source(conn, source, evidence)):
+            return None
+        matches = conn.execute(
+            "SELECT * FROM memory_entries WHERE scope=? AND project_id IS ? AND memory_type=? "
+            "AND extraction_model=? AND content IN (?,?) AND json_extract(metadata,'$.evidence')=? "
+            "ORDER BY status IN ('retracted','superseded') DESC,memory_id LIMIT 3",
+            (payload.scope, payload.project_id, payload.memory_type, payload.extraction_model,
+             evidence, evidence[:-1], evidence),
+        ).fetchall()
+        if any(row["status"] in {"retracted", "superseded"} for row in matches):
+            raise MemoryPublicationSuppressed("publication_alias_tombstone")
+        if len(matches) > 1:
+            raise MemoryPublicationSuppressed("publication_alias_ambiguous")
+        if not matches:
+            return None
+        prior_sources = conn.execute(
+            "SELECT s.* FROM memory_entry_sources es JOIN memory_sources s USING(source_id) WHERE es.memory_id=?",
+            (matches[0]["memory_id"],),
+        ).fetchall()
+        if (not prior_sources or not all(self._literal_alias_source(conn, s, evidence) for s in prior_sources)
+                or not any(self._source_valid(s, _now()) for s in prior_sources)):
+            return None
+        return matches[0]
+
     def create(
         self,
         payload: MemoryInput,
@@ -513,6 +561,9 @@ class MemoryService:
             if not self._source_valid(source, now):
                 raise ValueError("Source is revoked or expired")
             self._check_correction_fences(conn, source, payload)
+            alias = self._publication_alias(conn, payload, source) if publication_lease is not None else None
+            if alias is not None:
+                memory_id = alias["memory_id"]
             status: MemoryStatus = "active" if payload.user_confirmed or source["trusted_source"] else "candidate"
             existing = conn.execute("SELECT * FROM memory_entries WHERE memory_id=?", (memory_id,)).fetchone()
             if existing:
@@ -581,6 +632,9 @@ class MemoryService:
                     "independent_user_sources": int(independent_user_evidence),
                     **({"previous_expires_at": old_expiry, "expires_at": effective_expiry}
                        if expiry_extended else {}),
+                    **({"publication_alias": "terminal_chinese_period",
+                        "incoming_claim": payload.content,
+                        "incoming_evidence": payload.metadata["evidence"]} if alias is not None else {}),
                 })
                 if publication_lease is not None:
                     self._validate_publication_lease(conn, publication_lease)
@@ -980,7 +1034,7 @@ class MemoryService:
 
 
 class MemoryPublicationSuppressed(ValueError):
-    """An authoritative later user turn rejected this earlier claim."""
+    """Publication blocked by correction, tombstone, or ambiguous alias identity."""
 
 
 class MemoryConflictError(RuntimeError):

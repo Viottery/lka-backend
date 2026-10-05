@@ -529,8 +529,7 @@ class MemoryBackgroundCoordinator:
                 {"slot": hint.slot, "polarity": hint.polarity, "condition": hint.condition}
                 for hint in candidate.conflict_hints
             ]},
-            publication_lease=(job["job_id"], job["lease_owner"], job["lease_epoch"]),
-        ))
+        ), publication_lease=(job["job_id"], job["lease_owner"], job["lease_epoch"]))
 
     def start(self) -> None:
         self.recover_missing_jobs()
