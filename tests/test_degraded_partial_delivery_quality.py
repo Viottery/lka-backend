@@ -7,6 +7,7 @@ failed. Historical evidence is delivery-only, never current contract success.
 """
 
 import asyncio
+import json
 from contextlib import contextmanager
 from copy import deepcopy
 
@@ -22,6 +23,8 @@ from app.core.multi_agent import (
     TaskResultStatus,
 )
 from app.core.multi_agent_scheduler import MultiAgentScheduler
+from app.core.prompt_budget import PromptBudgeter
+from app.core.prompt_tokens import PromptTokenCounter
 from tests.test_multi_agent_scheduler import FakeChildExecutor, _active_parent, _step
 
 NOTE = "DEGRADE-NOTE: source lookup was empty; independent coverage remains incomplete."
@@ -217,3 +220,23 @@ def test_compacted_fork_observation_keeps_degradation_and_historical_evidence():
         assert kept["historical_task_results"][0]["summary"].startswith("RETAINED-HEAD")
         assert kept["historical_task_results"][0]["historical_only"] is True
         assert kept["task_results"] == [] and kept["skipped_step_ids"] == ["skipped-part"]
+
+
+def test_provider_capacity_gate_retains_historical_status_and_missing_contract():
+    with degraded_run() as (_, _, _, result):
+        payload = {"observations": [{
+            "action": "fork_subtasks", "execution_status": "degraded", "task_results": [],
+            "historical_task_results": [result.model_copy(update={"summary": "EVIDENCE " + "x" * 10000}).model_dump(mode="json")],
+            "degradation_notes": {"skipped-part": NOTE}, "skipped_step_ids": ["skipped-part"],
+        }]}
+        fitted = PromptBudgeter(PromptTokenCounter()).fit(
+            system_prompt="Answer from evidence, never treat historical work as verified.",
+            user_prompt=json.dumps(payload), input_limit=2244, output_reserve_tokens=256,
+        )
+        retained = json.loads(fitted.user_prompt)["observations"][0]
+        assert retained["_prompt_budget_compacted"] is True
+        assert retained["degradation_notes"]["skipped-part"] == NOTE
+        history = retained["historical_task_results"][0]
+        assert history["historical_only"] and history["status"] == "partial"
+        assert history["missing_requirements"] == ["child_budget_finish"]
+        assert history["result_id"] == result.result_id

@@ -99,3 +99,21 @@ SHA-256 `55432e411332f26ed44f2c155b602cb9d759bc87841d70eedca72eacfdb805d8`。
 保留历史标志、result/snapshot 引用、降级说明及省略计数。不增加总体上下文预算。
 保留既有重复缺失项统计语义，不顺手清洗历史数据。
 修复后新旧 partial 交付 **21 passed / 0.41s**，Ruff 通过。
+
+继续核对 provider 容量门槛发现第二层 PromptBudgeter 也只保留当前结果。现同样保留
+历史 partial、missing_requirements、result/snapshot、降级说明，当前与历史仍共用
+20 项上限。真实 fit + 原有预算回归 **4 passed / 0.35s**。测试编写时修正了误用的
+`context_window_tokens` 参数，正确使用既有 `input_limit`，未变更真实容量合同。
+
+## 后台连续运行探针：未闭合，暂不消耗远程预算
+
+尝试把现有 medium followup 探针扩展为三次发布时，离线 provider 路径在进入实际
+dispatch 前超时；第一条 context_compact 处于 running，provider/账本派发均为 0。
+进一步以原两次模式和原 fixture 作有界诊断，亦复现进入 workload admission 后的等待。
+`_reserve` 实际返回约 0.008s；不能将其归因为模型慢、SQL 预留计算慢或摘要来源拒绝。
+
+本轮未确认等待链路的根因，**不宣称是生产摘要缺陷**；已有来源继承同步检查仍通过。
+没有启动真实后台付费复测，没有绕过 workload 控制或改用户在开发的消息/配额模块。
+三次探针扩展未验收，撤回本轮未完成扩展（原测试/脚本完整保留），不加 xfail 或放宽断言。
+下一局部 TODO：隔离复现 admission 的后台 event-loop/future 返回，再区分评测注入、
+当前并行修改与生产路径；根因确认后恢复三发布测试。60 分钟负载继续待办。

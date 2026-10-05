@@ -219,22 +219,37 @@ class PromptBudgeter:
             for key in (
                 "action", "status", "execution_status", "operation_id", "plan_id",
                 "failed_step_ids", "replan_required", "waiting_child_run_ids",
+                "skipped_step_ids",
             ) if key in observation
         }
-        results = observation.get("task_results")
-        if isinstance(results, list):
-            summary["task_results"] = [
+        notes = observation.get("degradation_notes")
+        if isinstance(notes, dict):
+            summary["degradation_notes"] = {
+                str(key)[:80]: str(value or "")[:300] for key, value in list(notes.items())[:8]
+            }
+            summary["omitted_degradation_note_count"] = max(0, len(notes) - 8)
+        remaining = 20
+        for field in ("task_results", "historical_task_results"):
+            results = observation.get(field)
+            if not isinstance(results, list):
+                continue
+            selected = results[:remaining]
+            remaining -= len(selected)
+            summary[field] = [
                 {
-                    **{key: row[key] for key in ("step_id", "child_run_id", "status") if key in row},
+                    **{key: row[key] for key in ("step_id", "child_run_id", "status", "attempt", "result_id", "snapshot_id") if key in row},
                     "summary": str(row.get("summary") or "")[:160],
+                    **({"historical_only": True} if field == "historical_task_results" else {}),
+                    "missing_requirements": [str(value)[:160] for value in row.get("missing_requirements", [])[:6]]
+                    if isinstance(row.get("missing_requirements"), list) else [],
                     "failure": {
                         key: row["failure"][key]
                         for key in ("category", "code", "retryable")
                         if isinstance(row.get("failure"), dict) and key in row["failure"]
                     },
                 }
-                for row in results[:20] if isinstance(row, dict)
+                for row in selected if isinstance(row, dict)
             ]
-            summary["omitted_task_result_count"] = max(0, len(results) - 20)
+            summary[f"omitted_{field[:-1]}_count"] = max(0, len(results) - len(selected))
         summary["_prompt_budget_compacted"] = True
         return summary
