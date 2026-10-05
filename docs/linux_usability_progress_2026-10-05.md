@@ -194,3 +194,32 @@ identity 检查 **2 failed / 8.19s**；这不是 model 发表失败。第二批�
 默认 focus 为 21 项，仍跳过基础与已确认 live 修复；UX-01 从 open 改为 fixed_offline，
 新增 UX-11 仍为 open（两个新分支通过不替代原长会话组合验收）。统计由目录计算，
 引用/统计两个定向检查 2 passed / 0.11s；历史档案保留优化前快照并增加醒目说明。
+
+相同 seed/水位/32-call 额度复测一次：4 次 model publication 与两次纠正/追问继续通过，
+10 次调用全结算、源码不变、原始来源仍继承，活跃槽归零。末版摘要
+**2351→1235 字符（-47.5%）**；输入 **21588→13394 tokens（-38.0%）**，输出
+19814→18127、cache read 256→768；费用 **$0.080474496→$0.068119488（-15.4%）**。
+前台两轮 4.507s / 4.589s；整轮 **81.422→81.958s**，无端到端加速，不能把
+输入缩短宣传成响应速度提升。仍罗列部分重复的无决策记录，摘要质量不是最优；
+真实推理耗时仍主导此场景。单对样本非统计 A/B，不代表生产 SLA。
+原件 `runtime_background_followup_20261005T072431067367/report.json`，SHA-256
+`4088846d7fb20e5fc37a38c9c37434e633369946ccbf381fa5dabfa20645232f`。
+
+## 续轮 UX-03：native 请求中的重复执行合同
+
+检查发现 native decision 同时在函数定义与 JSON `expanded_tools` 中重复描述/schema。
+新投影只引用同一请求实际发送的唯一函数映射：相同 description 不再重复，只有完整
+原 schema 与 native parameters 的类型敏感 JSON 相同才去重；legacy/custom/有额外
+语义的 schema 继续完整保留。明确模型函数名称映射，read_only、确认要求、output
+schema、origin/effects 元数据继续显式可见。ToolView、executor、fork 能力及 32768
+child ceiling 不变，JSON fallback 仍有完整 schema，不在运行时加载案例/gold。
+
+真实注册 Bash 六工具只读投影测量：expanded metadata **3999→3566 UTF-8 bytes**
+（-10.8%），函数定义 2330 bytes 原样保留；六份 schema 均非精确等价，诚实保留，
+没有为了节省而移除约束。当前三独立审计使用 JSON 控制，此改动**不算它的闭环修复**。
+实际 native 控制、fork 可见与原生调用定向 **5 passed / 6.56s**；review 补充
+boolean/number 对比反例（Python `True == 1` 不足以证明合同一致），修复后模块
+**4 passed / 0.53s**，Ruff 通过。未再消耗付费模型复测这个局部协议投影。
+
+本续轮共两次真实 DeepSeek Flash、20 dispatch、$0.148593984、零搜索。
+不启动高开销 Agent，不改用户已有消息/配额/Windows 代码，未重启用户后端。

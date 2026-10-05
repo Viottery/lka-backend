@@ -3874,7 +3874,9 @@ class AgentTurnLoop:
             "verification without missing requirements does not itself mean a child failed. "
             "Keep execution completion distinct from independent verification; an "
             "inconclusive output-contract check is not a verified pass. "
-            "Follow function schemas exactly."
+            "Follow function schemas exactly. expanded_tools.native_function identifies "
+            "the matching provided function; input_schema_from_native_function means its "
+            "parameters contain the complete input contract without a duplicate in the payload."
             + USER_STATEMENT_POLICY
         )
         if require_function_call:
@@ -3918,7 +3920,7 @@ class AgentTurnLoop:
                     package_catalog, expanded_packages=expanded_package_names
                 ),
                 "expanded_package_names": expanded_package_names,
-                "expanded_tools": self._tools_for_prompt(expanded_tools),
+                "expanded_tools": self._native_tools_for_prompt(expanded_tools, tools, actions),
                 "agent_catalog": self._agent_catalog_for_prompt() if can_fork else [],
                 "observations": observations,
                 "completed_tool_calls": completed_tool_calls,
@@ -4629,6 +4631,37 @@ class AgentTurnLoop:
             if key not in server_fields
             and (key in mandatory or value is not None and value != [] and value != {})
         } for tool in tools]
+
+    @staticmethod
+    def _native_tools_for_prompt(
+        expanded_tools: list[dict[str, Any]], definitions: list[LLMToolDefinition],
+        actions: dict[str, dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Reference only byte-equivalent contracts already in this request.
+
+        Converted/legacy schemas may contain extra semantics, so retain them
+        unless the full original schema equals the provided parameters. Scope,
+        origin/effects, read-only and confirmation metadata remain explicit.
+        JSON control/fallback and the registered execution specs are unchanged.
+        """
+        projected = AgentTurnLoop._tools_for_prompt(expanded_tools)
+        for tool in projected:
+            matches = [definition for definition in definitions
+                       if actions.get(definition.name, {}).get("action") == "call_tool"
+                       and actions[definition.name].get("tool_name") == tool.get("name")]
+            if len(matches) != 1:
+                continue
+            definition = matches[0]
+            tool["native_function"] = definition.name
+            if tool.get("description") == definition.description:
+                tool.pop("description", None)
+            # Python equality conflates true/1 (also inside defaults/enums).
+            # Compare typed JSON, not dict equality, before removing a contract.
+            if (json.dumps(tool.get("input_schema"), sort_keys=True, ensure_ascii=False)
+                    == json.dumps(definition.parameters, sort_keys=True, ensure_ascii=False)):
+                tool.pop("input_schema", None)
+                tool["input_schema_from_native_function"] = True
+        return projected
 
     def _package_catalog(self, tool_view: ToolView | None = None) -> list[dict[str, Any]]:
         catalog: list[dict[str, Any]] = []
