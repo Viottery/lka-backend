@@ -1,4 +1,4 @@
-"""One explicitly approved SQLite web replay; mechanical evidence, not semantic scoring.
+"""One explicitly approved existing web goal; mechanical evidence, not semantic scoring.
 
 Run from the repository root: python -m scripts.eval_runtime_web_quality --remote --root-go
 Uses only the existing shared ledger. No automatic retry or configuration writes.
@@ -30,10 +30,12 @@ from scripts.eval_runtime_memory_quality import (
 )
 
 CASE = "heldout_web_sqlite"
+APPROVED_CASES = (CASE, "heldout_web_multisource", "web_search_release")
 MAX_CALLS, MAX_SEARCHES, TIMEOUT = 20, 3, 180
 SOURCES = (__file__, eval_realworld.__file__,
     "scripts/eval_runtime_memory_quality.py", "evals/lka_evals/live_budget.py",
     "app/core/agent_turn.py", "app/core/llm/service.py",
+    "app/core/tool_result_gate.py", "app/tool_packages/observation.py",
     "app/integrations/web_search.py", "app/tool_packages/web.py")
 
 
@@ -83,9 +85,9 @@ def fingerprints():
             for p in SOURCES}
 
 
-def raw_report_path(root, report):
+def raw_report_path(root, report, *, case_id=CASE):
     raw_root = Path(report["private_artifacts"])
-    if (raw_root.parent != root or not re.fullmatch(CASE + r"_\d{8}T\d{12}", raw_root.name)
+    if (raw_root.parent != root or not re.fullmatch(re.escape(case_id) + r"_\d{8}T\d{12}", raw_root.name)
             or raw_root.is_symlink() or raw_root.resolve().parent != root):
         raise ValueError("raw report directory is outside the expected private probe boundary")
     path = raw_root / "report.json"
@@ -94,8 +96,10 @@ def raw_report_path(root, report):
     return path
 
 
-async def run_probe(root, ledger, *, config=None, injected_service=None, timeout=TIMEOUT):
+async def run_probe(root, ledger, *, config=None, injected_service=None, timeout=TIMEOUT, case_id=CASE):
     """Service/timeout injection is offline-only, never exposed by the CLI."""
+    if case_id not in APPROVED_CASES:
+        raise ValueError("an approved web case from the existing realworld suite is required")
     root = Path(root).resolve()
     config = isolated_config(config or Settings().load_local_config())
     config = config.model_copy(update={"memory": config.memory.model_copy(
@@ -105,7 +109,7 @@ async def run_probe(root, ledger, *, config=None, injected_service=None, timeout
     root.mkdir(parents=True, mode=0o700, exist_ok=False)
     budget, records, lock = WebBudget(ledger, root.name), [], threading.Lock()
     before = fingerprints()
-    scenario_before = hashlib.sha256(json.dumps(eval_realworld.CASES[CASE],
+    scenario_before = hashlib.sha256(json.dumps(eval_realworld.CASES[case_id],
         sort_keys=True, ensure_ascii=False).encode()).hexdigest()
     runtime_class = eval_realworld.LocalKnowledgeAgentRuntime
 
@@ -133,7 +137,7 @@ async def run_probe(root, ledger, *, config=None, injected_service=None, timeout
     try:
         with patch.object(Settings, "load_local_config", return_value=config), patch.object(
                 eval_realworld, "LocalKnowledgeAgentRuntime", side_effect=create_runtime):
-            report = await eval_realworld.run_case(CASE, output=root, budget=budget,
+            report = await eval_realworld.run_case(case_id, output=root, budget=budget,
                 planning=False, protocol="configured", timeout=timeout)
     finally:
         budget.close()
@@ -142,10 +146,10 @@ async def run_probe(root, ledger, *, config=None, injected_service=None, timeout
             "input_tokens", "output_tokens", "cached_tokens")
         rows = [dict(zip(columns, row, strict=True)) for call_id in budget.ids + budget.search_ids
                 for row in conn.execute(f"SELECT {','.join(columns)} FROM calls WHERE id=?", (call_id,))]
-    report_path = raw_report_path(root, report)
+    report_path = raw_report_path(root, report, case_id=case_id)
     digest = hashlib.sha256(report_path.read_bytes()).hexdigest()
     after = fingerprints()
-    scenario_after = hashlib.sha256(json.dumps(eval_realworld.CASES[CASE],
+    scenario_after = hashlib.sha256(json.dumps(eval_realworld.CASES[case_id],
         sort_keys=True, ensure_ascii=False).encode()).hexdigest()
     report = {**report, "mode": "scripted" if injected_service else "real_foreground",
         "call_limit": MAX_CALLS, "search_limit": MAX_SEARCHES, "turn_limit_seconds": timeout,
@@ -171,12 +175,15 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--remote", action="store_true")
     parser.add_argument("--root-go", action="store_true")
+    parser.add_argument("--case", choices=APPROVED_CASES, default=CASE)
     args = parser.parse_args(argv)
     if not (args.remote and args.root_go):
         parser.error("both --remote and --root-go are required; no dispatch authorized")
     ledger = existing_ledger(LEDGER)
-    root = OUTPUT / ("runtime_web_sqlite_" + datetime.now(UTC).strftime("%Y%m%dT%H%M%S%f"))
-    report = asyncio.run(run_probe(root, ledger))
+    stem = "runtime_web_sqlite_" if args.case == CASE else "runtime_" + args.case + "_"
+    root = OUTPUT / (stem + datetime.now(UTC).strftime("%Y%m%dT%H%M%S%f"))
+    options = {} if args.case == CASE else {"case_id": args.case}
+    report = asyncio.run(run_probe(root, ledger, **options))
     print(json.dumps({key: report[key] for key in
         ("private_artifacts", "calls", "searches", "charged_usd", "semantic_review")}, ensure_ascii=False))
 

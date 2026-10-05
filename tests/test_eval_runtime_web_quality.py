@@ -144,6 +144,46 @@ def test_approved_cli_still_refuses_absent_shared_ledger(tmp_path, monkeypatch):
     assert not path.parent.exists()
 
 
+@pytest.mark.parametrize("case_id", ["web_search_release", "heldout_web_multisource"])
+def test_explicit_other_web_case_uses_same_bounds_and_one_dispatch(tmp_path, monkeypatch, capsys, case_id):
+    ledger = LiveBudget(tmp_path / "budget.sqlite3")
+    calls = []
+
+    async def offline(root, opened, *, case_id):
+        calls.append((root, opened.path, case_id))
+        return {"private_artifacts": str(root), "calls": 0, "searches": 0, "charged_usd": 0,
+                "semantic_review": {"status": "pending_root_review"}}
+
+    monkeypatch.setattr(probe, "LEDGER", ledger.path)
+    monkeypatch.setattr(probe, "OUTPUT", tmp_path)
+    monkeypatch.setattr(probe, "run_probe", offline)
+    probe.main(["--remote", "--root-go", "--case", case_id])
+    assert len(calls) == 1 and calls[0][1:] == (ledger.path, case_id)
+    assert case_id in calls[0][0].name
+    assert json.loads(capsys.readouterr().out)["semantic_review"]["status"] == "pending_root_review"
+    assert (probe.MAX_CALLS, probe.MAX_SEARCHES, probe.TIMEOUT) == (20, 3, 180)
+
+
+def test_non_web_or_unknown_case_is_rejected_before_runtime_or_directory(tmp_path):
+    root = tmp_path / "not-created"
+    ledger = LiveBudget(tmp_path / "budget.sqlite3")
+    with pytest.raises(ValueError, match="approved web case"):
+        asyncio.run(probe.run_probe(root, ledger, case_id="native_code_fix"))
+    assert not root.exists()
+    assert ledger.snapshot()["groups"] == {}
+
+
+def test_raw_boundary_uses_selected_existing_web_goal_not_default_case_name(tmp_path):
+    case_id = "web_search_release"
+    raw_root = tmp_path / (case_id + "_20261005T030000123456")
+    raw_root.mkdir()
+    path = raw_root / "report.json"
+    path.write_text("{}")
+    assert probe.raw_report_path(tmp_path, {"private_artifacts": str(raw_root)}, case_id=case_id) == path
+    with pytest.raises(ValueError, match="expected private probe boundary"):
+        probe.raw_report_path(tmp_path, {"private_artifacts": str(raw_root)})
+
+
 def test_allowances_thread_safe_failures_still_consume_and_close_blocks_dispatch(tmp_path):
     ledger = LiveBudget(tmp_path / "budget.sqlite3")
     budget = probe.WebBudget(ledger, "one_probe")
