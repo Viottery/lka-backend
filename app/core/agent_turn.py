@@ -1987,6 +1987,8 @@ class AgentTurnLoop:
             "verification": verification,
             "warnings": [warning], "message": warning,
         }
+        historical_results, _ = self._degraded_child_delivery(run, raw_plan)
+        recovery["historical_task_results"] = historical_results
         if run.metadata.get("multi_agent_recovery") != recovery:
             manager.append_event(
                 run.run_id, "multi_agent_recovery_ready", warning,
@@ -1996,6 +1998,59 @@ class AgentTurnLoop:
             "multi_agent_replan_required": False, "multi_agent_recovery": recovery,
         })
         return recovery
+
+    def _degraded_child_delivery(
+        self, run: AgentRunRecord, raw_plan: dict[str, Any],
+    ) -> tuple[list[dict[str, Any]], dict[str, str]]:
+        """Recover delivery-only history from accepted patches, never current success."""
+        manager = _turn_run_manager.get() or getattr(self, "run_manager", None)
+        if manager is None:
+            return [], {}
+        try:
+            plan = Plan.model_validate(raw_plan)
+        except (ValidationError, ValueError):
+            return [], {}
+        if (
+            plan.parent_run_id != run.run_id or plan.session_id != run.session_id
+            or plan.correlation_id != run.trace_id
+        ):
+            return [], {}
+        skipped = {step.step_id for step in plan.steps if step.status == PlanStepStatus.SKIPPED}
+        notes: dict[str, str] = {}
+        for record in plan.patch_history:
+            patch = record.patch
+            if (
+                patch.plan_id != plan.plan_id or record.revision > plan.patch_revision
+                or patch.target_step_id not in skipped
+                or patch.operation not in {
+                    PlanPatchOperation.SKIP_AND_DEGRADE, PlanPatchOperation.ALTERNATIVE_STEP,
+                }
+                or not patch.degradation_note
+                or sha256(record.before_json.encode()).hexdigest() != record.before_hash
+                or sha256(record.after_json.encode()).hexdigest() != record.after_hash
+            ):
+                continue
+            notes[patch.target_step_id] = patch.degradation_note
+        if not notes:
+            return [], {}
+        history = []
+        for event in manager.list_events(run.run_id):
+            raw = event.payload.get("task_result") if event.type == "subtask_result" else None
+            if not isinstance(raw, dict) or raw.get("step_id") not in notes:
+                continue
+            try:
+                result = TaskResult.model_validate(raw)
+            except (ValidationError, ValueError):
+                continue
+            child = manager.get_run(result.child_run_id)
+            if (
+                result.plan_id == plan.plan_id and result.correlation_id == run.trace_id
+                and child is not None and child.parent_run_id == run.run_id
+                and child.run_id in run.child_run_ids and child.plan_id == plan.plan_id
+                and child.step_id == result.step_id and child.attempt == result.attempt
+            ):
+                history.append(result.model_dump(mode="json"))
+        return history, notes
 
     def _unresolved_multi_agent_answer(self) -> str:
         """Return bounded available results without clearing the unresolved gate."""
@@ -2020,9 +2075,11 @@ class AgentTurnLoop:
         raw_results = aggregate.get("task_results")
         if not isinstance(raw_results, list):
             return notice
+        historical_results, degradation_notes = self._degraded_child_delivery(run, plan)
+        delivery_results = [*raw_results, *historical_results]
         latest: dict[str, TaskResult] = {}
         conflicting: set[str] = set()
-        for raw in raw_results[:64]:
+        for raw in delivery_results[:64]:
             try:
                 result = TaskResult.model_validate(raw)
             except (ValidationError, ValueError):
@@ -2044,6 +2101,10 @@ class AgentTurnLoop:
                 conflicting.add(result.step_id)
         entries = [result for step_id, result in latest.items() if step_id not in conflicting]
         lines = [notice]
+        for step_id, note in list(degradation_notes.items())[:8]:
+            lines.append(f"明确降级 {step_id[:80]}（原合同未完成）：{note[:300]}")
+        if len(degradation_notes) > 8:
+            lines.append("其他降级说明未展示；请查看完整计划历史。")
         raw_conflicts = aggregate.get("conflicts")
         if isinstance(raw_conflicts, list):
             shown_conflicts = 0
@@ -2064,7 +2125,8 @@ class AgentTurnLoop:
                 lines.append("其他冲突详情未展示；请查看完整聚合记录。")
         missing = aggregate.get("missing_step_ids")
         if isinstance(missing, list):
-            missing_ids = [value[:80] for value in missing[:8] if isinstance(value, str)]
+            missing_ids = [value[:80] for value in missing[:8]
+                           if isinstance(value, str) and value not in latest]
             if missing_ids:
                 lines.append("未取得结果的子任务：" + "、".join(missing_ids))
             if len(missing) > 8:
@@ -2074,11 +2136,14 @@ class AgentTurnLoop:
                 step_id[:80] for step_id in sorted(conflicting)[:8]
             ))
         return self._render_partial_child_results(
-            lines=lines, entries=entries, omitted=len(raw_results) > 64 or bool(conflicting),
+            lines=lines, entries=entries,
+            omitted=len(delivery_results) > 64 or bool(conflicting),
+            historical_step_ids=set(degradation_notes),
         )
 
     def _render_partial_child_results(
         self, *, lines: list[str], entries: list[TaskResult], omitted: bool,
+        historical_step_ids: set[str] | None = None,
     ) -> str:
         """Render validated child results, keeping the unresolved gate and originals intact."""
         lines = list(lines)
@@ -2088,7 +2153,8 @@ class AgentTurnLoop:
         marker = "…（partial；摘要截取）…"
         blocks: list[tuple[str, str, str]] = []
         for result in entries[:8]:
-            header = f"- {result.step_id[:80]} [{result.status.value}]："
+            historical = "历史/已降级/" if result.step_id in (historical_step_ids or ()) else ""
+            header = f"- {result.step_id[:80]} [{historical}{result.status.value}]："
             trailer = ""
             if result.missing_requirements:
                 trailer += "；未完成：" + "、".join(result.missing_requirements)[:160]
@@ -2825,6 +2891,7 @@ class AgentTurnLoop:
                 "skipped_step_ids": [step.step_id for step in child_steps],
                 "degradation_notes": degraded_steps,
             }
+            historical_results, _ = self._degraded_child_delivery(run, raw_plan)
             if run.metadata.get("multi_agent_degradation") != degradation:
                 self.run_manager.append_event(
                     run_id, "multi_agent_plan_degraded",
@@ -2842,6 +2909,7 @@ class AgentTurnLoop:
                 "status": "validated", "execution_status": "degraded",
                 "operation_id": operation_id, "plan_id": plan.plan_id,
                 "step_ids": step_ids or [], "task_results": [],
+                "historical_task_results": historical_results,
                 "replan_required": False, **degradation,
                 "message": (
                     "Independent child work did not complete. Answer from available parent "
