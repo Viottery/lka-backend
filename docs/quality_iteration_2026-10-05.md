@@ -962,3 +962,17 @@ JSON输入，日志仍pretty。18新行为测试先红后绿；原byte-bound fix
 而失配，重新保留压力为5源精确4读、1源unknown，32k上限不变，不只改预期数字。
 Root相关85项、独立86项通过，无P1/P2。14.15%是历史输入重编码估计；真实复杂
 并行取证是否改善仍待同目标复测，不把离线节省当成成功。
+
+- [ ] R23-B：真正远程记忆提取＋真实后台worker压缩/前台并发，核对原文出处、自动晋升、
+  实际重叠、heartbeat、pool费用、covered_seq/revision和语义保留，不只看job succeeded。
+
+R23-B 隔离入口先离线：普通偏好确认规则提取为空，两个实际session交流触发remote
+worker；只有非空合法claim/原文evidence与两个独立source ID/checksum成立才计自动active。
+允许合法概括和短原文excerpt，不以“必须复制整句”伪造模型失败，也不以fuzzy把错误
+记忆洗成正确。候选normalized identity/未晋升原因单独保留，semantic另人工审阅。
+第二场景走Graph/outbox/worker真实compaction，不直接_summarize：后台provider已dispatch
+未返回后才启动前台Graph＋只读文件工具；自然未重叠标inconclusive，不远程人为延迟。
+512 context仅为fixture触发压力，不改生产历史/模型窗口。合计24 LLM/search0，provider30s、
+每场景120s；budget先close再stop，unknown/reserved/pending/cached与两pool费用分别记录，
+20相关源码前后指纹。实现者定向34项、Root新入口及旧memory harness20项通过。
+scripted实worker19calls机械通过不是实际模型成绩；真实运行下一步执行。
