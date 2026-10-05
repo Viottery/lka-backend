@@ -336,8 +336,9 @@ child token 预算。原预算不是上下文窗口；child run completed 不等
 已有前台主动压缩入口保留；正常整理仍由后台完成，硬溢出使用有界紧急视图并标降级，
 不临时在前台等待后台 LLM。Fallback 是可用性降级，不伪装 model publication 成功。
 
-- [ ] 重放原 medium probe，至少连续三次有效 model publication：旧摘要+新消息，
+- [x] 重放原 medium probe，至少连续三次有效 model publication：旧摘要+新消息，
   验证继承来源只来自服务端同会话、已覆盖序列，不信正文自报 ID。
+  2026-10-05 续轮两次真实隔离重放水位 4→6→12→14；证据与优化前后统计见执行记录。
 - [ ] 在每次摘要后追问旧事实、新事实，再更正日期 / 否定旧决定，检查实际 prompt
   交付；来源 membership 合法不等于摘要语义正确，人工单独核对保真。
 - [ ] 超出 64 IDs / 4096 bytes 的 metadata 上限明确截断 / incomplete，保留原始
@@ -353,6 +354,8 @@ child token 预算。原预算不是上下文窗口；child run completed 不等
   前台基线中位数不增加超过约 15%，无同步摘要等待；初步目标不承诺跨机器 SLA。
 - [ ] 背景摘要失败有 reason、重试耗尽与 fallback 方式；不把 model 格式失败、
   provenance 拒绝、provider timeout 都归为一个“摘要失败”。
+- [x] 重复文本生成可逆、有来源 hash/次数的有界 provider 投影；不修改原始历史。
+  实际输入 -38.0%、末版摘要字符 -47.5%，同预算事实/更正通过；未测得端到端提速。
 
 验收：原 model→fallback 问题闭合；新事实 / 更正保真；取消后旧 worker 不发表；
 长历史和满队列最终追上合法水位，前台不被语义压缩阻塞。未知或仍降级保持可见。

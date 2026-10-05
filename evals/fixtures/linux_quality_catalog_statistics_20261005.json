@@ -1,13 +1,13 @@
 {
   "catalog_id": "linux_quality_2026_10_05",
   "as_of": "2026-10-05",
-  "catalog_sha256": "eba7bd88d3b850640946a50ad465d9d7b1478aee4e07db8131061141d5e6e503",
+  "catalog_sha256": "810934216ae6b6be325fddf0a8ff1402b00721edb2efc86dea8f11b3210d3b03",
   "catalog_statistics": {
     "logical_cases": 41,
     "by_status": {
       "baseline_passed": 4,
-      "fixed_live": 16,
-      "fixed_offline": 13,
+      "fixed_live": 17,
+      "fixed_offline": 12,
       "open": 8,
       "inconclusive": 0
     },
@@ -68,8 +68,8 @@
       "background": {
         "total": 2,
         "baseline_passed": 0,
-        "fixed_live": 1,
-        "fixed_offline": 1,
+        "fixed_live": 2,
+        "fixed_offline": 0,
         "open": 0,
         "inconclusive": 0
       },
@@ -96,7 +96,7 @@
     "label": "Curated logical issues/baselines, NOT run count or current model accuracy"
   },
   "profile_counts": {
-    "focus": 21,
+    "focus": 20,
     "regression": 29,
     "foundation": 4,
     "historical_holdout": 10,

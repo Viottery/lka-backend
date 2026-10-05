@@ -12,7 +12,7 @@
       "status": "open",
       "symptom": "用户更正自己计划日期后，答案仍无谓要求外部确认；承认自述与验证外部记录没有明确区分。",
       "cause": "证据校准过度泛化，把用户的本轮工作前提与外部独立事实混为一谈。",
-      "optimization": "加入通用来源语义，不扩大权限、不自动发布长期记忆；两新合成现场分支通过，原长会话摘要后的更正组合仍未闭合。",
+      "optimization": "通用来源语义不扩大权限或自动发布记忆；两小场景及四次摘要后的纠正现场通过，引用伪造/跨项目记忆组合尚未完整验收。",
       "acceptance": [
         "确认用户自己的计划无需工具取证；保留否定与未完成状态",
         "明确要求核对记录时实际读取，并区分用户安排和持久记录",
@@ -20,14 +20,15 @@
       ],
       "evidence": [
         "docs/linux_quality_final_report_2026-10-05.md — 用户自述过度核实的额外体验问题",
-        "docs/linux_usability_progress_2026-10-05.md — UX-11：两真实小场景7.543s/2 calls零工具及9.871s/4 calls一读取；只证明两个基础分支，不算长会话组合闭合"
+        "docs/linux_usability_progress_2026-10-05.md — UX-11：两真实小场景7.543s/2 calls零工具及9.871s/4 calls一读取；只证明两个基础分支",
+        "docs/linux_usability_progress_2026-10-05.md — 续轮UX-07：四次model摘要后实际prompt完整，纠正11-09保留未批准/未完成；非跨项目记忆/引用伪造验收"
       ],
       "regression_tests": [
         "tests/test_answer_evidence_calibration_quality.py",
         "tests/test_unified_entry_quality.py"
       ],
       "replay": {"runner": "realworld", "case": "user_plan_correction", "args": []},
-      "tags": ["bounded_live_variants", "long_context_correction_pending", "working_premise_not_permission"],
+      "tags": ["bounded_live_variants", "bounded_long_context_correction_live", "working_premise_not_permission"],
       "exposure": "seen",
       "data_class": "synthetic"
     },
@@ -1252,7 +1253,7 @@
       "title": "摘要跨prefix来源误拒导致local fallback",
       "group": "background",
       "tier": "regression",
-      "status": "fixed_offline",
+      "status": "fixed_live",
       "symptom": "同会话追问事实可用但第二publication local_fallback，连续model摘要原验收失败。",
       "cause": "validator只准当前chunk trace2，合法已发表summary的trace1被误拒。",
       "optimization": "server来源继承须同session、seq≤covered与当前watermark原始membership；64 IDs/4096 bytes，截断/legacy incomplete明示，CAS/lease不变。",
@@ -1264,7 +1265,8 @@
       "evidence": [
         "docs/quality_iteration_2026-10-05.md — R25-B：37.051s/7 calls，水位4→6，发表1173字符summary实际prompt完整，前台4.975/5.005s接受更正；model→fallback整体false",
         "docs/quality_iteration_2026-10-05.md — R27-B收尾73 passed/22.68s，1d6acb8；未再live，原失败保留；宽后台76 passed/1 failed为用户workload15/11列失配",
-        "docs/quality_iteration_2026-10-05.md — 私有独立核对：data/quality_runs/linux_20261005/runtime_background_followup_20261005T033238312609/independent_review.json"
+        "docs/quality_iteration_2026-10-05.md — 私有独立核对：data/quality_runs/linux_20261005/runtime_background_followup_20261005T033238312609/independent_review.json",
+        "docs/linux_usability_progress_2026-10-05.md — 续轮UX-07：两次真实四水位model发表/同会话纠正；报告SHA 1b36ab4600781c8f7faef871f8fa1002d4c15012068315ac0657b0d01aaeb36c、4088846d7fb20e5fc37a38c9c37434e633369946ccbf381fa5dabfa20645232f；非65536或60分钟SLA"
       ],
       "regression_tests": [
         "tests/test_background_summary_provenance_quality.py",
@@ -1277,8 +1279,8 @@
         "args": []
       },
       "tags": [
-        "offline_only",
-        "continuous_publication_not_retested"
+        "bounded_live",
+        "continuous_medium_publication_live"
       ],
       "exposure": "seen",
       "data_class": "synthetic"

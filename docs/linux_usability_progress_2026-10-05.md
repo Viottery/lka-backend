@@ -223,3 +223,8 @@ boolean/number 对比反例（Python `True == 1` 不足以证明合同一致）�
 
 本续轮共两次真实 DeepSeek Flash、20 dispatch、$0.148593984、零搜索。
 不启动高开销 Agent，不改用户已有消息/配额/Windows 代码，未重启用户后端。
+共享账本累计 $6.425726688（含 7 条历史未知预留）、1126 模型 dispatch、8 搜索。
+评测仍为 41 项；连续 prefix 案例有真实证据后改为 fixed_live：4 baseline、17 live、
+12 offline、8 open，默认 focus **21→20**。用户自述保留 open 并记录长会话新证据，
+不把尚未完成的引用/跨项目组合一起算通过。目录引用/自动统计
+**2 passed / 0.10s**；一次错误测试节点选择未运行任何测试，改用实际节点后完成验证。
