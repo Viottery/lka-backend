@@ -282,7 +282,8 @@ def _page_evidence_urls(tool_events: list, *, source_hosts: list[str] | None = N
     """Count delivered page evidence, not search candidates or semantic verification.
 
     Re-reading offsets, fragments or query variants of one static page does not
-    satisfy a multiple-page goal. No-match find results are not page evidence.
+    satisfy a multiple-page goal. Bare no-match metadata is not page evidence;
+    explicitly returned recovery excerpts are readable source text, not matches.
     """
     pages = set()
     hosts = {host.casefold() for host in source_hosts} if source_hosts is not None else None
@@ -294,11 +295,14 @@ def _page_evidence_urls(tool_events: list, *, source_hosts: list[str] | None = N
             continue
         text = output.get("text")
         matches = output.get("matches", [])
+        recovery = output.get("recovery_preview", [])
+        windows = (matches if isinstance(matches, list) else []) + (
+            recovery if isinstance(recovery, list) else [])
         delivered = (
             isinstance(text, str) and bool(text.strip()) if event.tool_name == "web.open"
-            else isinstance(matches, list) and any(
+            else any(
                 isinstance(match, dict) and isinstance(match.get("snippet"), str)
-                and bool(match["snippet"].strip()) for match in matches
+                and bool(match["snippet"].strip()) for match in windows
             )
         )
         url = output.get("url")

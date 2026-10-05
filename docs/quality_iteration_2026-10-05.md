@@ -829,3 +829,24 @@ context_answer 仍未注入/校验 Task schema。实际新模型复测尚未完�
 - [ ] R21-D：decision/repair 统一完整性与恢复预算，stream thinking 参数一致；先离线边界再一次实际 Watch。
 - [ ] R21-W：web.find 零短语命中的同 fetch 有界原文恢复，不当语义命中/完整阅读；实际 SQLite 留出复测。
 - [ ] R21-P：32-call 有界复杂并行复测，六事实与真实 child/范围/原文件完整性，不以 COMPLETED 洗白空证据。
+
+R21-W 离线：原 web.find 字面零匹配返回 no text；`single writer` 与正文 `one writer` 的
+表达差异，使模型重复搜索空缓存仍拿不到第二页原文。工具侧现在在同 fetch 的首次全局
+zero-match 附≤1200 字符有界原文恢复：有限 query-token 上下文，或未发现 token 时的
+page prefix。实际 matches/分页计数/SSRF/字节限制/expected hash 不放松；明确非短语、
+非 semantic、非 verified、非完整阅读，CJK 不分词。offset 超过已有匹配单独标 exhausted。
+schema/描述/领域 hints 同步，Agent core 没有网页/SQLite 步骤特例。评测把真实返回的
+恢复 snippet 计为已交付 source text，但仅 metadata/空 snippet/失败调用不计，也不把
+页面计数当语义互证。Root web find/paging/readability/tools/eval **106 passed /9.35s**；
+实现者补空 extraction、positive offset 无全局匹配与四 token 采样边界后 92 项通过。
+新实际 SQLite 留出尚未执行，不声称已经减少 174 秒旧失败的耗时。
+
+R21-W 独立复核未发现新增 P1/P2，41 项离线检查通过；1MB Mock 页面单次 fetch
+恢复约 0.728s、预览≤1200 字符。切词和截句仍是启发式，不保证上下文语义完整。
+
+R21-P 复测脚本复用原 parallel_audit 的目标、文件与 32768 child token 上限，父子及
+恢复共享线程安全 32-call 硬上限、权威账本和 secret guard，禁止搜索。必须显式
+`--remote --root-go`；关闭隔离测试中的后台同步/记忆，不改生产设置。保留原始 run、
+child、verification、budget 与前后源码指纹，按本次 reservation IDs 统计成本，不用
+共享账本差分误算其他并发测试。字符串 6/6 只是机械覆盖，语义判断单独待审核。
+离线预算/脚本检查 31 项通过；实际调用尚未执行。

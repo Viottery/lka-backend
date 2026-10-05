@@ -42,6 +42,12 @@
   偏移不同。用 snippet_start 再 open 可扩读上下文，携带指纹防止混用版本。每次仍
   重新抓取，沿用 open 的网络/SSRF/类型/字节限制和现有来源约束。无命中不证明网页
   没有相关语义，也不能覆盖关注项已收集正文的证据及对应抓取时间。
+  `match_status` 区分 phrase_matches、全局 no_literal_match 与有匹配但当前 offset 超范围的
+  offset_exhausted。只有 offset=0 的全局零匹配会附同一次 extraction 的 recovery_preview：
+  最多三个非重叠 query-token 原文窗口（总≤1200字符），无 token 候选则返回开头≤1200。
+  不再为此多发 HTTP/LLM/搜索请求；仍是原 Unicode offset 和同一文本指纹。token 仅取
+  最长的四个 Unicode word runs，每个至多64个候选，无 CJK 分词、同义词或完整语义相关
+  保证。预览不是短语 matches，不代表核验/完整阅读，complete 仍只指字面检索分页。
 - Agent 通过 Tool Package Registry 懒展开并经 ToolExecutor 调用；不在 Agent core 里硬编码网络工具。长结果仍进现有 tool-result gate，模型可按需读缓存。网页与邮件/RAG 同为证据，不赋予网页创建事项或执行命令的能力。
 - `observation.search(..., distinct_contexts=true)` 可按不同完整上下文窗口分页，避免近邻
   标签/链接挤占命中数；默认仍按 occurrence 分页。去重窗口不会因单页预算再次缩短，

@@ -62,6 +62,26 @@ def test_page_coverage_rejects_no_match_search_failure_and_fake_official_hosts()
     assert len(_page_evidence_urls(events, source_hosts=hosts)) == 2
 
 
+def test_find_recovery_excerpts_count_as_delivered_text_not_semantic_verification():
+    from types import SimpleNamespace
+
+    from scripts.eval_realworld import _page_evidence_urls
+
+    url = "https://sqlite.org/lang_transaction.html"
+
+    def event(recovery, status="completed", page=url):
+        return SimpleNamespace(tool_name="web.find", result={"status": status, "output": {
+            "url": page, "matches": [], "total_matches": 0, "match_status": "no_literal_match",
+            "recovery_preview": recovery}})
+
+    preview = [{"kind": "query_token_context", "snippet": "Only one simultaneous write transaction."}]
+    assert _page_evidence_urls([event(preview)], source_hosts=["sqlite.org"]) == {url}
+    for recovery in ([], {}, None, [{"query_tokens": ["writer"]}], [{"snippet": "  "}], [{"snippet": 1}]):
+        assert not _page_evidence_urls([event(recovery)], source_hosts=["sqlite.org"])
+    assert not _page_evidence_urls([event(preview, status="failed")], source_hosts=["sqlite.org"])
+    assert not _page_evidence_urls([event(preview, page="https://sqlite.org.evil.test/x")], source_hosts=["sqlite.org"])
+
+
 def test_copy_verification_catches_mutation_missing_copy_and_extra_files():
     from scripts.eval_realworld import _copy_checks
 

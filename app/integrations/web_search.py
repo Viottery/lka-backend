@@ -339,6 +339,39 @@ def _page_literal_matches(text: str, folded_query: str):
             previous = source_pair
 
 
+def _find_recovery_preview(text: str, query: str) -> list[dict[str, Any]]:
+    """Bounded lexical hints, not phrase/semantic matches or source verification.
+
+    Consider four Unicode word runs (no CJK segmentation), at most 64 anchors
+    each. Rank these bounded candidates by token overlap, then source offset.
+    """
+    tokens = sorted({token.casefold() for token in re.findall(r"\w+", query)
+                     if len(token) >= 2}, key=lambda token: (-len(token), token))[:4]
+    candidates = []
+    for token in tokens:
+        for index, (start, _) in enumerate(_page_literal_matches(text, token)):
+            if index >= 64:
+                break
+            snippet_start = max(0, start - 100)
+            snippet_end = min(len(text), snippet_start + 400)
+            snippet = text[snippet_start:snippet_end]
+            matched = [term for term in tokens if term in snippet.casefold()]
+            candidates.append({"kind": "query_token_context", "snippet_start": snippet_start,
+                               "snippet_end": snippet_end, "snippet": snippet, "query_tokens": matched})
+    previews = []
+    for candidate in sorted(candidates, key=lambda row: (-len(row["query_tokens"]), row["snippet_start"])):
+        if any(candidate["snippet_start"] < row["snippet_end"]
+               and row["snippet_start"] < candidate["snippet_end"] for row in previews):
+            continue
+        previews.append(candidate)
+        if len(previews) == 3:
+            break
+    if not previews and text:
+        previews.append({"kind": "page_prefix", "snippet_start": 0,
+                         "snippet_end": min(len(text), 1200), "snippet": text[:1200], "query_tokens": []})
+    return previews
+
+
 class PublicPageFetcher:
     """Fetch bounded public HTTPS text with per-hop DNS validation and pinning."""
 
@@ -409,10 +442,15 @@ class PublicPageFetcher:
             if len(matches) > limit:
                 break
         has_more = len(matches) > limit
+        match_status = "phrase_matches" if matches else ("offset_exhausted" if total else "no_literal_match")
+        recovery_preview = _find_recovery_preview(text, query) if total == 0 and offset == 0 else []
         return {**fetched, "query": query, "matches": matches[:limit], "offset": offset,
                 "offset_unit": "matches", "total_chars": len(text), "has_more": has_more,
                 "next_offset": offset + len(matches[:limit]) if has_more else None,
-                "complete": not has_more, "total_matches": None if has_more else total}
+                "complete": not has_more, "total_matches": None if has_more else total,
+                "match_status": match_status, "recovery_preview": recovery_preview,
+                "recovery_preview_scope": "non_phrase_nonsemantic_excerpt",
+                "query_tokenization": "unicode_word_runs_no_cjk_segmentation"}
 
     def _readable_page(
         self, url: str, *, expected_text_sha256: str | None = None,
