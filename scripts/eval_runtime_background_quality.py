@@ -60,6 +60,21 @@ def fingerprint(value):
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def extraction_identity_diagnostics(valid_identities, records):
+    """Raw extraction hashes describe variation, not the service's alias result."""
+    active_count = sum(row["status"] == "active" for row in records)
+    return {"valid_candidate_count": len(valid_identities),
+        "same_publication_identity": len(valid_identities) >= 2 and len(set(valid_identities)) == 1,
+        "unique_publication_identities": sorted(set(valid_identities)),
+        "identity_basis": "raw_claim_hash_not_service_alias_resolution",
+        "active_count": active_count,
+        "observed_not_promoted_reason": None if active_count else
+            "no_valid_candidates" if not valid_identities else
+            "different_candidate_identities" if len(set(valid_identities)) > 1 else
+            "no_active_record_observed; inspect records/jobs",
+        "semantic_review": "Root manual pending"}
+
+
 def source_fingerprints():
     base = Path(__file__).resolve().parents[1]
     return {name: hashlib.sha256((base / name).read_bytes()).hexdigest() for name in SOURCE_FILES}
@@ -449,14 +464,8 @@ async def run_probe(root, ledger, *, config=None, injected_service=None):
                 report["extraction_diagnostics"].append({"invalid_model_json": True})
         extraction = report["scenarios"].get("extraction")
         if extraction is not None:
-            extraction["identity_diagnostics"] = {"valid_candidate_count": len(valid_identities),
-                "same_publication_identity": len(valid_identities) >= 2 and len(set(valid_identities)) == 1,
-                "unique_publication_identities": sorted(set(valid_identities)),
-                "active_count": sum(m["status"] == "active" for m in extraction["records"]),
-                "observed_not_promoted_reason": "no_valid_candidates" if not valid_identities else
-                    "different_candidate_identities" if len(set(valid_identities)) > 1 else
-                    "no_active_record_observed; inspect records/jobs" if not any(m["status"] == "active" for m in extraction["records"]) else None,
-                "semantic_review": "Root manual pending"}
+            extraction["identity_diagnostics"] = extraction_identity_diagnostics(
+                valid_identities, extraction["records"])
         source_after = source_fingerprints()
         report["source_fingerprints_before"] = source_before
         report["source_fingerprints_after"] = source_after

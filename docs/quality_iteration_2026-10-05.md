@@ -963,7 +963,7 @@ JSON输入，日志仍pretty。18新行为测试先红后绿；原byte-bound fix
 Root相关85项、独立86项通过，无P1/P2。14.15%是历史输入重编码估计；真实复杂
 并行取证是否改善仍待同目标复测，不把离线节省当成成功。
 
-- [ ] R23-B：真正远程记忆提取＋真实后台worker压缩/前台并发，核对原文出处、自动晋升、
+- [x] R23-B：真正远程记忆提取＋真实后台worker压缩/前台并发，核对原文出处、自动晋升、
   实际重叠、heartbeat、pool费用、covered_seq/revision和语义保留，不只看job succeeded。
 
 R23-B 隔离入口先离线：普通偏好确认规则提取为空，两个实际session交流触发remote
@@ -1048,3 +1048,70 @@ correction和lease fence仍优先。原真实偏好两种提取顺序的行为�
 另发现coordinator把publication_lease误放MemoryInput未知extra，被Pydantic忽略；现传给
 MemoryService.create的真正关键词。直接coordinator stale-owner回归确保零发布，不只
 测service helper。离线合成provider零付费；不通过弱化真实晋升判据掩盖原失败。
+
+R23-B 新真实（`runtime_background_20261005T020635164693`）42.191s、19 knowncalls、
+33959 input/6100 output/11648 cache、$0.037555168；interactive16calls/$0.030004032，
+background3calls/$0.007551136，无unknown/pending，budget关闭，20监测source不变。
+两次remote合法claim仍仅差句号，两个raw hash不同；真实DB同原memory_id version2/
+active，两个不同persisted user refs；promotion audit明确terminal_chinese_period alias与
+independent_user_sources=2，独立复核确认来源角色、原文、checksum和provider输入一致。
+后台compact provider7.032s，期间4前台请求与真正read_file完成；前台5.989s，对照7.065s，
+heartbeat583ticks/max15.187ms，summary watermark0→2/revision0→1，保留日期/否定/24条。
+这是一次短窗口重叠证据，不是稳定SLA、生产长窗口压力或同会话下轮复用证明；512
+fixture recent history保留后仍913token，未宣称整个请求512上限。原raw SHA
+b11226aa2e1b4684da4f022762d3d07722942668f03c02172ae13eb312007713。
+独立review另查出报告诊断P2：已active却仍给different_candidate_identities为“未晋升
+原因”。该字段将raw claim hash错当service alias identity；本轮修复纯诊断优先使用
+观察到的active状态，明示raw_hash_not_service_alias_resolution，5单元场景及实际worker
+异句号晋升回归共6 GREEN/5.01s。旧raw不改，产品晋升与诊断问题分开记录。
+
+R23-P/S 新真实（`parallel-quality-20261005T015921893148-7051563f`）165.544s、31派发/
+29 known/2 SDKtimeout unknown；known146493input/18239output/49792cache/$0.136522272，
+未知用量保守预留$0.1215328，总$0.258055072，不称未知为实际收费。原raw SHA
+7bde9e79bc9f89e86e3669e6beafd962c7e0f3ad49e3185977a5f6daacff9873，监测source/fixture不变。
+六事实关系有原文支持，机械3checks为true，父交付completed但三原child均partial，
+补跑一个completed，aggregate partial/verifier inconclusive仍披露。目录scopehide在受限
+补跑有效；原三child授权较宽，不能称强制READ隔离。无虚占位success/旧480截取问题。
+独立复核仍有两个P2：静态恢复失败被说成“备份不可恢复”，历史启动错误推为当前无法
+启动；且startup的execution replacement只核查发布资料，未证明原合同覆盖。不能以
+6/6字符串覆盖或父completed宣称任务质量全面通过。
+
+- [ ] R24-T：确认显式thinking-disabled timeout recovery完整成功后，同run/client/model
+  control-only cooldown，避免每个新decision再次30s超时；未知原因不标推理overflow。
+- [ ] R24-R：execution replacement与原合同覆盖分离，合同改变须显式degradation，
+  默认保留原contract/verification；旧journal同样不能被自动replacement说明绕过。
+- [ ] R24-C：报告失败/历史证据不能升级为不可能/当前实时状态；静态与实时、观察与
+  推断、scope内未发现与全局不存在的校准，通用证据边界而非任务名/结论词表。
+
+R24-T 实际两个parent decision timeout串行60.271s，占165.544s约36.4%；两次各自的
+单次thinking-disabled恢复均成功，下一个decision却又默认重置。保留timeout根因unknown，
+不声称429或length。离线已增加确认事件而不是把尝试当成功；同run/client/model后续
+control复用，answer/newrun/其他identity不变，每decision≤2派发、取消/finish reserve仍保留。
+28新例11 RED→GREEN，implementer相关120 GREEN，Root与receipt/cache/回答联合99 GREEN
+（11.16s）；独立review及新真实复测尚待。
+
+R23-V 已从纯提案接到provider-boundary：registered backend callable重验当前run的
+artifact/hash/JSON Pointer/实际文本；raw工具正文同名字段不是authority。server bindings
+不进prompt，只有≤24个cached-value区间摘要；按invocation ID识别最终保留observation，
+同version/path合并不重复计数，未知二次投影unknown，metadata加入后最多3次重拟合，
+不可稳定/挤占child回答reserve就安全保留原已拟合prompt。取消在新I/O后重新检查。
+read/search增加描述性delivery view，scan complete不等于文本交付，完整cache value也
+永远不自动认证upstream完整。12原红→绿＋8安全例共20 GREEN；Root实际provider-request
+4 RED→GREEN再加reserve/cancel共8 GREEN，联合99 GREEN。未增加LLM调用；独立性能
+与安全复核、同网页实际claim校准仍待，不据metadata测试称任意自然语言都不会过度声称。
+
+R24-R 离线闭合：literal output_contract或verification_criteria改变时，alternative_step
+必须明确提供已有degradation_note；相同合同可换objective/执行策略。降级说明传递下游，
+原partial结果和inconclusive verification不被升级。终态恢复复查旧journal的before
+snapshot，不把自动“已替换”当原义务覆盖。5 RED/2 GREEN→新15 GREEN，相关144 GREEN；
+Root合同/恢复/诊断/cooldown/receipt/observation联合157 GREEN（22.68s）。这是字面合同
+与显式降级门禁，不是语义正确性认证；同任务真实复测和独立复核仍待。
+
+R23-V 独立复核实际再找出两处outer-hook P2：callback未拿到现有ToolView、首次cache
+load取消后仍进行多余I/O。新增2例真实RED后，复用现有ToolView getter，对generic及
+registered mapping均验权，cache load/producer/refit前后检查取消；Root10 GREEN/3.14s，
+独立10 GREEN/2.80s确认这两处闭合。另将取消checker可选传入registered callback，
+每个source load前后检查，首次取消即不读第二份source，不返回receipt；内层目标40
+GREEN。微基准仅测纯mapping/summarizer：20k字符约0.078ms，1MB约3.091ms，不含SQLite、
+tokenizer/refit，不当作完整链路SLA。独立还发现最后24条索引会漏计仍保留的较旧文本，
+当前单独修复并补全列表duplicate-id回归；真实网页claim仍独立验收。
