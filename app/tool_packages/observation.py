@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
+from hashlib import sha256
 from itertools import islice
 from typing import Any
 
+from app.core.tool_result_gate import preview
 from app.core.tools import ToolContext, ToolInvocation, ToolPackageSpec, ToolResult, ToolSpec
 
 OBSERVATION_PACKAGE = ToolPackageSpec(
@@ -18,6 +21,7 @@ OBSERVATION_PACKAGE = ToolPackageSpec(
         "Expand only after an observation provides _result_cache.artifact_id; paths refer to the raw stored ToolResult, not its structural preview wrappers.",
         "Use search to locate literal terms in long cached text, then read its returned path/character offset for more context; a bounded search is not proof of full coverage.",
         "When repeated labels or links crowd search hits, use distinct_contexts=true to page through different text windows, then read from snippet_start. complete describes the cached text only, not an upstream truncated source.",
+        "_delivery_view describes original-character windows of a cached value, not fetched or fully read upstream documents. Later prompt trimming can reduce that view further.",
         "For an array of records, use read with fields to retain the requested shallow keys rather than generic first-key previews. Follow next_offset to cover further records; report incomplete coverage when stopping early.",
         "For exact counts by a scalar field, use group on the cached raw array instead of adding counts from remembered previews. Group counts cover that entire array before group paging; they do not cover other artifacts or source pages. Follow next_offset to see every group and inspect skipped record counts.",
     ],
@@ -31,11 +35,210 @@ _SEARCH_MAX_NODES = 10_000
 _SEARCH_MAX_CHARS = 200_000
 _SEARCH_MAX_PATH_CHARS = 512
 _SEARCH_SNIPPET_CHARS = 500
+_DELIVERY_LIMIT = 24
+_DELIVERY_MISSING = object()
+
+
+def _artifact_content_hash(payload: dict[str, Any]) -> str:
+    # Exactly SqliteAgentRunStore's existing serialization; not a text-only hash.
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                            separators=(",", ":"), default=str)
+    return sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _cached_text_description(
+    artifact_id: str, content_hash: str, path: str, text: str,
+    windows: list[list[int]], *, empty_delivered: bool = False,
+) -> dict[str, Any]:
+    ranges: list[list[int]] = []
+    for start, end in sorted(windows):
+        if start == end:
+            continue
+        if ranges and start <= ranges[-1][1]:
+            ranges[-1][1] = max(ranges[-1][1], end)
+        else:
+            ranges.append([start, end])
+    covered = sum(end - start for start, end in ranges)
+    return {
+        "scope": "cached_value", "artifact_id": artifact_id, "content_hash": content_hash,
+        "path": path, "unit": "unicode_codepoints", "total_chars": len(text),
+        "ranges": ranges, "covered_chars": covered,
+        "coverage": "complete" if covered == len(text) and (text or empty_delivered) else "partial",
+        "upstream_coverage": "unknown",
+    }
+
+
+def _projected_text_fragments(
+    raw_text: str, view: Any, *, view_path: str, raw_path: str, source_start: int,
+) -> tuple[list[dict[str, Any]], bool]:
+    if view is _DELIVERY_MISSING:
+        return [], False
+    if isinstance(view, str) and view == raw_text:
+        return [{"view_path": view_path, "start": source_start,
+                 "end": source_start + len(raw_text), "text": raw_text}], False
+    if isinstance(view, dict) and view == preview(raw_text, path=raw_path):
+        return [{"view_path": f"{view_path}/{field}", "start": source_start + start,
+                 "end": source_start + end, "text": raw_text[start:end]}
+                for field, (start, end) in (
+                    ("head", (0, 350)), ("tail", (len(raw_text) - 150, len(raw_text))),
+                )], False
+    return [], True
+
+
+def _context_delivery_bindings(
+    tool: Any, *, result_payload: dict[str, Any], view_payload: dict[str, Any], context: ToolContext,
+    check_cancel: Callable[[], None] | None = None,
+) -> list[dict[str, Any]]:
+    """Called only through a registered backend object; revalidate cached origin.
+
+    Descriptive tool JSON is not trusted by core. This method reloads the owning
+    run's artifact and proves every returned body window against that version.
+    Missing/stale/malformed mapping returns no authority, never a generic fallback.
+    """
+    if (
+        not context.run_id or not isinstance(result_payload, dict)
+        or result_payload.get("status") != "completed"
+        or result_payload.get("tool_name") != tool.spec.name
+        or (context.tool_view is not None and context.tool_view.child_run_id is not None
+            and context.tool_view.child_run_id != context.run_id)
+        or (context.tool_view is not None and not context.tool_view.allows_tool(
+            tool_name=tool.spec.name, package=tool.spec.package, read_only=True))
+    ):
+        return []
+    identity = result_payload.get("invocation_id")
+    output = result_payload.get("output")
+    if not isinstance(identity, str) or not 0 < len(identity) <= 200 or not isinstance(output, dict):
+        return []
+    descriptions = output.get("_delivery_view")
+    if not isinstance(descriptions, list) or len(descriptions) > _DELIVERY_LIMIT:
+        return []
+    view_result = view_payload.get("result") if isinstance(view_payload, dict) else None
+    if (
+        isinstance(view_payload, dict) and view_payload.get("_observation_id") not in (None, identity)
+        or isinstance(view_result, dict) and view_result.get("invocation_id") not in (None, identity)
+    ):
+        return []
+    view_output = view_result.get("output") if isinstance(view_result, dict) else None
+    bindings: list[dict[str, Any]] = []
+    cached_versions: dict[str, tuple[dict[str, Any], str]] = {}
+    for description in descriptions:
+        if not isinstance(description, dict):
+            continue
+        described_ranges = description.get("ranges")
+        if (
+            type(description.get("total_chars")) is not int
+            or type(description.get("covered_chars")) is not int
+            or not isinstance(described_ranges, list) or len(described_ranges) > _DELIVERY_LIMIT
+            or any(not isinstance(interval, list) or len(interval) != 2
+                   or any(type(index) is not int for index in interval)
+                   for interval in described_ranges)
+        ):
+            continue
+        artifact_id, path = description.get("artifact_id"), description.get("path")
+        if (
+            not isinstance(artifact_id, str) or not 0 < len(artifact_id) <= 200
+            or not isinstance(path, str) or len(path) > 512
+        ):
+            continue
+        if artifact_id not in cached_versions:
+            if check_cancel is not None:
+                check_cancel()
+            cached = tool.store.load_tool_result_artifact(artifact_id, context.run_id)
+            if check_cancel is not None:
+                check_cancel()
+            if cached is None:
+                continue
+            cached_versions[artifact_id] = cached, _artifact_content_hash(cached)
+        cached, content_hash = cached_versions[artifact_id]
+        if content_hash != description.get("content_hash"):
+            continue
+        try:
+            text = _resolve_pointer(cached, path)
+        except (KeyError, IndexError, ValueError, TypeError):
+            continue
+        if not isinstance(text, str):
+            continue
+        windows: list[list[int]] = []
+        fragments: list[dict[str, Any]] = []
+        unknown = False
+        empty_delivered = False
+        if isinstance(tool, ObservationReadTool) and output.get("value_type") == "string":
+            if output.get("path") != path or type(output.get("total")) is not int or output["total"] != len(text):
+                continue
+            body = output.get("text")
+            ranges = description.get("ranges")
+            if not isinstance(body, str) or not isinstance(ranges, list) or len(ranges) > 1:
+                continue
+            if ranges:
+                interval = ranges[0]
+                if (
+                    not isinstance(interval, list) or len(interval) != 2
+                    or any(type(index) is not int for index in interval)
+                    or not 0 <= interval[0] < interval[1] <= len(text)
+                    or body != text[interval[0]:interval[1]]
+                ):
+                    continue
+                start = interval[0]
+                windows = [interval]
+            elif not body:
+                start = len(text)
+            else:
+                continue
+            empty_delivered = not text
+            view = view_output.get("text", _DELIVERY_MISSING) if isinstance(view_output, dict) else _DELIVERY_MISSING
+            fragments, unknown = _projected_text_fragments(
+                body, view, view_path="/result/output/text", raw_path="/output/text", source_start=start)
+        elif isinstance(tool, ObservationSearchTool) and isinstance(output.get("matches"), list):
+            matches = output["matches"]
+            if len(matches) > _DELIVERY_LIMIT:
+                continue
+            projected = view_output.get("matches") if isinstance(view_output, dict) else None
+            items_path = "/result/output/matches"
+            if isinstance(projected, dict) and projected.get("_type") == "array" and isinstance(projected.get("items"), list):
+                projected = projected["items"]
+                items_path += "/items"
+            valid = True
+            for index, match in enumerate(matches):
+                if not isinstance(match, dict) or match.get("path") != path:
+                    continue
+                start, end, body = (match.get(key) for key in ("snippet_start", "snippet_end", "snippet"))
+                if (type(start) is not int or type(end) is not int or not 0 <= start <= end <= len(text)
+                    or not isinstance(body, str) or body != text[start:end]):
+                    valid = False
+                    break
+                windows.append([start, end])
+                item = projected[index] if isinstance(projected, list) and index < len(projected) else None
+                view = item.get("snippet", _DELIVERY_MISSING) if isinstance(item, dict) else _DELIVERY_MISSING
+                new_fragments, changed = _projected_text_fragments(
+                    body, view, view_path=f"{items_path}/{index}/snippet",
+                    raw_path=f"/output/matches/{index}/snippet", source_start=start)
+                fragments.extend(new_fragments)
+                unknown = unknown or changed
+            if not valid:
+                continue
+        else:
+            continue
+        expected = _cached_text_description(artifact_id, description["content_hash"], path, text,
+                                            windows, empty_delivered=empty_delivered)
+        if description != expected:
+            continue
+        binding = {"observation_id": identity, "artifact_id": artifact_id,
+                   "content_hash": description["content_hash"], "path": path,
+                   "total_chars": len(text), "fragments": fragments}
+        if unknown:
+            binding["projection_unknown"] = True
+        bindings.append(binding)
+    return bindings
 
 
 class ObservationReadTool:
     def __init__(self, store: Any) -> None:
         self.store = store
+
+    def context_delivery_bindings(self, *, result_payload, view_payload, context, check_cancel=None):
+        return _context_delivery_bindings(
+            self, result_payload=result_payload, view_payload=view_payload, context=context,
+            check_cancel=check_cancel)
 
     spec = ToolSpec(
         name="observation.read",
@@ -206,6 +409,9 @@ class ObservationReadTool:
                 "total": len(value),
                 "has_more": end < len(value),
                 "next_offset": end if end < len(value) else None,
+                "_delivery_view": [_cached_text_description(
+                    artifact_id, _artifact_content_hash(payload), path, value,
+                    [[min(offset, len(value)), end]], empty_delivered=not value)],
             })
         else:
             output["value"] = value
@@ -223,6 +429,11 @@ class ObservationSearchTool:
 
     def __init__(self, store: Any) -> None:
         self.store = store
+
+    def context_delivery_bindings(self, *, result_payload, view_payload, context, check_cancel=None):
+        return _context_delivery_bindings(
+            self, result_payload=result_payload, view_payload=view_payload, context=context,
+            check_cancel=check_cancel)
 
     spec = ToolSpec(
         name="observation.search",
@@ -309,6 +520,7 @@ class ObservationSearchTool:
         wanted = offset + limit + 1
         total_matches = 0
         matches: list[dict[str, Any]] = []
+        delivery_values = {path: root} if isinstance(root, str) else {}
         nodes_scanned = 0
         nodes_scheduled = 1
         chars_scanned = 0
@@ -334,6 +546,8 @@ class ObservationSearchTool:
                                               distinct_contexts=distinct_contexts):
                     if total_matches >= offset:
                         matches.append(match)
+                        if len(delivery_values) < _DELIVERY_LIMIT:
+                            delivery_values.setdefault(value_path, value)
                     total_matches += 1
                     if total_matches >= wanted:
                         break
@@ -421,6 +635,27 @@ class ObservationSearchTool:
             if distinct_contexts:
                 output["complete"] = False
                 output["total_matches"] = None
+        # Preserve the existing literal windows and bounds. Descriptive metadata
+        # may use leftover capacity, never evict evidence or rescan a wide object
+        # that supplied no text window. Missing mappings remain non-authoritative.
+        descriptions = output["_delivery_view"] = []
+        delivered_values = {
+            value_path: text for value_path, text in delivery_values.items()
+            if value_path == path or any(match["path"] == value_path for match in output["matches"])
+        }
+        if delivered_values:
+            content_hash = _artifact_content_hash(payload)
+            for value_path, text in delivered_values.items():
+                description = _cached_text_description(
+                    artifact_id, content_hash, value_path, text,
+                    [[match["snippet_start"], match["snippet_end"]]
+                     for match in output["matches"] if match["path"] == value_path],
+                )
+                descriptions.append(description)
+                if len(json.dumps(output, ensure_ascii=False)) > 5_500:
+                    descriptions.pop()
+        if len(json.dumps(output, ensure_ascii=False)) > 5_500:
+            output.pop("_delivery_view")
         return ToolResult(
             invocation_id=invocation.invocation_id,
             tool_name=self.spec.name,

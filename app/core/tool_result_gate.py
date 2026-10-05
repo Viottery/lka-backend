@@ -4,7 +4,241 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
+from itertools import islice
 from typing import Any
+
+_DELIVERY_LIMIT = 24
+_MISSING = object()
+
+
+def _delivery_origin_valid(artifact_id: Any, content_hash: Any, path: Any) -> bool:
+    return (
+        isinstance(artifact_id, str) and 0 < len(artifact_id) <= 200
+        and isinstance(content_hash, str) and len(content_hash) == 64
+        and all(char in "0123456789abcdef" for char in content_hash)
+        and isinstance(path, str) and len(path) <= 512
+        and (not path or path.startswith("/"))
+    )
+
+
+def _delivery_pointer(value: Any, path: str) -> Any:
+    if not isinstance(path, str) or len(path) > 1024 or (path and not path.startswith("/")):
+        return _MISSING
+    if not path:
+        return value
+    parts = path[1:].split("/")
+    if len(parts) > _DELIVERY_LIMIT:
+        return _MISSING
+    for part in parts:
+        # Only valid JSON Pointer escapes; do not normalize source identifiers.
+        if any(part[index + 1:index + 2] not in ("0", "1")
+               for index, char in enumerate(part) if char == "~"):
+            return _MISSING
+        key = part.replace("~1", "/").replace("~0", "~")
+        if isinstance(value, dict):
+            value = value.get(key, _MISSING)
+        elif (
+            isinstance(value, list) and key.isascii() and key.isdecimal() and len(key) <= 10
+            and (key == "0" or not key.startswith("0"))
+        ):
+            index = int(key)
+            value = value[index] if index < len(value) else _MISSING
+        else:
+            return _MISSING
+    return value
+
+
+def _delivery_ranges(ranges: list[list[int]]) -> list[list[int]]:
+    merged: list[list[int]] = []
+    for start, end in sorted(ranges):
+        if start == end:
+            continue
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return merged
+
+
+def bind_context_delivery(
+    raw_payload: Any, view_payload: Any, artifact_id: str,
+    content_hash: str, observation_id: str,
+) -> list[dict[str, Any]]:
+    """Bind a server projection of long cached strings, never an upstream source.
+
+    view_payload is the entire observation envelope, including its result.
+    Only exact strings or the exact preview() head/tail structure yield ranges.
+    Walk/entry counts are bounded; untracked values cannot gain completeness.
+    """
+    if (
+        not _delivery_origin_valid(artifact_id, content_hash, "")
+        or not isinstance(observation_id, str) or not 0 < len(observation_id) <= 200
+        or not isinstance(raw_payload, dict) or raw_payload.get("invocation_id") != observation_id
+    ):
+        return []
+    bindings: list[dict[str, Any]] = []
+    view_result = view_payload.get("result", _MISSING) if isinstance(view_payload, dict) else _MISSING
+    stack = [(raw_payload, view_result, "", "/result")]
+    visited = 0
+    while stack and visited < _DELIVERY_LIMIT:
+        raw, view, path, view_path = stack.pop()
+        visited += 1
+        if len(path) > 512 or len(view_path) > 1024:
+            continue
+        if isinstance(raw, str) and len(raw) >= 700:
+            binding: dict[str, Any] = {
+                "observation_id": observation_id, "artifact_id": artifact_id,
+                "content_hash": content_hash, "path": path,
+                "total_chars": len(raw), "fragments": [],
+            }
+            if isinstance(view, str) and view == raw:
+                binding["fragments"] = [{
+                    "view_path": view_path, "start": 0, "end": len(raw), "text": raw,
+                }]
+            elif isinstance(view, dict) and view == preview(raw, path=path):
+                binding["fragments"] = [
+                    {"view_path": pointer(view_path, field), "start": start,
+                     "end": end, "text": raw[start:end]}
+                    for field, (start, end) in (
+                        ("head", (0, 350)), ("tail", (len(raw) - 150, len(raw))),
+                    )
+                ]
+            elif view is not _MISSING:
+                binding["projection_unknown"] = True
+            bindings.append(binding)
+        elif isinstance(raw, dict):
+            room = _DELIVERY_LIMIT - visited - len(stack)
+            children = [
+                (item, view.get(key, _MISSING) if isinstance(view, dict) else _MISSING,
+                 pointer(path, key), pointer(view_path, key))
+                for key, item in islice(raw.items(), room)
+            ]
+            stack.extend(reversed(children))
+        elif isinstance(raw, list):
+            room = _DELIVERY_LIMIT - visited - len(stack)
+            if isinstance(view, list):
+                items, items_path = view, view_path
+            elif (
+                isinstance(view, dict) and view.get("_type") == "array"
+                and type(view.get("total_count")) is int and view["total_count"] == len(raw)
+                and isinstance(view.get("items"), list)
+            ):
+                items, items_path = view["items"], pointer(view_path, "items")
+            else:
+                items, items_path = [], view_path
+            stack.extend(reversed([
+                (item, items[index] if index < len(items) else _MISSING,
+                 pointer(path, index), pointer(items_path, index))
+                for index, item in islice(enumerate(raw), room)
+            ]))
+    return bindings
+
+
+def summarize_context_delivery(
+    *, prompt_payload: dict[str, Any], bindings: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Check trusted bindings against the final fitted prompt, without mutations.
+
+    Tool JSON, descriptive delivery fields, scan flags and cache handles are
+    never authority. Matching is by invocation ID, not drifting array indexes.
+    Complete means only this version of this cached string was delivered.
+    """
+    if not isinstance(bindings, list):
+        return []
+    bounded_bindings = bindings[:_DELIVERY_LIMIT]
+    needed_ids = {
+        binding["observation_id"] for binding in bounded_bindings
+        if isinstance(binding, dict) and isinstance(binding.get("observation_id"), str)
+        and 0 < len(binding["observation_id"]) <= 200
+    }
+    observations = prompt_payload.get("observations") if isinstance(prompt_payload, dict) else None
+    by_id: dict[str, Any] = {}
+    if isinstance(observations, list) and needed_ids:
+        # Scan only ID fields throughout the actual fitted list. The last 24
+        # observations need not contain the 24 bound IDs, and an earlier
+        # duplicate/contradiction must not escape ambiguity detection.
+        for observation in observations:
+            result = observation.get("result") if isinstance(observation, dict) else None
+            identity = observation.get("_observation_id") if isinstance(observation, dict) else None
+            raw_identity = result.get("invocation_id") if isinstance(result, dict) else None
+            if identity is None:
+                identity = raw_identity
+            if isinstance(identity, str) and 0 < len(identity) <= 200 and identity in needed_ids:
+                by_id[identity] = (
+                    _MISSING if identity in by_id or raw_identity not in (None, identity) else observation
+                )
+            if (
+                isinstance(raw_identity, str) and 0 < len(raw_identity) <= 200
+                and raw_identity in needed_ids and identity != raw_identity
+            ):
+                by_id[raw_identity] = _MISSING
+    groups: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for binding in bounded_bindings:
+        if not isinstance(binding, dict):
+            continue
+        artifact_id, content_hash, path = (binding.get(key) for key in ("artifact_id", "content_hash", "path"))
+        total = binding.get("total_chars")
+        if not _delivery_origin_valid(artifact_id, content_hash, path) or type(total) is not int or total < 0:
+            continue
+        group = groups.setdefault((artifact_id, content_hash, path), {
+            "total": total, "ranges": [], "unknown": False, "seen_empty": False,
+        })
+        if total != group["total"]:
+            group["unknown"] = True
+            continue
+        identity = binding.get("observation_id")
+        if not isinstance(identity, str) or not 0 < len(identity) <= 200:
+            group["unknown"] = True
+            continue
+        observation = by_id.get(identity)
+        if observation is None:
+            continue  # Evicted; an artifact continuation handle is not text.
+        if observation is _MISSING:
+            group["unknown"] = True  # Ambiguous duplicate invocation ID.
+            continue
+        if binding.get("projection_unknown") is not None and binding.get("projection_unknown") is not False:
+            group["unknown"] = True
+        fragments = binding.get("fragments")
+        if not isinstance(fragments, list) or len(fragments) > _DELIVERY_LIMIT:
+            group["unknown"] = True
+            continue
+        for fragment in fragments:
+            if not isinstance(fragment, dict):
+                group["unknown"] = True
+                continue
+            start, end, text, view_path = (fragment.get(key) for key in ("start", "end", "text", "view_path"))
+            if (
+                type(start) is not int or type(end) is not int or not 0 <= start <= end <= total
+                or not isinstance(text, str) or len(text) != end - start
+                or not isinstance(view_path, str) or not view_path.startswith("/result/")
+            ):
+                group["unknown"] = True
+                continue
+            visible = _delivery_pointer(observation, view_path)
+            if visible is _MISSING:
+                continue
+            if not isinstance(visible, str) or visible != text:
+                group["unknown"] = True
+                continue
+            group["ranges"].append([start, end])
+            if total == 0:
+                group["seen_empty"] = True
+    summaries = []
+    for (artifact_id, content_hash, path), group in groups.items():
+        ranges = _delivery_ranges(group["ranges"])
+        if len(ranges) > _DELIVERY_LIMIT:
+            ranges = ranges[:_DELIVERY_LIMIT]
+            group["unknown"] = True
+        covered = sum(end - start for start, end in ranges)
+        complete = covered == group["total"] and (group["total"] > 0 or group["seen_empty"])
+        summaries.append({
+            "scope": "cached_value", "artifact_id": artifact_id, "content_hash": content_hash,
+            "path": path, "unit": "unicode_codepoints", "total_chars": group["total"],
+            "ranges": ranges, "covered_chars": covered,
+            "coverage": "unknown" if group["unknown"] else "complete" if complete else "partial",
+            "upstream_coverage": "unknown",
+        })
+    return summaries
 
 
 def pointer(parent: str, part: str | int) -> str:

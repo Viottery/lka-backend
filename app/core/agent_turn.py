@@ -12,14 +12,16 @@ import time
 from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
+from dataclasses import replace
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
-from hashlib import sha1
+from hashlib import sha1, sha256
 from pathlib import Path
 from typing import Any, ClassVar
 
 from pydantic import BaseModel, Field, ValidationError
 
+from app.core import tool_result_gate
 from app.core.agent_runs import (
     AgentRunCancelled,
     AgentRunRecord,
@@ -4837,6 +4839,7 @@ class AgentTurnLoop:
         if compacted:
             observation["_prompt_compacted"] = True
         if gated:
+            observation["_observation_id"] = tool_result.invocation_id
             observation["_result_cache"] = {
                 "artifact_id": f"tool_result_{tool_result.invocation_id}",
                 "read_tool": "observation.read",
@@ -5817,6 +5820,10 @@ class AgentTurnLoop:
             "do not exist, and do not claim a complete enumeration from a partial view. "
             "A _result_cache preview is also partial; if it was not read further, state "
             "the resulting coverage limitation. "
+            "The server context_delivery view describes text retained in this exact answer "
+            "prompt, not everything fetched or scanned by a tool. Complete cached-value "
+            "coverage is not proof of complete upstream-source coverage; when upstream "
+            "coverage is unknown, do not claim the entire source was read. "
             "For multi-Agent results, distinguish completed child execution from "
             "independent output-contract verification; never describe an inconclusive "
             "verification check as passed. Preserve exact identifiers, counts, dates and units "
@@ -5825,7 +5832,13 @@ class AgentTurnLoop:
             "only the evidence and limitations needed to understand or act on them. "
             "Keep internal execution/audit metadata out of ordinary answers unless requested "
             "or it changes a user-relevant conclusion: express actual missing work or uncertainty "
-            "in plain language, not run IDs, schema fields or repeated validation-status sections."
+            "in plain language, not run IDs, schema fields or repeated validation-status sections. "
+            "Preserve evidence source scope, negation, qualifiers and known event time. "
+            "Do not upgrade a reported result, unverified state or missing evidence into "
+            "verified current state, impossibility or universal absence. Fetch time or tool "
+            "completion does not establish the reported event's time or the object's current "
+            "correctness. Attach each material unknown once to its affected conclusion, within "
+            "the requested output contract; do not repeat audit details."
         )
         if output_contract:
             system_prompt += (
@@ -5996,7 +6009,13 @@ class AgentTurnLoop:
             "explain what information is missing. Honor the user-requested language and deliverable format. "
             "Default to Chinese and concise prose when neither is specified. "
             "A user-requested data format is a deliverable, not an internal operation envelope; "
-            "do not add prose or markup that violates that requested format."
+            "do not add prose or markup that violates that requested format. "
+            "Preserve evidence source scope, negation, qualifiers and known event time. "
+            "Do not upgrade a reported result, unverified state or missing evidence into "
+            "verified current state, impossibility or universal absence. Fetch time or tool "
+            "completion does not establish the reported event's time or the object's current "
+            "correctness. Attach each material unknown once to its affected conclusion, within "
+            "the requested output contract; do not repeat audit details."
         )
         user_prompt = serialize_prompt_payload(
             {
@@ -6326,6 +6345,140 @@ class AgentTurnLoop:
             output_reserve_tokens=output_reserve,
         )
 
+    def _answer_delivery_prompt(
+        self, *, budgeted: BudgetedPrompt, original_user_prompt: str,
+        system_prompt: str, max_output_tokens: int | None,
+        tools: list[LLMToolDefinition] | None,
+    ) -> BudgetedPrompt:
+        """Reconcile server cache projections with the final fitted answer payload.
+
+        This optional deterministic view never calls a model, borrows another
+        run's artifacts, or treats tool-body coverage assertions as authority.
+        A small fixed-point refit prevents the metadata from certifying evidence
+        that its own token cost evicted.
+        """
+        run_id = _turn_run_id.get()
+        store = getattr(self, "tool_invocation_store", None)
+        load = getattr(store, "load_tool_result_artifact", None)
+        if run_id is None or not callable(load):
+            return budgeted
+        try:
+            original = json.loads(original_user_prompt)
+        except (TypeError, ValueError):
+            return budgeted
+        observations = original.get("observations") if isinstance(original, dict) else None
+        if not isinstance(observations, list) or not observations:
+            return budgeted
+        manager = _turn_run_manager.get() or getattr(self, "run_manager", None)
+        run = manager.get_run(run_id) if manager is not None else None
+        self._raise_if_cancel_requested()
+        context = ToolContext(session_id=run.session_id if run else "context-delivery", run_id=run_id,
+                              tool_view=self._tool_view_for_run(run_id))
+        bindings: list[dict[str, Any]] = []
+        mapping_errors = 0
+        for observation in reversed(observations[-64:]):
+            self._raise_if_cancel_requested()
+            if not isinstance(observation, dict):
+                continue
+            result = observation.get("result")
+            result_id = result.get("invocation_id") if isinstance(result, dict) else None
+            invocation_id = observation.get("_observation_id", result_id)
+            if not isinstance(invocation_id, str) or not 1 <= len(invocation_id) <= 200:
+                continue
+            if result_id is not None and result_id != invocation_id:
+                continue
+            try:
+                raw = load(f"tool_result_{invocation_id}", run_id)
+                self._raise_if_cancel_requested()
+                if not isinstance(raw, dict) or raw.get("invocation_id") != invocation_id:
+                    continue
+                executor = getattr(self, "tool_executor", None)
+                registry = getattr(executor, "registry", None)
+                tool = registry.get_tool_or_none(raw.get("tool_name", "")) if registry else None
+                if context.tool_view is not None and (
+                    context.tool_view.child_run_id not in (None, run_id)
+                    or tool is None
+                    or not context.tool_view.allows_tool(
+                        tool_name=raw.get("tool_name", ""), package=tool.spec.package,
+                        read_only=effective_tool_read_only(tool, observation.get("input", {})),
+                    )
+                ):
+                    continue
+                producer = getattr(tool, "context_delivery_bindings", None)
+                if callable(producer):
+                    # Only registered backend code can produce a mapping. A
+                    # same-named JSON field from a remote tool is never called.
+                    self._raise_if_cancel_requested()
+                    callback_args = (
+                        {"check_cancel": self._raise_if_cancel_requested}
+                        if "check_cancel" in inspect.signature(producer).parameters else {}
+                    )
+                    entries = producer(result_payload=raw, view_payload=observation, context=context,
+                                       **callback_args)
+                    self._raise_if_cancel_requested()
+                else:
+                    content_hash = sha256(json.dumps(raw, ensure_ascii=False, sort_keys=True,
+                        separators=(",", ":"), default=str).encode("utf-8")).hexdigest()
+                    entries = tool_result_gate.bind_context_delivery(
+                        raw_payload=raw, view_payload=observation,
+                        artifact_id=f"tool_result_{invocation_id}", content_hash=content_hash,
+                        observation_id=invocation_id,
+                    )
+                if isinstance(entries, list):
+                    bindings.extend(entries[:24 - len(bindings)])
+            except AgentRunCancelled:
+                raise
+            except Exception:  # noqa: BLE001 - optional projection must not break delivery.
+                mapping_errors += 1
+            if len(bindings) >= 24:
+                break
+        if not bindings:
+            return budgeted
+        current = budgeted
+        omitted = dict(budgeted.omitted)
+        unavailable_reason = "projection_budget_not_converged"
+        try:
+            payload = json.loads(current.user_prompt)
+            for _ in range(3):
+                self._raise_if_cancel_requested()
+                summary = tool_result_gate.summarize_context_delivery(
+                    prompt_payload=payload, bindings=bindings,
+                )
+                payload["context_delivery"] = summary
+                current = self._budget_llm_prompt(
+                    system_prompt=system_prompt, user_prompt=serialize_prompt_payload(payload),
+                    max_output_tokens=max_output_tokens, tools=tools,
+                )
+                self._raise_if_cancel_requested()
+                omitted.update(current.omitted)
+                final_payload = json.loads(current.user_prompt)
+                if tool_result_gate.summarize_context_delivery(
+                    prompt_payload=final_payload, bindings=bindings,
+                ) == summary:
+                    child_budget = self._child_budget_for_prompt()
+                    if child_budget and type(child_budget.get("remaining_tokens")) is int:
+                        available = child_budget["remaining_tokens"] - child_budget["prompt_overhead_tokens"]
+                        reserved_output = min(budgeted.output_reserve_tokens or 0,
+                                              max(0, available - budgeted.input_tokens))
+                        if available - current.input_tokens < reserved_output:
+                            unavailable_reason = "child_answer_reserve_preserved"
+                            break
+                    self._append_run_event(type="context_delivery_checked", stage="answer",
+                        message="Cached text coverage checked against the final fitted prompt; upstream coverage remains unknown.",
+                        payload={"entries": len(summary), "mapping_errors": mapping_errors,
+                                 "input_tokens": current.input_tokens,
+                                 "partial_or_unknown": sum(item["coverage"] != "complete" for item in summary)})
+                    return replace(current, omitted=omitted)
+                payload = final_payload
+        except AgentRunCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001 - keep the already-safe answer when metadata cannot fit.
+            unavailable_reason = type(exc).__name__
+        self._append_run_event(type="context_delivery_unavailable", stage="answer",
+            message="Optional cached coverage metadata could not be safely fitted; no completeness was certified.",
+            payload={"reason": unavailable_reason, "mapping_errors": mapping_errors})
+        return budgeted
+
     def _complete_text_with_retry(
         self,
         *,
@@ -6351,6 +6504,12 @@ class AgentTurnLoop:
                 max_output_tokens=max_output_tokens,
                 tools=tools,
             )
+            if stage == "answer":
+                budgeted = self._answer_delivery_prompt(
+                    budgeted=budgeted, original_user_prompt=user_prompt,
+                    system_prompt=system_prompt, max_output_tokens=max_output_tokens, tools=tools,
+                )
+            self._raise_if_cancel_requested()
         except PromptBudgetExceeded as exc:
             self._append_run_event(
                 type="prompt_budget_failed",

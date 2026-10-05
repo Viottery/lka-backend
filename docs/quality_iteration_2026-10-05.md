@@ -1123,3 +1123,33 @@ registered mapping均验权，cache load/producer/refit前后检查取消；Root
 GREEN。微基准仅测纯mapping/summarizer：20k字符约0.078ms，1MB约3.091ms，不含SQLite、
 tokenizer/refit，不当作完整链路SLA。独立还发现最后24条索引会漏计仍保留的较旧文本，
 当前单独修复并补全列表duplicate-id回归；真实网页claim仍独立验收。
+
+R23-V 最终独立33 GREEN（5.74s）确认outer及source I/O取消、当前ToolView、旧条目
+统计及远端重复/矛盾ID unknown；限定范围无新增P1/P2。Root最终receipt/reader/search/
+gate目标54 GREEN（11.70s），约束仍只认证cached text，不是upstream/事实正确性。
+
+R24-C 最小实现仅在两条answer system prompt加入相同通用证据校准说明：来源范围、
+否定、限定与已知event time不得提升为当前确定状态/不可能/普遍不存在；fetch time和
+tool completed不是事件时间/当前正确性的证明。重要未知只说明一次、贴近相关结论，
+遵守用户输出契约，不额外调用LLM。7例RED→GREEN，provider-boundary验证JSON/CSV、
+schema优先级及实际预算淘汰后的历史/partial限定仍保留；相关142 GREEN/33.36s。
+这是prompt投递证明，不是任意自然语言服从认证；同web/parallel实际输出仍待。
+
+下一组有界真实验收（单次，不自动重试）：
+
+- [ ] R25-V：同SQLite目标20-LLM/3-search复测，核对来源与实际visible区间，单独审查
+  是否再声称整页阅读或过度断言；保持原始结果不可变。
+- [ ] R25-P：同parallel_audit目标/fixture/child32768预算/32-dispatch复测，审查原合同
+  与显式降级、超时事件/实际thinking参数、六事实关系及历史→当前校准。
+- [ ] R25-S：使用已有web_search_release目标测试真实Brave时效/官方页面/版本关系，
+  同20-LLM/3-search/180s硬上限；核对模型判断，不以关键词或抓取成功当语义准确。
+- [ ] R25-B：同会话实际后续请求复用后台summary并保留新更正，补上前轮并发之外的
+  用户可用性验收；中等/生产窗口两者明确区分，不降低生产阈值或伪造summary。
+
+为R25-S复用现有受控网页入口，新增仅三种已有web case的显式选择，不改目标/fixture、
+provider配置、能力标志或预算。4个初始RED→GREEN，全部22 GREEN/4.53s，Ruff clean。
+web/parallel source fingerprint补入本轮receipt/replan实际改动；paid运行期间生产源码冻结。
+
+R24-C 独立7 GREEN/0.31s且限定差异无P1/P2；web case选择独立review保持原目标和
+secret/shared-budget边界。Root校准与两种有界入口联合50 GREEN/6.14s。实现先提交再
+真实派发，后续仍记录不遵从/部分完成，不根据离线结果预填实际成功。
