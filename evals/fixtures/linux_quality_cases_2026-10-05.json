@@ -597,7 +597,7 @@
       "status": "open",
       "symptom": "早期只取一页；最终两页三事实有支持，但把长读无条件说成WAL持续增长且1368字。",
       "cause": "证据范围和条件校准未稳定遵从；长读约束checkpoint不自动产生写入。",
-      "optimization": "相邻条件摘录、注册短证据叶子完整保留和有界receipt映射；最新原任务两正文、事务开始快照及checkpoint核心结论改善，但1129字符仍冗长、日期来源叙述待校准，整体保留open。",
+      "optimization": "相邻条件摘录、注册短证据叶子完整保留、来源角色与有界核查交接；最新原任务核心三点仍有来源且未再混标HTTP日期，Concurrency局部确实完整可见，但1104字符仍冗长，可选核查未被真实模型采用，整体保留open。",
       "acceptance": [
         "两官方页支持单写者、读快照、checkpoint影响",
         "WAL持续增长须保留持续写入条件；简短且不声称模型全文读完"
@@ -605,11 +605,13 @@
       "evidence": [
         "docs/quality_iteration_2026-10-05.md — R17：174.039s/14 calls，仅一页，任务失败；R22-T：60.998s/11 calls，两页支持但1120字和整页已读误称",
         "docs/quality_iteration_2026-10-05.md — R25-V：82.537s/12 calls/0 search；三partial receipts、upstream unknown；独立复核P2条件遗漏/1368字",
-        "docs/linux_usability_progress_2026-10-05.md — 能力续轮UX-05：首轮54.209s/9 calls仍丢时点/持续写入条件；修复二次截断后84.427s/11 calls，1122字符cached片段完整交付、核心三点改善，非简洁性/整体通过"
+        "docs/linux_usability_progress_2026-10-05.md — 能力续轮UX-05：首轮54.209s/9 calls仍丢时点/持续写入条件；修复二次截断后84.427s/11 calls，1122字符cached片段完整交付、核心三点改善，非简洁性/整体通过",
+        "docs/linux_usability_progress_2026-10-05.md — 来源角色与核查交接：89.177s/11 calls/0 search/$0.07960096；日期误标本样本不再出现，1104字符仍不简短；局部小节实际完整可见，Graph交接另经离线端到端修复，题仍open"
       ],
       "regression_tests": [
         "tests/test_eval_runtime_web_quality.py",
-        "tests/test_answer_evidence_calibration_quality.py"
+        "tests/test_answer_evidence_calibration_quality.py",
+        "tests/test_answer_working_set_quality.py"
       ],
       "replay": {
         "runner": "web",

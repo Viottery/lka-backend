@@ -1,7 +1,7 @@
 {
   "catalog_id": "linux_quality_2026_10_05",
   "as_of": "2026-10-05",
-  "catalog_sha256": "714eafbb9131bbdba9f7f0e2a21f729b9b2c48c71fbaed20154f3a5640a714be",
+  "catalog_sha256": "ca3e69ddd179325169801ca52a1ab0eb9455e66d48b4bb52b2a9f6a0b970f096",
   "catalog_statistics": {
     "logical_cases": 43,
     "by_status": {
@@ -105,7 +105,7 @@
   "plan_statistics": {
     "cases_with_replay": 27,
     "unique_replay_jobs": 20,
-    "unique_regression_targets": 87,
+    "unique_regression_targets": 88,
     "manual_replay_cases": [
       "bash_readonly_arguments",
       "bash_shell_lexing_hooks",

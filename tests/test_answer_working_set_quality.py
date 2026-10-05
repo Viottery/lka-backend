@@ -1,5 +1,6 @@
 """Prompt provenance and quote presence are not semantic entailment scores."""
 
+import asyncio
 import copy
 import json
 from dataclasses import replace
@@ -104,6 +105,15 @@ def test_dropped_or_truncated_quote_is_not_visible_and_invalid_notes_are_optiona
     assert normalize_answer_checks([{"requirement": "Missing source", "gap": "No authorized source available"}])[0]["evidence"] == []
 
 
+def test_duplicate_outside_bounded_index_cannot_be_confirmed_as_unique():
+    items = [observation(body="Only when enabled.")]
+    items.extend(observation(identifier=str(index), body="other") for index in range(64))
+    items.append(observation(body="Only when enabled."))
+    working = build_answer_working_set(payload(items, [check()]), registry())
+    assert working["answer_check_visibility"][0]["references"][0] == {
+        "reference_index": 0, "quote_visible": False, "role": "unknown"}
+
+
 def test_wildcards_expand_only_arrays_escape_keys_and_keep_bounds():
     spec = ToolSpec(name="renamed.read", type="local_tool", description="Arbitrary producer", read_only=True,
         output_evidence_roles=[{"path": "/rows/*/a~1b~0c", "role": "source_content"}])
@@ -203,3 +213,43 @@ def test_optional_roles_preserve_child_answer_reserve_and_context(tmp_path, monk
         monkeypatch.setattr(loop, "_child_budget_for_prompt", lambda: None)
         monkeypatch.setattr(loop, "_budget_llm_prompt", lambda **kwargs: replace(fitted, user_prompt=json.dumps({**request, "session_context_window": {}})))
         assert loop._answer_working_set_prompt(budgeted=fitted, system_prompt="Answer.", max_output_tokens=100, tools=None) is fitted
+
+
+def test_real_graph_carries_decision_checks_to_final_provider(tmp_path, monkeypatch):
+    from app.integrations.web_search import PublicPageFetcher
+    from evals.lka_evals.live_budget import LiveBudget
+    from scripts import eval_runtime_web_quality as probe
+    from tests.test_eval_runtime_web_quality import PAGES, WebProvider, fixture_service
+
+    config, service = fixture_service(tmp_path)
+    original = WebProvider.complete
+    answer_requests = []
+
+    async def complete(self, request):
+        result = await original(self, request)
+        prompt = json.loads(request.messages[1].content)
+        if request.metadata["stage"] == "decision":
+            observations = [o for o in prompt["observations"] if o.get("tool_name")]
+            if len(observations) < 2:
+                operation = {"type": "tool_call", "tool_name": "web.find", "tool_input": {
+                    "url": list(PAGES)[len(observations)], "query": "snapshot"}}
+            else:
+                item = observations[-1]
+                operation = {"type": "final_answer", "reason": "Deliver evidence", "answer_checks": [
+                    check(identifier=item["result"]["invocation_id"], path="/matches/0/snippet",
+                          quote="A read transaction sees a historic snapshot of the database.")]}
+            result = result.model_copy(update={"content": json.dumps({"operation": operation})})
+        elif request.metadata["stage"] == "answer":
+            answer_requests.append(prompt)
+        return result
+
+    monkeypatch.setattr(WebProvider, "complete", complete)
+    monkeypatch.setattr(PublicPageFetcher, "_fetch", lambda self, url: (200, {"content-type": "text/plain"}, PAGES[url].encode()))
+    report = asyncio.run(probe.run_probe(tmp_path / "probe", LiveBudget(tmp_path / "ledger.sqlite3"),
+                                       config=config, injected_service=service))
+    assert "error" not in report, report.get("error")
+    assert len(answer_requests) == 1
+    fitted = answer_requests[0]
+    assert fitted["answer_stage_decision"]["operation"]["answer_checks"][0]["requirement"] == "Report required condition"
+    assert fitted["answer_working_set"]["answer_check_visibility"] == [{"check_index": 0, "references": [
+        {"reference_index": 0, "quote_visible": True, "role": "source_content"}]}]

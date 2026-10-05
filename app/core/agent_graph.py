@@ -1267,6 +1267,18 @@ class AgentGraphRunner:
         self.turn_loop._raise_if_cancel_requested()
         ws, data = self._data(s)
         llm = self._models(data["llm_events"], AgentTurnLLMEvent)
+        final_decision = {
+            "action": "final_answer",
+            "reason": ws.terminal_reason or ws.pending_decision.get("reason"),
+        }
+        if ws.pending_decision.get("action") == "final_answer":
+            operation = ws.pending_decision.get("operation")
+            if isinstance(operation, dict) and "answer_checks" in operation:
+                # Carry only optional handoff notes, not duplicated reasons or
+                # decision-stage prose. The writer normalizes the bounded notes.
+                final_decision["operation"] = {
+                    "type": "final_answer", "answer_checks": operation["answer_checks"],
+                }
         answer = (
             self.turn_loop._unresolved_multi_agent_answer()
             if self.turn_loop._multi_agent_replan_pending(ws.run_id)
@@ -1283,10 +1295,7 @@ class AgentGraphRunner:
                     route=ws.route,
                     context_window=data["context_window"],
                     observations=data["observations"],
-                    final_decision={
-                        "action": "final_answer",
-                        "reason": ws.terminal_reason or ws.pending_decision.get("reason"),
-                    },
+                    final_decision=final_decision,
                     llm_events=llm,
                 )
             )

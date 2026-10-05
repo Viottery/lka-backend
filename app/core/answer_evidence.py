@@ -214,7 +214,9 @@ def build_answer_working_set(payload: dict[str, Any], registry: Any) -> dict[str
         for reference_index, reference in enumerate(check["evidence"]):
             candidates = index.get(reference["observation_id"], [])
             role, visible = "unknown", False
-            if len(candidates) == 1:
+            # Outside the bounded index an earlier duplicate ID may remain in
+            # the prompt. Do not claim a uniquely resolved reference then.
+            if len(observations) <= 64 and len(candidates) == 1:
                 output, roles = candidates[0]
                 value = _value_at(output, _segments(reference["path"]))
                 visible = isinstance(value, str) and reference["quote"] in value
