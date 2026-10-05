@@ -1587,7 +1587,26 @@ Content-Type: application/json
 
 ## 网络检索与持续关注（本地后端）
 
-Agent 可展开 `web` 包，再调用只读 `web.search`（参数 `query`、`mode=web|news`、`limit<=10`、可选 `freshness=pd|pw|pm|py`）与 `web.open`（公开 HTTPS URL）。搜索需配置 `BRAVE_SEARCH_API_KEY`，无密钥或达到本地月度请求上限时返回工具失败，不伪装成零结果。页面读取只返回有界纯文本；来源 URL、抓取时间、截断状态必须保留。
+Agent 可展开 `web` 包，再调用只读 `web.search`（参数 `query`、`mode=web|news`、`limit<=10`、可选 `freshness=pd|pw|pm|py`）与 `web.open`/`web.find`。搜索需配置 `BRAVE_SEARCH_API_KEY`，无密钥或达到本地月度请求上限时返回工具失败，不伪装成零结果。页面读取只返回有界纯文本；来源 URL、抓取时间、截断状态必须保留。
+
+生产 runtime 的渐进式网页合同（不新增专用 HTTP 端点）：
+
+- search 默认 `view=compact`，每项短摘要附 `snippet_truncated/snippet_total_chars`、候选
+  `ref_id`；整体附 `queried_at/search_id/cache_hit`。`web.search(search_id=..., view=full)`
+  只读本地标准化响应，不能同时传 query/filter；无新 provider 请求。
+- open/find 恰好传一个 `url/ref_id/snapshot_id`。首次 open 默认概要，可选 query 本地
+  选择原文，附位置／有界 outline／省略范围；显式 offset/max_chars 或 view=page 为连续页。
+  open offset 是 Unicode 字符，find offset 是匹配序号，二者不混用。
+- `snapshot_id` 是不可变的有界可读正文，不代表完整 HTML、模型全文阅读或语义核验。
+  同快照 find／续页不再联网；expected_text_sha256 校验版本。
+- URL 默认复用≤300秒快照；`refresh=true` 或 `max_age_seconds=0` 新抓取。固定 snapshot_id
+  不能 refresh，可用 max_age_seconds 拒绝旧版；过期、淘汰或越权固定引用不静默联网。
+  默认 retention 一天、256项／64MB，可在 [web_search] 配置修改，重启生效。
+- fetched_at／cache_read_at 与来源 publication 时间分开；cache_hit 只描述本系统。
+  根会话可跨 turn／重启续读，child 按 run／权限视图隔离；web artifact 不能用通用
+  observation.read 跨 run 读取，完整正文不进入常规 HTTP/SSE。
+
+详情与离线验证见 [渐进检索 TODO／报告](web_progressive_retrieval_todolist.md)。
 
 `POST /watches` 创建每日关注项，主体包含 `title`、`goal`、IANA `timezone`、本地 `daily_time`、`categories` 与显式 `scope`（如 `web_enabled`、`source_ids`、`account_ids`）。响应给出稳定 `watch_id`，不创建固定会话。每次触发都会产生新的 `Occurrence` 和独立 `session_id`，可以在那次会话继续通过通用 Agent 入口追问。`GET /watches`、`GET /watches/{watch_id}`、`PATCH /watches/{watch_id}`、`DELETE /watches/{watch_id}` 管理关注项；`POST /watches/{watch_id}/pause|resume|run-now` 控制触发，`GET /watches/{watch_id}/runs` 查询执行记录。
 

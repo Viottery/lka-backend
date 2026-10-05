@@ -366,6 +366,15 @@ class WebSearchConfig(BaseModel):
     provider: Literal["brave"] = "brave"
     api_key_env: str = "BRAVE_SEARCH_API_KEY"
     monthly_request_limit: int = Field(default=900, ge=0, le=1_000_000)
+    snapshot_ttl_seconds: int = Field(default=86400, ge=60, le=604800)
+    page_max_age_seconds: int = Field(default=300, ge=0, le=86400)
+    cache_max_entries: int = Field(default=256, ge=1, le=4096)
+    cache_max_bytes: int = Field(default=64_000_000, ge=1_000_000, le=512_000_000)
+    page_preview_chars: int = Field(default=2400, ge=400, le=4000)
+    search_snippet_chars: int = Field(default=360, ge=120, le=500)
+    max_parallel_requests: int = Field(default=4, ge=1, le=16)
+    max_pending_requests: int = Field(default=16, ge=1, le=64)
+    request_timeout_seconds: float = Field(default=12, ge=1, le=60)
 
     def resolved_api_key(self) -> str | None:
         return _resolved_env_value(self.api_key_env) if self.api_key_env else None

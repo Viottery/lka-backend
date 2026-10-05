@@ -184,6 +184,17 @@ api_key_env = "BRAVE_SEARCH_API_KEY"
 # Conservative local cap, below Brave's current $5 monthly Search credit at
 # $5/1,000 requests. Set 0 to disable paid searches entirely.
 monthly_request_limit = 900
+# Immutable readable-text snapshots are retained for a day; URL reads reuse
+# at most 5-minute-old snapshots. Explicit snapshot_id reads do not refetch.
+snapshot_ttl_seconds = 86400
+page_max_age_seconds = 300
+cache_max_entries = 256
+cache_max_bytes = 64000000
+page_preview_chars = 2400
+search_snippet_chars = 360
+max_parallel_requests = 4
+max_pending_requests = 16
+request_timeout_seconds = 12
 
 [memory]
 # Local memory store and scoped recall are enabled by default. Background

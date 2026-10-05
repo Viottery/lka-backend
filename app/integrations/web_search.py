@@ -9,6 +9,7 @@ import re
 import socket
 import sqlite3
 import ssl
+import threading
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -81,7 +82,7 @@ class BraveSearchAdapter:
 
     def search(self, query: str, *, mode: str = "web", limit: int = 5,
                freshness: str | None = None, country: str | None = None,
-               search_lang: str | None = None) -> dict[str, Any]:
+               search_lang: str | None = None, deadline: float | None = None) -> dict[str, Any]:
         query = query.strip()
         if not query or len(query) > MAX_QUERY_CHARS or len(query.split()) > 50:
             raise WebSearchError(f"query must contain 1 to {MAX_QUERY_CHARS} characters and at most 50 words")
@@ -97,13 +98,18 @@ class BraveSearchAdapter:
             raise WebSearchError("search_lang must be a language code")
         if not self.api_key:
             raise WebSearchError("Web search is unavailable: no Brave Search API key is configured.")
+        timeout = self.timeout_seconds
+        if deadline is not None:
+            timeout = min(timeout, deadline - time.monotonic())
+            if timeout <= 0:
+                raise WebSearchError("Search acquisition deadline exceeded.")
         if self.quota is not None:
             self.quota.reserve()
 
         endpoint = "web/search" if mode == "web" else "news/search"
         try:
             with httpx.Client(
-                timeout=self.timeout_seconds, transport=self.transport, trust_env=False,
+                timeout=timeout, transport=self.transport, trust_env=False,
                 follow_redirects=False,
             ) as client:
                 response = client.get(
@@ -169,7 +175,7 @@ class _PlainTextParser(HTMLParser):
     }
     _BLOCK: ClassVar[set[str]] = {
         "address", "article", "br", "dd", "div", "dt", "h1", "h2", "h3", "h4",
-        "li", "main", "p", "pre", "section",
+        "h5", "h6", "li", "main", "p", "pre", "section",
     }
     _VOID: ClassVar[set[str]] = {
         "area", "base", "br", "col", "embed", "hr", "img", "input", "link",
@@ -184,6 +190,8 @@ class _PlainTextParser(HTMLParser):
         self.title_parts: list[str] = []
         self.stack: list[tuple[str, bool, str | None]] = []
         self.title_depth = 0
+        self.headings: list[str] = []
+        self.heading_parts: list[str] | None = None
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attr_map = {key.lower(): value or "" for key, value in attrs}
@@ -206,6 +214,8 @@ class _PlainTextParser(HTMLParser):
                 self._append_text("\n")
             return
         self.stack.append((tag, hidden, href))
+        if tag in {"h1", "h2", "h3", "h4", "h5", "h6"} and not hidden:
+            self.heading_parts = []
         if tag == "title":
             self.title_depth += 1
         if not hidden and tag in self._BLOCK:
@@ -220,6 +230,9 @@ class _PlainTextParser(HTMLParser):
             return
         if tag == "title" and self.title_depth:
             self.title_depth -= 1
+        if tag in {"h1", "h2", "h3", "h4", "h5", "h6"} and self.heading_parts is not None:
+            self.headings.append(_clean_text("".join(self.heading_parts)))
+            self.heading_parts = None
         link_href = None
         link_hidden = True
         for index in range(len(self.stack) - 1, -1, -1):
@@ -237,6 +250,8 @@ class _PlainTextParser(HTMLParser):
             self.title_parts.append(data)
         if not any(parent_hidden for _, parent_hidden, _ in self.stack):
             self._append_text(data)
+            if self.heading_parts is not None:
+                self.heading_parts.append(data)
 
     def text(self) -> str:
         article_value = "".join(self.article_parts)
@@ -426,6 +441,12 @@ class PublicPageFetcher:
         self.max_text_chars = max_text_chars
         self.max_redirects = max_redirects
         self.transport = transport
+        self._fetch_deadline = threading.local()
+
+    def read(self, url: str, *, deadline: float | None = None,
+             check: Callable[[], None] | None = None) -> dict[str, Any]:
+        """Return one complete bounded extraction for snapshot acquisition."""
+        return self._readable_page(url, deadline=deadline, check=check)
 
     def open(
         self, url: str, *, offset: int = 0, max_chars: int | None = None,
@@ -465,6 +486,13 @@ class PublicPageFetcher:
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 5:
             raise WebSearchError("limit must be an integer from 1 through 5.")
         fetched = self._readable_page(url, expected_text_sha256=expected_text_sha256)
+        return self.find_in_page(fetched, query, offset=offset, limit=limit)
+
+    @staticmethod
+    def find_in_page(fetched: dict[str, Any], query: str, *, offset: int = 0,
+                     limit: int = 5) -> dict[str, Any]:
+        """Use the exact existing literal/context semantics without another HTTP call."""
+        fetched = dict(fetched)
         text = fetched.pop("text")
         matches = []
         total = 0
@@ -489,6 +517,7 @@ class PublicPageFetcher:
 
     def _readable_page(
         self, url: str, *, expected_text_sha256: str | None = None,
+        deadline: float | None = None, check: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         """Share the identical network, extraction and revision gate for read/find."""
         if expected_text_sha256 is not None and (
@@ -499,9 +528,18 @@ class PublicPageFetcher:
         target = _safe_public_https_url(url)
         requested_url = target
         redirects = []
+        deadline = deadline if deadline is not None else time.monotonic() + self.timeout_seconds
+        check = check or (lambda: None)
         try:
             for hop in range(self.max_redirects + 1):
+                check()
+                if time.monotonic() >= deadline:
+                    raise WebSearchError("Page fetch timed out.")
+                self._fetch_deadline.value = deadline
                 status, headers, content = self._fetch(target)
+                check()
+                if time.monotonic() >= deadline:
+                    raise WebSearchError("Page fetch timed out.")
                 if status in {301, 302, 303, 307, 308}:
                     location = headers.get("location")
                     if not location or hop >= self.max_redirects:
@@ -525,10 +563,18 @@ class PublicPageFetcher:
                     parser.close()
                     text = parser.text()
                 else:
-                    text = _clean_text(raw)
+                    text = re.sub(r"[ \t\xa0]+", " ", raw.replace("\r\n", "\n")).strip()
                 fingerprint = hashlib.sha256(text.encode("utf-8")).hexdigest()
                 if expected_text_sha256 is not None and expected_text_sha256 != fingerprint:
                     raise WebSearchError("Page extraction changed; restart pagination from offset 0.")
+                outline = []
+                cursor = 0
+                for heading in parser.headings[:256]:
+                    start = text.find(heading, cursor) if heading else -1
+                    if start >= 0:
+                        outline.append({"text": heading[:120], "start": start,
+                                        "end": start + len(heading), "heuristic": False})
+                        cursor = start + len(heading)
                 return {
                     "url": target,
                     "fetched_at": datetime.now(UTC).isoformat(),
@@ -536,6 +582,9 @@ class PublicPageFetcher:
                     "text_sha256": fingerprint,
                     "snapshot_stable": False,
                     "text_scope": "readable_text_extraction",
+                    "title": _clean_text("".join(parser.title_parts))[:200],
+                    "outline": outline,
+                    "extraction_version": "readable-html-v2",
                     "network_observations": {
                         "requested_url": requested_url, "redirects": redirects,
                         "redirect_count": len(redirects), "final_http_status": status,
@@ -550,14 +599,18 @@ class PublicPageFetcher:
             raise
         except (httpx.HTTPError, http.client.HTTPException, OSError, ssl.SSLError, UnicodeError, LookupError) as exc:
             raise WebSearchError(f"Page fetch failed: {exc}") from exc
+        finally:
+            self._fetch_deadline.value = None
         raise WebSearchError("Page fetch did not produce a response.")
 
     def _fetch(self, target: str) -> tuple[int, dict[str, str], bytes]:
+        deadline = getattr(self._fetch_deadline, "value", None) or time.monotonic() + self.timeout_seconds
+        remaining = max(0.001, min(self.timeout_seconds, deadline - time.monotonic()))
         if self.transport is not None:
             # Injected transport is for deterministic tests only; production uses
             # a pinned socket so DNS cannot change between validation and connect.
             with (
-                httpx.Client(timeout=self.timeout_seconds, transport=self.transport,
+                httpx.Client(timeout=remaining, transport=self.transport,
                              trust_env=False, follow_redirects=False) as client,
                 client.stream("GET", target, headers={"Accept": "text/html,text/plain;q=0.9"}) as response,
             ):
@@ -565,6 +618,8 @@ class PublicPageFetcher:
                     return response.status_code, dict(response.headers), b""
                 content = bytearray()
                 for chunk in response.iter_bytes():
+                    if time.monotonic() >= deadline:
+                        raise WebSearchError("Page fetch timed out.")
                     content.extend(chunk)
                     if len(content) > self.max_bytes:
                         raise WebSearchError("Page exceeded the configured byte limit.")
@@ -573,8 +628,10 @@ class PublicPageFetcher:
         parts = urlsplit(target)
         host = parts.hostname or ""
         pinned_ip = _public_address(host)
-        conn = _PinnedHTTPSConnection(host, pinned_ip, self.timeout_seconds)
-        deadline = time.monotonic() + self.timeout_seconds
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise WebSearchError("Page fetch timed out.")
+        conn = _PinnedHTTPSConnection(host, pinned_ip, min(self.timeout_seconds, remaining))
         path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
         try:
             conn.request("GET", path, headers={

@@ -102,7 +102,7 @@ def test_paging_never_bypasses_private_redirect_or_full_response_byte_limit():
 @pytest.mark.parametrize("field,bad_value", [
     ("next_offset", "20"), ("next_offset", True), ("next_offset", -1),
     ("text_sha256", 42), ("text_sha256", []),
-    ("snapshot_stable", True), ("snapshot_stable", "false"),
+    ("snapshot_stable", 1), ("snapshot_stable", "false"),
     ("text_scope", "whole_source"), ("text_scope", False),
 ])
 def test_actual_executor_rejects_mutated_paging_output_fields(field, bad_value):

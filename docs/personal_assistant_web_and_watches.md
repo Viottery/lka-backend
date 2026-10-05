@@ -27,20 +27,28 @@
 
 ## 阶段 A 网络检索工具包
 
-- `web.search(query, mode=web|news, freshness?, limit?)`：可替换搜索 provider；先提供 Brave Search API 适配器（需用户配置服务端密钥）。返回标题、URL、有限摘要、发布时间/抓取时间（若 provider 有）、查询参数、结果数量和可能仍有更多结果的提示。服务不可用、限额或网络错误与“零结果”严格区分。
-- `web.open(url, offset=0, max_chars=20000, expected_text_sha256?)`：只读取公开 HTTPS
+本轮渐进检索实现与验收见 [网页优化 TODO／报告](web_progressive_retrieval_todolist.md)。
+
+- `web.search(query, mode=web|news, freshness?, limit?, view=compact)`：可替换搜索 provider；Brave 需服务端密钥。首屏默认每项360字符的 provider 摘录（可配置），标题最多200字符，附 published_at/provider_fetched_at、queried_at、search_id 和稳定候选 ref_id。不抓搜索结果网页，不追加摘要模型调用。完整**标准化**响应（原 adapter 摘要最多1000字符）保存在本地；`web.search(search_id=..., view=full)` 本地恢复，不能同时传 query/filter。服务不可用、限额或网络错误与“零结果”严格区分。重新提交 query 是新的实时 provider 请求，不默认复用旧查询。
+- `web.open(url|ref_id|snapshot_id, query?, view=auto|overview|page, offset?, max_chars?, refresh?, max_age_seconds?, expected_text_sha256?)`：三个定位字段必须恰好一个；只读取公开 HTTPS
   文本/HTML，不使用用户登录态、不执行 JavaScript；限制类型、1MB 响应、时间、重定向和
   单页可读文本字符数。拒绝内网、环回、链路本地、保留地址及 DNS 重绑定/重定向 SSRF。
   返回规范化 URL、抓取时间、当前 offset/returned_chars、完整抽取 total_chars、续页位置、
   has_more、text_sha256；offset 是规范化可读文本的 Unicode 字符索引，不是 HTML 字节。
-  每次调用重新抓取（snapshot_stable=false），续页携带前页 SHA-256 时，文本变化会拒绝
-  返回，需从零重读；不能将未带版本校验的多次抓取声称为一个稳定快照。
-- `web.find(url, query, offset=0, limit=5, expected_text_sha256?)`：在完整可读抽取中做
+  首次抓取完整的有界可读抽取后建立不可变 snapshot_id（snapshot_stable=true），初始默认
+  给≤1200字符主摘录及有界目录，query 可本地选取相关原文与相邻段落；原文及额外摘录合计
+  默认≤2400字符。不连续摘录各带位置，不能拼成连续 text。显式 offset/max_chars 或 view=page
+  是连续分页，单页上限仍20000；大页仍受通用 gate，完整模型交付不保证。续读建议携带
+  snapshot_id，并按需要设置 expected_text_sha256。URL 默认复用最多300秒的同作用域快照；
+  refresh=true 或 max_age_seconds=0 强制新抓取并建立新版本。固定引用过期/淘汰直接失败，
+  不静默联网；刷新失败保留旧版但不能把它当新结果。默认保留一天、256项/64MB，全局 FIFO
+  容量只清理本服务索引的网页 artifact，不删除普通 tool_result 或 run 审计。
+- `web.find(url|ref_id|snapshot_id, query, offset=0, limit=3, expected_text_sha256?)`：在完整可读抽取中做
   不区分大小写的字面定位，包括首个 20k 字符之外的内容；不是语义搜索，不执行额外
-  模型调用或 Brave 查询。query 仅在本地处理，不发给网页服务器。最多五个 400 字符
+  模型调用或 Brave 查询。query 仅在本地处理，不发给网页服务器。最多五个≤1200字符
   片段，返回原 Unicode 匹配与片段偏移、抽取指纹；offset 是命中序号，与 open 的字符
-  偏移不同。用 snippet_start 再 open 可扩读上下文，携带指纹防止混用版本。每次仍
-  重新抓取，沿用 open 的网络/SSRF/类型/字节限制和现有来源约束。无命中不证明网页
+  偏移不同。用 snapshot_id + snippet_start/context_start 再 open 可扩读上下文；固定快照
+  查找与续页不联网，URL 无近期快照时才抓取，沿用 open 的网络/SSRF/类型/字节限制与来源约束。无命中不证明网页
   没有相关语义，也不能覆盖关注项已收集正文的证据及对应抓取时间。
   `match_status` 区分 phrase_matches、全局 no_literal_match 与有匹配但当前 offset 超范围的
   offset_exhausted。只有 offset=0 的全局零匹配会附同一次 extraction 的 recovery_preview：
@@ -52,8 +60,17 @@
 - `observation.search(..., distinct_contexts=true)` 可按不同完整上下文窗口分页，避免近邻
   标签/链接挤占命中数；默认仍按 occurrence 分页。去重窗口不会因单页预算再次缩短，
   放不下时返回较少窗口及 next_offset。缓存的 complete 只描述该缓存内容，不能证明
-  web.open 的其他源页已读；用 web.open 的 next_offset 才能读取未抓入当前结果的部分。
+  web.open 的其他源页已读；用 web.open 的 snapshot_id + next_offset 读取尚未展示的快照部分。
 - 先用 mock HTTP 结果验证解析、分页、限额、超时、SSRF/重定向及截断；没有密钥时必须明确不可用。真实 provider 的连通性只有在用户配置密钥后才能验收。
+
+根 Agent 快照按会话及当前权限视图隔离，可以跨 turn／服务重启追问；child 快照只限同一
+child run／ToolView。每次检查活动会话、run 状态、取消及 ToolView，原 observation.read
+仍只限当前 run 的 tool_result，不能读取 web_page/web_search。历史 web 观察经既有 metadata
+缓存恢复，明确不是最新证据。缓存命中/读取时间不能当正文发表时间，也不能诊断 provider
+摘要为何不同。同作用域同请求合并 in-flight；默认最多4个网络请求、16个活动/等待调用、
+12秒 acquisition deadline（adapter 自身8秒限制仍在）。Graph 仍用线程节点，不增加独立
+后台预取。并发协调仅限一个 Runtime 进程；DNS 系统解析及已进入的同步 I/O 不能保证强制中断，
+在后续边界阻止超期/取消结果发布。
 
 当前默认 Brave Search。其 [官方价格页](https://brave.com/search/api/) 标示 Search 计划每 1000 次请求 5 美元，每月附带 5 美元额度；[额度说明](https://api-dashboard.search.brave.com/documentation/resources/help-feedback) 允许预付额设为 0，以免费月额度运行，超限请求会被拒绝。本地默认每 UTC 月最多请求 900 次（可配置），相当于按当前价格计的 4.50 美元用量；这只约束此后端产生的请求，建议同时在 Brave 控制台设预付额 0。每个 Agent 任务最多 8 次工具调用，但工具调用数不等于搜索次数预算；要严格保证“搜索 API 花费不超过 LLM 花费”，仍需把两类实际用量统一记账。未配置密钥时 `web.search` 会明确不可用，不会偷偷切换到付费渠道。
 

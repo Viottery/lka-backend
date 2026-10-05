@@ -351,6 +351,7 @@ class LocalKnowledgeAgentRuntime:
             self.tool_registry.register_package(MEMORY_PACKAGE)
         register_web_tools(
             self.tool_registry, api_key=self.local_app_config.web_search.resolved_api_key(),
+            conn_factory=self._conn, config=self.local_app_config.web_search,
             quota=BraveSearchQuota(
                 self._conn, self.local_app_config.web_search.monthly_request_limit,
             ),
