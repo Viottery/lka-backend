@@ -714,7 +714,7 @@ Root 分类/诊断/审计/目录联合 **74 passed /4.46s**，实现者扩展联
 本轮局部 TODO：
 
 - [x] R20-T：动态分类拒绝非 bool 授权，实际 READ/NONE 零执行及审批路径回归。
-- [ ] R20-S：审查发现 shell 注释和 quoted separator 的解析仍可能绕过参数白名单；先建立真实副作用红例再修复，不宣称完整 shell sandbox。
+- [x] R20-S：shell 注释/quoted separator 参数绕过和继承环境执行钩子先用真实副作用红例再修复，不宣称完整 shell sandbox。
 - [x] R20-W：完成预算 partial、完整本地比较与有界模型预览、严格原子摘录和跨来源 identity 的独立审查及真实三轮复测。
 - [x] R20-C：本地 ONNX 线程策略整合、固定输入性能证据与实际 retrieval 留出复核。
 
@@ -776,3 +776,18 @@ Root 最小追加联合 **75 passed /25.99s**。上述不等于实际模型已�
 configured 快路径 P2 已作最小修复：从 registry 获取实际 Tool 再动态分类，缺注册项不
 授予权限；不改成静态属性或取消 ToolView。新 15 个快路径测试原先 12 failed/3 passed，
 Root 快路径/动态分类/拒绝诊断联合 **60 passed /0.36s**；no-ToolView 兼容保留。
+
+R20-S：去引号后的 `;`/`|` 被错误当分隔符、普通单词内 `#` 被 shlex 当注释，能够隐藏
+`uniq` 输出文件或 `sort -o`。新的最小 scanner 在保留引号的原始文本上辨认操作符，shell
+comment 只在单词开头成立；真实换行后的每条 command 都检查，NBSP 不当 ASCII blank。
+五个真实 READ 副作用反例先红；额外允许普通 quoted literal 与合法多行只读命令，不
+允许分隔符变成绕过写参数的方式。继承 RIPGREP_CONFIG_PATH 的 `--pre` 同样能写，
+READ 同步与后台环境移除它，审核后的显式/configured 非只读语义保留。
+
+独立 reviewer 再现前存 BASH_ENV 启动钩子 P1，Root 追加启动文件/导出函数 × 同步/后台
+四个实际 executor 红例：`pwd` 返回只读却确实写出 marker。READ 环境再排除 BASH_ENV、
+ENV 与 BASH_FUNC_ 导出函数；批准后的非只读调用仍能执行已授权钩子。Root 最终
+shell/参数/既有 Bash/目录发现/拒绝诊断 **153 passed /8.42s**。Windows/PowerShell、
+用户新平台层与凭据过滤 hunks 不混入本轮 Git patch；新测试也不依赖用户未提交的
+IS_WINDOWS/close 接口。该分类仍不隔离宿主 login profile、PATH、Git 配置和系统程序，
+不能称为完整 OS sandbox 或以此授予不可信代码任意执行能力。

@@ -468,7 +468,7 @@ class BashRunTool:
             completed = subprocess.run(
                 ["/bin/bash", "-lc", command],
                 cwd=cwd,
-                env=self._env(policy),
+                env=self._env(policy, read_only=read_only),
                 capture_output=True,
                 timeout=timeout,
                 check=False,
@@ -514,7 +514,7 @@ class BashRunTool:
             cwd=cwd,
             workspace_root=policy.default_root,
             read_only=read_only,
-            env=self._env(policy),
+            env=self._env(policy, read_only=read_only),
             owner_run_id=owner_run_id,
         )
         return {
@@ -534,8 +534,14 @@ class BashRunTool:
             "next_offset": 0,
         }
 
-    def _env(self, policy: BashAccessPolicy) -> dict[str, str]:
+    def _env(self, policy: BashAccessPolicy, *, read_only: bool = False) -> dict[str, str]:
         env = dict(os.environ)
+        if read_only:
+            # Startup files, exported functions and rg --pre can run code even
+            # when argv is read-only. Reviewed commands retain those semantics.
+            env = {key: value for key, value in env.items()
+                   if key not in {"RIPGREP_CONFIG_PATH", "BASH_ENV", "ENV"}
+                   and not key.startswith("BASH_FUNC_")}
         env.update(policy.env())
         return env
 
@@ -772,29 +778,91 @@ class BashTerminateSessionTool:
 
 
 def is_read_only_command(command: str) -> bool:
-    if not command.strip():
+    segments = _shell_command_segments(command)
+    if not segments:
         return False
-    if _has_unsafe_shell_syntax(command):
-        return False
-    try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
-        lexer.whitespace_split = True
-        tokens = list(lexer)
-    except ValueError:
-        return False
-    if not tokens:
-        return False
-    if any(token in {"&", "tee"} or "(" in token or ")" in token for token in tokens):
-        return False
-    segments: list[list[str]] = [[]]
-    for token in tokens:
-        if token in SHELL_CONTROL_TOKENS:
-            if not segments[-1]:
-                return False
-            segments.append([])
+    for segment in segments:
+        if _has_unsafe_shell_syntax(segment):
+            return False
+        try:
+            # Comments/operators were identified while quotes were still present.
+            # shlex's default comments also erase '#' inside ordinary shell words.
+            tokens = shlex.split(segment, comments=False, posix=True)
+        except ValueError:
+            return False
+        if not tokens or any(token in {"&", "tee"} or "(" in token or ")" in token for token in tokens):
+            return False
+        if not _segment_is_read_only(tokens):
+            return False
+    return True
+
+
+def _shell_command_segments(command: str) -> list[str] | None:
+    """Split only unquoted shell controls, retaining raw argv for safety checks.
+
+    This is deliberately a conservative subset, not a shell parser/sandbox.
+    In particular, '#' begins a comment only at the start of a shell word.
+    """
+    segments: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    in_word = False
+    requires_command = False
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if quote == "'":
+            current.append(char)
+            if char == quote:
+                quote = None
+        elif char == "\\":
+            if index + 1 == len(command) or command[index + 1] in "\n\r":
+                return None
+            current.extend((char, command[index + 1]))
+            index += 1
+            in_word = True
+        elif quote == '"':
+            current.append(char)
+            if char == quote:
+                quote = None
+        elif char in {"'", '"'}:
+            quote = char
+            current.append(char)
+            in_word = True
+        elif char == "#" and not in_word:
+            # Leave the newline to be processed as a real command boundary.
+            newline = command.find("\n", index)
+            index = len(command) if newline < 0 else newline
             continue
-        segments[-1].append(token)
-    return all(_segment_is_read_only(segment) for segment in segments if segment)
+        elif char in ";|&\n":
+            operator = char
+            if char in "|&" and command[index:index + 2] == char * 2:
+                operator = char * 2
+                index += 1
+            if operator == "&":
+                return None
+            raw = "".join(current).strip(" \t")
+            if raw:
+                segments.append(raw)
+                current = []
+                requires_command = operator in {"|", "||", "&&"}
+            elif char != "\n":
+                return None
+            in_word = False
+        else:
+            current.append(char)
+            # Shell blanks are ASCII space/tab, not Unicode whitespace. Treating
+            # NBSP as a blank could hide real argv behind a false '#' comment.
+            in_word = char not in " \t"
+        index += 1
+    if quote is not None:
+        return None
+    raw = "".join(current).strip(" \t")
+    if raw:
+        segments.append(raw)
+    elif requires_command:
+        return None
+    return segments
 
 
 def _has_unsafe_shell_syntax(command: str) -> bool:

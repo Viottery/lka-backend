@@ -300,7 +300,10 @@ backend/
   子进程 hook、可编程脚本、可隐藏参数的动态展开与可执行文件路径不视为已证明只读；
   `sed` 仅保留数字/末行 print 选择，`uniq` 不允许第二个输出文件参数。未知/未证明只读的
   调用仍可在批准后执行，但不能绕过冻结 READ scope。这是保守分类，不是 OS sandbox，
-  不能证明第三方可执行程序及其隐式本地配置绝无副作用。`bash.run` 默认工作目录是当前 session
+  不能证明第三方可执行程序及其隐式本地配置绝无副作用。POSIX 分类保留引号识别真实
+  分隔符/注释，换行后命令分别检查；READ 同步/后台环境不继承 RIPGREP_CONFIG_PATH、
+  BASH_ENV、ENV 或 BASH_FUNC_ 导出函数，审批后的非只读调用保留相关语义。这不隔离
+  宿主 login profile、PATH 或所有程序配置。`bash.run` 默认工作目录是当前 session
   workspace（未设置时为第一个 configured workspace root），相对 `cwd` 在该 root 内解析；命令环境注入 `workspace_root`、
   `WORKSPACE_ROOT`、`LKA_WORKSPACE_ROOT` 和以分号分隔的 `LKA_WORKSPACE_ROOTS`，模型应优先
   使用相对路径或这些变量定位 workspace 文件。
