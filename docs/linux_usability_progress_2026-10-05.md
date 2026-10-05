@@ -228,3 +228,23 @@ boolean/number 对比反例（Python `True == 1` 不足以证明合同一致）�
 12 offline、8 open，默认 focus **21→20**。用户自述保留 open 并记录长会话新证据，
 不把尚未完成的引用/跨项目组合一起算通过。目录引用/自动统计
 **2 passed / 0.10s**；一次错误测试节点选择未运行任何测试，改用实际节点后完成验证。
+
+## 续轮 UX-03：子任务 control 冷证据视图
+
+原三任务 trace 在预算未耗尽时提前结束：下一次重复携带已读文件的 decision 输入，
+加上必须保留的完整 answer 输入/输出额度，超过剩余额度。不能靠扩大 ceiling、削减
+answer 预留或给原评测增加能力修复。本轮在 child control 构造可回读工作集：最新观察
+原样保留；仅较早 completed/accepted/protocol-valid 的结果尝试摘录长字符串，字典、
+数组、标量状态和缺口字段完整保留。root、失败、action/replan、历史缓存不投影。
+
+投影须有当前 child ToolView 允许的实际只读 reader、同 run 原始 artifact，且原件必须
+与此前观察的类型敏感投影精确一致；缺失、改写、越权或遍历超限时保留原观察。
+复用现有 gate 的分页 ID/路径和 reader 提示，不在 core 写领域工具名、关键词或 gold。
+原观察与 artifact 不修改。JSON/native 的控制输入均可瘦身，但两条链路的 answer
+预算预测和最终回答继续使用原观察；取消不被可选投影吞掉。事件只记录 projection
+数量/错误和 UTF-8 bytes，不把 bytes 当成 provider tokens。
+
+8 个新边界实例、4 个 native 合同投影、3 个预算/重规划实例及一个真实注册 reader
+隔离测试合计 **16 passed / 2.12s**；Ruff 通过。低成本 Luna 独立只读审查未发现阻塞
+缺陷，没有额外模型 reviewer 调用。这里仅记录离线验证，原 UX-03 保持 open，待原
+三独立任务、相同 32768 ceiling、32-call 总上限的单次真实重放核对。

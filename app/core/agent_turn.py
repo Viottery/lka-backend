@@ -3198,7 +3198,7 @@ class AgentTurnLoop:
         plan_patch_repair: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         can_fork = self._can_fork_for_prompt()
-        prompt_observations = self._observations_within_prompt_budget(observations)
+        prompt_observations = self._observations_for_child_control(observations)
         fork_repair_feedback = next(
             (
                 observation
@@ -3221,6 +3221,7 @@ class AgentTurnLoop:
                 expanded_package_names=expanded_package_names,
                 expanded_tools=expanded_tools,
                 observations=prompt_observations,
+                delivery_observations=observations,
                 completed_tool_calls=self._completed_tool_call_summaries(observations),
                 tools=native_tools,
                 actions=native_tool_actions,
@@ -3856,6 +3857,7 @@ class AgentTurnLoop:
         llm_events: list[AgentTurnLLMEvent],
         fork_repair_feedback: dict[str, Any] | None = None,
         plan_patch_repair: dict[str, Any] | None = None,
+        delivery_observations: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any] | None:
         require_function_call = self._supports_required_tool_choice()
         system_prompt = (
@@ -3936,7 +3938,7 @@ class AgentTurnLoop:
             stage="decision",
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            observations=observations,
+            observations=delivery_observations if delivery_observations is not None else observations,
             prompt_summary=f"agent_turn_native_decision observations={len(observations)}",
             llm_events=llm_events,
             tools=tools,
@@ -4968,13 +4970,16 @@ class AgentTurnLoop:
         tool_result: ToolResult,
         feedback: dict[str, Any],
         run_id: str | None = None,
+        force_gate: bool = False,
     ) -> dict[str, Any]:
         result_payload = tool_result.model_dump(mode="json")
         effective_run_id = run_id or _turn_run_id.get()
         gate_available = self.tool_invocation_store is not None and effective_run_id is not None
-        gated = gate_available and needs_gate(result_payload)
+        gated = gate_available and (force_gate or needs_gate(result_payload))
         if gated:
-            compacted_result = bounded_preview(result_payload)
+            compacted_result = (tool_result_gate.preview_text_fields(result_payload)
+                                if force_gate and not needs_gate(result_payload)
+                                else bounded_preview(result_payload))
             compacted = True
         else:
             compacted_result, compacted = self._compact_for_decision_prompt(result_payload)
@@ -5128,6 +5133,85 @@ class AgentTurnLoop:
                 },
             )
         return bounded
+
+    def _observations_for_child_control(
+        self, observations: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Keep latest evidence hot; earlier accepted results stay recoverable.
+
+        Only child control consumes this view. Answer reservation/delivery use
+        the original observations. Never compact failures, planner signals or
+        history lacking an authorized same-run artifact reader.
+        """
+        manager = _turn_run_manager.get() or getattr(self, "run_manager", None)
+        run_id = _turn_run_id.get()
+        run = manager.get_run(run_id) if manager is not None and run_id else None
+        store = getattr(self, "tool_invocation_store", None)
+        load = getattr(store, "load_tool_result_artifact", None)
+        if run is None or run.parent_run_id is None or not callable(load) or len(observations) < 2:
+            return self._observations_within_prompt_budget(observations)
+        view = self._tool_view_for_run(run_id)
+        if view is None or view.child_run_id != run_id:
+            return self._observations_within_prompt_budget(observations)
+        projected = list(observations)
+        changed = []
+        projection_errors = 0
+        for index, observation in enumerate(observations[:-1]):
+            result, feedback = observation.get("result"), observation.get("feedback")
+            if ("action" in observation or "_cache" in observation
+                    or not isinstance(result, dict) or result.get("status") != "completed"
+                    or result.get("error") or not isinstance(feedback, dict)
+                    or feedback.get("status") != "accepted"
+                    or feedback.get("protocol_status") != "valid"):
+                continue
+            invocation_id = result.get("invocation_id")
+            if not isinstance(invocation_id, str) or not 1 <= len(invocation_id) <= 180:
+                continue
+            old_size = len(serialize_prompt_payload(observation).encode("utf-8"))
+            if old_size < 1800:
+                continue
+            try:
+                self._raise_if_cancel_requested()
+                raw = load(f"tool_result_{invocation_id}", run_id)
+                self._raise_if_cancel_requested()
+                if (not isinstance(raw, dict) or raw.get("invocation_id") != invocation_id
+                        or raw.get("tool_name") != observation.get("tool_name")
+                        or raw.get("status") != "completed"):
+                    continue
+                # Refuse changed artifacts, including same-ID/same-tool rewrites.
+                expected = (bounded_preview(raw) if "_result_cache" in observation
+                            else self._compact_for_decision_prompt(raw)[0])
+                if json.dumps(expected, sort_keys=True) != json.dumps(result, sort_keys=True):
+                    continue
+                candidate = self._observation_for_decision_prompt(
+                    tool_name=observation["tool_name"], tool_input=observation.get("input", {}),
+                    tool_result=ToolResult.model_validate(raw), feedback=feedback,
+                    run_id=run_id, force_gate=True,
+                )
+                reader_name = candidate["_result_cache"]["read_tool"]
+                reader = self.tool_executor.registry.get_tool_or_none(reader_name)
+                if (reader is None or reader.spec.read_only is not True
+                        or not view.allows_tool(tool_name=reader_name, package=reader.spec.package, read_only=True)):
+                    continue
+                candidate["_control_working_set"] = "Earlier accepted evidence preview; full original remains available for answer and authorized on-demand reading."
+                if len(serialize_prompt_payload(candidate).encode("utf-8")) >= old_size:
+                    continue
+                projected[index] = candidate
+                changed.append(invocation_id)
+            except AgentRunCancelled:
+                raise
+            except Exception:  # noqa: BLE001 - optional projection must retain original evidence on failure.
+                projection_errors += 1
+        if changed or projection_errors:
+            self._append_run_event(
+                type="control_working_set_projected", stage="decision",
+                message="Earlier child evidence projected for control only; original answer working set retained.",
+                payload={"projected_invocation_ids": changed[:20], "projected_count": len(changed),
+                         "projection_errors": projection_errors,
+                         "original_utf8_bytes": len(serialize_prompt_payload(observations).encode("utf-8")),
+                         "projected_utf8_bytes": len(serialize_prompt_payload(projected).encode("utf-8"))},
+            )
+        return self._observations_within_prompt_budget(projected)
 
     def _observations_for_answer_prompt(
         self, observations: list[dict[str, Any]],

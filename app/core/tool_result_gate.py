@@ -294,6 +294,31 @@ def needs_gate(value: Any) -> bool:
     return isinstance(value, str) and len(value) > 4_000
 
 
+def preview_text_fields(value: Any) -> Any:
+    """Preview long strings without sampling structural/status fields.
+
+    For previously accepted small results in a control working set, arrays and
+    dictionaries must keep their status, gaps and counts. A bounded walk fails
+    closed rather than omit unknown fields. Standard gate behavior is unchanged.
+    """
+    remaining = 512
+
+    def visit(item: Any, path: str, depth: int) -> Any:
+        nonlocal remaining
+        remaining -= 1
+        if remaining < 0 or depth > 32:
+            raise ValueError("control text preview exceeds bounded walk")
+        if isinstance(item, str):
+            return preview(item, path=path)
+        if isinstance(item, dict):
+            return {key: visit(child, pointer(path, key), depth + 1) for key, child in item.items()}
+        if isinstance(item, list):
+            return [visit(child, pointer(path, index), depth + 1) for index, child in enumerate(item)]
+        return item
+
+    return visit(value, "", 0)
+
+
 def bounded_preview(value: Any) -> Any:
     result = preview(value)
     if len(json.dumps(result, ensure_ascii=False, default=str)) <= 7_000:
