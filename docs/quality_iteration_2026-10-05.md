@@ -825,8 +825,8 @@ context_answer 仍未注入/校验 Task schema。实际新模型复测尚未完�
 本轮局部 TODO：
 
 - [x] R21-F：去掉用户交付格式与内部控制 JSON 的通用冲突，保留 schema/default 兼容。
-- [ ] R21-R：格式修复后同一实际 Agent 多跳题及一个留出题，核对事实/引用/格式/token/耗时。
-- [ ] R21-D：decision/repair 统一完整性与恢复预算，stream thinking 参数一致；先离线边界再一次实际 Watch。
+- [x] R21-R：格式修复后同一实际 Agent 多跳题及一个留出题，核对事实/引用/格式/token/耗时。
+- [x] R21-D：decision/repair 统一完整性与恢复预算，stream thinking 参数一致；先离线边界再一次实际 Watch（新领域问题另列 R22-W）。
 - [ ] R21-W：web.find 零短语命中的同 fetch 有界原文恢复，不当语义命中/完整阅读；实际 SQLite 留出复测。
 - [ ] R21-P：32-call 有界复杂并行复测，六事实与真实 child/范围/原文件完整性，不以 COMPLETED 洗白空证据。
 
@@ -861,3 +861,34 @@ R21-D：从真实 Watch trace 可见，三次 1024-token 控制输出全部用�
 独立复核原先暴露 schema feedback 3-dispatch 和 default-target 状态串用两个 P2；修复后
 原复现及 closure 7 项通过，无未闭 P1/P2。实现者定向 150 项通过。每个新 run 的首次
 overflow 仍可能发生；不声称已经消除全部 reasoning 延时，不改变生产预算。
+
+R21-D 实际同三时隙（`runtime_watch_20261005T004234171157`）18 calls、63.700s、
+77388 input/9491 output、$0.0722112；前次 18 calls、85.549s、77459/13789、$0.085018080。
+同 child 40k/6-call/120s，未提高上限。原文/来源范围、独立会话与变化去重机械检查全部通过，
+但 slot1/2 仍为预算 PARTIAL，slot3 COMPLETED。这是单次 replay 诊断，不是稳定延时承诺。
+真实语义复核另暴露 slot3 同 subject 同时显示“改为北楼”和旧“南楼未变化”：引用真实
+不等于当前状态一致。此问题需领域聚合解决，不能因为十项机械检查绿而接受。
+
+- [ ] R22-W：同 subject 的当前状态一致性，旧 baseline 与新 observation 不同时当作当前事实；
+  多个不能消解的变化必须保留冲突/弃权，不通过时间或提示词猜测事实。红例→修复→同 replay。
+
+R21-R 首题实际格式复测（`public_agent_...b7f10d94..._20261005T004411178467`）：
+1447-document full corpus，hybrid/rerank 实际开启，两次依赖检索+一次原文加载，6 calls、
+20.831s、36156/1397 tokens，$0.018141696。JSON 格式有效，桥接电影→作曲家→去世地点
+及两引用由实际返回原文支持。项目 strict EM=0/F1=0.0769，原因是 answer 字段带解释，
+不可手动抽取 Lakshadweep 重写成 EM=1；正确事实与 extractive 字面评分分别报告。
+准备+执行合计118.419s，其中显式 index44.175s，初始化1.281s，其余包括bulk fixture导入。
+实际 turn 延时不能掩盖从零准备成本；生产持久化缓存是否摊销另需验证。源码指纹未变；
+已预选的 comparison 留出仍在运行。未改目标重试，未给模型 gold 或 supporting ID。
+
+R21-R 预先固定 comparison 留出（`...77803f9c..._20261005T004609608791`）5 calls、
+16.886s、26015/1079 tokens、$0.015132768，JSON有效、两影片1920/1932顺序正确，
+两篇实际返回来源可定位。strict EM=0/F1=0.5333，仍因 answer 带说明，不抽取改分。
+准备+turn112.727s，index43.765s。两题源码未变、不代表200题整体准确率；均未通过独立
+LLM judge。原始SHA/检索配置/工具调用保留，原题的格式问题修复及留出均完成。
+
+R22-W 独立复核另确认：同轮 changes北楼/unchanged南楼不仅展示矛盾，旧 sections 顺序
+还会让下一轮 baseline 被旧南楼覆盖。slot1 PARTIAL 的 coverage 警告处于 unconfirmed
+第五项，摘要前四项截断后看不到。两项 P2 进入修复，而非提高子调用预算。三次真实
+overflow分别5.901/4.966/5.417s；后两次恢复1.244/1.432s；首轮因回答预留不恢复，
+12.841s生成最终 partial 答案。当前机制缩短有限控制恢复，仍不能保证首次输出快。
