@@ -10,7 +10,7 @@ from tests.test_control_recovery_budget_quality import FINISH, MALFORMED, calibr
 
 
 @pytest.mark.parametrize("stream", [False, True])
-def test_typed_timeout_recovery_is_bounded_temporary_and_audited(tmp_path, stream):
+def test_typed_timeout_recovery_is_bounded_run_control_only_and_audited(tmp_path, stream):
     loop, provider, manager = make_loop(tmp_path, [
         LLMTimeoutError("provider request timed out"), response(FINISH),
         response(FINISH), response("answer"),
@@ -20,7 +20,7 @@ def test_typed_timeout_recovery_is_bounded_temporary_and_audited(tmp_path, strea
         assert _decide(loop, [])["action"] == "final_answer"
         assert answer(loop, []) == "answer"
         events = manager.list_events(run.run_id)
-    assert [r.thinking_enabled for r in provider.requests] == [None, False, None, None]
+    assert [r.thinking_enabled for r in provider.requests] == [None, False, False, None]
     recovered = [e for e in events if e.type == "control_generation_timeout_recovery"]
     assert len(recovered) == 1
     assert recovered[0].payload["client_name"] == "selected"

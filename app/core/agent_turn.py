@@ -3485,7 +3485,7 @@ class AgentTurnLoop:
         if manager is None or run_id is None:
             return None
         return False if any(
-            event.type == "control_generation_overflow"
+            event.type in {"control_generation_overflow", "control_generation_timeout_cooldown_confirmed"}
             and event.payload.get("client_name") == client_name
             and event.payload.get("model") == model
             and event.payload.get("thinking_enabled") is False
@@ -3526,13 +3526,14 @@ class AgentTurnLoop:
         elif self._control_recovery_thinking_flag() is False:
             identity = self._inference_selection()[:2]
         recovery_flag = self._control_recovery_thinking_flag(identity[0] if identity else None)
+        thinking_flag = self._control_run_thinking_flag(identity)
         events_before = len(llm_events)
         response = self._complete_text_with_retry(
             stage=stage, system_prompt=system_prompt, user_prompt=user_prompt,
             prompt_summary=prompt_summary, max_output_tokens=output_cap,
             llm_events=llm_events,
             **({"tools": tools, "tool_choice": tool_choice} if tools is not None else {}),
-            thinking_enabled=self._control_run_thinking_flag(identity), max_attempts=1,
+            thinking_enabled=thinking_flag, max_attempts=1,
             dispatch_identity=identity if isinstance(getattr(self, "llm_client", None), LLMService) else None,
         )
         if (response is None and state is not None and state["calls"] < 2
@@ -3541,9 +3542,10 @@ class AgentTurnLoop:
                 and llm_events[-1].is_retriable is True):
             # A classified request timeout is not proof of reasoning overflow.
             # This decision's only remaining recovery still passes the child
-            # gate; do not retain a timeout-based downgrade for later decisions.
+            # gate. Only its complete, unfiltered return can confirm a cooldown.
             state["thinking_enabled"] = recovery_flag
             state["thinking_identity"] = identity
+            state["timeout_recovery_identity"] = identity if recovery_flag is False else None
             self._append_run_event(
                 type="control_generation_timeout_recovery", stage=stage,
                 message="One classified control-timeout recovery; cause remains unknown.",
@@ -3585,6 +3587,17 @@ class AgentTurnLoop:
                     payload={"reason": reason, "client_name": identity[0],
                              "model": identity[1], "thinking_enabled": recovery_flag},
                 )
+        elif (response is not None and identity is not None and all(identity) and thinking_flag is False
+              and state is not None and state.get("timeout_recovery_identity") == identity):
+            self._raise_if_cancel_requested()
+            self._append_run_event(
+                type="control_generation_timeout_cooldown_confirmed", stage=stage,
+                message="Explicit thinking-disabled timeout recovery returned complete; timeout cause remains unknown.",
+                payload={"client_name": identity[0], "model": identity[1],
+                         "thinking_enabled": False, "cause": "unknown",
+                         "recovery_scope": "current_run_control_only",
+                         "llm_call_id": llm_events[-1].llm_call_id if len(llm_events) > events_before else None},
+            )
         return response, None
 
     def _can_fork_for_prompt(self) -> bool:

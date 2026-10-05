@@ -1090,6 +1090,10 @@ control复用，answer/newrun/其他identity不变，每decision≤2派发、取
 28新例11 RED→GREEN，implementer相关120 GREEN，Root与receipt/cache/回答联合99 GREEN
 （11.16s）；独立review及新真实复测尚待。
 
+R24-T 独立28例实际重跑全GREEN、限定差异无P1/P2；Root联合157 GREEN包含本轮28例。
+按owned patch单独提交。成功确认只在完整、非filtered、取消检查通过的恢复后写入，
+失败尝试和unknown capability不产生同run持久cooldown；不能将此称为超时根因已确定。
+
 R23-V 已从纯提案接到provider-boundary：registered backend callable重验当前run的
 artifact/hash/JSON Pointer/实际文本；raw工具正文同名字段不是authority。server bindings
 不进prompt，只有≤24个cached-value区间摘要；按invocation ID识别最终保留observation，
