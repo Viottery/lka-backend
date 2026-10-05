@@ -233,8 +233,8 @@ class ChildAgentExecutor:
         """Classify explicit control termination, never the answer's prose."""
         missing: list[str] = []
         for event in self.run_manager.list_events(child_run_id):
-            if event.type == "child_budget_finish":
-                missing.append("child_budget_finish")
+            if event.type in {"child_budget_finish", "answer_generation_failed"}:
+                missing.append(event.type)
             elif event.type == "subtask_result":
                 missing.extend(event.payload.get("missing_requirements", ()))
         if decision_events:
@@ -244,6 +244,10 @@ class ChildAgentExecutor:
                 "invalid_empty_decision", "invalid_structured_decision", "child_budget_finish",
             }:
                 missing.append(action)
+            elif action == "answer_generation_failed":
+                source = last.get("source") if isinstance(last, dict) else last.source
+                if source == "local":
+                    missing.append(action)
         return tuple(dict.fromkeys(missing))
 
     def _context_failure(self, child: Any, snapshot: ContextSnapshot, message: str) -> TaskResult:

@@ -75,6 +75,34 @@ class ToolInvocation(BaseModel):
     input: dict[str, Any] = Field(default_factory=dict)
 
 
+def tool_scope_discovery_denial(spec: ToolSpec, tool_view: ToolView | None) -> str | None:
+    """Share input-independent scope denials between discovery and execution.
+
+    Visibility is not authorization: argument selection, paths, review and run
+    lifetime still pass through ToolExecutor for every invocation.
+    """
+    if tool_view is None or tool_view.child_run_id is None:
+        return None
+    source_ids = tool_view.allowed_source_ids
+    account_ids = tool_view.allowed_account_ids
+    uses_sources = spec.scope_uses_sources or bool(spec.scope_source_fields)
+    uses_accounts = spec.scope_uses_accounts or bool(spec.scope_account_fields)
+    uses_workspace = spec.scope_uses_workspace or bool(spec.scope_path_fields)
+    if uses_sources and not source_ids and not tool_view.full_data_authority:
+        return "Child run has no authorized source scope for this tool."
+    if uses_accounts and not account_ids and not tool_view.full_data_authority:
+        return "Child run has no authorized account scope for this tool."
+    if uses_sources and source_ids and not spec.scope_source_fields and not spec.scope_filtering_required:
+        return "Tool does not enforce this child run's source scope."
+    if uses_accounts and account_ids and not spec.scope_account_fields and not spec.scope_filtering_required:
+        return "Tool does not enforce this child run's account scope."
+    if uses_workspace and not tool_view.allowed_paths and not tool_view.full_workspace_authority:
+        return "Child run has no authorized workspace scope for this tool."
+    if uses_workspace and not spec.scope_path_fields and not spec.scope_filtering_required and not tool_view.full_workspace_authority:
+        return "Tool does not enforce this child run's workspace scope."
+    return None
+
+
 class ToolContext(BaseModel):
     session_id: str
     trace_id: str | None = None
@@ -336,26 +364,11 @@ class ToolExecutor:
         """Apply tool-declared argument scope and fail closed on unfiltered data tools."""
         if tool_view is None or tool_view.child_run_id is None:
             return None
+        if denial := tool_scope_discovery_denial(spec, tool_view):
+            return denial
         source_ids = tuple(getattr(tool_view, "allowed_source_ids", ()))
         account_ids = tuple(getattr(tool_view, "allowed_account_ids", ()))
-        full_data_authority = bool(getattr(tool_view, "full_data_authority", False))
-        full_workspace_authority = bool(getattr(tool_view, "full_workspace_authority", False))
-        uses_sources = spec.scope_uses_sources or bool(spec.scope_source_fields)
-        uses_accounts = spec.scope_uses_accounts or bool(spec.scope_account_fields)
-        uses_workspace = spec.scope_uses_workspace or bool(spec.scope_path_fields)
-        if uses_sources and not source_ids and not full_data_authority:
-            return "Child run has no authorized source scope for this tool."
-        if uses_accounts and not account_ids and not full_data_authority:
-            return "Child run has no authorized account scope for this tool."
-        if uses_sources and source_ids and not spec.scope_source_fields and not spec.scope_filtering_required:
-            return "Tool does not enforce this child run's source scope."
-        if uses_accounts and account_ids and not spec.scope_account_fields and not spec.scope_filtering_required:
-            return "Tool does not enforce this child run's account scope."
         paths = tuple(getattr(tool_view, "allowed_paths", ()))
-        if uses_workspace and not paths and not full_workspace_authority:
-            return "Child run has no authorized workspace scope for this tool."
-        if uses_workspace and not spec.scope_path_fields and not spec.scope_filtering_required and not full_workspace_authority:
-            return "Tool does not enforce this child run's workspace scope."
         for field in spec.scope_source_fields:
             requested = _scope_values(tool_input.get(field))
             if source_ids and not requested and not spec.scope_filtering_required:

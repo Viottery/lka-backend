@@ -121,6 +121,7 @@ from app.core.tools import (
     ToolExecutor,
     ToolResult,
     effective_tool_read_only,
+    tool_scope_discovery_denial,
 )
 
 DEFAULT_MAX_DECISION_STEPS = 10
@@ -2041,22 +2042,79 @@ class AgentTurnLoop:
             lines.append("同次尝试有冲突结果，未选取任何一份：" + "、".join(
                 step_id[:80] for step_id in sorted(conflicting)[:8]
             ))
+        return self._render_partial_child_results(
+            lines=lines, entries=entries, omitted=len(raw_results) > 64 or bool(conflicting),
+        )
+
+    def _render_partial_child_results(
+        self, *, lines: list[str], entries: list[TaskResult], omitted: bool,
+    ) -> str:
+        """Render validated child results, keeping the unresolved gate and originals intact."""
+        lines = list(lines)
         if entries:
             lines.append("已有局部结果（任务未完成，以下子结果未通过独立核验）：")
-        shown = 0
+        note = "部分子结果或冲突已省略；完整内容仍保留在原始子运行记录中。"
+        marker = "…（partial；摘要截取）…"
+        blocks: list[tuple[str, str, str]] = []
         for result in entries[:8]:
-            excerpt = result.summary[:480]
-            if len(result.summary) > 480:
-                excerpt += "…（摘要截取）"
-            line = f"- {result.step_id[:80]} [{result.status.value}]：{excerpt}"
+            header = f"- {result.step_id[:80]} [{result.status.value}]："
+            trailer = ""
             if result.missing_requirements:
-                line += "；未完成：" + "、".join(result.missing_requirements)[:160]
-            if sum(len(value) + 1 for value in lines) + len(line) > 5500:
+                trailer += "；未完成：" + "、".join(result.missing_requirements)[:160]
+            blocks.append((header, result.summary, trailer))
+
+        has_omissions = omitted or len(blocks) < len(entries)
+        full_size = len("\n".join(lines)) + sum(
+            1 + len(header) + len(summary) + len(trailer) for header, summary, trailer in blocks
+        ) + (1 + len(note) if has_omissions else 0)
+        if full_size <= 5500:
+            return "\n".join(lines + [header + summary + trailer
+                                     for header, summary, trailer in blocks]
+                             + ([note] if has_omissions else []))
+        blocks = [
+            (header, summary, trailer +
+             f"；原件：child_run_id={result.child_run_id} result_id={result.result_id}")
+            for (header, summary, trailer), result in zip(blocks, entries[:8], strict=True)
+        ]
+
+        # Reserve every label, reference, separator and omission notice before
+        # allocating summary space. Unusually large identifiers may reduce the
+        # visible group count, never silently cut the report or its references.
+        while True:
+            has_omissions = omitted or len(blocks) < len(entries)
+            prefix = lines + ([note] if has_omissions else [])
+            room = 5500 - len("\n".join(prefix)) - sum(
+                1 + len(header) + len(trailer) for header, _, trailer in blocks
+            )
+            if not blocks or room >= sum(min(len(summary), len(marker) + 32)
+                                         for _, summary, _ in blocks):
                 break
-            lines.append(line)
-            shown += 1
-        if shown < len(entries) or len(raw_results) > 64 or conflicting:
-            lines.append("部分子结果或冲突已省略；完整内容仍保留在原始子运行记录中。")
+            blocks.pop()
+
+        # Water-fill: keep small summaries whole and share the remaining space
+        # equally among longer ones. When all fit, nothing in their text changes.
+        allowances = [0] * len(blocks)
+        pending = list(range(len(blocks)))
+        while pending:
+            share, remainder = divmod(room, len(pending))
+            fitting = [index for index in pending if len(blocks[index][1]) <= share]
+            if fitting:
+                for index in fitting:
+                    allowances[index] = len(blocks[index][1])
+                    room -= allowances[index]
+                    pending.remove(index)
+            else:
+                for position, index in enumerate(pending):
+                    allowances[index] = share + (position < remainder)
+                break
+        for (header, summary, trailer), allowance in zip(blocks, allowances, strict=True):
+            if len(summary) > allowance:
+                kept = allowance - len(marker)
+                head, tail = (kept + 1) // 2, kept // 2
+                summary = summary[:head] + marker + summary[-tail:]
+            lines.append(header + summary + trailer)
+        if has_omissions:
+            lines.append(note)
         return "\n".join(lines)
 
     def _fork_caller_kind_for_run(self, run: AgentRunRecord) -> ForkCallerKind:
@@ -4366,6 +4424,7 @@ class AgentTurnLoop:
                     else effective_tool_read_only(self.tool_executor.registry.get_tool(tool.name), {})
                 ),
             )
+            and tool_scope_discovery_denial(tool, tool_view) is None
         ]
 
     @staticmethod

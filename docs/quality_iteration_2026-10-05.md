@@ -869,7 +869,7 @@ R21-D 实际同三时隙（`runtime_watch_20261005T004234171157`）18 calls、63
 真实语义复核另暴露 slot3 同 subject 同时显示“改为北楼”和旧“南楼未变化”：引用真实
 不等于当前状态一致。此问题需领域聚合解决，不能因为十项机械检查绿而接受。
 
-- [ ] R22-W：同 subject 的当前状态一致性，旧 baseline 与新 observation 不同时当作当前事实；
+- [x] R22-W：同 subject 的当前状态一致性，旧 baseline 与新 observation 不同时当作当前事实；
   多个不能消解的变化必须保留冲突/弃权，不通过时间或提示词猜测事实。红例→修复→同 replay。
 
 R21-R 首题实际格式复测（`public_agent_...b7f10d94..._20261005T004411178467`）：
@@ -992,9 +992,9 @@ release_v2实际读全部五文件并给出六事实原文，但父错误答固�
 backup_v2两生成阶段失败后本地占位答却TaskResult completed。父级未完成声明/partial
 聚合/verifier inconclusive正确，但局部状态和信息交付P2不能接受。
 
-- [ ] R23-P：结构化生成失败/占位答不得标子任务成功；预算内交付完整已有子摘要，
+- [x] R23-P：结构化生成失败/占位答不得标子任务成功；预算内交付完整已有子摘要，
   超限才明确有界截断/可追溯原件，partial/verification不洗白。
-- [ ] R23-S：工具discovery反映实际scope/grant可用性，避免模型选择确定不可用的来源，
+- [x] R23-S：工具discovery反映实际scope/grant可用性，避免模型选择确定不可用的来源，
   用registry metadata契约而非core硬编码具体包，不自动扩权。
 
 R22-T 新网页（`runtime_web_sqlite_20261005T012246817531`）60.998s、11 knowncalls/
@@ -1017,3 +1017,21 @@ $0.039910304；后台3calls/1681input/2657output/$0.009746848，前台16calls/
 失败为记忆晋升：两次完全同偏好，合法提取仅差末尾中文“。”，被hash成两个候选，
 各一个独立来源，active=0。不能通过弱化判据或改fixture称已学会；需要确定性身份兼容
 修复，并保留原claim/evidence、来源与撤回保护，不用fuzzy语义合并。
+
+R23-S 离线修复：将原ToolExecutor的六项“不依赖调用参数”的scope拒绝条件提取为
+同一确定性predicate，由discovery/catalog/expansion和执行共同使用。没有来源、账号、
+工作区grant或无法过滤部分grant的工具不再出现在child目录；保留full authority、
+参数相关选择和conditional read的正常发现。实际参数/路径、expiry、safety、run检查
+仍逐次执行，未扩权，未引入具体包关键词。新增矩阵先10 RED/13 GREEN；修复后矩阵、
+conditional read、catalog共35 GREEN，再加多Agent integration/runtime/live findings
+49 GREEN（11.37s）。独立review无P1/P2，新增23例独立重跑与4096组合等价探针通过；
+同parallel实际复测尚待，不将目录修复称为任务成功。
+
+R23-P 离线闭合：Graph在无有效生成结果时追加server-owned
+answer_generation_failed事件/decision，child首次和原件恢复均partial/missing_requirements；
+同一句文案若由真实LLM生成，不按词匹配误杀。Run正常结束与子任务业务成功继续分离。
+partial renderer预算仍5500，能容纳则原样交付，超限公平分配head/tail、截取标记及
+原件引用，未改变未完成/verification门禁。15新增例先9 RED→GREEN，implementer116
+GREEN；Root跨生成恢复、child、交付、scope共84 GREEN（6.45s），Ruff通过。
+旧失败raw离线回放5296字符，三子摘要原样可见，release_v2原3685字完整保留；这是
+确定性交付修复，不是新模型端到端成功。真实并行复测仍独立保留失败和预算指标。

@@ -1278,17 +1278,39 @@ class AgentGraphRunner:
                     llm_events=llm,
                 )
             )
-        ) or "我还没有获得足够的有效证据来完成这个请求。请重试或提供更多上下文。"
+        )
+        generation_failed = not answer or not answer.strip()
+        progress = self._models(data["progress_events"], AgentTurnProgressEvent)
+        if generation_failed:
+            answer = "我还没有获得足够的有效证据来完成这个请求。请重试或提供更多上下文。"
+            decisions = self._models(data["decision_events"], AgentTurnDecisionEvent)
+            self.turn_loop._record_decision(
+                decisions,
+                source="local",
+                action="answer_generation_failed",
+                reason="No valid generated answer was available.",
+                operation={"type": "answer_generation_failed"},
+            )
+            data["decision_events"] = self._dump(decisions)
+            self.turn_loop._append_progress(
+                progress,
+                type="answer_generation_failed",
+                stage="answer",
+                status="failed",
+                message="No valid generated answer was available.",
+                metadata={"missing_requirements": ["answer_generation_failed"]},
+            )
         data["llm_events"] = self._dump(llm)
         ws.terminal_answer = answer
-        progress = self._models(data["progress_events"], AgentTurnProgressEvent)
         self.turn_loop._append_progress(
             progress,
             type="final_answer",
             stage="answer",
-            status="completed",
+            status="failed" if generation_failed else "completed",
             message=self.turn_loop._short_text(answer),
-            metadata={"answer": answer},
+            metadata={"answer": answer, **(
+                {"missing_requirements": ["answer_generation_failed"]} if generation_failed else {}
+            )},
         )
         data["progress_events"] = self._dump(progress)
         return self._save(s, ws, data, "answered")
