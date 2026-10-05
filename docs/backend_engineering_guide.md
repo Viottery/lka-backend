@@ -84,6 +84,10 @@ decision 输出必须区分自然语言和内部操作，并采用 operation-fir
 stage；`operation.final_answer` 即使存在也不能作为最终用户答案返回。真正展示给用户的
 最终自然语言回答只能来自独立 `answer` 或 `context_answer` LLM stage。这样工具调用中途的
 模型文本可以被展示和记录，但不会和真实执行动作或最终回答混在同一个字段里。
+这里的“最终回答”可以是用户明确要求的 JSON、CSV 或其他交付文本，不等于内部 operation
+控制信封；不得用全局 JSON 禁令或无条件语言指令覆盖用户的交付格式。显式 TaskContract
+的 schema 在原结构化 answer 路径保持优先并验证；普通用户格式要求尚不是强制 schema
+校验，context_answer 也尚未补齐该合同验证，不能宣传所有结构化输出都已保证合法。
 如果 LLM 判断当前 turn 不需要展开任何 Tool Package，Agent Loop 仍应允许 LLM 基于当前
 session context window 直接回答；“不需要工具”和“系统无法处理”不能混为一谈。
 当 provider 返回不完整 JSON 但明确选择了某个 package 时，Agent Loop 可以做保守恢复，

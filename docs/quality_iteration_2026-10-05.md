@@ -791,3 +791,41 @@ shell/参数/既有 Bash/目录发现/拒绝诊断 **153 passed /8.42s**。Windo
 用户新平台层与凭据过滤 hunks 不混入本轮 Git patch；新测试也不依赖用户未提交的
 IS_WINDOWS/close 接口。该分类仍不隔离宿主 login profile、PATH、Git 配置和系统程序，
 不能称为完整 OS sandbox 或以此授予不可信代码任意执行能力。
+
+### R21：完整 Agent 检索与交付格式、控制恢复效率
+
+新增公共 RAG 小诊断复用真实 run_case/Agent/工具链，而非直接给生成模型 top-k；每题
+导入整个 normalized corpus（不是只给 gold/support docs），不把答案、support ID/title
+或工具步骤放进 goal。每题最多 20 次调用、原共享 ledger/secret guard、禁止搜索预留，
+没有付费 judge/repair 重跑；原文 refs、项目非 official EM/F1、格式和人工语义分开记录。
+bulk fixture 只显式同步一次缓存索引；源码 before/after 指纹标出并发改动，原 raw SHA
+独立保留，不改报告补分。新 harness/ledger/既有真实评测联合 **36 passed /11.07s**。
+
+唯一实际 2Wiki Nurse/composer/death 题：**1447 docs**，实际 hybrid+rerank、两次依赖搜索
+再加载第二跳完整 1625 字符，问题/goal 没有 gold hints。turn **22.961s /6 calls/35436
+输入/1677 输出/3 tools**，没有失败工具；另索引准备 44.668s、runtime 初始化 1.263s，
+不隐藏到用户回答耗时中（当时没有测完整 fixture import+cleanup wall）。USD0.018762752，
+共享账本增至 **807 calls/USD4.804144320**，Brave 仍 7 次。
+
+Root 已核对 Nurse 的配乐作者句和 Sreenivasan 去世原文，目标地点及日期/情境有出处；
+第一跳短全文来自 search snippet，第二跳才是 load_chunks，所以不把 loaded_all_hops=false
+自动当回答错误。之前同题直接 RAG diagnostic 因缺第二跳而 abstain；本次完整 Agent 找
+到了桥接关系，不是两种 pipeline 的严格 A/B、全数据集准确率或并行多 query 能力证明。
+任务仍有失败：用户要求 only short JSON，却交付中文长 prose。格式不通过，不从 prose
+手动截答案回填 EM/F1 来美化分数。raw 留在
+`public_agent_2wikimultihopqa_200_b7f10d940bda11eba7f7acde48001122_20261005T000412309106/`。
+
+发现通用契约冲突：普通 answer/context_answer 无条件要求中文且禁止 JSON，覆盖了用户
+所需格式。四个有效请求级红例后，移除该冲突，默认中文/prose 但尊重用户语言与交付格式；
+不在 core 插入 RAG/题目步骤，原显式 TaskContract/schema 验证优先不变。Root 格式/
+answer delivery/recovery/evidence **32 passed /6.89s**，独立格式+recovery **28 passed
+/5.36s**，未发现 slice 新 P1/P2。此改动是 prompt-level 遵循，不是任意格式的强制验证；
+context_answer 仍未注入/校验 Task schema。实际新模型复测尚未完成，历史格式失败保留。
+
+本轮局部 TODO：
+
+- [x] R21-F：去掉用户交付格式与内部控制 JSON 的通用冲突，保留 schema/default 兼容。
+- [ ] R21-R：格式修复后同一实际 Agent 多跳题及一个留出题，核对事实/引用/格式/token/耗时。
+- [ ] R21-D：decision/repair 统一完整性与恢复预算，stream thinking 参数一致；先离线边界再一次实际 Watch。
+- [ ] R21-W：web.find 零短语命中的同 fetch 有界原文恢复，不当语义命中/完整阅读；实际 SQLite 留出复测。
+- [ ] R21-P：32-call 有界复杂并行复测，六事实与真实 child/范围/原文件完整性，不以 COMPLETED 洗白空证据。

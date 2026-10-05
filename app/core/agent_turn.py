@@ -5600,7 +5600,9 @@ class AgentTurnLoop:
         system_prompt = (
             "You are the Final Answer Writer for Local Knowledge Agent OS. Use the provided "
             "session context window, tool observations, and decision reason to answer the "
-            "user directly in Chinese. The decision stage is only a structured control step; "
+            "user directly. Honor the user-requested language and deliverable format. "
+            "Default to Chinese and concise prose when neither is specified. "
+            "The decision stage is only a structured control step; "
             "do not treat any decision-stage final_answer text as authoritative final prose. "
             "Base the answer on evidence from observations and session context. Mention "
             "uncertainty when evidence is incomplete. Tool observations may show only a subset "
@@ -5630,7 +5632,10 @@ class AgentTurnLoop:
                 "fences or surrounding prose."
             )
         else:
-            system_prompt += " Do not wrap the answer in JSON."
+            system_prompt += (
+                " A user-requested data format is a deliverable, not an internal operation "
+                "envelope. Do not add prose or markup that violates that requested format."
+            )
         prompt_observations = self._observations_for_answer_prompt(observations)
         answer_payload = {
             "user_input": user_input,
@@ -5782,10 +5787,13 @@ class AgentTurnLoop:
             return None
         system_prompt = (
             "You are the Main Agent Brain for Local Knowledge Agent OS. Answer the "
-            "current user turn directly in Chinese using only the provided session "
+            "current user turn directly using only the provided session "
             "context window when it is sufficient. Do not invent unavailable local "
             "facts. If the context is insufficient and no tool package was selected, "
-            "explain what information is missing. Do not wrap the answer in JSON."
+            "explain what information is missing. Honor the user-requested language and deliverable format. "
+            "Default to Chinese and concise prose when neither is specified. "
+            "A user-requested data format is a deliverable, not an internal operation envelope; "
+            "do not add prose or markup that violates that requested format."
         )
         user_prompt = json.dumps(
             {
