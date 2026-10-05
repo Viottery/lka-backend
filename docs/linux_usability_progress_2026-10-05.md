@@ -399,3 +399,36 @@ mapping饥饿；不将这两项工具/harness修复洗成网页语义三题成�
 目录引用和自动统计最终 **2 passed / 0.11s**；源码Ruff与diff check通过。
 本轮所有提交都排除并保留用户既有工具约束/权限和其它并行开发修改；未重启后端、
 未读取或修改真实邮件、未把本地原始prompt/网页快照纳入Git。
+
+## 能力续轮 UX-05：来源角色与任务核查交接
+
+继续暂停开销优化。本轮针对上一现场“HTTP Last-Modified被说成正文标注日期”和
+“长篇重复审计说明”接入通用回答工作集，不写SQLite/Python/版本事实或gold到core。
+
+注册生产者声明output-relative路径的来源角色；正文、搜索候选、网络元数据、采集
+时间、来源定位符和表示版本分别呈现，来源文本仍不可信。工具输出不能自声明角色，
+工具名错配与未知MCP默认unknown。final_answer/原native finish可选附最多8个任务
+核查项，每项最多3个真实observation ID/路径/精确可见引用及gap。只在已有decision
+中交接，不新增planner/reviewer调用，不为填表增加检索。旧reason-only操作仍有效。
+
+provider拟合后本地核对quote是否仍在实际保留的字符串中；丢失、截断、失败、重复
+或错配ID不能得到可见确认。工作集不复制正文，不把可见性/协议成功/角色标签说成
+语义蕴含、完整核查或真实原文认证。引用经过cache-search等未声明生产者时仍unknown，
+不会靠字段名字猜它源自哪个领域。保留warning-only和原JSON/CSV输出合同，不自动
+重写答案；context_answer只增加同一来源/前提校准，不重认证普通会话历史。
+
+可选工作集最多12观察/每项24路径/6000字符；仅检查最近64观察，有界通配只展开数组。
+若拟合会挤掉正文、任何会话内容或child回答预留，放弃工作集、继续原安全prompt，
+不增大窗口、权限或工具查询预算。native finish改为非strict可选schema，避免启用了
+provider严格全属性required协议时拒绝旧reason-only调用；本地仍校验可选notes。
+
+新增20个定向实例（含参数化），正文/HTTP/搜索时间类型、未知工具/伪造角色、重复
+与错配ID、消失/截断quote、通配边界/转义、无效声明、最终假provider交付与JSON格式、
+取消、可选metadata不能挤掉证据/历史/child预留、旧native调用。
+最终七个相关目标 **84 passed / 6.21s**，Ruff/diff check通过；独立Luna只读审查
+未发现具体残留问题。假provider证明机制和交付，不证明真实语义准确率。
+
+首轮新fixture遗漏ToolSpec必填type导致12个实例失败，补齐fixture后通过。另一个
+原fork_schema测试替身仍只收一个参数，而此前已提交的answer观察预算调用会传
+max_chars；该失败不在本轮改动，定向原生schema组运行时明确排除该一项（56 passed /
+1 deselected），没有改断言、生产逻辑或假装全套通过。实际语义验收待下面现场记录。

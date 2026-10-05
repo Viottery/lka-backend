@@ -11,6 +11,7 @@ from typing import Any, ClassVar, Protocol
 
 from pydantic import BaseModel, Field
 
+from app.core.answer_evidence import OutputEvidenceRole
 from app.core.context import TaskContext
 from app.core.context_driver import ToolView
 
@@ -68,6 +69,7 @@ class ToolSpec(BaseModel):
     # Registered producer metadata, never a value read from ToolResult.output.
     # Preserve bounded evidence leaves without changing the overall gate cap.
     output_preview_max_string_chars: int = Field(default=700, strict=True, ge=700, le=1200)
+    output_evidence_roles: list[OutputEvidenceRole] = Field(default_factory=list, max_length=8)
 
 
 class ToolInvocation(BaseModel):

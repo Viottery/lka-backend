@@ -60,6 +60,13 @@ class WebSearchTool:
         description="Search public web or news via Brave Search. Requires a server-configured API key; returns bounded source URLs and snippets, not verified facts.",
         risk="low", requires_confirmation=False, read_only=True,
         side_effects=["external_read"],
+        output_evidence_roles=[
+            {"path": "/results/*/snippet", "role": "search_candidate"},
+            {"path": "/results/*/title", "role": "search_candidate"},
+            {"path": "/results/*/published_at", "role": "search_candidate"},
+            {"path": "/results/*/provider_fetched_at", "role": "search_candidate"},
+            {"path": "/results/*/url", "role": "source_locator"},
+        ],
         input_schema={"type": "object", "required": ["query"], "properties": {
             "query": {"type": "string", "minLength": 1, "maxLength": 400},
             "mode": {"type": "string", "allowed_values": ["web", "news"]},
@@ -104,6 +111,13 @@ class WebOpenTool:
         ),
         risk="low", requires_confirmation=False, read_only=True,
         side_effects=["external_read"],
+        output_evidence_roles=[
+            {"path": "/text", "role": "source_content"},
+            {"path": "/network_observations", "role": "transport_metadata"},
+            {"path": "/fetched_at", "role": "collection_time"},
+            {"path": "/url", "role": "source_locator"},
+            {"path": "/text_sha256", "role": "source_version"},
+        ],
         input_schema={"type": "object", "required": ["url"], "properties": {
             "url": {"type": "string", "minLength": 1, "maxLength": 2048},
             "offset": {"type": "integer", "minimum": 0, "default": 0},
@@ -156,6 +170,14 @@ class WebFindTool:
             "Matching and fetch observations do not establish semantic support or search-provider cache causes."
         ),
         risk="low", requires_confirmation=False, read_only=True, side_effects=["external_read"],
+        output_evidence_roles=[
+            {"path": "/matches/*/snippet", "role": "source_content"},
+            {"path": "/recovery_preview/*/snippet", "role": "source_content"},
+            {"path": "/network_observations", "role": "transport_metadata"},
+            {"path": "/fetched_at", "role": "collection_time"},
+            {"path": "/url", "role": "source_locator"},
+            {"path": "/text_sha256", "role": "source_version"},
+        ],
         input_schema={"type": "object", "required": ["url", "query"], "properties": {
             "url": {"type": "string", "minLength": 1, "maxLength": 2048},
             "query": {"type": "string", "minLength": 1, "maxLength": 200},

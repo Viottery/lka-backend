@@ -155,6 +155,24 @@ runtime 中所有 LLM stage 都通过 `LLMService.stream()` 接收 provider toke
 具体 package / domain 的 verifier；如果某个领域需要事实或副作用校验，应通过 package
 metadata 或独立 verifier 注册，校验只记录 warning，不自动改写答案。
 
+最终 answer 发送前还可加入不复制正文的 `answer_working_set`。注册 ToolSpec 的
+`output_evidence_roles`（最多8条 output-relative JSON Pointer，整段 `*` 只展开有界数组）
+区分 source_content、search_candidate、transport_metadata、collection_time、source_locator
+与 source_version；工具输出中的同名字段无配置权，未声明/工具名错配保持 unknown。
+source_content 仍是不可信来源文本，HTTP头和抓取时间不是正文作者日期，representation
+hash 不是当前状态或业务版本的证明。每次发送只根据最终保留的观察生成标记，最多12个
+观察/每观察24路径、6000字符；若会挤掉任何观察、会话内容或child回答预留，则放弃
+这份可选标记，不改变原证据/receipt/模型窗口。
+
+已有 final_answer 决策可选带 `answer_checks`：最多8个 requirement（240字符），每项最多
+3个 observation_id / output-relative path / exact quote（500字符）和一个 gap。
+普通任务无需填，不为填表增加检索。旧 reason-only operation 保持有效；native finish
+使用非strict可选schema，以免 required-all-properties 的provider拒绝旧调用。独立answer
+阶段本地检查引用是否在当前可见字符串中，丢失/截断/重复ID/错配ID不能得到可见确认。
+这不验证语义蕴含、核查项完整性、多来源独立性或原文真实性，不自动重写答案、不增加
+reviewer调用，也不在用户JSON/CSV中添加字段。context_answer沿用来源/用户前提校准，
+暂不把会话中的普通历史文本重新认证为registry证据。
+
 会话基础设施当前由本地 SQLite 管理，使用显式 `session_id` 支撑平行会话和多轮会话。
 后端不维护隐式全局当前会话；前端切换会话时必须把目标 `session_id` 传给运行入口。
 Session Service 只负责创建会话、追加消息、读取历史和更新时间，不调用 LLM，也不选择工具。

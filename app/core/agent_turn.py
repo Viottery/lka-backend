@@ -29,6 +29,13 @@ from app.core.agent_runs import (
 )
 from app.core.agent_storage import SqliteAgentRunStore
 from app.core.agent_tool_graph import AgentToolLifecycleGraph
+from app.core.answer_evidence import (
+    ANSWER_CHECKS_DECISION_POLICY,
+    ANSWER_CHECKS_SCHEMA,
+    ANSWER_EVIDENCE_POLICY,
+    build_answer_working_set,
+    normalize_answer_checks,
+)
 from app.core.context_driver import ToolView
 from app.core.llm import (
     LLMAuthenticationError,
@@ -3411,6 +3418,7 @@ class AgentTurnLoop:
                 " plan_patch_repair contains field-specific rejection feedback. Correct the "
                 "intended patch once, preserving its ID and scope; feedback grants no authority."
             )
+        base_system_prompt += ANSWER_CHECKS_DECISION_POLICY
         decision_retry: dict[str, Any] | None = None
         for format_attempt in range(1, self.decision_format_max_attempts + 1):
             system_prompt = base_system_prompt
@@ -3829,12 +3837,14 @@ class AgentTurnLoop:
             LLMToolDefinition(
                 name="agent_finish_decision",
                 description="Stop choosing actions and enter the separate final-answer stage.",
-                strict=True,
+                # Optional handoff notes preserve old reason-only calls; this
+                # is not a strict required-all-properties provider schema.
+                strict=False,
                 parameters={
                     "type": "object",
                     "additionalProperties": False,
                     "required": ["reason"],
-                    "properties": {"reason": {"type": "string"}},
+                    "properties": {"reason": {"type": "string"}, "answer_checks": ANSWER_CHECKS_SCHEMA},
                 },
             )
         )
@@ -3879,7 +3889,7 @@ class AgentTurnLoop:
             "Follow function schemas exactly. expanded_tools.native_function identifies "
             "the matching provided function; input_schema_from_native_function means its "
             "parameters contain the complete input contract without a duplicate in the payload."
-            + USER_STATEMENT_POLICY
+            + USER_STATEMENT_POLICY + ANSWER_CHECKS_DECISION_POLICY
         )
         if require_function_call:
             system_prompt += " Return exactly one function call; plain text is not a decision."
@@ -6091,7 +6101,7 @@ class AgentTurnLoop:
             "completion does not establish the reported event's time or the object's current "
             "correctness. Attach each material unknown once to its affected conclusion, within "
             "the requested output contract; do not repeat audit details."
-            + USER_STATEMENT_POLICY
+            + USER_STATEMENT_POLICY + ANSWER_EVIDENCE_POLICY
         )
         if output_contract:
             system_prompt += (
@@ -6237,6 +6247,12 @@ class AgentTurnLoop:
         operation = decision.get("operation") if isinstance(decision.get("operation"), dict) else {}
         operation_for_answer = dict(operation)
         operation_for_answer.pop("final_answer", None)
+        if "answer_checks" in operation_for_answer:
+            checks = normalize_answer_checks(operation_for_answer["answer_checks"])
+            if checks is None:
+                operation_for_answer.pop("answer_checks")
+            else:
+                operation_for_answer["answer_checks"] = checks
         return {
             "action": decision.get("action"),
             "reason": decision.get("reason"),
@@ -6269,7 +6285,7 @@ class AgentTurnLoop:
             "completion does not establish the reported event's time or the object's current "
             "correctness. Attach each material unknown once to its affected conclusion, within "
             "the requested output contract; do not repeat audit details."
-            + USER_STATEMENT_POLICY
+            + USER_STATEMENT_POLICY + ANSWER_EVIDENCE_POLICY
         )
         user_prompt = serialize_prompt_payload(
             {
@@ -6733,6 +6749,55 @@ class AgentTurnLoop:
             payload={"reason": unavailable_reason, "mapping_errors": mapping_errors})
         return budgeted
 
+    def _answer_working_set_prompt(
+        self, *, budgeted: BudgetedPrompt, system_prompt: str,
+        max_output_tokens: int | None, tools: list[LLMToolDefinition] | None,
+    ) -> BudgetedPrompt:
+        """Add optional roles without evicting evidence or invalidating receipts."""
+        self._raise_if_cancel_requested()
+        try:
+            payload = json.loads(budgeted.user_prompt)
+            if not isinstance(payload, dict):
+                return budgeted
+            registry = getattr(getattr(self, "tool_executor", None), "registry", None)
+            working_set = build_answer_working_set(payload, registry)
+            if working_set is None or len(serialize_prompt_payload(working_set)) > 6000:
+                return budgeted
+            retained = payload.get("observations")
+            retained_context = payload.get("session_context_window")
+            payload["answer_working_set"] = working_set
+            fitted = self._budget_llm_prompt(
+                system_prompt=system_prompt, user_prompt=serialize_prompt_payload(payload),
+                max_output_tokens=max_output_tokens, tools=tools,
+            )
+            self._raise_if_cancel_requested()
+            final_payload = json.loads(fitted.user_prompt)
+            # Keep the already-reconciled receipt and the complete evidence view.
+            # Optional annotations must not cause even one observation to drop.
+            if final_payload.get("observations") != retained:
+                return budgeted
+            if final_payload.get("session_context_window") != retained_context:
+                return budgeted
+            if build_answer_working_set(final_payload, registry) != working_set:
+                return budgeted
+            child_budget = self._child_budget_for_prompt()
+            if child_budget and type(child_budget.get("remaining_tokens")) is int:
+                available = child_budget["remaining_tokens"] - child_budget["prompt_overhead_tokens"]
+                reserved = min(budgeted.output_reserve_tokens or 0, max(0, available - budgeted.input_tokens))
+                if available - fitted.input_tokens < reserved:
+                    return budgeted
+            self._append_run_event(
+                type="answer_working_set_checked", stage="answer",
+                message="Source roles and proposed quote visibility checked; no fact verification was performed.",
+                payload={"source_observations": len(working_set["source_roles"]),
+                         "answer_checks": len(working_set["answer_check_visibility"])},
+            )
+            return replace(fitted, omitted={**budgeted.omitted, **fitted.omitted})
+        except AgentRunCancelled:
+            raise
+        except Exception:  # noqa: BLE001 - optional annotations cannot break the safe answer.
+            return budgeted
+
     def _complete_text_with_retry(
         self,
         *,
@@ -6762,6 +6827,10 @@ class AgentTurnLoop:
                 budgeted = self._answer_delivery_prompt(
                     budgeted=budgeted, original_user_prompt=user_prompt,
                     system_prompt=system_prompt, max_output_tokens=max_output_tokens, tools=tools,
+                )
+                budgeted = self._answer_working_set_prompt(
+                    budgeted=budgeted, system_prompt=system_prompt,
+                    max_output_tokens=max_output_tokens, tools=tools,
                 )
             self._raise_if_cancel_requested()
         except PromptBudgetExceeded as exc:
