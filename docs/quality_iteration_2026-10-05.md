@@ -1182,3 +1182,25 @@ R25-S 单次新搜索（`runtime_web_search_release_20261005T030946490153`）：
 source/goal不变，raw SHA 4d7ff12265f35bb2649e0f87c8607bd939fca33ece1e175b6c764a6fb4ac8c57。
 模型以官方页面校对搜索中旧版本，使用分段release text并披露取样时点/非全文阅读。
 官方“Latest”与redirect等具体声明尚需独立核对，先不填语义pass；raw不改。
+
+R25-V/S 独立报告各存于新private independent_review.json，原raw/analysis SHA保持。
+SQLite三事实核心有正文支持，但P2仍有：长读事务不应无条件称WAL持续增长，遗漏持续
+写入条件；1368字符不够简短。receipt仅有界映射5040字符，复核实际可见7222字符，
+两者不是全文认证。uv版本/日期/两变化关系有实际可见正文支持，partial/as-of披露存在；
+P2为未经验证的“搜索摘要是过期缓存”原因与未直接验证的latest跳转，回答798字符。
+两轮全部known/无timeout，不作普遍可信性/时效SLA认证；核心事实支持与修辞推断错误
+分别记录，不根据一个问题过度调整输出或用自然语言关键词规则强行判pass。
+
+R25-P 独立确认合同变更缺note被实际拒绝；尚无成功explicit-degradation现场分支。
+36 llm_started中只有32 paid，其余4次本地cap拒绝；三首轮child在剩约5.5–6k token
+触发交付reserve，backup重试才遇32全局cap。planner加了用户未要求的来源类型，
+child把探索objective误作必须履行的来源条件；首次fork前已有workspace/catalog，但
+observations为空，没有实际文件发现与索引源状态。后续应复用注册discovery与input_refs
+传递有界环境证据，不在core硬编码来源或自动缩减原合同，先隔离R26-K修复的实际效果。
+
+R26-K 离线/独立闭合：仅knowledge两helper对齐server full authority。22新例先8 RED/
+14 GREEN→22 GREEN，implementer相关114 GREEN/29.92s；Root多query/chunk/rewrite/tools
+46 GREEN/32.39s，独立22 GREEN/9.26s、限定差异无P1/P2。显式IDs始终intersection；
+workspace/session其他源、组合约束、requested source越界均拒绝或空结果，read-only与
+output协议不变。既有项目隔离依workspace路径，未新增独立project_id授权能力。
+将helper实现与证据按本轮独立提交，再保持同目标32-call实际复测，不扩scope/cap。

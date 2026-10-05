@@ -347,7 +347,7 @@ class LoadKnowledgeDocumentTool:
 def _child_knowledge_scope_error(scope) -> str | None:
     if scope is None or scope.child_run_id is None:
         return None
-    if not scope.allowed_source_ids:
+    if not scope.allowed_source_ids and not scope.full_data_authority:
         return "Child knowledge access requires an explicit source grant."
     return None
 
@@ -359,6 +359,11 @@ def _authorized_knowledge_source_ids(
         workspace_path=context.workspace_root, session_id=context.session_id,
     ))
     scope = context.tool_view
-    if scope is not None and scope.child_run_id is not None:
+    if (
+        scope is not None and scope.child_run_id is not None
+        and (scope.allowed_source_ids or not scope.full_data_authority)
+    ):
+        # Explicit grants always narrow the current service-authorized corpus,
+        # even with full authority; only a server-full empty grant inherits it.
         authorized.intersection_update(scope.allowed_source_ids)
     return sorted(authorized)
