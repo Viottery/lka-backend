@@ -1,0 +1,261 @@
+{
+  "catalog_id": "linux_quality_2026_10_05",
+  "as_of": "2026-10-05",
+  "catalog_sha256": "a083c04b7952438973edcdf292e600e5067ae1b044c68424ee50acbf541acec5",
+  "catalog_statistics": {
+    "logical_cases": 40,
+    "by_status": {
+      "baseline_passed": 4,
+      "fixed_live": 16,
+      "fixed_offline": 12,
+      "open": 8,
+      "inconclusive": 0
+    },
+    "by_tier": {
+      "foundation": 4,
+      "regression": 29,
+      "challenge": 7
+    },
+    "groups": {
+      "files_bash_code": {
+        "total": 6,
+        "baseline_passed": 3,
+        "fixed_live": 1,
+        "fixed_offline": 2,
+        "open": 0,
+        "inconclusive": 0
+      },
+      "mail": {
+        "total": 5,
+        "baseline_passed": 0,
+        "fixed_live": 4,
+        "fixed_offline": 1,
+        "open": 0,
+        "inconclusive": 0
+      },
+      "web": {
+        "total": 5,
+        "baseline_passed": 0,
+        "fixed_live": 0,
+        "fixed_offline": 2,
+        "open": 3,
+        "inconclusive": 0
+      },
+      "rag": {
+        "total": 6,
+        "baseline_passed": 0,
+        "fixed_live": 3,
+        "fixed_offline": 1,
+        "open": 2,
+        "inconclusive": 0
+      },
+      "multi_agent": {
+        "total": 5,
+        "baseline_passed": 0,
+        "fixed_live": 2,
+        "fixed_offline": 1,
+        "open": 2,
+        "inconclusive": 0
+      },
+      "memory": {
+        "total": 3,
+        "baseline_passed": 0,
+        "fixed_live": 2,
+        "fixed_offline": 1,
+        "open": 0,
+        "inconclusive": 0
+      },
+      "background": {
+        "total": 2,
+        "baseline_passed": 0,
+        "fixed_live": 1,
+        "fixed_offline": 1,
+        "open": 0,
+        "inconclusive": 0
+      },
+      "context_tools": {
+        "total": 6,
+        "baseline_passed": 1,
+        "fixed_live": 1,
+        "fixed_offline": 3,
+        "open": 1,
+        "inconclusive": 0
+      },
+      "watches": {
+        "total": 2,
+        "baseline_passed": 0,
+        "fixed_live": 2,
+        "fixed_offline": 0,
+        "open": 0,
+        "inconclusive": 0
+      }
+    },
+    "unseen_cases": 0,
+    "with_regression_targets": 40,
+    "with_replay_entry": 26,
+    "label": "Curated logical issues/baselines, NOT run count or current model accuracy"
+  },
+  "profile_counts": {
+    "focus": 20,
+    "regression": 29,
+    "foundation": 4,
+    "historical_holdout": 10,
+    "all": 40
+  },
+  "plan_statistics": {
+    "cases_with_replay": 26,
+    "unique_replay_jobs": 19,
+    "unique_regression_targets": 83,
+    "manual_replay_cases": [
+      "bash_readonly_arguments",
+      "bash_shell_lexing_hooks",
+      "benchmark_query_prefix_profile",
+      "degraded_history_partial_missing",
+      "incomplete_control_not_completion",
+      "mail_expert_identity_audit",
+      "mail_stable_pagination",
+      "memory_extractive_grounding",
+      "preexecution_rejection_audit",
+      "public_qa_relation_reasoning",
+      "public_retrieval_all_hop_regression",
+      "replan_atomic_attempt_recovery",
+      "tool_discovery_read_truth_table",
+      "web_html_readability"
+    ],
+    "executed": false
+  },
+  "repository_inventory": {
+    "suite_files": 17,
+    "suite_case_definitions": 56,
+    "unique_suite_case_ids": 56,
+    "repeated_suite_case_ids": [],
+    "suites": [
+      {
+        "path": "evals/suites/capabilities.yaml",
+        "cases": 2
+      },
+      {
+        "path": "evals/suites/failure_recovery.yaml",
+        "cases": 1
+      },
+      {
+        "path": "evals/suites/file_ops/bash_tools.yaml",
+        "cases": 4
+      },
+      {
+        "path": "evals/suites/file_ops/filesystem_tools.yaml",
+        "cases": 3
+      },
+      {
+        "path": "evals/suites/file_ops/real_llm_file_bash_tasks.yaml",
+        "cases": 5
+      },
+      {
+        "path": "evals/suites/file_ops/safety_review_tools.yaml",
+        "cases": 2
+      },
+      {
+        "path": "evals/suites/hard_mail_tasks.yaml",
+        "cases": 6
+      },
+      {
+        "path": "evals/suites/knowledge_retrieval.yaml",
+        "cases": 5
+      },
+      {
+        "path": "evals/suites/mail_qa.yaml",
+        "cases": 11
+      },
+      {
+        "path": "evals/suites/mail_to_matter.yaml",
+        "cases": 1
+      },
+      {
+        "path": "evals/suites/matter_tools.yaml",
+        "cases": 1
+      },
+      {
+        "path": "evals/suites/planner_quality.yaml",
+        "cases": 7
+      },
+      {
+        "path": "evals/suites/real_llm_hard_mail_tasks.yaml",
+        "cases": 4
+      },
+      {
+        "path": "evals/suites/session_followup.yaml",
+        "cases": 1
+      },
+      {
+        "path": "evals/suites/smoke.yaml",
+        "cases": 1
+      },
+      {
+        "path": "evals/suites/stream_contract.yaml",
+        "cases": 1
+      },
+      {
+        "path": "evals/suites/workspace_context.yaml",
+        "cases": 1
+      }
+    ],
+    "goal_only_scenarios": 27,
+    "goal_only_case_ids": [
+      "known_fact",
+      "long_file_tail",
+      "conflicting_files",
+      "native_code_fix",
+      "bash_diagnosis",
+      "mail_conflict",
+      "web_official",
+      "real_mail_overview",
+      "synthetic_mail_overview",
+      "heldout_unknown_path",
+      "heldout_log_middle",
+      "heldout_mutable_default",
+      "web_search_release",
+      "parallel_audit",
+      "knowledge_policy",
+      "knowledge_multihop",
+      "heldout_knowledge_long_policy",
+      "mail_specialist_overview",
+      "real_mail_specialist_overview",
+      "mail_specialist_review",
+      "heldout_broken_test_runner",
+      "heldout_file_organization",
+      "heldout_mail_routine_actions",
+      "heldout_file_collision",
+      "heldout_web_multisource",
+      "heldout_context_reuse",
+      "heldout_web_sqlite"
+    ],
+    "public_datasets": [
+      {
+        "dataset": "multihop-rag",
+        "queries": 528,
+        "documents": 355,
+        "sha256": "d7f99b9d8e7427c58fae1f092f01711a144b70fb6d7f43344030a5165575331f"
+      },
+      {
+        "dataset": "hotpotqa",
+        "queries": 200,
+        "documents": 1952,
+        "sha256": "99f9d1749f61a4d3194f53044475ffa6d221ed2873a99dbc7fdb8e21f5a7a186"
+      },
+      {
+        "dataset": "2wikimultihopqa",
+        "queries": 200,
+        "documents": 1447,
+        "sha256": "564cc08bff3346985a3260ea4289eb06004028eee678fbb4c3650cd543eeef8d"
+      },
+      {
+        "dataset": "musique",
+        "queries": 200,
+        "documents": 2195,
+        "sha256": "e2bc1665c2097c03be7747d6e01621a8d178ebd377c0d609ccff09d9faf9548b"
+      }
+    ],
+    "public_queries": 1128,
+    "note": "Separate inventories; overlapping fixtures/replays are not added into a single accuracy denominator. No pytest collection, model loading or private-log scanning."
+  }
+}

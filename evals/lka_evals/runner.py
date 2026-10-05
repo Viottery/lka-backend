@@ -9,13 +9,13 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from evals.lka_evals.case_loader import load_suite
+from app.core.llm import build_text_llm_client
+from app.core.local_config import load_local_config
+from evals.lka_evals.case_loader import load_suite, select_suite_cases
+from evals.lka_evals.judge import judge_answer
 from evals.lka_evals.metrics import evaluate_case, summarize_metrics
 from evals.lka_evals.report import write_reports
 from evals.lka_evals.subject import EvalRunArtifact, build_subject
-from evals.lka_evals.judge import judge_answer
-from app.core.local_config import load_local_config
-from app.core.llm import build_text_llm_client
 
 
 def run_suite(
@@ -29,9 +29,18 @@ def run_suite(
     timeout: float = 120.0,
     report_dir: Path = Path("evals/reports"),
     judge: bool = False,
+    case_ids: set[str] | None = None,
+    exclude_case_ids: set[str] | None = None,
+    tags: set[str] | None = None,
 ) -> dict[str, Any]:
     suite = load_suite(suite_path)
     suite_id = str(suite.get("suite_id") or suite_path.stem)
+    selected = select_suite_cases(suite["cases"], case_ids=case_ids,
+                                  exclude_case_ids=exclude_case_ids, tags=tags)
+    selected_ids = {case["case_id"] for case in selected}
+    selection = {"total": len(suite["cases"]), "selected": len(selected),
+                 "skipped_case_ids": [case["case_id"] for case in suite["cases"]
+                                      if case["case_id"] not in selected_ids]}
     subject = build_subject(
         name=subject_name,
         base_url=base_url,
@@ -47,9 +56,7 @@ def run_suite(
         judge_client = build_text_llm_client(load_local_config(config_path))
         if judge_client is None:
             raise RuntimeError("LLM judge requested but no configured LLM client is available")
-    for case in suite.get("cases", []):
-        if not isinstance(case, dict):
-            continue
+    for case in selected:
         artifact = subject.run_case(suite_id=suite_id, case=case)
         metrics = evaluate_case(case, artifact)
         if judge_client is not None:
@@ -67,6 +74,7 @@ def run_suite(
         suite_id=suite_id,
         subject=subject_name,
         case_results=case_results,
+        selection=selection,
     )
     passed = all(case["passed"] for case in case_results)
     score = (
@@ -81,6 +89,7 @@ def run_suite(
         "score": round(score, 4),
         "passed": passed,
         "case_count": len(case_results),
+        "selection": selection,
         "report_paths": report_paths,
         "cases": case_results,
     }
@@ -110,7 +119,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--report-dir", type=Path, default=Path("evals/reports"))
     parser.add_argument("--judge", action="store_true", help="Run optional LLM-as-judge answer scoring.")
     parser.add_argument("--json", action="store_true", help="Print machine-readable summary.")
+    parser.add_argument("--case", action="append", help="Include exact case ID (repeatable).")
+    parser.add_argument("--exclude-case", action="append", help="Skip exact case ID (repeatable).")
+    parser.add_argument("--tag", action="append", help="Any-of tags within this suite (repeatable).")
+    parser.add_argument("--list", action="store_true", help="List selected IDs without constructing a subject or judge.")
     args = parser.parse_args(argv)
+
+    filters = {"case_ids": set(args.case) if args.case else None,
+               "exclude_case_ids": set(args.exclude_case) if args.exclude_case else None,
+               "tags": set(args.tag) if args.tag else None}
+    try:
+        suite = load_suite(args.suite)
+        selected = select_suite_cases(suite["cases"], **filters)
+    except (ValueError, OSError) as exc:
+        parser.error(str(exc))
+    if args.list:
+        listing = {"suite_id": suite["suite_id"], "total": len(suite["cases"]),
+                   "selected": [case["case_id"] for case in selected], "executed": False}
+        print(json.dumps(listing, ensure_ascii=False) if args.json else "\n".join(listing["selected"]))
+        return 0
 
     result = run_suite(
         args.suite,
@@ -122,6 +149,7 @@ def main(argv: list[str] | None = None) -> int:
         timeout=args.timeout,
         report_dir=args.report_dir,
         judge=args.judge,
+        **filters,
     )
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))

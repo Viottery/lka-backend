@@ -1,5 +1,68 @@
 # Local Knowledge Agent OS Eval Benchmarks
 
+## Linux real-task quality catalog (2026-10-05)
+
+Historical badcases, fixes, evidence and remaining failures are documented in
+[the case dossier](../docs/linux_quality_badcases_2026-10-05.md). The reviewed
+[JSON catalog](fixtures/linux_quality_cases_2026-10-05.json) is the source for
+selection/counts; it is evaluator metadata, **never model-visible task hints**.
+
+```bash
+# Default: unresolved/offline-only issues, no basic smoke cases; no dispatch.
+.venv/bin/python scripts/eval_quality_catalog.py
+.venv/bin/python scripts/eval_quality_catalog.py --group multi_agent --group web
+.venv/bin/python scripts/eval_quality_catalog.py --profile all --inventory --json
+# Opt-in repaired-failure regressions or foundation checks.
+.venv/bin/python scripts/eval_quality_catalog.py --profile regression
+.venv/bin/python scripts/eval_quality_catalog.py --profile foundation
+```
+
+All commands above only list cases and generate plans. They do not run pytest,
+read private logs/mail, instantiate the backend or call a provider. Replay plans
+deduplicate shared scenarios and preserve existing budget and explicit remote/GO
+gates. Private mail additionally needs an explicit authorized `--mail-db`
+snapshot; the planner never discovers the production database. Logical issues,
+suite definitions, physical replay jobs and public queries are separate counts,
+not one accuracy denominator. `fixed_offline` is not a model-quality pass.
+
+`historical_holdout` selects previously used transfer cases, **not unseen cases**.
+Use new undisclosed fixtures/seeds for future generalization checks. Foundation
+checks may be skipped during focused quality iterations, but run relevant
+foundation plus repaired regressions when their tools/contracts change and
+before release. Do not disable safety/authorization boundary regressions merely
+because a task is simple.
+
+The existing suite runner also supports exact include/exclude IDs and any-of
+tags on tagged suites, preserving the original suite order:
+
+```bash
+.venv/bin/python -m evals.lka_evals.runner evals/suites/mail_qa.yaml \
+  --case ntuso_requirements --list --json
+.venv/bin/python -m evals.lka_evals.runner evals/suites/mail_qa.yaml \
+  --exclude-case ntuso_requirements --list --json
+```
+
+`--list` never constructs a subject or judge, even with real/judge flags.
+Unknown IDs/tags, duplicates and empty selections fail before execution.
+Executed reports persist the selected/total counts and skipped IDs; skipped
+tests are never counted as passes. Scripted metric success still does not
+certify semantic task completion. Latency-only failures are separately listed
+but remain failed, without relaxing thresholds. Existing default execution
+behavior remains.
+
+One unresolved historical failure is versioned as an **opt-in** reproducer:
+
+```bash
+.venv/bin/pytest -q evals/reproductions/skip_degrade_delivery.py
+```
+
+At this catalog revision it intentionally yields 3 failures / 7 passes: accepted
+degradation loses the note and a child's historical partial summary. It is not
+collected by default (`skip_degrade_delivery.py` is not a `test_*.py` file), and
+is not hidden using xfail or relaxed assertions. A focus/regression plan may
+include it; use the case status to interpret failure rather than calling the
+whole quality inventory green. No production fix is claimed.
+
 ## Offline Memory Release Regression Foundation
 
 Run the deterministic, local memory provenance/scope/retraction/injection
