@@ -42,6 +42,7 @@ def test_both_provider_prompts_calibrate_evidence_without_changing_format(
     request = provider.requests[0]
     assert request.messages[0].content.count(CALIBRATION) == 1
     assert "user-requested language and deliverable format" in request.messages[0].content
+    assert turn.USER_STATEMENT_POLICY in request.messages[0].content
     assert "Do not wrap the answer in JSON" not in request.messages[0].content
     assert json.loads(request.messages[1].content)["user_input"] == goal
     assert request.thinking_enabled is None

@@ -29,7 +29,8 @@ def runtime_for(tmp_path, monkeypatch, orchestrator, outputs):
     config = LocalAppConfig(agent=AgentConfig(orchestrator=orchestrator,
                                             unified_entry_enabled=True))
     config.memory.enabled = False
-    config.message_history.enabled = False
+    if hasattr(config, "message_history"):
+        config.message_history.enabled = False
     monkeypatch.setattr(Settings, "load_local_config", lambda _: config)
     runtime = LocalKnowledgeAgentRuntime(Settings(LKA_DATA_DIR=tmp_path / "data",
                                                   LKA_WORKSPACE_ROOTS=str(tmp_path)))

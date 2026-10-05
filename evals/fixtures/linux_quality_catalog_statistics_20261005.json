@@ -1,20 +1,20 @@
 {
   "catalog_id": "linux_quality_2026_10_05",
   "as_of": "2026-10-05",
-  "catalog_sha256": "a083c04b7952438973edcdf292e600e5067ae1b044c68424ee50acbf541acec5",
+  "catalog_sha256": "eba7bd88d3b850640946a50ad465d9d7b1478aee4e07db8131061141d5e6e503",
   "catalog_statistics": {
-    "logical_cases": 40,
+    "logical_cases": 41,
     "by_status": {
       "baseline_passed": 4,
       "fixed_live": 16,
-      "fixed_offline": 12,
+      "fixed_offline": 13,
       "open": 8,
       "inconclusive": 0
     },
     "by_tier": {
       "foundation": 4,
       "regression": 29,
-      "challenge": 7
+      "challenge": 8
     },
     "groups": {
       "files_bash_code": {
@@ -53,8 +53,8 @@
         "total": 5,
         "baseline_passed": 0,
         "fixed_live": 2,
-        "fixed_offline": 1,
-        "open": 2,
+        "fixed_offline": 2,
+        "open": 1,
         "inconclusive": 0
       },
       "memory": {
@@ -74,11 +74,11 @@
         "inconclusive": 0
       },
       "context_tools": {
-        "total": 6,
+        "total": 7,
         "baseline_passed": 1,
         "fixed_live": 1,
         "fixed_offline": 3,
-        "open": 1,
+        "open": 2,
         "inconclusive": 0
       },
       "watches": {
@@ -91,21 +91,21 @@
       }
     },
     "unseen_cases": 0,
-    "with_regression_targets": 40,
-    "with_replay_entry": 26,
+    "with_regression_targets": 41,
+    "with_replay_entry": 27,
     "label": "Curated logical issues/baselines, NOT run count or current model accuracy"
   },
   "profile_counts": {
-    "focus": 20,
+    "focus": 21,
     "regression": 29,
     "foundation": 4,
     "historical_holdout": 10,
-    "all": 40
+    "all": 41
   },
   "plan_statistics": {
-    "cases_with_replay": 26,
-    "unique_replay_jobs": 19,
-    "unique_regression_targets": 83,
+    "cases_with_replay": 27,
+    "unique_replay_jobs": 20,
+    "unique_regression_targets": 85,
     "manual_replay_cases": [
       "bash_readonly_arguments",
       "bash_shell_lexing_hooks",
@@ -199,8 +199,10 @@
         "cases": 1
       }
     ],
-    "goal_only_scenarios": 27,
+    "goal_only_scenarios": 29,
     "goal_only_case_ids": [
+      "user_plan_correction",
+      "user_record_verification",
       "known_fact",
       "long_file_tail",
       "conflicting_files",

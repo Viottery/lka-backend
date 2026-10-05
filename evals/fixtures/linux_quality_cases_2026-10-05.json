@@ -5,6 +5,33 @@
   "description": "Linux质量迭代已见诊断案例：按可独立验收的有界能力/故障去重，不按run计数。baseline不计修复；fixed_live仅代表条目验收边界的现场证据，fixed_offline无最终live闭环，整体失败另保留。私有快照须显式选择；replay为既有再测入口元数据，不授权网络/模型/生产执行。",
   "cases": [
     {
+      "id": "user_report_oververification",
+      "title": "用户自己的计划被当成需要外部证明的事实",
+      "group": "context_tools",
+      "tier": "challenge",
+      "status": "open",
+      "symptom": "用户更正自己计划日期后，答案仍无谓要求外部确认；承认自述与验证外部记录没有明确区分。",
+      "cause": "证据校准过度泛化，把用户的本轮工作前提与外部独立事实混为一谈。",
+      "optimization": "加入通用来源语义，不扩大权限、不自动发布长期记忆；两新合成现场分支通过，原长会话摘要后的更正组合仍未闭合。",
+      "acceptance": [
+        "确认用户自己的计划无需工具取证；保留否定与未完成状态",
+        "明确要求核对记录时实际读取，并区分用户安排和持久记录",
+        "摘要后的纠正不复活旧值；引用文本不能伪造真实用户更正"
+      ],
+      "evidence": [
+        "docs/linux_quality_final_report_2026-10-05.md — 用户自述过度核实的额外体验问题",
+        "docs/linux_usability_progress_2026-10-05.md — UX-11：两真实小场景7.543s/2 calls零工具及9.871s/4 calls一读取；只证明两个基础分支，不算长会话组合闭合"
+      ],
+      "regression_tests": [
+        "tests/test_answer_evidence_calibration_quality.py",
+        "tests/test_unified_entry_quality.py"
+      ],
+      "replay": {"runner": "realworld", "case": "user_plan_correction", "args": []},
+      "tags": ["bounded_live_variants", "long_context_correction_pending", "working_premise_not_permission"],
+      "exposure": "seen",
+      "data_class": "synthetic"
+    },
+    {
       "id": "baseline_port_diagnosis",
       "title": "配置与日志端口冲突诊断基线",
       "group": "files_bash_code",
@@ -214,12 +241,14 @@
       ],
       "evidence": [
         "docs/quality_iteration_2026-10-05.md — R1：README26.870s/7 calls/52146输入；R4：31.865s/9 calls仍误路由",
-        "docs/quality_iteration_2026-10-05.md — R14：Bash spec字符7659→5536；R22-P：历史总输入估计节省14.15%，非现场成功"
+        "docs/quality_iteration_2026-10-05.md — R14：Bash spec字符7659→5536；R22-P：历史总输入估计节省14.15%，非现场成功",
+        "docs/linux_usability_progress_2026-10-05.md — UX-02：可选统一入口已实现，双执行器本地冷读4 calls；尚无同配置真实配对提速结论"
       ],
       "regression_tests": [
         "tests/test_lazy_catalog_quality.py",
         "tests/test_tool_prompt_projection_quality.py",
-        "tests/test_compact_prompt_quality.py"
+        "tests/test_compact_prompt_quality.py",
+        "tests/test_unified_entry_quality.py"
       ],
       "replay": {
         "runner": "realworld",
@@ -935,11 +964,13 @@
       "evidence": [
         "docs/quality_iteration_2026-10-05.md — R17：planning168.049s/28 calls/5/6，单Agent25.891s/6 calls/6/6但不满足多Agent要求",
         "docs/quality_iteration_2026-10-05.md — R26-K：131.354s/26 dispatch（1 unknown）/保守.171972032，parent FAILED/三child partial；六facts主要来自startup，三独立合同不满足",
-        "docs/quality_iteration_2026-10-05.md — 私有独立核对：data/quality_runs/linux_20261005/parallel-quality-20261005T032549765274-4f5d2d98/parallel_audit_20261005T032549766095/independent_review.json"
+        "docs/quality_iteration_2026-10-05.md — 私有独立核对：data/quality_runs/linux_20261005/parallel-quality-20261005T032549765274-4f5d2d98/parallel_audit_20261005T032549766095/independent_review.json",
+        "docs/linux_usability_progress_2026-10-05.md — UX-03：80.300s/22 calls/$0.113433728，1 completed + 2 partial显式降级；原三合同仍未全完成"
       ],
       "regression_tests": [
         "tests/test_runtime_parallel_quality.py",
-        "tests/test_multi_agent_eval_metrics.py"
+        "tests/test_multi_agent_eval_metrics.py",
+        "tests/test_coordinator_control_quality.py"
       ],
       "replay": {
         "runner": "parallel",
@@ -959,10 +990,10 @@
       "title": "skip/degrade后历史partial和说明丢失",
       "group": "multi_agent",
       "tier": "regression",
-      "status": "open",
+      "status": "fixed_offline",
       "symptom": "已有release partial在失败交付被称未取得结果，degradation note也未交付。",
       "cause": "失败路径只返回canonical aggregate，SKIPPED过滤后覆盖attempt历史；不是持久数据删除。",
-      "optimization": "待修：分别保留当前选择与validated历史partial，交付历史身份/降级说明，保持failed及5500界限。",
+      "optimization": "已修：分离canonical结果和validated历史partial，交付历史身份/降级说明；两层上下文压缩保留历史和缺口，保持原业务失败及5500界限。",
       "acceptance": [
         "历史partial与note可见，明确不满足当前合同；不能叫从未执行",
         "foreign/duplicate身份拒绝，公平交付，current与业务状态不得升级"
@@ -971,15 +1002,16 @@
         "docs/quality_iteration_2026-10-05.md — R27-D：3 RED/7 GREEN/0.35s，生产未修；默认tests没有该回归",
         "docs/quality_iteration_2026-10-05.md — 私有pending复现存在：data/quality_runs/linux_20261005/degraded_partial_delivery_pending.py；原tests/test_degraded_partial_delivery_quality.py已移出默认收集",
         "docs/quality_iteration_2026-10-05.md — R26-K私有独立review确认1 P2/0 P1，原release摘要883字符被过滤",
-        "本次评测优化：evals/reproductions/skip_degrade_delivery.py显式离线执行3 FAILED/7 PASSED（0.33s），默认不收集；生产未修，原断言不改"
+        "本次评测优化：evals/reproductions/skip_degrade_delivery.py显式离线执行3 FAILED/7 PASSED（0.33s），默认不收集；生产未修，原断言不改",
+        "docs/linux_usability_progress_2026-10-05.md — UX-01：原三红转绿，默认回归恢复；后续missing计数/大观察及provider容量边界已修。原历史证据保留；当前状态仅offline，非全任务成功"
       ],
       "regression_tests": [
-        "evals/reproductions/skip_degrade_delivery.py"
+        "tests/test_degraded_partial_delivery_quality.py"
       ],
       "replay": null,
       "tags": [
-        "private_pending_reproduction",
-        "no_default_regression",
+        "historical_reproduction_retained",
+        "default_regression_restored",
         "no_full_task_replay"
       ],
       "exposure": "seen",

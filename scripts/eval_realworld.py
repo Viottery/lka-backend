@@ -27,6 +27,15 @@ from evals.lka_evals.fixtures import apply_setup
 from evals.lka_evals.live_budget import LiveBudget, instrument_service
 
 CASES = {
+    "user_plan_correction": {
+        "goal": "我把我自己的评审安排从2026-11-06改到2026-11-09了，仍不打算现在发布，安全复核还没完成。简短确认一下目前的安排。",
+        "files": {}, "facts": ["2026-11-09", "安全"], "read_only": True,
+    },
+    "user_record_verification": {
+        "goal": "我把我自己的评审安排改到2026-11-09了。请核对 review-record.txt 里是否已经登记新日期，说明我的安排与记录是否一致。",
+        "files": {"review-record.txt": "Recorded review date: 2026-11-06. Release approval pending.\n"},
+        "facts": ["2026-11-09", "2026-11-06"], "read_only": True,
+    },
     "known_fact": {
         "goal": "这个项目目前的状态是什么？唯一标识是什么？",
         "files": {"README.md": "# Sample project\nStatus: amber\nUnique marker: citrus-642\n"},
