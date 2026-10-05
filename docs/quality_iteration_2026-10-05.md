@@ -976,3 +976,44 @@ worker；只有非空合法claim/原文evidence与两个独立source ID/checksum
 每场景120s；budget先close再stop，unknown/reserved/pending/cached与两pool费用分别记录，
 20相关源码前后指纹。实现者定向34项、Root新入口及旧memory harness20项通过。
 scripted实worker19calls机械通过不是实际模型成绩；真实运行下一步执行。
+
+R22-W 新实际三slot（`runtime_watch_20261005T012552918489`）69.223s/18 calls、
+67477 input/10856 output、$0.068048288；三slot分别26.875/18.687/23.526s，均PARTIAL。
+南楼→重复不变→北楼变化同identity，第三slot不再同时列旧南楼为当前；partial覆盖警告
+每份摘要置顶可见、旧值留previous，来源与授权/独立会话/邮件不变检查通过。
+与下一parallel复测为两个隔离process部分并发，不是纯单负载严格AB；不据69s/120s
+宣称稳定加速。原失败raw回放＋新实际范围满足当前状态/告警修复的局部验收。
+
+R22-P 新实际（`parallel-quality-20261005T012459366997-39dc2eea`）120.553s、32
+真实unique provider dispatch均known/$0.1236832/123060input/21998output，任务仍FAILED。
+trace全生命周期37 started/32 completed/5本地budget拒绝，脚本混合指标33不等于33付费。
+首轮child错误走未grant的knowledge.search，拒绝后没有在预算内取得正文；replan的
+release_v2实际读全部五文件并给出六事实原文，但父错误答固定480字符prefix截掉事实；
+backup_v2两生成阶段失败后本地占位答却TaskResult completed。父级未完成声明/partial
+聚合/verifier inconclusive正确，但局部状态和信息交付P2不能接受。
+
+- [ ] R23-P：结构化生成失败/占位答不得标子任务成功；预算内交付完整已有子摘要，
+  超限才明确有界截断/可追溯原件，partial/verification不洗白。
+- [ ] R23-S：工具discovery反映实际scope/grant可用性，避免模型选择确定不可用的来源，
+  用registry metadata契约而非core硬编码具体包，不自动扩权。
+
+R22-T 新网页（`runtime_web_sqlite_20261005T012246817531`）60.998s、11 knowncalls/
+74459input/8606output、$0.057101152，7工具、0search，无失败。实际核对wal/isolation
+两官方页，三核心结论由最终prompt正文支持，独立review无P1；本次无timeout恢复也
+无web.find调用，不能据结果证明二者是直接原因。相比旧174.039s/14calls/29096output
+是工程诊断而非严格AB。仍有P2：1120字符不够简短，两次称“整页已直接读取”。
+实际模型可见覆盖WAL7962/36649、isolation2493/14507，足够核实目标但不是全文阅读；
+observation.read limit=4返回4000字符，不是4字符，Root早期疑问经实际输出核对纠正。
+
+- [ ] R23-V：fetched与模型实际visible/read区别可追踪，回答不能凭工具取回全文就声称
+  全文阅读；通用上下文/输出契约设计，避免网页名或自然语言词表硬规则。
+
+R23-B 第一真实（`runtime_background_20261005T013132510031`）45.833s、19knowncalls/
+$0.039910304；后台3calls/1681input/2657output/$0.009746848，前台16calls/
+30384input/4088output/$0.030163456，无unknown/pending，budget已close。
+真实前台baseline5.880s、并发5.472s、heartbeat最大14.979ms，readonly文件读取在
+后台provider返回前完成；summary revision0→1/covered_seq0→2，非fallback，保留日期
+2026-11-06、“尚未批准”和“仍未选择”。512 fixture和短网络窗口不认证全部长期负载。
+失败为记忆晋升：两次完全同偏好，合法提取仅差末尾中文“。”，被hash成两个候选，
+各一个独立来源，active=0。不能通过弱化判据或改fixture称已学会；需要确定性身份兼容
+修复，并保留原claim/evidence、来源与撤回保护，不用fuzzy语义合并。
