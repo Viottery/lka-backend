@@ -156,7 +156,7 @@ async def run_probe(root, ledger, *, config=None, injected_service=None):
             "worker_prefix_byte_limit": max(1024, runtime.memory_background.max_job_tokens // 3),
             "worker_chunk_byte_target": 8000,
             "production_warning": "~183500 ASCII chars at threshold; whole-exchange prefixes plus chunking can exceed 32 calls/180s. Not tested as production SLA.",
-            "medium_seed_plan": "3 x ~4100 chars plus small raw tail; expect >=2 prefixes, ~3 initial compaction dispatches; recovery still shares 32 cap"},
+            "medium_seed_plan": "3 x ~4100 chars plus small raw tail; await two prefixes, then append another such batch for >=3 publications; recovery still shares 32 cap"},
         "semantic_review": "required_independent_not_scored", "private_artifacts": str(root),
         "foreground_scope": "execution-only isolated READ view; not discovery authorization coverage",
         "turns": [], "checks": {}, "confounded": False}
@@ -209,6 +209,25 @@ async def run_probe(root, ledger, *, config=None, injected_service=None):
             runtime.memory_background.start()  # no mail/watch/server startup
             await wait_for(lambda: bool(publications) and publications[-1]["covered_seq"] >= 6,
                            seconds=PROBE_SECONDS)
+            # Append only after the first prefixes publish. Seeding everything
+            # at once would test emergency foreground fallback, not continuous
+            # background publication. The real threshold still selects work.
+            report["first_prefixes"] = [dict(p) for p in publications]
+            for index in range(4, 8):
+                text = (f"seeded follow-up comparison {index}; no new approval. " * 100)[:4100 if index < 7 else 80]
+                trace = f"seeded_followup_{index}"
+                answer = "模拟比较记录已收录，没有新的审批结论。"
+                for role, content in (("user", text), ("agent", answer)):
+                    runtime.session_service.append_message(session_id=session_id, role=role, content=content,
+                        payload={"trace_id": trace, "synthetic_seed": True})
+                window = runtime.session_service.record_context_exchange(session_id=session_id,
+                    user_input=text, agent_answer=answer, trace_id=trace,
+                    background_enqueue=runtime.memory_background.enqueue_compaction)
+                seeds.append({"trace_id": trace, "user_sha256": fingerprint(text), "chars": len(text),
+                              "context_token_estimate": window.token_estimate})
+            report["seeded_target_seq"] = 16
+            await wait_for(lambda: bool(publications) and publications[-1]["covered_seq"] >= 14,
+                           seconds=PROBE_SECONDS)
             report["published_before_followup"] = runtime.session_service.get_context_window(
                 session_id=session_id).model_dump(mode="json")
             await turn(RECALL)
@@ -248,7 +267,7 @@ async def run_probe(root, ledger, *, config=None, injected_service=None):
                         continue
                     if isinstance(payload, dict) and isinstance(payload.get("user_input"), str):
                         correction_inputs.append(payload["user_input"])
-        report["checks"].update(multiple_prefix_watermarks=len({p["covered_seq"] for p in publications}) >= 2,
+        report["checks"].update(multiple_prefix_watermarks=len({p["covered_seq"] for p in publications}) >= 3,
             model_publications=bool(publications) and all(p["summary_metadata"].get("method") == "model" for p in publications),
             same_session_two_turns=len(report["turns"]) == 2,
             recall_summary_delivered=report["recall_summary_delivery"]["status"] == "complete",

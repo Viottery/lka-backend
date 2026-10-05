@@ -63,9 +63,12 @@ def test_real_prefix_publications_then_same_session_recall_and_tail_correction(t
     assert report["semantic_review"] == "required_independent_not_scored"
     assert report["calls"] <= 32 and report["search_limit"] == 0
     assert report["budget_closed"] and report["accounting"]["accounting_final"]
-    assert len(report["publications"]) >= 2
+    assert len(report["publications"]) >= 3
+    assert report["first_prefixes"][-1]["covered_seq"] == 6
+    assert report["publications"][-1]["covered_seq"] >= 12
     assert len({p["covered_seq"] for p in report["publications"]}) == len(report["publications"])
     assert all(p["summary_metadata"]["method"] == "model" for p in report["publications"])
+    assert "seeded_followup_0" in report["publications"][-1]["summary_metadata"]["input_trace_ids"]
     assert report["turns"][0]["result"]["answer"] == probe.OLD_FACTS
     assert report["turns"][1]["result"]["answer"] == probe.CORRECTION
     assert len({t["session_id"] for t in report["turns"]}) == 1
