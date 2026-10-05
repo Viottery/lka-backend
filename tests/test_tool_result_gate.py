@@ -45,6 +45,33 @@ def test_small_serialized_but_long_list_is_gated():
     assert needs_gate({"output": {"ids": list(range(40))}})
 
 
+def test_registered_priority_survives_sorting_and_cap_pressure_without_mutating_raw():
+    raw = {"invocation_id": "large", "tool_name": "custom.inspect", "status": "completed", "output": {
+        **{f"diagnostic_{i}": "d" * 1300 for i in range(30)},
+        "evidence": [{"snippet": f"Necessary condition {i}. " + "x" * 1150} for i in range(5)],
+        "handle": "immutable-version", "next_offset": 5,
+    }}
+    raw = json.loads(json.dumps(raw, sort_keys=True))
+    view = bounded_preview(raw, max_string_chars=1200,
+                           output_priority_fields=["evidence", "handle", "next_offset"])
+    assert len(json.dumps(view, ensure_ascii=False)) <= 7000
+    assert view["output"]["handle"] == "immutable-version"
+    assert "Necessary condition 0." in view["output"]["evidence"]["items"][0]["snippet"]
+    assert view["output"]["evidence"]["omitted_count"] >= 1
+    assert view["output"]["_partial"] is True
+    assert len(raw["output"]["evidence"]) == 5 and "diagnostic_29" in raw["output"]
+
+
+def test_fallback_overlong_keys_cannot_escape_size_cap_or_forge_truncated_pointers():
+    for length in (300, 10000):
+        value = {str(index) + "x" * length: ["y" * 1200] * 4 for index in range(30)}
+        view = bounded_preview(value, max_string_chars=1200)
+        assert len(json.dumps(view, ensure_ascii=False)) <= 7000
+        assert view["total_keys"] == 30
+        assert view["omitted_keys"] == 30 - len(view["fields"])
+        assert all(field["path"] is None or field["path"][1:] in value for field in view["fields"])
+
+
 def test_aggregate_budget_retains_omitted_artifact_handles():
     loop = object.__new__(AgentTurnLoop)
     observations = [

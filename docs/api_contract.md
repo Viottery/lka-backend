@@ -528,6 +528,9 @@ audit record 和本地日志路径均不属于正常 HTTP 响应；它们只保�
   `observation` package 后可调用 `observation.read`，传入 `artifact_id`、可选的
   JSON Pointer `path`（默认根路径）、`offset`（默认 0）及 `limit`（1–20，默认 5）。
   返回类型、总量、分页 `has_more`/`next_offset`；字符串每次最多回读 4000 字符。
+  字符串可用 `max_chars`（1–4000，旧默认仍4000）控制窗口；≤1200 更适合短证据交付。
+  `fields` 投影中的截断字段附 `read_path` 与字段内 `next_offset`，可省略 fields 按该路径续读。
+  数组 `has_more=false` 只表示记录分页结束，不表示所有字段已完整读取。
   artifact 只在产生它的同一个 run 内可读，不是跨会话或子 Agent 的共享引用。
 - 所有非只读工具调用都会先进入 safety review。审查模式由本地配置选择：
   `skip` 记录并自动通过、`llm` 调用 LLM 审查、`manual` 进入等待前端确认状态。
@@ -1605,6 +1608,10 @@ Agent 可展开 `web` 包，再调用只读 `web.search`（参数 `query`、`mod
 - fetched_at／cache_read_at 与来源 publication 时间分开；cache_hit 只描述本系统。
   根会话可跨 turn／重启续读，child 按 run／权限视图隔离；web artifact 不能用通用
   observation.read 跨 run 读取，完整正文不进入常规 HTTP/SSE。
+- 注册生产者的 `output_preview_priority_fields`（最多16个有界 output 顶层字段名）
+  优先保留证据／续读／版本信息，JSON 持久化排序不影响优先级；未知工具保持默认。
+  此元数据只从实际 ToolSpec 读取，结果正文无法授权。超限先舍弃诊断，再减少预览条数，
+  整体 gate 仍≤7000字符；原始结果与当前 run 的缓存访问边界不变。
 
 详情与离线验证见 [渐进检索 TODO／报告](web_progressive_retrieval_todolist.md)。
 

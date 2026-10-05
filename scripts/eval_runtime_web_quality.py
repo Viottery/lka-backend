@@ -37,6 +37,7 @@ SOURCES = (__file__, eval_realworld.__file__,
     "app/core/agent_turn.py", "app/core/agent_graph.py", "app/core/answer_evidence.py", "app/core/tools.py", "app/core/llm/service.py",
     "app/core/tool_result_gate.py", "app/tool_packages/observation.py",
     "app/integrations/web_search.py", "app/tool_packages/web.py")
+SOURCES += ("app/domains/web_cache.py", "app/domains/web_views.py", "app/tool_packages/web_resources.py")
 
 
 class WebBudget(RunBudget):

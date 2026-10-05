@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from bisect import bisect_left
 from copy import deepcopy
+from math import log, log1p
 
 _MAX_VIEW_CHARS = 20_000
 _MAX_LEAF_CHARS = 1_200
@@ -37,20 +38,36 @@ def _query_hits(source: str, paragraphs: list[tuple[int, int]], terms: list[str]
         folded_parts.append(folded_char)
         folded_offsets.extend([source_index] * len(folded_char))
     folded = "".join(folded_parts)
+    paragraph_texts = [
+        folded[bisect_left(folded_offsets, start):bisect_left(folded_offsets, end)]
+        for start, end in paragraphs
+    ]
+    document_frequency = {
+        term: sum(term in paragraph for paragraph in paragraph_texts)
+        for term in terms
+    }
+    term_weight = {
+        term: 1.0 + log((len(paragraphs) + 1) / (frequency + 1))
+        for term, frequency in document_frequency.items()
+    }
     hits = []
-    for index, (start, end) in enumerate(paragraphs):
-        paragraph = folded[bisect_left(folded_offsets, start):bisect_left(folded_offsets, end)]
-        score = sum(paragraph.count(term) for term in terms)
-        if not score:
-            continue
+    for index, ((start, end), paragraph) in enumerate(zip(paragraphs, paragraph_texts)):
+        score = 0.0
         positions = []
         for term in terms:
+            frequency = paragraph.count(term)
+            if not frequency:
+                continue
+            score += term_weight[term] * (1.0 + min(0.35, log1p(frequency - 1) * 0.12))
             folded_position = folded.find(term, bisect_left(folded_offsets, start),
                                           bisect_left(folded_offsets, end))
             if folded_position >= 0:
-                positions.append(folded_offsets[folded_position])
-        hits.append({"index": index, "start": start, "end": end, "score": score,
-                     "hit": min(positions) if positions else start})
+                positions.append((term_weight[term], folded_offsets[folded_position]))
+        if score:
+            # Prefer anchoring on the most discriminative matched query term.
+            anchor = max(positions, default=(0.0, start))[1]
+            hits.append({"index": index, "start": start, "end": end, "score": score,
+                         "hit": anchor})
     return sorted(hits, key=lambda hit: (-hit["score"], hit["index"]))
 
 

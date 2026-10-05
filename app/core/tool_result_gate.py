@@ -109,10 +109,14 @@ def bind_context_delivery(
             bindings.append(binding)
         elif isinstance(raw, dict):
             room = min(_DELIVERY_LIMIT, _DELIVERY_WALK_LIMIT - visited - len(stack))
+            # Inspect fields that actually survived the projection first. Raw
+            # persistence order must not crowd visible evidence out of receipts.
+            keys = list(islice((key for key in view if key in raw), room)) if isinstance(view, dict) else []
+            keys.extend(islice((key for key in raw if key not in keys), room - len(keys)))
             children = [
-                (item, view.get(key, _MISSING) if isinstance(view, dict) else _MISSING,
+                (raw[key], view.get(key, _MISSING) if isinstance(view, dict) else _MISSING,
                  pointer(path, key), pointer(view_path, key))
-                for key, item in islice(raw.items(), room)
+                for key in keys
             ]
             stack.extend(reversed(children))
         elif isinstance(raw, list):
@@ -247,7 +251,9 @@ def pointer(parent: str, part: str | int) -> str:
     return f"{parent}/{escaped}"
 
 
-def preview(value: Any, *, path: str = "", depth: int = 0, max_string_chars: int = 700) -> Any:
+def preview(value: Any, *, path: str = "", depth: int = 0, max_string_chars: int = 700,
+            output_priority_fields: tuple[str, ...] = (), max_items: int = 4,
+            priority_only: bool = False) -> Any:
     """Expose structure and stable paths without pretending a sample is complete."""
     if isinstance(value, str):
         if len(value) <= max_string_chars:
@@ -261,23 +267,30 @@ def preview(value: Any, *, path: str = "", depth: int = 0, max_string_chars: int
     if isinstance(value, list):
         if depth >= 4:
             return {"_type": "array", "path": path, "total_count": len(value), "_partial": True}
-        visible = min(len(value), 4)
+        visible = min(len(value), max_items)
         return {
             "_type": "array", "path": path, "total_count": len(value),
             "visible_count": visible, "omitted_count": len(value) - visible,
             "_partial": len(value) > visible,
-            "items": [preview(item, path=pointer(path, i), depth=depth + 1, max_string_chars=max_string_chars)
+            "items": [preview(item, path=pointer(path, i), depth=depth + 1, max_string_chars=max_string_chars,
+                              output_priority_fields=output_priority_fields, max_items=max_items,
+                              priority_only=priority_only)
                       for i, item in enumerate(value[:visible])],
         }
     if isinstance(value, dict):
         if depth >= 4:
             return {"_type": "object", "path": path, "total_keys": len(value), "_partial": True}
         keys = list(value)
-        shown = keys[:12]
-        result = {key: preview(value[key], path=pointer(path, key), depth=depth + 1, max_string_chars=max_string_chars)
+        if path == "/output" and output_priority_fields:
+            priorities = list(dict.fromkeys(key for key in output_priority_fields if key in value))
+            keys = priorities + ([] if priority_only else [key for key in keys if key not in priorities])
+        shown = keys[:16 if path == "/output" and output_priority_fields else 12]
+        result = {key: preview(value[key], path=pointer(path, key), depth=depth + 1, max_string_chars=max_string_chars,
+                              output_priority_fields=output_priority_fields, max_items=max_items,
+                              priority_only=priority_only)
                   for key in shown}
-        if len(keys) > len(shown):
-            result["_omitted_keys"] = len(keys) - len(shown)
+        if len(value) > len(shown):
+            result["_omitted_keys"] = len(value) - len(shown)
             result["_path"] = path
             result["_partial"] = True
         return result
@@ -332,24 +345,45 @@ def preview_text_fields(value: Any, *, max_string_chars: int = 700) -> Any:
     return visit(value, "", 0)
 
 
-def bounded_preview(value: Any, *, max_string_chars: int = 700) -> Any:
+def bounded_preview(value: Any, *, max_string_chars: int = 700,
+                    output_priority_fields: tuple[str, ...] = ()) -> Any:
     if type(max_string_chars) is not int or not 700 <= max_string_chars <= 1200:
         raise ValueError("registered preview leaf limit must be 700 through 1200")
-    result = preview(value, max_string_chars=max_string_chars)
+    if (not isinstance(output_priority_fields, (tuple, list)) or len(output_priority_fields) > 16
+        or any(not isinstance(key, str) or not 0 < len(key) <= 64 for key in output_priority_fields)):
+        raise ValueError("registered preview priorities must be at most 16 bounded output fields")
+    result = preview(value, max_string_chars=max_string_chars,
+                     output_priority_fields=output_priority_fields)
     if len(json.dumps(result, ensure_ascii=False, default=str)) <= 7_000:
         return result
+    if output_priority_fields:
+        # Drop diagnostics before evidence, then page fewer records. Never raise
+        # the overall cap or slice serialized JSON into an unusable fragment.
+        for max_items in (4, 3, 2, 1):
+            result = preview(value, max_string_chars=max_string_chars,
+                             output_priority_fields=output_priority_fields,
+                             max_items=max_items, priority_only=True)
+            if len(json.dumps(result, ensure_ascii=False, default=str)) <= 7_000:
+                return result
     # Adversarially wide/nested output must not evict the cache handle itself.
     if isinstance(value, dict):
-        return {
+        fallback = {
             "_type": "object", "path": "", "total_keys": len(value),
             "fields": [
-                {"key": str(key)[:100], "path": pointer("", key),
+                {"key": str(key)[:100],
+                 "path": pointer("", key) if len(pointer("", key)) <= 512 else None,
                  "type": type(item).__name__,
                  "size": len(item) if isinstance(item, (str, list, dict)) else None}
                 for key, item in list(value.items())[:20]
             ],
             "omitted_keys": max(0, len(value) - 20),
         }
+        # Never truncate a pointer into a different address. The root remains
+        # readable by object pagination when an individual key is too long.
+        while len(json.dumps(fallback, ensure_ascii=False, default=str)) > 7_000:
+            fallback["fields"].pop()
+            fallback["omitted_keys"] += 1
+        return fallback
     return {"_type": type(value).__name__, "path": "",
             "size": len(value) if isinstance(value, (str, list)) else None}
 

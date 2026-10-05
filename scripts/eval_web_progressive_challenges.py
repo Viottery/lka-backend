@@ -16,8 +16,9 @@ from uuid import uuid4
 import httpx
 
 from app.core.agent_storage import SqliteAgentRunStore
-from app.core.tool_result_gate import bounded_preview, needs_gate
-from app.core.tools import ToolContext, ToolExecutor, ToolRegistry
+from app.core.agent_turn import AgentTurnLoop
+from app.core.tool_result_gate import needs_gate
+from app.core.tools import ToolContext, ToolExecutor, ToolRegistry, ToolResult
 from app.domains.web_cache import WebCacheService
 from app.integrations.web_search import BraveSearchAdapter, PublicPageFetcher
 from app.storage.db import connect, init_db
@@ -197,7 +198,8 @@ def main() -> int:
             out = rig.call("web.open", {"url": f"{BASE}/table"}, ctx)["output"]
             text = out.get("text", "")
             ok = "North" in text and "12" in text and "South" in text and "4" in text
-            associated = "North 12" in text or "North\n12" in text
+            rows = [line.strip() for line in text.splitlines() if line.strip()]
+            associated = rows == ["Region | Limit", "North | 12", "South | 4"]
             return {"full_pass": ok and associated, "first": associated, "recovered": False,
                     "evidence": [text], "positions": [text.find("North"), text.find("12"), text.find("South"), text.find("4")],
                     "http_count": len(rig.calls), "gap": "values may be present while HTML table row/column association is flattened" if not associated else ""}
@@ -264,7 +266,12 @@ def main() -> int:
                 kind="tool_result", payload=raw, summary="hard evidence delivery",
                 created_at="2026-10-05T00:00:00+00:00")
             persisted = store.load_tool_result_artifact("tool_result_challenge_gate", ctx.run_id)
-            gated = bounded_preview(persisted, max_string_chars=1200)["output"]
+            loop = object.__new__(AgentTurnLoop)
+            loop.tool_executor = rig.executor
+            loop.tool_invocation_store = store
+            observed = loop._observation_for_decision_prompt(tool_name="web.find", tool_input={},
+                tool_result=ToolResult.model_validate(persisted), feedback={}, run_id=ctx.run_id)
+            gated = observed["result"]["output"]
             matches_survive = "matches" in gated
             snapshot_survives = "snapshot_id" in gated
             claim_survives = claim in json.dumps(gated)

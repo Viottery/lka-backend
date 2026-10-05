@@ -4991,11 +4991,13 @@ class AgentTurnLoop:
             resolve = getattr(registry, "get_tool_or_none", None)
             tool = resolve(tool_name) if callable(resolve) and tool_result.tool_name == tool_name else None
             leaf_limit = getattr(getattr(tool, "spec", None), "output_preview_max_string_chars", 700)
+            priorities = getattr(getattr(tool, "spec", None), "output_preview_priority_fields", ())
             if type(leaf_limit) is not int or not 700 <= leaf_limit <= 1200:
                 leaf_limit = 700
             compacted_result = (tool_result_gate.preview_text_fields(result_payload, max_string_chars=leaf_limit)
                                 if force_gate and not needs_gate(result_payload)
-                                else bounded_preview(result_payload, max_string_chars=leaf_limit))
+                                else bounded_preview(result_payload, max_string_chars=leaf_limit,
+                                                     output_priority_fields=priorities))
             compacted = True
         else:
             compacted_result, compacted = self._compact_for_decision_prompt(result_payload)

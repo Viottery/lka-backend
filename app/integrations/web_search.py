@@ -192,6 +192,8 @@ class _PlainTextParser(HTMLParser):
         self.title_depth = 0
         self.headings: list[str] = []
         self.heading_parts: list[str] | None = None
+        self.table_rows: list[int | None] = []
+        self._last_char = ""
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attr_map = {key.lower(): value or "" for key, value in attrs}
@@ -218,7 +220,16 @@ class _PlainTextParser(HTMLParser):
             self.heading_parts = []
         if tag == "title":
             self.title_depth += 1
-        if not hidden and tag in self._BLOCK:
+        if tag == "tr":
+            self.table_rows.append(None if hidden else 0)
+            if not hidden:
+                self._append_row_break()
+        elif tag in {"td", "th"}:
+            if not hidden and self.table_rows and self.table_rows[-1] is not None:
+                if self.table_rows[-1]:
+                    self._append_text(" | ")
+                self.table_rows[-1] += 1
+        elif not hidden and tag in self._BLOCK:
             self._append_text("\n")
 
     def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
@@ -242,6 +253,10 @@ class _PlainTextParser(HTMLParser):
                 break
         if not any(parent_hidden for _, parent_hidden, _ in self.stack) and tag in self._BLOCK:
             self._append_text("\n")
+        if tag == "tr":
+            visible_row = self.table_rows.pop() if self.table_rows else None
+            if visible_row is not None:
+                self._append_row_break()
         if tag == "a" and link_href and not link_hidden:
             self._append_text(f" ({urljoin(self.base_url, link_href)})")
 
@@ -265,8 +280,14 @@ class _PlainTextParser(HTMLParser):
 
     def _append_text(self, value: str) -> None:
         self.parts.append(value)
+        if value:
+            self._last_char = value[-1]
         if any(tag in {"main", "article"} and not hidden for tag, hidden, _ in self.stack):
             self.article_parts.append(value)
+
+    def _append_row_break(self) -> None:
+        if self._last_char != "\n":
+            self._append_text("\n")
 
 
 def _safe_public_https_url(url: str) -> str:
@@ -584,7 +605,7 @@ class PublicPageFetcher:
                     "text_scope": "readable_text_extraction",
                     "title": _clean_text("".join(parser.title_parts))[:200],
                     "outline": outline,
-                    "extraction_version": "readable-html-v2",
+                    "extraction_version": "readable-html-v3",
                     "network_observations": {
                         "requested_url": requested_url, "redirects": redirects,
                         "redirect_count": len(redirects), "final_http_status": status,

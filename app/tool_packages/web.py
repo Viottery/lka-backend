@@ -75,6 +75,8 @@ _PAGE_REFERENCE_FIELDS = {
 class WebSearchTool:
     spec = ToolSpec(
         name="web.search", package="web", type="local_tool",
+        output_preview_priority_fields=["results", "search_id", "query", "mode", "result_count",
+                                        "possible_more", "queried_at", "cache_hit"],
         description="Search public web/news with query, or locally reread a saved search_id (omit query/filter fields). Compact snippets by default; view=full restores saved provider snippets. No result-page fetch or summary model call. Candidates are not verified facts.",
         risk="low", requires_confirmation=False, read_only=True,
         side_effects=["external_read"],
@@ -129,6 +131,9 @@ class WebOpenTool:
     spec = ToolSpec(
         name="web.open", package="web", type="local_tool",
         output_preview_max_string_chars=1200,
+        output_preview_priority_fields=["text", "excerpts", "snapshot_id", "text_sha256", "url",
+                                        "offset", "returned_chars", "total_chars", "has_more",
+                                        "next_offset", "context_complete", "fetched_at"],
         description=(
             "Fetch a public HTTPS page and return bounded plain text. DNS resolves to public addresses "
             "and the connection is pinned to a validated address while TLS verifies the original domain. "
@@ -192,6 +197,9 @@ class WebFindTool:
     spec = ToolSpec(
         name="web.find", package="web", type="local_tool",
         output_preview_max_string_chars=1200,
+        output_preview_priority_fields=["matches", "recovery_preview", "snapshot_id", "text_sha256",
+                                        "url", "query", "offset", "total_chars", "has_more",
+                                        "next_offset", "complete", "fetched_at"],
         unrestricted_execution=True,
         description=(
             "Provide exactly one URL, search ref_id, or snapshot_id. Find a case-insensitive literal in full readable text, "

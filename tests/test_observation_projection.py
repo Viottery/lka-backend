@@ -79,3 +79,22 @@ def test_projection_rejects_invalid_fields_and_preserves_reader_scope(tmp_path):
     mismatch = ToolView(snapshot_id="snapshot", child_run_id="run-2", side_effect_level="read")
     assert _invoke(tool, artifact_id="rows", path="/output/rows", fields=["subject"],
                    tool_view=mismatch).status == "rejected"
+
+
+def test_truncated_field_read_path_escapes_keys_and_string_pages_continue(tmp_path):
+    text = "x" * 520 + " decisive condition " + "y" * 1800
+    tool = ObservationReadTool(_store(tmp_path, {"output": {"a/b": [{"q~r": text}]}}))
+    projected = _invoke(tool, artifact_id="rows", path="/output/a~1b", fields=["q~r"])
+    field = projected.output["items"][0]["fields"]["q~r"]
+    assert field["read_path"] == "/output/a~1b/0/q~0r"
+    assert projected.output["has_more"] is False and field["truncated"] is True
+    page = _invoke(tool, artifact_id="rows", path=field["read_path"],
+                   offset=field["next_offset"], max_chars=1200)
+    assert page.output["text"] == text[500:1700]
+    assert "decisive condition" in page.output["text"] and page.output["has_more"] is True
+    tail = _invoke(tool, artifact_id="rows", path=field["read_path"],
+                   offset=page.output["next_offset"], max_chars=1200)
+    assert tail.output["text"] == text[1700:] and tail.output["has_more"] is False
+    for invalid in (0, 4001, True):
+        assert _invoke(tool, artifact_id="rows", path=field["read_path"], max_chars=invalid).status == "rejected"
+    assert _invoke(tool, artifact_id="rows", path="/output/a~1b", max_chars=1200).status == "rejected"

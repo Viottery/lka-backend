@@ -23,6 +23,7 @@ OBSERVATION_PACKAGE = ToolPackageSpec(
         "When repeated labels or links crowd search hits, use distinct_contexts=true to page through different text windows, then read from snippet_start. complete describes the cached text only, not an upstream truncated source.",
         "_delivery_view describes original-character windows of a cached value, not fetched or fully read upstream documents. Later prompt trimming can reduce that view further.",
         "For an array of records, use read with fields to retain the requested shallow keys rather than generic first-key previews. Follow next_offset to cover further records; report incomplete coverage when stopping early.",
+        "Array has_more=false ends record pagination only. Truncated fields include read_path and next_offset; read that exact string path (omit fields) to recover omitted text. Text windows up to 1200 characters are less likely to be compacted again.",
         "For exact counts by a scalar field, use group on the cached raw array instead of adding counts from remembered previews. Group counts cover that entire array before group paging; they do not cover other artifacts or source pages. Follow next_offset to see every group and inspect skipped record counts.",
     ],
 )
@@ -248,12 +249,19 @@ class ObservationReadTool:
             "Read a bounded page from a cached tool_result artifact belonging to the current run. "
             "Path is a JSON Pointer rooted at the raw stored ToolResult dictionary, not its preview. "
             "For an array of records, fields selects relevant shallow keys. Offset is an array index, "
-            "object-key index, or character offset for strings; inspect has_more and next_offset."
+            "object-key index, or character offset for strings; inspect has_more and next_offset. "
+            "Array has_more=false does not mean projected fields are complete. Use a truncated field's "
+            "read_path with fields omitted to read its text; max_chars controls string pages (up to 4000, "
+            "1200 recommended for evidence delivery). next_offset on that field skips its visible prefix."
         ),
         risk="low",
         requires_confirmation=False,
         read_only=True,
         side_effects=["read_local_db"],
+        output_preview_max_string_chars=1200,
+        output_preview_priority_fields=["text", "items", "entries", "path", "value_type", "has_more",
+                                        "next_offset", "total", "projected_fields", "_delivery_view",
+                                        "value", "keys"],
         input_schema={
             "type": "object",
             "required": ["artifact_id"],
@@ -262,6 +270,8 @@ class ObservationReadTool:
                 "path": {"type": "string", "default": ""},
                 "offset": {"type": "integer", "minimum": 0, "default": 0},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 5},
+                "max_chars": {"type": "integer", "minimum": 1, "maximum": 4000,
+                              "description": "String page size only; does not change record pagination."},
                 "fields": {
                     "type": "array", "minItems": 1, "maxItems": 12,
                     "items": {"type": "string", "minLength": 1, "maxLength": 64},
@@ -294,6 +304,7 @@ class ObservationReadTool:
         offset = invocation.input.get("offset", 0)
         limit = invocation.input.get("limit", 5)
         fields = invocation.input.get("fields")
+        max_chars = invocation.input.get("max_chars", _MAX_STRING_CHARS)
         if not isinstance(artifact_id, str) or not artifact_id:
             return rejected("artifact_id must be a non-empty string.")
         if not isinstance(path, str):
@@ -302,6 +313,8 @@ class ObservationReadTool:
             return rejected("offset must be an integer greater than or equal to zero.")
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 20:
             return rejected("limit must be an integer from 1 through 20.")
+        if type(max_chars) is not int or not 1 <= max_chars <= _MAX_STRING_CHARS:
+            return rejected("max_chars must be an integer from 1 through 4000.")
         if "fields" in invocation.input and (
             not isinstance(fields, list)
             or not 1 <= len(fields) <= 12
@@ -319,6 +332,8 @@ class ObservationReadTool:
             return rejected("path does not identify a value in the tool result.")
         if fields is not None and not isinstance(value, list):
             return rejected("fields projection requires path to identify an array.")
+        if "max_chars" in invocation.input and not isinstance(value, str):
+            return rejected("max_chars requires path to identify a string.")
 
         output = {"path": path, "value_type": _value_type(value)}
         if isinstance(value, list):
@@ -329,7 +344,8 @@ class ObservationReadTool:
                     field_budget = max(64, min(500, 2_200 // len(fields)))
                     if isinstance(item, dict):
                         projected = {
-                            field: _projection_value(item[field], field_budget)
+                            field: _projection_value(item[field], field_budget,
+                                path=_pointer_child(_pointer_child(path, offset + len(items)), field))
                             for field in fields if field in item
                         }
                         missing = [field for field in fields if field not in item]
@@ -344,7 +360,8 @@ class ObservationReadTool:
                             "item_type": _value_type(item),
                             "fields": {},
                             "missing_fields": fields,
-                            "value": _projection_value(item, field_budget),
+                            "value": _projection_value(item, field_budget,
+                                path=_pointer_child(path, offset + len(items))),
                         }
                 else:
                     item_preview = _preview(item)
@@ -356,7 +373,8 @@ class ObservationReadTool:
                         item_preview = {
                             "index": offset + len(items),
                             "fields": {
-                                field: {"_type": "omitted", "_partial": True}
+                                field: {"_type": "omitted", "_partial": True,
+                                        "read_path": _pointer_child(_pointer_child(path, offset + len(items)), field)}
                                 for field in fields if isinstance(item, dict) and field in item
                             },
                             "missing_fields": [
@@ -379,6 +397,7 @@ class ObservationReadTool:
             })
             if fields is not None:
                 output["projected_fields"] = fields
+                output["pagination_scope"] = "records_only; truncated fields require their read_path"
         elif isinstance(value, dict):
             keys = list(value.keys())
             entries: dict[str, Any] = {}
@@ -403,7 +422,7 @@ class ObservationReadTool:
                 "next_offset": end if end < len(keys) else None,
             })
         elif isinstance(value, str):
-            end = min(offset + _MAX_STRING_CHARS, len(value))
+            end = min(offset + max_chars, len(value))
             output.update({
                 "text": value[offset:end],
                 "total": len(value),
@@ -795,7 +814,7 @@ def _preview(value: Any, depth: int = 0) -> Any:
     return value
 
 
-def _projection_value(value: Any, max_string_chars: int) -> Any:
+def _projection_value(value: Any, max_string_chars: int, *, path: str = "") -> Any:
     """Keep projected fields useful while making nested values explicitly partial."""
     if isinstance(value, str):
         if len(value) <= max_string_chars:
@@ -805,9 +824,11 @@ def _projection_value(value: Any, max_string_chars: int) -> Any:
             "preview": value[:max_string_chars],
             "total_chars": len(value),
             "truncated": True,
+            "read_path": path,
+            "next_offset": max_string_chars,
         }
     if isinstance(value, dict):
-        return {"_type": "object", "total_keys": len(value), "_partial": bool(value)}
+        return {"_type": "object", "total_keys": len(value), "_partial": bool(value), "read_path": path}
     if isinstance(value, list):
-        return {"_type": "array", "total_items": len(value), "_partial": bool(value)}
+        return {"_type": "array", "total_items": len(value), "_partial": bool(value), "read_path": path}
     return value
