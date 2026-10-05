@@ -339,3 +339,32 @@ answer拟合→假provider的最终覆盖状态。新模块与既有delivery模�
 最终五个相关模块 **98 passed / 4.89s**，Ruff 与 diff check 通过。独立审查确认总树
 遍历、单容器宽度与绑定条数都仍有界，认证不扩权。工作区另有用户的两处 web 工具
 权限属性改动，单独构造本轮diff暂存，原属性改动保持未暂存，未纳入本轮提交。
+
+原 SQLite 任务第一次真实重放 **54.209s / 9 calls / 1 search / $0.045987392**，
+全部模型usage结算：输入63506、输出7244、cache read35712；源码/原目标未变。
+两官方正文确实取回，机械检查通过；人工仍判 bad：读快照时点仅说“之前某时刻”，
+没有明确读事务开始；WAL无界增长解释仍漏持续写入条件，回答1097字符且大量审计说明。
+同时拿到页面正文不等于模型看了全文：两段wal的cached text均只交付500字符；
+isolation.find的830/1016字符完整块又被规则gate截首尾，部分snapshot条件在中间，
+对应receipt是partial。不能靠“已经两来源/全文取回”冒充限定条件被理解。
+原件 `runtime_web_sqlite_20261005T093115175754/heldout_web_sqlite_20261005T093115183533/report.json`，
+SHA-256 `298c825041774087fa24764726a21037fe86fbb00e4b5ed750280e85878a62a3`。
+
+针对真实缺口追加**注册生产者的声明式短证据保留规则**：ToolSpec可声明严格整数
+`output_preview_max_string_chars`，700..1200，默认700。只有实际registry spec可影响
+预览，ToolResult.output的同名字段无效；未声明工具/MCP沿用默认。web.find声明1200，
+其已确定有界的短块不再二次截掉中间限定句。更长字符串仍首尾摘录，整体序列化
+7000字符gate cap、深度/列表边界、授权和回答窗口预算不变；core不识别领域名字。
+普通精确原文binding会确认保留下来的cached value complete，而upstream仍unknown。
+不保证一次命中等于语义支持、不自动替模型完成进一步网页读取。
+
+追加默认/未知工具、输出伪造、登记字段非法/强转值、整体cap及实际provider完整短块
+验证；既有“通用默认gate会丢中间内容”负例仍保留，未改成伪完整。新的provider验收
+明确是该registered片段完整交付，不是全文或事实验证；仍无额外审查模型调用。
+
+独立审查补齐两处边界：child冷证据force分支也遵循相同叶子保留上限；只有
+observation工具名与ToolResult工具名一致才解析注册spec，否则默认700。新增错配、
+force小结果断言，不让其它工具借用扩大预览；未经注册的同名输出字段仍无效。
+最终相关默认/gate/provider/child/native/评测探针定向 **63 passed / 7.25s**，
+Ruff通过；独立审查未发现上述两处残留。评测源码指纹加入影响行为的ToolSpec文件，
+不能因为只改metadata就漏记版本。用户现有tools约束和web权限修改仍分hunk保留。

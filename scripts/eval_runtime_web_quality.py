@@ -34,7 +34,7 @@ APPROVED_CASES = (CASE, "heldout_web_multisource", "web_search_release")
 MAX_CALLS, MAX_SEARCHES, TIMEOUT = 20, 3, 180
 SOURCES = (__file__, eval_realworld.__file__,
     "scripts/eval_runtime_memory_quality.py", "evals/lka_evals/live_budget.py",
-    "app/core/agent_turn.py", "app/core/llm/service.py",
+    "app/core/agent_turn.py", "app/core/tools.py", "app/core/llm/service.py",
     "app/core/tool_result_gate.py", "app/tool_packages/observation.py",
     "app/integrations/web_search.py", "app/tool_packages/web.py")
 

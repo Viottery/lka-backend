@@ -5,10 +5,11 @@ import json
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 from app.core import tool_result_gate
 from app.core.agent_storage import SqliteAgentRunStore
-from app.core.tools import ToolContext, ToolExecutor, ToolRegistry, ToolResult
+from app.core.tools import ToolContext, ToolExecutor, ToolRegistry, ToolResult, ToolSpec
 from app.integrations.web_search import MAX_FIND_CONTEXT_CHARS, PublicPageFetcher, WebSearchError
 from app.tool_packages.web import WebFindTool, WebOpenTool
 from tests.test_answer_generation_recovery_quality import make_loop, response, scope
@@ -153,7 +154,7 @@ def test_casefold_partial_character_is_not_mislabeled_a_literal_match():
                for hit in full["matches"])
 
 
-def test_actual_answer_fit_receives_partial_receipt_not_fetch_completeness(tmp_path):
+def test_actual_answer_fit_preserves_registered_excerpt_not_upstream_completeness(tmp_path):
     from datetime import UTC, datetime
 
     html = "<main>" + "".join(f"<p>Anchor{index} " + "a" * 500 + " ONLY UNDER CONDITION "
@@ -180,6 +181,50 @@ def test_actual_answer_fit_receives_partial_receipt_not_fetch_completeness(tmp_p
     assert answer == "Read further for omitted conditions." and len(provider.requests) == 1
     payload = json.loads(provider.requests[0].messages[1].content)
     receipt = next(item for item in payload["context_delivery"] if item["path"] == "/output/matches/0/snippet")
-    assert receipt["coverage"] == "partial" and receipt["upstream_coverage"] == "unknown"
+    assert receipt["coverage"] == "complete" and receipt["upstream_coverage"] == "unknown"
+    assert receipt["total_chars"] > 700
+    assert "ONLY UNDER CONDITION" in provider.requests[0].messages[1].content
     # Fake-provider text is not semantic success; these assertions test only
     # the real artifact -> fit -> provider boundary and its coverage contract.
+
+
+def test_only_registered_preview_policy_preserves_leaves_and_global_cap_stays(tmp_path):
+    from types import SimpleNamespace
+
+    text = "x" * 450 + " ONLY UNDER CONDITION " + "y" * 350
+    result = ToolResult(invocation_id="generic", tool_name="renamed.inspect", status="completed",
+        output={"excerpt": text, "noise": "n" * 5000, "output_preview_max_string_chars": 1200})
+    loop, _, manager = make_loop(tmp_path, [])
+    registry = ToolRegistry()
+    loop.tool_executor = ToolExecutor(registry)
+    loop.tool_invocation_store = object()
+    with scope(manager) as run:
+        kwargs = {"tool_name": result.tool_name, "tool_input": {}, "tool_result": result,
+                  "feedback": {"status": "accepted", "protocol_status": "valid"}, "run_id": run.run_id}
+        unknown = loop._observation_for_decision_prompt(**kwargs)
+        assert unknown["result"]["output"]["excerpt"]["_partial"] is True
+        assert "ONLY UNDER CONDITION" not in json.dumps(unknown)
+        spec = ToolSpec(name=result.tool_name, package="renamed", type="local_tool",
+                        description="Bounded evidence", read_only=True, output_preview_max_string_chars=1200)
+        registry.register_tool(SimpleNamespace(spec=spec))
+        known = loop._observation_for_decision_prompt(**kwargs)
+        assert known["result"]["output"]["excerpt"] == text
+        assert known["_result_cache"]["artifact_id"] == "tool_result_generic"
+        mismatched = loop._observation_for_decision_prompt(**{**kwargs, "tool_name": "other.inspect"})
+        assert mismatched["result"]["output"]["excerpt"]["_partial"] is True
+        small = result.model_copy(update={"output": {"excerpt": text}})
+        forced = loop._observation_for_decision_prompt(**{**kwargs, "tool_result": small}, force_gate=True)
+        assert forced["result"]["output"]["excerpt"] == text
+    wide = {f"field-{index}": "x" * 1200 for index in range(20)}
+    assert len(json.dumps(tool_result_gate.bounded_preview(wide, max_string_chars=1200), ensure_ascii=False)) <= 7000
+
+
+@pytest.mark.parametrize("limit", [True, "1200", 0, 1201])
+def test_registered_leaf_limit_cannot_be_unbounded_or_coerced(limit):
+    with pytest.raises(ValidationError):
+        ToolSpec(name="unknown.inspect", type="local_tool", description="read",
+                 output_preview_max_string_chars=limit)
+    with pytest.raises(ValueError):
+        tool_result_gate.bounded_preview({}, max_string_chars=limit)
+    with pytest.raises(ValueError):
+        tool_result_gate.preview_text_fields({}, max_string_chars=limit)

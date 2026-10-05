@@ -140,6 +140,7 @@ class WebOpenTool:
 class WebFindTool:
     spec = ToolSpec(
         name="web.find", package="web", type="local_tool",
+        output_preview_max_string_chars=1200,
         unrestricted_execution=True,
         description=(
             "Find a case-insensitive literal in a fresh public HTTPS page's full readable text, "

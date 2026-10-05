@@ -247,10 +247,10 @@ def pointer(parent: str, part: str | int) -> str:
     return f"{parent}/{escaped}"
 
 
-def preview(value: Any, *, path: str = "", depth: int = 0) -> Any:
+def preview(value: Any, *, path: str = "", depth: int = 0, max_string_chars: int = 700) -> Any:
     """Expose structure and stable paths without pretending a sample is complete."""
     if isinstance(value, str):
-        if len(value) <= 700:
+        if len(value) <= max_string_chars:
             return value
         return {
             "_type": "string", "path": path, "total_chars": len(value),
@@ -266,7 +266,7 @@ def preview(value: Any, *, path: str = "", depth: int = 0) -> Any:
             "_type": "array", "path": path, "total_count": len(value),
             "visible_count": visible, "omitted_count": len(value) - visible,
             "_partial": len(value) > visible,
-            "items": [preview(item, path=pointer(path, i), depth=depth + 1)
+            "items": [preview(item, path=pointer(path, i), depth=depth + 1, max_string_chars=max_string_chars)
                       for i, item in enumerate(value[:visible])],
         }
     if isinstance(value, dict):
@@ -274,7 +274,7 @@ def preview(value: Any, *, path: str = "", depth: int = 0) -> Any:
             return {"_type": "object", "path": path, "total_keys": len(value), "_partial": True}
         keys = list(value)
         shown = keys[:12]
-        result = {key: preview(value[key], path=pointer(path, key), depth=depth + 1)
+        result = {key: preview(value[key], path=pointer(path, key), depth=depth + 1, max_string_chars=max_string_chars)
                   for key in shown}
         if len(keys) > len(shown):
             result["_omitted_keys"] = len(keys) - len(shown)
@@ -295,7 +295,7 @@ def needs_gate(value: Any) -> bool:
     return isinstance(value, str) and len(value) > 4_000
 
 
-def preview_text_fields(value: Any) -> Any:
+def preview_text_fields(value: Any, *, max_string_chars: int = 700) -> Any:
     """Preview long strings without sampling structural/status fields.
 
     For previously accepted small results in a control working set, arrays and
@@ -304,6 +304,8 @@ def preview_text_fields(value: Any) -> Any:
     A bounded walk fails closed rather than omit unknown fields. Standard gate
     behavior is unchanged.
     """
+    if type(max_string_chars) is not int or not 700 <= max_string_chars <= 1200:
+        raise ValueError("registered preview leaf limit must be 700 through 1200")
     remaining = 512
     seen_text: dict[str, str] = {}
 
@@ -313,14 +315,14 @@ def preview_text_fields(value: Any) -> Any:
         if remaining < 0 or depth > 32:
             raise ValueError("control text preview exceeds bounded walk")
         if isinstance(item, str):
-            if len(item) > 700:
+            if len(item) > max_string_chars:
                 first_path = seen_text.get(item)
                 if first_path is not None:
                     return {"_partial": True, "path": path, "total_chars": len(item),
                             "exact_text_ref": first_path,
                             "note": "Original text is identical to the referenced field; its preview appears there. This path remains independently readable."}
                 seen_text[item] = path
-            return preview(item, path=path)
+            return preview(item, path=path, max_string_chars=max_string_chars)
         if isinstance(item, dict):
             return {key: visit(child, pointer(path, key), depth + 1) for key, child in item.items()}
         if isinstance(item, list):
@@ -330,8 +332,10 @@ def preview_text_fields(value: Any) -> Any:
     return visit(value, "", 0)
 
 
-def bounded_preview(value: Any) -> Any:
-    result = preview(value)
+def bounded_preview(value: Any, *, max_string_chars: int = 700) -> Any:
+    if type(max_string_chars) is not int or not 700 <= max_string_chars <= 1200:
+        raise ValueError("registered preview leaf limit must be 700 through 1200")
+    result = preview(value, max_string_chars=max_string_chars)
     if len(json.dumps(result, ensure_ascii=False, default=str)) <= 7_000:
         return result
     # Adversarially wide/nested output must not evict the cache handle itself.

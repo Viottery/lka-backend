@@ -65,6 +65,9 @@ class ToolSpec(BaseModel):
     scope_uses_workspace: bool = False
     input_schema: dict[str, Any] = Field(default_factory=dict)
     output_schema: dict[str, Any] = Field(default_factory=dict)
+    # Registered producer metadata, never a value read from ToolResult.output.
+    # Preserve bounded evidence leaves without changing the overall gate cap.
+    output_preview_max_string_chars: int = Field(default=700, strict=True, ge=700, le=1200)
 
 
 class ToolInvocation(BaseModel):
