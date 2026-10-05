@@ -298,10 +298,13 @@ def preview_text_fields(value: Any) -> Any:
     """Preview long strings without sampling structural/status fields.
 
     For previously accepted small results in a control working set, arrays and
-    dictionaries must keep their status, gaps and counts. A bounded walk fails
-    closed rather than omit unknown fields. Standard gate behavior is unchanged.
+    dictionaries must keep their status, gaps and counts. Identical long strings
+    share one preview by JSON Pointer without merging merely similar text.
+    A bounded walk fails closed rather than omit unknown fields. Standard gate
+    behavior is unchanged.
     """
     remaining = 512
+    seen_text: dict[str, str] = {}
 
     def visit(item: Any, path: str, depth: int) -> Any:
         nonlocal remaining
@@ -309,6 +312,13 @@ def preview_text_fields(value: Any) -> Any:
         if remaining < 0 or depth > 32:
             raise ValueError("control text preview exceeds bounded walk")
         if isinstance(item, str):
+            if len(item) > 700:
+                first_path = seen_text.get(item)
+                if first_path is not None:
+                    return {"_partial": True, "path": path, "total_chars": len(item),
+                            "exact_text_ref": first_path,
+                            "note": "Original text is identical to the referenced field; its preview appears there. This path remains independently readable."}
+                seen_text[item] = path
             return preview(item, path=path)
         if isinstance(item, dict):
             return {key: visit(child, pointer(path, key), depth + 1) for key, child in item.items()}

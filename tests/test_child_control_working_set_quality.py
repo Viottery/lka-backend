@@ -6,6 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from app.core.agent_runs import AgentRunCancelled
+from app.core.agent_turn import _turn_run_id
 from app.core.context_driver import ToolView
 from app.core.multi_agent import SideEffectLevel
 from app.core.tool_result_gate import preview_text_fields
@@ -64,11 +66,13 @@ def test_only_older_accepted_child_results_project_without_losing_structural_gap
         assert len(json.dumps(projected)) < len(json.dumps(original))
 
 
-@pytest.mark.parametrize("denial", ["scope", "missing", "changed", "history", "reader_missing"])
+@pytest.mark.parametrize("denial", ["scope", "missing", "changed", "history", "reader_missing",
+                                   "already_gated", "structurally_compacted"])
 def test_unrecoverable_or_changed_evidence_is_not_projected(tmp_path, denial):
     with child_loop(tmp_path) as (loop, _, child, _):
         observed, artifacts, _ = configure(loop, child, reader_allowed=denial != "scope")
-        observations = [observed("earlier"), observed("latest", size=1000)]
+        observations = [observed("earlier", size=7000 if denial == "already_gated" else 2700),
+                        observed("latest", size=1000)]
         if denial == "missing":
             artifacts.clear()
         elif denial == "changed":
@@ -77,6 +81,13 @@ def test_unrecoverable_or_changed_evidence_is_not_projected(tmp_path, denial):
             observations[0]["_cache"] = {"historical_only": True}
         elif denial == "reader_missing":
             loop.tool_executor.registry.get_tool_or_none = lambda _: None
+        elif denial == "structurally_compacted":
+            raw = artifacts["tool_result_earlier"]
+            raw["output"]["many"] = list(range(25))
+            observations[0] = loop._observation_for_decision_prompt(
+                tool_name=raw["tool_name"], tool_input={}, tool_result=ToolResult.model_validate(raw),
+                feedback=observations[0]["feedback"], run_id=child.run_id)
+            assert observations[0]["_prompt_compacted"] is True
         assert loop._observations_for_child_control(observations) == observations
 
 
@@ -113,3 +124,43 @@ def test_control_text_projection_preserves_all_structure_or_fails_closed():
     assert result["missing"] == ["gap"]
     with pytest.raises(ValueError, match="bounded walk"):
         preview_text_fields(list(range(513)))
+
+
+def test_cancel_during_artifact_load_is_not_swallowed(tmp_path):
+    with child_loop(tmp_path) as (loop, _, child, _):
+        observed, _, _ = configure(loop, child)
+        observations = [observed("earlier"), observed("latest")]
+        checkpoints = []
+        def check():
+            checkpoints.append(None)
+            if len(checkpoints) == 2:
+                raise AgentRunCancelled("cancelled after artifact load")
+        loop._raise_if_cancel_requested = check
+        with pytest.raises(AgentRunCancelled, match="after artifact load"):
+            loop._observations_for_child_control(observations)
+
+
+def test_root_control_does_not_read_or_project_child_artifacts(tmp_path):
+    with child_loop(tmp_path) as (loop, manager, child, _):
+        observed, _, reads = configure(loop, child)
+        observations = [observed("earlier"), observed("latest")]
+        token = _turn_run_id.set(manager.get_run(child.run_id).parent_run_id)
+        try:
+            assert loop._observations_for_child_control(observations) == observations
+            assert reads == []
+        finally:
+            _turn_run_id.reset(token)
+
+
+def test_exact_text_alias_is_local_reversible_and_does_not_merge_similar_text():
+    text = "否定：仍未确认。" + "evidence" * 220
+    raw = {"evidence/a~b": text, "compatibility": [text], "different": text + "已更正"}
+    before = copy.deepcopy(raw)
+    projected = preview_text_fields(raw)
+    alias = projected["compatibility"][0]
+    assert alias["exact_text_ref"] == "/evidence~1a~0b"
+    assert alias["path"] == "/compatibility/0"
+    assert alias["total_chars"] == len(text) and alias["_partial"] is True
+    assert "exact_text_ref" not in projected["different"]
+    assert raw == before
+    assert len(json.dumps(projected)) < len(json.dumps(before))

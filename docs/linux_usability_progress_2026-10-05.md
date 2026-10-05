@@ -238,7 +238,7 @@ answer 预留或给原评测增加能力修复。本轮在 child control 构造�
 数组、标量状态和缺口字段完整保留。root、失败、action/replan、历史缓存不投影。
 
 投影须有当前 child ToolView 允许的实际只读 reader、同 run 原始 artifact，且原件必须
-与此前观察的类型敏感投影精确一致；缺失、改写、越权或遍历超限时保留原观察。
+与此前完整观察类型敏感地精确一致；缺失、改写、越权或遍历超限时保留原观察。
 复用现有 gate 的分页 ID/路径和 reader 提示，不在 core 写领域工具名、关键词或 gold。
 原观察与 artifact 不修改。JSON/native 的控制输入均可瘦身，但两条链路的 answer
 预算预测和最终回答继续使用原观察；取消不被可选投影吞掉。事件只记录 projection
@@ -248,3 +248,52 @@ answer 预留或给原评测增加能力修复。本轮在 child control 构造�
 隔离测试合计 **16 passed / 2.12s**；Ruff 通过。低成本 Luna 独立只读审查未发现阻塞
 缺陷，没有额外模型 reviewer 调用。这里仅记录离线验证，原 UX-03 保持 open，待原
 三独立任务、相同 32768 ceiling、32-call 总上限的单次真实重放核对。
+
+原任务真实重放 **53.147s / 21 dispatch**（parent 4、child 17）；原三个 child 各有
+独立 bash 取证、明确来源/范围/未确认项，canonical aggregate complete、三份 TaskResult
+completed、没有 skip/replan/预算提前结束，parent 未补读或替换 child。消费累计 tokens
+分别 release **29373**、backup **30467**、startup **22274**，均低于 32768。
+release/backup 开始相差 **0.156s**，有实际执行重叠；startup 随第二槽释放启动，保持
+max-2 并发。输出六事实、路径、否定状态与“未确认”人工核对通过；不从机械字符串
+通过推断合同通过。保留独立形式校验未裁决说明，不洗成 verification pass。
+
+分阶段 provider tokens（输入/输出，输入含 cache read；不是上下文窗口占用）：
+
+| child | route | control | answer | 累计 |
+| --- | ---: | ---: | ---: | ---: |
+| release | 1697/117 | 21508/714 | 4474/863 | 29373 |
+| backup | 1704/134 | 21746/803 | 4720/1360 | 30467 |
+| startup | 1697/178 | 14382/866 | 4149/1002 | 22274 |
+
+费用 **$0.074443808**，输入 96725、输出 9149、cache read 41088，21 条全部结算；
+原件/代码/fixture 未改变、零搜索、文件未修改。较上轮 80.300s 的样本耗时 -33.8%、
+输入 -17.0%、费用 -34.4%，但**新投影只实际生效一次，9009→8867 bytes（142 bytes）**。
+本次取证动作/修复次数与上次不同，单样本不能把差值归因新投影，不能据此宣布稳定
+性能或整体闭环。最终回答仍 1796 字符、重复列出缺口；部分结论先以确定口吻推断应用加载
+配置、随后才承认未验证，表达校准仍有改善空间。UX-03 保持 open 和 focus 中，待
+换名/变体及更稳定预算验收；不为漂亮统计降级验收要求。
+原件 `parallel-quality-20261005T083859340749-cc6195b1/parallel_audit_20261005T083859344084/report.json`，
+SHA-256 `fefbaf35fabbb33e3c25627c7f67ce7180c5237e9363574653d0c005ff2afa35`。
+
+静态复查暴露进一步原因：同一个结果里完整文本被兼容字段重复承载，现有摘录的
+JSON 元数据抵消很多收益。追加只对**完全相同**长字符串的一次摘录+JSON Pointer
+局部引用，保留每个原路径/长度/partial 标识，不合并相似内容、不改原结果、不得
+跨观察引用。这是通用类型投影，不以 stdout/output 等具体字段名分支。为 root 不投影、
+artifact 读取后取消传播和转义路径/相似文本不合并追加三例。
+离线回放同一实际 ToolResult，在保持最新观察完整的控制视图中：release 8253→8253、
+backup **9009→8414**、startup **5727→5537 UTF-8 bytes**。仅计 bytes，不据此推断
+tokens、调用数或延迟；这次追加未再付费重放。原三任务现场通过来自前一提交
+`b15c16f`，不得冒充追加精确引用的 live 证据。
+
+补齐后的同组定向回归 **19 passed / 1.94s**，Ruff 通过；没有跑全量 suite。
+
+最终主审再收紧原件身份校验：两个截断 preview 相等不能证明被省略的中间内容未被
+同-ID 改写。因此已经 gated/compacted 的观察不作这次冷证据二次投影，只比较完整
+ToolResult 的类型敏感 JSON；其已有 gate/续读行为不变。追加已 gate 与结构化数组
+已截断两例，最终 **21 passed / 2.19s**，Ruff 通过。此收紧是离线验收，不扩张上面的
+旧提交 live 证据边界。目录引用与统计同步 **2 passed / 0.13s**。
+
+本轮使用 DeepSeek Flash 单次、21 dispatch、$0.074443808，零搜索；不使用高开销
+子 Agent、不更改用户并行开发的消息/Windows 模块、不重启后端。共享账本累计
+$6.500170496、1147 dispatch（7 条历史未知预留），搜索仍 8。评测状态计数维持
+41 项：4 baseline / 17 bounded live / 12 offline / 8 open，focus 仍 20。

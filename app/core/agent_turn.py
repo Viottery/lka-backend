@@ -5159,6 +5159,7 @@ class AgentTurnLoop:
         for index, observation in enumerate(observations[:-1]):
             result, feedback = observation.get("result"), observation.get("feedback")
             if ("action" in observation or "_cache" in observation
+                    or "_result_cache" in observation or observation.get("_prompt_compacted")
                     or not isinstance(result, dict) or result.get("status") != "completed"
                     or result.get("error") or not isinstance(feedback, dict)
                     or feedback.get("status") != "accepted"
@@ -5178,10 +5179,9 @@ class AgentTurnLoop:
                         or raw.get("tool_name") != observation.get("tool_name")
                         or raw.get("status") != "completed"):
                     continue
-                # Refuse changed artifacts, including same-ID/same-tool rewrites.
-                expected = (bounded_preview(raw) if "_result_cache" in observation
-                            else self._compact_for_decision_prompt(raw)[0])
-                if json.dumps(expected, sort_keys=True) != json.dumps(result, sort_keys=True):
+                # Only a full earlier result proves identity with the raw artifact.
+                # Preview equality cannot detect a rewrite of omitted content.
+                if json.dumps(raw, sort_keys=True) != json.dumps(result, sort_keys=True):
                     continue
                 candidate = self._observation_for_decision_prompt(
                     tool_name=observation["tool_name"], tool_input=observation.get("input", {}),

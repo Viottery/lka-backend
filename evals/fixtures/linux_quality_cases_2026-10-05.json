@@ -956,7 +956,7 @@
       "status": "open",
       "symptom": "多轮六facts机械通过却三原child均partial，未独立核查发布/备份/启动并综合上线结论。",
       "cause": "32k含重复输入、controller fork/发现开销、回答预留；父级补读或单child读全资料不能替代三个合同。",
-      "optimization": "compact JSON、scope目录、知识guard、控制恢复及有界partial交付已局部修复；整体保持FAILED。",
+      "optimization": "compact JSON、scope目录、控制恢复及child冷证据视图已局部改进；原三合同单次现场全部完成，投影仅省142 bytes，不可据此归因提速或宣称稳定闭环，换名/变体及简洁性仍待验收。",
       "acceptance": [
         "三个独立合同各取证且核对来源和未确认项，再综合结论",
         "六字符串、子run completed、替代child或父补做均不能代替原合同",
@@ -966,12 +966,14 @@
         "docs/quality_iteration_2026-10-05.md — R17：planning168.049s/28 calls/5/6，单Agent25.891s/6 calls/6/6但不满足多Agent要求",
         "docs/quality_iteration_2026-10-05.md — R26-K：131.354s/26 dispatch（1 unknown）/保守.171972032，parent FAILED/三child partial；六facts主要来自startup，三独立合同不满足",
         "docs/quality_iteration_2026-10-05.md — 私有独立核对：data/quality_runs/linux_20261005/parallel-quality-20261005T032549765274-4f5d2d98/parallel_audit_20261005T032549766095/independent_review.json",
-        "docs/linux_usability_progress_2026-10-05.md — UX-03：80.300s/22 calls/$0.113433728，1 completed + 2 partial显式降级；原三合同仍未全完成"
+        "docs/linux_usability_progress_2026-10-05.md — UX-03：80.300s/22 calls/$0.113433728，1 completed + 2 partial显式降级；原三合同仍未全完成",
+        "docs/linux_usability_progress_2026-10-05.md — 续轮child冷证据：53.147s/21 calls/$0.074443808，3 completed独立实际取证；单样本、仅142 bytes投影收益，整体仍open"
       ],
       "regression_tests": [
         "tests/test_runtime_parallel_quality.py",
         "tests/test_multi_agent_eval_metrics.py",
-        "tests/test_coordinator_control_quality.py"
+        "tests/test_coordinator_control_quality.py",
+        "tests/test_child_control_working_set_quality.py"
       ],
       "replay": {
         "runner": "parallel",
@@ -981,7 +983,8 @@
       "tags": [
         "semantic_open",
         "mechanical_not_semantic",
-        "original_contracts"
+        "original_contracts",
+        "bounded_live_variant"
       ],
       "exposure": "seen",
       "data_class": "synthetic"

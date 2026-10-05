@@ -193,8 +193,10 @@ child token 预算。原预算不是上下文窗口；child run completed 不等
 再按测量结果引入“聚焦执行 / 需要委派”的执行提示，由服务端解析为合法执行策略。
 现有 `PlanStep.agent_kind` 是服务端字段，不能让模型通过同名参数直接扩权。
 
-- [ ] 为每个 child 报告实际预算分解：控制提示、任务与证据输入、输出、最终回答
+- [x] 为每个 child 报告实际预算分解：控制提示、任务与证据输入、输出、最终回答
   预留、调用 / 排队耗时；说明下次 dispatch 为什么被预算拒绝，区分非预算故障。
+  续轮记录原失败节点的 decision/answer reserve 拒绝原因及本轮三 child 分阶段
+  token/时间消费；原始完整日志保留，不将 UTF-8 bytes 当 provider tokens。
 - [ ] 第一阶段保持原三任务、独立性和 32768 ceiling，裁剪 coordinator 重复 schema
   / fork 示例 / 不相关目录；保留当前合法动作，不省略必须执行的 schema。
   有条件地加载完整委派说明时，要有明确可用的发现动作，不能让模型猜隐藏能力。
@@ -209,9 +211,16 @@ child token 预算。原预算不是上下文窗口；child run completed 不等
   ToolView，不重置已消费费用，不全局禁止 coordinator。旧请求保持原默认。
 - [ ] 先用相同有效预算比较轻量视图；若角色预算不同，单列实验，不伪装同配置 A/B。
   保留可执行的回答预留，实际拟合下一次 prompt，不单纯缩小预留或提高 ceiling。
-- [ ] 验证独立节点真正重叠：记录 queued/start/end 和 provider 并发；查明是
+- [x] 验证独立节点真正重叠：记录 queued/start/end 和 provider 并发；查明是
   scheduler 串行、共享 workload 限流还是模型服务慢，再针对实际瓶颈调整。
   不用无上限 fan-out，保持前台优先和后台让出。
+  原三任务本轮 release/backup starts 相差 0.156s，执行区间重叠；第三个依 max-2
+  槽位启动，无 scheduler 串行问题。这不证明供应商内部 GPU 并行。
+- [x] child 控制视图将较早 accepted 证据转为有当前授权 reader 的可回读摘录，
+  保留最新观察、失败、replan 与结构化缺口；JSON/native answer 预留及实际输入
+  使用原观察。兼容字段中完全相同长文本采用局部引用，不修改原始结果。
+  21 项离线边界通过；原三合同单次现场通过，但仅一个步骤省142 bytes，整体仍
+  open。追加局部引用只有离线证据，不把一次耗时下降当成因果/稳定验收。
 - [ ] 失败时以 UX-01 交付已有发现，以 UX-04 处理有限重规划；空检索须报告来源范围，
   不能靠父级补读、第四个万能 child 或放宽合同把三独立审计算通过。
 
