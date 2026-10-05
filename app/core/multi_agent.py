@@ -349,7 +349,14 @@ class PlanPatch(ValueObject):
     target_step_id: str | None = Field(default=None, max_length=200)
     reduced_scope: ScopeGrant | None = None
     alternative_step: PlanStep | None = None
-    degradation_note: str | None = None
+    degradation_note: str | None = Field(
+        default=None,
+        description=(
+            "Explicit unmet original requirements when skipping or changing an "
+            "alternative step's literal output contract or verification criteria; "
+            "an execution replacement is not proof of original contract coverage."
+        ),
+    )
     user_question: str | None = None
     budget: RuntimeBudget | None = None
 
@@ -360,6 +367,10 @@ class PlanPatch(ValueObject):
             if getattr(self, field_name) is None:
                 raise ValueError(f"{self.operation.value} patch requires {field_name}.")
         allowed = set(required) | {"budget"}
+        if self.operation == PlanPatchOperation.ALTERNATIVE_STEP:
+            allowed.add("degradation_note")
+            if self.degradation_note is not None and not self.degradation_note.strip():
+                raise ValueError("Alternative degradation_note must be nonempty.")
         supplied = {
             name for name in ("target_step_id", "reduced_scope", "alternative_step", "degradation_note", "user_question")
             if getattr(self, name) is not None

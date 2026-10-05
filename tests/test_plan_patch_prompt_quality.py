@@ -483,7 +483,11 @@ def _mixed_terminal_recovery(planner, *, operation, has_output):
     patch = _patch(operation=operation)
     completed_id = "already-done"
     if operation == "alternative_step":
-        patch.pop("degradation_note")
+        # This alternative changes the literal contract, not just execution.
+        patch["degradation_note"] = (
+            "Original cited findings remain unverified; replacement delivers "
+            "a conclusion with limitations."
+        )
         completed_id = "replacement"
         patch["alternative_step"] = {
             "correlation_id": plan.correlation_id,

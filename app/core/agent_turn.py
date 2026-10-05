@@ -1888,13 +1888,42 @@ class AgentTurnLoop:
         for record in plan.patch_history:
             patch = record.patch
             if patch.operation == PlanPatchOperation.SKIP_AND_DEGRADE:
+                if not (patch.degradation_note and patch.degradation_note.strip()):
+                    return None
                 relinquished[patch.target_step_id] = patch.degradation_note
             elif (
                 patch.operation == PlanPatchOperation.ALTERNATIVE_STEP
                 and patch.alternative_step.step_id in completed + skipped
             ):
-                relinquished[patch.target_step_id] = (
-                    f"Replaced by canonical step {patch.alternative_step.step_id}."
+                # Old journals predate the contract-change gate. Compare the
+                # immutable pre-patch contract, not objectives or a generated
+                # replacement description, before relinquishing obligations.
+                try:
+                    before = Plan.model_validate_json(record.before_json)
+                except (ValidationError, ValueError):
+                    return None
+                if (
+                    before.plan_id != plan.plan_id
+                    or before.parent_run_id != run.run_id
+                    or before.session_id != run.session_id
+                    or before.correlation_id != run.trace_id
+                ):
+                    return None
+                original = next(
+                    (step for step in before.steps if step.step_id == patch.target_step_id),
+                    None,
+                )
+                if original is None:
+                    return None
+                changed = (
+                    original.output_contract != patch.alternative_step.output_contract
+                    or original.verification_criteria != patch.alternative_step.verification_criteria
+                )
+                if changed and not (patch.degradation_note and patch.degradation_note.strip()):
+                    return None
+                relinquished[patch.target_step_id] = patch.degradation_note or (
+                    f"Execution replaced by step {patch.alternative_step.step_id}; "
+                    "original contract unchanged, independent verification not established."
                 )
         if any(step_id not in relinquished for step_id in skipped):
             return None

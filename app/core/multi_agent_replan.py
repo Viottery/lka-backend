@@ -194,6 +194,14 @@ def _mutate(plan: Plan, patch: PlanPatch, context: PlanPatchContext) -> Plan:
             raise PlanPatchRejected("Alternative steps can replace only failed or blocked steps.")
         alternative = patch.alternative_step
         assert alternative is not None
+        if (
+            alternative.output_contract != target.output_contract
+            or alternative.verification_criteria != target.verification_criteria
+        ) and not (patch.degradation_note and patch.degradation_note.strip()):
+            raise PlanPatchRejected(
+                "Alternative changes the original contract or verification criteria; "
+                "explicit degradation_note is required for uncovered requirements."
+            )
         if alternative.agent_id not in context.fork_policy.allowed_agent_ids:
             raise PlanPatchRejected(f"Alternative requests an unavailable Agent: {alternative.agent_id}")
         if (
@@ -268,7 +276,12 @@ def _mutate(plan: Plan, patch: PlanPatch, context: PlanPatchContext) -> Plan:
                     "depends_on": tuple(
                         alternative.step_id if dep == target.step_id else dep
                         for dep in dependent.depends_on
-                    )
+                    ),
+                    "degraded_dependency_notes": (
+                        (*dependent.degraded_dependency_notes,
+                         f"{target.step_id}: {patch.degradation_note}")
+                        if patch.degradation_note else dependent.degraded_dependency_notes
+                    ),
                 })
         steps.append(alternative)
         return _validated_update(plan, steps=tuple(steps), status=PlanStatus.REPLANNING)

@@ -1107,6 +1107,10 @@ snapshot，不把自动“已替换”当原义务覆盖。5 RED/2 GREEN→新15
 Root合同/恢复/诊断/cooldown/receipt/observation联合157 GREEN（22.68s）。这是字面合同
 与显式降级门禁，不是语义正确性认证；同任务真实复测和独立复核仍待。
 
+R24-R 独立复核60 GREEN（7.00s），限定差异无P1/P2；原scope、role budget、DAG及
+provenance门禁仍存在。非空degradation_note只表示有明确降级，不证明已覆盖原义务。
+实现与回归按独立owned patch提交，未包含同文件中的receipt/cooldown或用户改动。
+
 R23-V 独立复核实际再找出两处outer-hook P2：callback未拿到现有ToolView、首次cache
 load取消后仍进行多余I/O。新增2例真实RED后，复用现有ToolView getter，对generic及
 registered mapping均验权，cache load/producer/refit前后检查取消；Root10 GREEN/3.14s，
