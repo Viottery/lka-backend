@@ -1204,3 +1204,15 @@ R26-K 离线/独立闭合：仅knowledge两helper对齐server full authority。2
 workspace/session其他源、组合约束、requested source越界均拒绝或空结果，read-only与
 output协议不变。既有项目隔离依workspace路径，未新增独立project_id授权能力。
 将helper实现与证据按本轮独立提交，再保持同目标32-call实际复测，不扩scope/cap。
+
+R25-B 隔离follow-up入口完成：仅新增脚本/离线测试，用正常append_message与
+record_context_exchange/outbox种入4组合成历史，worker依生产prefix/CAS机制发表
+watermark4→6，然后同session两次真实Graph调用检查摘要复用及尾部更正。4096为本次
+medium override，配置与生产默认65536不变；不声称生产长窗口负载。源句只seed0，
+追问不携带日期/审批答案；禁止前台写入、32LLM/0search/provider30s/probe180s、shared
+ledger、secret guard在Recorded前、close先于worker stop、private0600 raw+hash。
+Root预审还纠正“摘要交付=原源句完整literal”的诊断错误：解析实际provider JSON，
+比较已发表summary版本；合法改写可complete，裁剪partial/unknown，事实仍独立审核。
+native新10 GREEN/7.62s、Root独立10 GREEN/8.01s、独立review10 GREEN/7.30s且无P1/P2，
+复用入口相关20 GREEN。受限环境2个reservation timeout/零dispatch不作产品缺陷；
+Linux宿主目标全绿。本轮只提交测试入口，remote真实验收下一次单独进行。
