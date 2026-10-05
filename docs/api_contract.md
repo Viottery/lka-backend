@@ -599,6 +599,16 @@ audit record 和本地日志路径均不属于正常 HTTP 响应；它们只保�
 - `verification_warnings` 是本地最终回答检查结果。当前只做 warning，不自动改写 LLM
   最终回答；领域级校验规则必须通过 package metadata 或独立 verifier 注册，不能在
   Agent core 中写死。
+- finish 的可选 `answer_checks` 支持 `requirement_id` 与
+  `status=pending|supported|blocked`，旧 reason-only 调用保持兼容。已声明要求保存在
+  Graph checkpoint，并以独立 `task_completion` 进入后续 decision/answer；遗漏要求不等于
+  解决要求。存在 pending 时可按预算恢复最多两次，无新增成功工具证据时停止并交付
+  部分结果；blocked 必须有原因。`supported` 只是模型声明，不是后端语义校验。
+  服务端 `task_completion_handoff` 记录交付时的缺口，child `TaskResult` 据此保留
+  `partial/missing_requirements`，包括终态重放；Graph `final_answer` progress 会标记
+  partial。简单任务不必填这些字段，也不增加默认模型调用。未声明要求或仅在回答阶段
+  才发现的缺口目前不会自动重开执行。设计与验收见
+  `docs/task_completion_optimization_2026-10-05.md`。
 - 展开工具时，`expanded_tools[*].input_schema` 会尽量暴露 required fields、allowed values
   和 examples。LLM decision prompt 要求模型严格遵循这些 schema；具体枚举值、示例和
   领域约束由对应 Tool Package schema 提供。

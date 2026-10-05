@@ -763,6 +763,7 @@ class AgentGraphRunner:
             expanded_tools=data["expanded_tools"],
             observations=data["observations"],
             llm_events=llm,
+            task_completion=ws.completion_state.context(),
         )
         for observation in reversed(data["observations"]):
             if (
@@ -972,6 +973,19 @@ class AgentGraphRunner:
                 data["progress_events"] = self._dump(progress)
                 ws.pending_decision = {}
                 return self._save(s, ws, data, "operation_rejected")
+            operation = x.get("operation")
+            if ws.completion_state.requirements or (
+                isinstance(operation, dict) and operation.get("answer_checks") is not None
+            ):
+                progress = self._models(data["progress_events"], AgentTurnProgressEvent)
+                ready = self.turn_loop._check_task_completion(
+                    state=ws.completion_state, decision=x, observations=data["observations"],
+                    progress_events=progress, can_continue=ws.step_index < self.turn_loop.max_decision_steps,
+                )
+                data["progress_events"] = self._dump(progress)
+                if not ready:
+                    ws.pending_decision = {}
+                    return self._save(s, ws, data, "operation_rejected")
             return self._save(s, ws, data, "operation_answer")
         if action != "call_tool":
             ws.terminal_reason = (
@@ -1270,6 +1284,7 @@ class AgentGraphRunner:
         final_decision = {
             "action": "final_answer",
             "reason": ws.terminal_reason or ws.pending_decision.get("reason"),
+            "_task_completion": ws.completion_state.context(),
         }
         if ws.pending_decision.get("action") == "final_answer":
             operation = ws.pending_decision.get("operation")
@@ -1289,7 +1304,7 @@ class AgentGraphRunner:
                     context_window=data["context_window"],
                     llm_events=llm,
                 )
-                if ws.initial_package is None and not data["observations"]
+                if ws.initial_package is None and not data["observations"] and not ws.completion_state.requirements
                 else self.turn_loop._answer_with_llm(
                     user_input=ws.user_input,
                     route=ws.route,
@@ -1323,15 +1338,22 @@ class AgentGraphRunner:
             )
         data["llm_events"] = self._dump(llm)
         ws.terminal_answer = answer
+        missing = [item.requirement_id for item in ws.completion_state.requirements if item.status != "supported"]
+        if ws.completion_state.stop_reason == "requirement_capacity_exhausted":
+            missing.append("task_completion_capacity_exhausted")
+        if generation_failed:
+            missing.insert(0, "answer_generation_failed")
         self.turn_loop._append_progress(
             progress,
             type="final_answer",
             stage="answer",
-            status="failed" if generation_failed else "completed",
+            status="failed" if generation_failed else "partial" if missing or ws.completion_state.stop_reason else "completed",
             message=self.turn_loop._short_text(answer),
-            metadata={"answer": answer, **(
-                {"missing_requirements": ["answer_generation_failed"]} if generation_failed else {}
-            )},
+            metadata={
+                "answer": answer,
+                **({"missing_requirements": missing, "completion_stop_reason": ws.completion_state.stop_reason}
+                   if missing or ws.completion_state.stop_reason else {}),
+            },
         )
         data["progress_events"] = self._dump(progress)
         return self._save(s, ws, data, "answered")

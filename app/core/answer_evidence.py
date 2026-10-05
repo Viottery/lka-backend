@@ -50,7 +50,9 @@ class AnswerEvidenceReference(BaseModel):
 
 class AnswerCheck(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    requirement_id: str | None = Field(default=None, strict=True, min_length=1, max_length=80)
     requirement: str = Field(strict=True, min_length=1, max_length=240)
+    status: Literal["pending", "supported", "blocked"] | None = None
     evidence: list[AnswerEvidenceReference] = Field(default_factory=list, max_length=3)
     gap: str = Field(default="", strict=True, max_length=240)
 
@@ -62,7 +64,9 @@ ANSWER_CHECKS_SCHEMA = {
     "items": {
         "type": "object", "additionalProperties": False, "required": ["requirement"],
         "properties": {
+            "requirement_id": {"type": "string", "minLength": 1, "maxLength": 80},
             "requirement": {"type": "string", "minLength": 1, "maxLength": 240},
+            "status": {"type": "string", "enum": ["pending", "supported", "blocked"]},
             "gap": {"type": "string", "maxLength": 240},
             "evidence": {"type": "array", "maxItems": 3, "items": {
                 "type": "object", "additionalProperties": False,
@@ -78,13 +82,14 @@ ANSWER_CHECKS_SCHEMA = {
 }
 
 ANSWER_CHECKS_DECISION_POLICY = (
-    " For a task with several required findings, final_answer may include optional "
-    "answer_checks (at most 8): each has requirement, optional gap, and optional evidence "
-    "references (at most 3) with observation_id, output-relative JSON Pointer path and "
-    "an exact quote of at most 500 characters already visible in that observation. "
-    "Use only actual observation IDs; never invent references or declare verification. "
-    "These are concise handoff notes for the answer writer, not final prose; omit them "
-    "for simple answers. Do not perform extra reads merely to populate this optional field."
+    " For multiple required findings, use optional answer_checks (max 8): requirement, "
+    "optional stable requirement_id, status (pending/supported/blocked), gap, and up to 3 "
+    "evidence references with real observation_id, output-relative JSON Pointer path and "
+    "exact visible quote (max 500 characters). supported is a model declaration, never "
+    "verification; blocked needs a reason in gap. task_completion preserves known IDs and "
+    "gaps; omission does not resolve them. task_completion_feedback requests bounded "
+    "continuation. Keep the IDs when updating notes. These are handoff notes, not final "
+    "prose. Omit for simple answers. Do not perform extra reads merely to populate notes."
 )
 
 ANSWER_EVIDENCE_POLICY = (
@@ -108,7 +113,7 @@ def normalize_answer_checks(value: Any) -> list[dict[str, Any]] | None:
     if not isinstance(value, list) or len(value) > 8:
         return None
     try:
-        return [AnswerCheck.model_validate(item).model_dump(mode="json") for item in value]
+        return [AnswerCheck.model_validate(item).model_dump(mode="json", exclude_none=True) for item in value]
     except ValidationError:
         return None
 

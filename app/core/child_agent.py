@@ -232,11 +232,17 @@ class ChildAgentExecutor:
     ) -> tuple[str, ...]:
         """Classify explicit control termination, never the answer's prose."""
         missing: list[str] = []
+        completion_missing: tuple[str, ...] = ()
         for event in self.run_manager.list_events(child_run_id):
             if event.type in {"child_budget_finish", "answer_generation_failed"}:
                 missing.append(event.type)
             elif event.type == "subtask_result":
                 missing.extend(event.payload.get("missing_requirements", ()))
+            elif event.type == "task_completion_handoff":
+                # Only the latest server handoff describes delivery; earlier
+                # pending work may have been resolved before answering.
+                completion_missing = tuple(event.payload.get("missing_requirements", ()))
+        missing.extend(completion_missing)
         if decision_events:
             last = decision_events[-1]
             action = last.get("action") if isinstance(last, dict) else last.action

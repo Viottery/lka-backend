@@ -119,6 +119,7 @@ from app.core.safety import (
     stable_safety_review_id,
 )
 from app.core.sessions import AgentSession, SessionRecentMessage, SessionService
+from app.core.task_completion import TaskCompletionState, assess_finish, completion_feedback
 from app.core.tool_result_gate import (
     bounded_preview,
     cache_scope_compatible,
@@ -680,6 +681,7 @@ class AgentTurnWorkingSet(BaseModel):
     observation_artifact_refs: list[dict[str, Any]] = Field(default_factory=list)
     terminal_answer: str | None = None
     terminal_reason: str | None = None
+    completion_state: TaskCompletionState = Field(default_factory=TaskCompletionState)
 
 
 class AgentTurnLoop:
@@ -1475,6 +1477,7 @@ class AgentTurnLoop:
         observations: list[dict[str, Any]] = []
         successful_call_fingerprints: set[str] = set()
         fork_format_repair_used = False
+        completion_state = TaskCompletionState()
         observations.extend(self._cached_tool_observations_from_context_window(context_window))
         package_catalog = self._package_catalog(context.tool_view)
         expanded_package_names = {selected_package} if selected_package else set()
@@ -1491,6 +1494,7 @@ class AgentTurnLoop:
                 expanded_tools=expanded_tools,
                 observations=observations,
                 llm_events=llm_events,
+                task_completion=completion_state.context(),
             )
             if decision is None:
                 return None
@@ -1634,6 +1638,12 @@ class AgentTurnLoop:
                         message="Unresolved child failures require a structured PlanPatch.",
                     )
                     continue
+                if not self._check_task_completion(
+                    state=completion_state, decision=decision, observations=observations,
+                    progress_events=progress_events, can_continue=step_index < self.max_decision_steps,
+                ):
+                    continue
+                decision = {**decision, "_task_completion": completion_state.context()}
                 return self._answer_with_llm(
                     user_input=user_input,
                     route=route,
@@ -1657,7 +1667,7 @@ class AgentTurnLoop:
                         route=route,
                         context_window=context_window,
                         observations=observations,
-                        final_decision=decision,
+                        final_decision={**decision, "_task_completion": completion_state.context()},
                         llm_events=llm_events,
                     )
                 return None
@@ -1669,7 +1679,7 @@ class AgentTurnLoop:
                         route=route,
                         context_window=context_window,
                         observations=observations,
-                        final_decision=decision,
+                        final_decision={**decision, "_task_completion": completion_state.context()},
                         llm_events=llm_events,
                     )
                 return None
@@ -1804,7 +1814,8 @@ class AgentTurnLoop:
                     route=route,
                     context_window=context_window,
                     observations=observations,
-                    final_decision={"action": "final_answer", "reason": reason},
+                    final_decision={"action": "final_answer", "reason": reason,
+                                    "_task_completion": completion_state.context()},
                     llm_events=llm_events,
                 )
 
@@ -1858,7 +1869,8 @@ class AgentTurnLoop:
 
         if self._multi_agent_replan_pending():
             return self._unresolved_multi_agent_answer()
-        if observations:
+        if observations or completion_state.requirements:
+            assess_finish(completion_state, operation={}, observations=observations, can_continue=False)
             return self._answer_with_llm(
                 user_input=user_input,
                 route=route,
@@ -1867,10 +1879,46 @@ class AgentTurnLoop:
                 final_decision={
                     "action": "final_answer",
                     "reason": "Step limit reached after loading evidence.",
+                    "_task_completion": completion_state.context(),
                 },
                 llm_events=llm_events,
             )
         return None
+
+    def _check_task_completion(
+        self, *, state: TaskCompletionState, decision: dict[str, Any],
+        observations: list[dict[str, Any]], progress_events: list[AgentTurnProgressEvent],
+        can_continue: bool,
+    ) -> bool:
+        self._raise_if_cancel_requested()
+        operation = decision.get("operation")
+        if not state.requirements and not (
+            isinstance(operation, dict) and operation.get("answer_checks") is not None
+        ):
+            return True
+        budget_finish = any(item.get("action") == "child_budget_finish" for item in observations)
+        child_budget = self._child_budget_for_prompt()
+        if child_budget and child_budget.get("remaining_llm_calls") is not None:
+            can_continue = can_continue and child_budget["remaining_llm_calls"] > 1
+            budget_finish = budget_finish or child_budget["remaining_llm_calls"] <= 1
+        ready = assess_finish(
+            state, operation=decision.get("operation"), observations=observations,
+            can_continue=can_continue and not budget_finish,
+            stop_reason="child_budget_exhausted" if budget_finish else "decision_budget_exhausted",
+        )
+        if state.requirements:
+            missing = [item.requirement_id for item in state.requirements if item.status != "supported"]
+            self._append_progress(
+                progress_events, type="task_completion_checked", stage="decision",
+                status="partial" if ready and (missing or state.stop_reason) else "ready" if ready else "needs_work",
+                message="Task requirement handoff checked; this is not semantic verification.",
+                metadata={"missing_requirements": missing, "stop_reason": state.stop_reason,
+                          "recovery_attempts": state.recovery_attempts},
+            )
+        if not ready:
+            observations.append(completion_feedback(state))
+        self._raise_if_cancel_requested()
+        return ready
 
     def _multi_agent_replan_pending(self, run_id: str | None = None) -> bool:
         manager = getattr(self, "run_manager", None)
@@ -3068,6 +3116,7 @@ class AgentTurnLoop:
         expanded_tools: list[dict[str, Any]],
         observations: list[dict[str, Any]],
         llm_events: list[AgentTurnLLMEvent],
+        task_completion: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """Bound PlanPatch repair in the shared JSON/native control path."""
         recovery = self._terminal_plan_recovery(_turn_run_id.get())
@@ -3107,6 +3156,7 @@ class AgentTurnLoop:
                 observations=observations,
                 llm_events=llm_events,
                 plan_patch_repair=repair_feedback,
+                task_completion=task_completion,
             )
             if decision is not None and isinstance(decision.get("_child_budget_finish"), dict):
                 observations.append(decision.pop("_child_budget_finish"))
@@ -3203,6 +3253,7 @@ class AgentTurnLoop:
         observations: list[dict[str, Any]],
         llm_events: list[AgentTurnLLMEvent],
         plan_patch_repair: dict[str, Any] | None = None,
+        task_completion: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         can_fork = self._can_fork_for_prompt()
         prompt_observations = self._observations_for_child_control(observations)
@@ -3235,6 +3286,7 @@ class AgentTurnLoop:
                 llm_events=llm_events,
                 fork_repair_feedback=fork_repair_feedback,
                 plan_patch_repair=plan_patch_repair,
+                task_completion=task_completion,
             )
             if native_decision is not None:
                 return native_decision
@@ -3444,6 +3496,8 @@ class AgentTurnLoop:
                 "observations": prompt_observations,
                 "completed_tool_calls": self._completed_tool_call_summaries(observations),
             }
+            if task_completion:
+                prompt_payload["task_completion"] = task_completion
             if plan_patch_contract is not None:
                 prompt_payload["plan_patch_contract"] = plan_patch_contract
             if plan_patch_repair is not None:
@@ -3868,6 +3922,7 @@ class AgentTurnLoop:
         fork_repair_feedback: dict[str, Any] | None = None,
         plan_patch_repair: dict[str, Any] | None = None,
         delivery_observations: list[dict[str, Any]] | None = None,
+        task_completion: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         require_function_call = self._supports_required_tool_choice()
         system_prompt = (
@@ -3936,6 +3991,7 @@ class AgentTurnLoop:
                 "agent_catalog": self._agent_catalog_for_prompt() if can_fork else [],
                 "observations": observations,
                 "completed_tool_calls": completed_tool_calls,
+                **({"task_completion": task_completion} if task_completion else {}),
                 **({"plan_patch_contract": plan_patch_contract}
                    if plan_patch_contract is not None else {}),
                 **({"plan_patch_repair": plan_patch_repair}
@@ -6112,8 +6168,9 @@ class AgentTurnLoop:
             "uncertainty when evidence is incomplete. Tool observations may show only a subset "
             "of returned items: use _prompt_compaction counts, never infer that unseen items "
             "do not exist, and do not claim a complete enumeration from a partial view. "
-            "A _result_cache preview is also partial; if it was not read further, state "
-            "the resulting coverage limitation. "
+            "A _result_cache preview is partial, but an unread remainder does not itself "
+            "mean the requested finding is incomplete. Mention a coverage limitation only "
+            "when it affects a requested conclusion or enumeration. "
             "The server context_delivery view describes text retained in this exact answer "
             "prompt, not everything fetched or scanned by a tool. Complete cached-value "
             "coverage is not proof of complete upstream-source coverage; when upstream "
@@ -6161,6 +6218,27 @@ class AgentTurnLoop:
         }
         if output_contract:
             answer_payload["output_contract"] = output_contract
+        completion_context = final_decision.get("_task_completion") if isinstance(final_decision, dict) else None
+        if completion_context:
+            answer_payload["task_completion"] = completion_context
+            missing = [item["requirement_id"] for item in completion_context["requirements"]
+                       if item["status"] in {"pending", "blocked"}]
+            if completion_context.get("stop_reason") == "requirement_capacity_exhausted":
+                missing.append("task_completion_capacity_exhausted")
+            self._append_run_event(
+                type="task_completion_handoff", stage="answer",
+                message="Known requirement state handed to the answer writer.",
+                payload={"missing_requirements": missing,
+                         "stop_reason": completion_context.get("stop_reason"),
+                         "scope": "model_declared_requirements_not_semantic_verification"},
+            )
+            system_prompt += (
+                " task_completion preserves known model-declared requirements; supported is not "
+                "independent verification. Answer satisfied requirements and disclose each material "
+                "pending/blocked requirement once within the user's format. A budget/no-progress "
+                "stop is a partial result, not completion or a need to ask permission to retry "
+                "already-authorized reads. Do not print the internal ledger or recovery counters."
+            )
         user_prompt = serialize_prompt_payload(answer_payload)
         response = self._complete_answer_with_recovery(
             stage="answer",
@@ -7823,6 +7901,8 @@ class AgentTurnLoop:
         output_contract = _current_output_contract()
         if output_contract:
             delivery["output_contract"] = output_contract
+        if control.get("task_completion"):
+            delivery["task_completion"] = control["task_completion"]
         fitted = self._budget_llm_prompt(
             system_prompt="", user_prompt=serialize_prompt_payload(delivery),
             max_output_tokens=CHILD_FINISH_OUTPUT_RESERVE_TOKENS, tools=None,
