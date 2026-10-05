@@ -34,7 +34,7 @@ SOURCE_FILES = (
     "app/core/agent_turn.py", "app/core/agent_graph.py", "app/core/agent_runs.py",
     "app/core/child_agent.py", "app/core/multi_agent.py", "app/core/prompt_budget.py",
     "app/core/multi_agent_replan.py", "app/core/tool_result_gate.py",
-    "app/tool_packages/observation.py",
+    "app/tool_packages/observation.py", "app/tool_packages/knowledge.py",
     "app/core/tools.py", "app/core/llm/service.py", "app/tool_packages/bash.py",
     "scripts/eval_realworld.py", "scripts/eval_runtime_parallel_quality.py",
 )
