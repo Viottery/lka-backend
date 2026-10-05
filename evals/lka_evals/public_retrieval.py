@@ -106,7 +106,7 @@ def _percentile(values: list[float], percentile: float) -> float:
 def _new_service(
     data_dir: Path, *, embedding_model: str | None = None,
     embedding_dimensions: int = 512, rerank_model: str | None = None,
-    model_cache_dir: Path | None = None,
+    model_cache_dir: Path | None = None, query_prefix: str = "",
 ) -> KnowledgeService:
     db_path = get_db_path(data_dir)
     init_db(db_path)
@@ -115,6 +115,7 @@ def _new_service(
         FastEmbedEmbeddingProvider(
             model_name=embedding_model, dimensions=embedding_dimensions,
             cache_dir=cache_dir, batch_size=16, local_files_only=True,
+            query_prefix=query_prefix,
         ) if embedding_model else None
     )
     index = (
@@ -155,7 +156,7 @@ def _load_corpus(service: KnowledgeService, dataset: PublicDataset) -> None:
 def evaluate_dataset(dataset: PublicDataset, *, mode: str, top_k: int, sample_limit: int,
                      seed: int, data_dir: Path, embedding_model: str | None = None,
                      embedding_dimensions: int = 512, rerank_model: str | None = None,
-                     model_cache_dir: Path | None = None,
+                     model_cache_dir: Path | None = None, query_prefix: str = "",
                      query_details: list[dict[str, Any]] | None = None,
                      capture_evidence_ids: set[str] | None = None) -> dict[str, Any]:
     queries = list(dataset.queries)
@@ -163,6 +164,7 @@ def evaluate_dataset(dataset: PublicDataset, *, mode: str, top_k: int, sample_li
         queries = random.Random(seed).sample(queries, sample_limit)
     requires_semantic = mode in {"semantic", "hybrid", "hybrid_rerank"}
     requires_rerank = mode in {"keyword_rerank", "hybrid_rerank"}
+    runtime_models = {"embedding": None, "reranker": None}
     unavailable_reason = (
         "No local embedding model was specified." if requires_semantic and not embedding_model
         else "No local reranker model was specified." if requires_rerank and not rerank_model
@@ -175,7 +177,7 @@ def evaluate_dataset(dataset: PublicDataset, *, mode: str, top_k: int, sample_li
                 "sample_limit": sample_limit, "seed": seed, "top_k": top_k,
                 "metrics": None, "forbidden_leak_count": None, "fallback_rate": None,
                 "failure_count": 0, "failure_rate": 0.0,
-                "latency_ms": {"p50": None, "p95": None}}
+                "latency_ms": {"p50": None, "p95": None}, "runtime_models": runtime_models}
 
     setup_wall_started = time.perf_counter()
     setup_cpu_started = time.process_time()
@@ -183,8 +185,25 @@ def evaluate_dataset(dataset: PublicDataset, *, mode: str, top_k: int, sample_li
         data_dir, embedding_model=embedding_model if requires_semantic else None,
         embedding_dimensions=embedding_dimensions,
         rerank_model=rerank_model if requires_rerank else None,
-        model_cache_dir=model_cache_dir,
+        model_cache_dir=model_cache_dir, query_prefix=query_prefix,
     )
+    if service._embedding_provider is not None:
+        provider = service._embedding_provider
+        runtime_models["embedding"] = {
+            "model_name": provider.model_info.model_name,
+            "dimensions": provider.model_info.dimensions,
+            "query_prefix": query_prefix,
+            "threads": getattr(provider, "threads", None),
+            "local_files_only": getattr(provider, "_local_files_only", None),
+            "adapter_instantiated": True,
+        }
+    if service._reranker is not None:
+        runtime_models["reranker"] = {
+            "model_name": getattr(service._reranker, "model_name", None),
+            "threads": getattr(service._reranker, "threads", None),
+            "local_files_only": getattr(service._reranker, "local_files_only", None),
+            "adapter_instantiated": True,
+        }
     reranker_probe_ms = 0.0
     try:
         if requires_rerank:
@@ -198,7 +217,7 @@ def evaluate_dataset(dataset: PublicDataset, *, mode: str, top_k: int, sample_li
                 "sample_limit": sample_limit, "seed": seed, "top_k": top_k,
                 "metrics": None, "forbidden_leak_count": None, "fallback_rate": None,
                 "failure_count": 0, "failure_rate": 0.0,
-                "latency_ms": {"p50": None, "p95": None}}
+                "latency_ms": {"p50": None, "p95": None}, "runtime_models": runtime_models}
     import_started = time.perf_counter()
     _load_corpus(service, dataset)
     corpus_import_ms = (time.perf_counter() - import_started) * 1000
@@ -215,7 +234,7 @@ def evaluate_dataset(dataset: PublicDataset, *, mode: str, top_k: int, sample_li
                     "sample_limit": sample_limit, "seed": seed, "top_k": top_k,
                     "metrics": None, "forbidden_leak_count": None, "fallback_rate": None,
                     "failure_count": 0, "failure_rate": 0.0,
-                    "latency_ms": {"p50": None, "p95": None}}
+                    "latency_ms": {"p50": None, "p95": None}, "runtime_models": runtime_models}
     setup_wall_ms = (time.perf_counter() - setup_wall_started) * 1000
     setup_cpu_ms = (time.process_time() - setup_cpu_started) * 1000
     by_title: dict[str, list[str]] = {}
@@ -304,7 +323,7 @@ def evaluate_dataset(dataset: PublicDataset, *, mode: str, top_k: int, sample_li
             slices.setdefault(key, []).append(row)
     return {"dataset": dataset.dataset, "mode": mode, "mode_status": "available", "query_count": count,
             "document_count": len(dataset.documents), "sample_limit": sample_limit,
-            "seed": seed, "top_k": top_k,
+            "seed": seed, "top_k": top_k, "runtime_models": runtime_models,
             "metrics": {name: statistics.fmean(values) if values else 0.0
                         for name, values in accum.items()},
             "forbidden_leak_count": forbidden_leaks, "fallback_rate": fallbacks / count if count else 0.0,
@@ -330,7 +349,8 @@ def evaluate_dataset(dataset: PublicDataset, *, mode: str, top_k: int, sample_li
 def run_benchmark(*, datasets: list[Path], modes: list[str], top_k: int, sample_limit: int,
                   seed: int, output: Path | None = None, embedding_model: str | None = None,
                   embedding_dimensions: int = 512, rerank_model: str | None = None,
-                  model_cache_dir: Path | None = None, recall_tolerance: float = 0.05,
+                  model_cache_dir: Path | None = None, query_prefix: str = "",
+                  recall_tolerance: float = 0.05,
                   all_hop_tolerance: float = 0.05, max_latency_ratio: float = 2.0) -> dict[str, Any]:
     if top_k < 1 or sample_limit < 0:
         raise ValueError("top_k must be positive and sample_limit non-negative")
@@ -351,7 +371,8 @@ def run_benchmark(*, datasets: list[Path], modes: list[str], top_k: int, sample_
                 rows.append(evaluate_dataset(dataset, mode=mode, top_k=top_k,
                     sample_limit=sample_limit, seed=seed, data_dir=Path(temp),
                     embedding_model=embedding_model, embedding_dimensions=embedding_dimensions,
-                    rerank_model=rerank_model, model_cache_dir=model_cache_dir))
+                    rerank_model=rerank_model, model_cache_dir=model_cache_dir,
+                    query_prefix=query_prefix))
     effective_cache_dir = model_cache_dir or Path("./data/runtime/models")
     report = {"schema_version": 2, "benchmark": "public_retrieval_offline",
               "manifest": manifest, "configuration": {"modes": modes, "top_k": top_k,
@@ -360,6 +381,10 @@ def run_benchmark(*, datasets: list[Path], modes: list[str], top_k: int, sample_
               "corpus_import_and_index_build_excluded_from_query_latency": True,
               "embedding_model": embedding_model,
               "embedding_dimensions": embedding_dimensions, "rerank_model": rerank_model,
+              "query_prefix": query_prefix,
+              "profile_source": "independent_benchmark_parameters",
+              "runtime_config_loaded": False,
+              "query_transform_layer": "adapter_literal_prefix_then_fastembed_embed",
               "retrieval_profile": "knowledge.search default (max 2 chunks/document)",
               "reranker_batch_size": RerankerConfig().batch_size,
               "reranker_max_candidates": RerankerConfig().max_candidates,
@@ -389,6 +414,8 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=20260929)
     parser.add_argument("--embedding-model", help="cached local FastEmbed model; never downloaded by the runner")
     parser.add_argument("--embedding-dimensions", type=int, default=512)
+    parser.add_argument("--query-prefix", default="",
+                        help="literal query-only adapter prefix before FastEmbed.embed; default empty, not read from runtime config")
     parser.add_argument("--rerank-model", help="cached local FastEmbed cross-encoder; never downloaded by the runner")
     parser.add_argument("--model-cache-dir", type=Path)
     parser.add_argument("--output", type=Path)
@@ -398,7 +425,8 @@ def main() -> None:
                            sample_limit=args.sample_limit, seed=args.seed, output=args.output,
                            embedding_model=args.embedding_model,
                            embedding_dimensions=args.embedding_dimensions,
-                           rerank_model=args.rerank_model, model_cache_dir=args.model_cache_dir)
+                           rerank_model=args.rerank_model, model_cache_dir=args.model_cache_dir,
+                           query_prefix=args.query_prefix)
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
 
