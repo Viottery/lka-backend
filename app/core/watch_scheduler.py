@@ -13,7 +13,11 @@ from zoneinfo import ZoneInfo
 from app.core.multi_agent import TaskResultStatus
 from app.core.watch_execution import WatchExecutionAdapter
 from app.domains.watch import BriefingInput, WatchService
-from app.domains.watch_briefing import is_complete_briefing_payload, normalize_briefing
+from app.domains.watch_briefing import (
+    is_complete_briefing_payload,
+    normalize_briefing,
+    reconcile_current_observations,
+)
 
 
 def _merge_previous_observations(
@@ -24,17 +28,19 @@ def _merge_previous_observations(
     """Keep prompt previews bounded; full comparison text never enters the goal."""
     latest: dict[str, dict[str, Any]] = {}
     for briefing in reversed(briefings):
-        for category in ("changes", "unchanged"):
-            for item in briefing.get(category, []):
+        # Historical contradictory records must not reintroduce section-order last-wins.
+        changed, unchanged, _ = reconcile_current_observations(
+            briefing.get("changes", []), briefing.get("unchanged", []), latest
+        )
+        for category, items in (("changes", changed), ("unchanged", unchanged)):
+            for item in items:
                 if not isinstance(item, dict):
                     continue
                 event_key = item.get("event_key")
                 if not isinstance(event_key, str) or not event_key:
                     continue
                 latest[event_key] = {
-                    key: (item[key] if for_comparison and key in {
-                        "claim", "current_observation", "previous_observation",
-                    } else str(item[key])[:240]) if isinstance(item.get(key), str) else item.get(key)
+                    key: item[key]
                     for key in (
                         "event_key",
                         "event_id",
@@ -46,13 +52,20 @@ def _merge_previous_observations(
                     )
                     if key in item
                 } | {
-                    "evidence_refs": [str(ref)[:240] for ref in item.get("evidence_refs", [])[:3]],
+                    "evidence_refs": item.get("evidence_refs", []),
                     "last_seen": briefing.get("created_at"),
                     "prior_section": category,
                 }
     recent = sorted(
         latest.values(), key=lambda item: str(item.get("last_seen") or ""), reverse=True
     )[:30]
+    # Reconciliation always uses full local values; only the prompt projection is shortened.
+    recent = [{key: (value if for_comparison and key in {
+        "claim", "current_observation", "previous_observation",
+    } else value[:240]) if isinstance(value, str) else value
+        for key, value in item.items()} for item in recent]
+    for item in recent:
+        item["evidence_refs"] = [str(ref)[:240] for ref in item["evidence_refs"][:3]]
     return {
         "changes": [item for item in recent if item.get("prior_section") == "changes"],
         "unchanged": [item for item in recent if item.get("prior_section") == "unchanged"],

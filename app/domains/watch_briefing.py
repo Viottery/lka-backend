@@ -52,6 +52,53 @@ def _excerpt_supports(claim: str, excerpt: str) -> bool:
     )
 
 
+def reconcile_current_observations(
+    changed: list[dict[str, Any]],
+    unchanged: list[dict[str, Any]],
+    prior_by_key: dict[str, dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Reconcile already-verified identities, never infer equivalence or timestamp authority."""
+    groups: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+    for section, items in (("changes", changed), ("unchanged", unchanged)):
+        for item in items:
+            if isinstance(item, dict):
+                key = item.get("event_key") or item.get("fingerprint")
+                if isinstance(key, str) and key:
+                    groups.setdefault(key, []).append((section, item))
+
+    def observation(item: dict[str, Any]) -> str:
+        return str(item.get("current_observation") or item.get("claim")
+                   or item.get("title") or item.get("status") or "")
+
+    current: dict[str, list[dict[str, Any]]] = {"changes": [], "unchanged": []}
+    conflicts: list[dict[str, Any]] = []
+    for key, entries in groups.items():
+        values = {observation(item).casefold() for _, item in entries}
+        if len(values) == 1:
+            section, item = entries[0]
+            current[section].append(item)
+            continue
+        prior = prior_by_key.get(key, {})
+        old_value = observation(prior)
+        baseline_entries = [item for _, item in entries
+                            if observation(item).casefold() == old_value.casefold()]
+        new_entries = [item for _, item in entries
+                       if observation(item).casefold() != old_value.casefold()]
+        prior_refs = prior.get("evidence_refs", [])
+        prior_refs = [prior_refs] if isinstance(prior_refs, str) else prior_refs
+        # A newly read independent source repeating the old value is a conflict,
+        # not proof that it is merely history. Only the actual baseline refs qualify.
+        if (old_value and len(values) == 2 and baseline_entries and new_entries
+                and prior_refs and all(
+                    item.get("evidence_refs")
+                    and all(ref in prior_refs for ref in item["evidence_refs"])
+                    for item in baseline_entries)):
+            current["changes"].append({**new_entries[0], "previous_observation": old_value})
+            continue
+        conflicts.extend({**item, "reason": "current_state_conflict"} for _, item in entries)
+    return current["changes"], current["unchanged"], conflicts
+
+
 def _briefing_summary(
     *,
     changes: list[dict[str, Any]],
@@ -70,6 +117,11 @@ def _briefing_summary(
     lines = [
         f"每日关注：变化 {len(changes)} 项；未变化 {len(unchanged)} 项；无法确认 {len(unconfirmed)} 项；需决定 {len(decisions)} 项。"
     ]
+    if any(item.get("reason") == "child_budget_finish" for item in unconfirmed):
+        # A server-generated coverage warning must precede per-section and overall caps.
+        lines.append("覆盖不足（partial / child_budget_finish）：Evidence collection stopped "
+                     "at the child budget; coverage is incomplete and unchecked information "
+                     "remains unknown.")
     for title, items in sections:
         lines.append(f"\n{title}：")
         if not items:
@@ -189,7 +241,10 @@ def normalize_briefing(
         for value in (item.get("ref"), item.get("evidence_id"))
         if isinstance(value, str) and value
     }
-    old_items = [*(previous or {}).get("changes", []), *(previous or {}).get("unchanged", [])]
+    old_changed, old_unchanged, _ = reconcile_current_observations(
+        (previous or {}).get("changes", []), (previous or {}).get("unchanged", []), {}
+    )
+    old_items = [*old_changed, *old_unchanged]
     prior_by_key: dict[str, dict[str, Any]] = {}
     for item in old_items:
         if isinstance(item, dict):
@@ -349,6 +404,9 @@ def normalize_briefing(
                 "reason": "An empty briefing cannot establish that nothing changed.",
             }
         )
+
+    changed, unchanged, conflicts = reconcile_current_observations(changed, unchanged, prior_by_key)
+    unconfirmed.extend(conflicts)
 
     include = _rule_terms(importance_rules.get("include_keywords"))
     exclude = _rule_terms(importance_rules.get("exclude_keywords"))

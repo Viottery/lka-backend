@@ -930,3 +930,28 @@ R21-W 受控复测入口补齐：复用原SQLite目标和configured协议（不�
 原始report.json不可改写，独立derived报告保存provider records/前后源码与场景SHA；
 非symlink私有子目录/原始文件路径验证；按本次call IDs保留cached usage及未知预留。
 Root 32项fake/mock检查通过，未改生产设置；下一步唯一真实复测。
+
+R22-W 修复并离线闭合：同 identity 的已核验“唯一新 observation＋原 baseline 值及原引用”
+仅保留新值作为当前，旧值留 previous；新来源重新声称旧值或多个不能协调的新状态
+全部进入 unconfirmed，不按时间猜、不合并不同文本同义句。旧持久化矛盾记录恢复基线
+也先协调，完整本地值/refs协调后才生成240字符模型预览。预算 coverage 警告固定置顶，
+不会被各区前四项显示限制吞掉。13行为红例/4原绿→18新绿；实现者Watch128项、独立
+47项、Root57项通过。失败原始raw离线重放后SHA未变；新实际三时隙复测仍待执行。
+
+R21-W 新实际（`runtime_web_sqlite_20261005T010201007541`）55.317s/5 calls/0 search
+失败，未进入web.find；调用顺序是WAL两次分页open、展开observation、下一decision
+在30s包装deadline终止，未产生最终回答。4 known calls $0.015285024；unknown失败
+预留$0.0566648，合计保守扣$0.071949824。源码与场景未变。不能声称零命中恢复已经
+改善实际网页任务，也不能把此评测wrapper plain TimeoutError 当成生产socket根因。
+
+- [ ] R22-T：已分类控制请求timeout的一次有界恢复，unknown失败保守预留、真实失败
+  client/model审计、取消/child回答预留/content_filter不变；同官方网页任务复测。
+
+R22-T 调查另暴露生产内部LLMTimeoutError被SDK分类器错归unknown/non-retriable。
+Root 5红/2原绿→超时边界8绿；实际失败identity审计另1红后修复，最终11绿，独立
+88项通过。明确timeout仅占整decision初次＋一次恢复额度；临时thinking=False仅支持
+参数的实际client/model，不记成reasoning overflow、不影响后续decision或回答。
+重试再次走取消/deadline/child budget预检；failed/inflight unknown持有dispatch reservation，
+不当0 token，两个预算视图一致。评测包装deadline转typed并单独标evaluation来源，
+整场景取消不泛抓为provider恢复。Root综合回归102项中1 fixture期望需同步类型，
+同步后相关53项通过。真实复测尚未完成，不声称网络或模型推理原因已确定。
