@@ -893,6 +893,18 @@ R22-W 独立复核另确认：同轮 changes北楼/unchanged南楼不仅展示�
 overflow分别5.901/4.966/5.417s；后两次恢复1.244/1.432s；首轮因回答预留不恢复，
 12.841s生成最终 partial 答案。当前机制缩短有限控制恢复，仍不能保证首次输出快。
 
+R22-W 离线修复：来源/完整摘录核验后，同 identity 仅在唯一不同当前值与原 baseline
+值/引用可明确协调时保留变化，旧值仅为 previous_observation；重复当前值只保留一项。
+来自新引用的旧值重申、多个不同变化、无 baseline 的不同文本（含同义候选）移入
+current_state_conflict/unconfirmed；不按 source 时间选择事实。历史 baseline 合并复用
+同一防线，冲突不回写当前状态，完整本地值/引用先协调再做原有有界提示投影。
+预算覆盖不足警告固定在摘要顶部，不受每区前四项或整体 2200 字符截断隐藏。
+实际 slot3/slot1 等回归先 **13 failed/4 passed**，新增完整长引用反例另先红后绿，
+最终新回归 **18 passed**；Watch scheduler/adapter/API/service/cache 与评测联合
+**128 passed/45.30s**，Ruff 通过。现有 raw 的实际 child 输出与工具摘录离线重放确认
+三轮为 1/0、0/1、1/0 changes/unchanged，前两轮 partial 警告显示，原始 SHA 未变。
+没有新付费 replay；R22-W 实际同 replay 与独立复核仍待 Root 决定，不宣称线上已复测。
+
 R21-P 实际唯一复测（`parallel-quality-20261005T004902788595-2dfb4fe7`）：
 100.090s（准备合计101.358s），20 calls/94394 input/14350 output；19 known calls
 $0.099558464，1 provider失败无usage保留$0.05884，账本本次保守扣$0.158398464，
@@ -905,3 +917,16 @@ $0.099558464，1 provider失败无usage保留$0.05884，账本本次保守扣$0.
 
 - [ ] R22-P：量化结构化prompt重复/缩进开销，先尝试不丢字段的确定性传输优化；
   不硬编码读取顺序、不扩大32768 child预算；验证复杂任务是否真正增加取证能力。
+
+R22-P 离线等价编码探针：历史三 child 的16次请求，用实际本地 DeepSeek tokenizer
+计数，仅将系统构建的 JSON payload 去缩进、不删字段/不改字符串。user部分64867→53726
+（-17.18%，含system/envelope总输入估计-14.15%）；route13.11%、decision19.48%、
+repair26.12%、answer8.68%。每child估计节省4065/3401/3675 tokens。目前只是历史
+重编码估计，不证明更多取证或功能成功；PromptBudgeter裁剪后recount也会加回indent。
+先验证结构等价、权威/续读字段和预留计数，再同目标32k实际测试，不直接改变预算。
+
+R21-W 受控复测入口补齐：复用原SQLite目标和configured协议（不隐式改JSON能力），
+20 LLM/3 search硬限、provider30s/turn180s，权威现有账本、关闭隔离后台同步/记忆。
+原始report.json不可改写，独立derived报告保存provider records/前后源码与场景SHA；
+非symlink私有子目录/原始文件路径验证；按本次call IDs保留cached usage及未知预留。
+Root 32项fake/mock检查通过，未改生产设置；下一步唯一真实复测。
