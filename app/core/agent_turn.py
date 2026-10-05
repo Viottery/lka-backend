@@ -517,6 +517,9 @@ _turn_run_manager: ContextVar[InMemoryAgentRunManager | None] = ContextVar(
     default=None,
 )
 _turn_run_id: ContextVar[str | None] = ContextVar("turn_run_id", default=None)
+_control_generation_attempt: ContextVar[dict[str, Any] | None] = ContextVar(
+    "control_generation_attempt", default=None,
+)
 
 
 class AgentTurnToolEvent(BaseModel):
@@ -2858,7 +2861,15 @@ class AgentTurnLoop:
         tool = self.tool_executor.registry.get_tool_or_none(tool_name)
         return tool is not None and effective_tool_read_only(tool, tool_input) is not True
 
-    def _decide_next_action(
+    def _decide_next_action(self, **kwargs: Any) -> dict[str, Any] | None:
+        # Schema feedback, native fallback and format repair share one quota.
+        token = _control_generation_attempt.set({"calls": 0, "thinking_enabled": None})
+        try:
+            return self._decide_next_action_bounded(**kwargs)
+        finally:
+            _control_generation_attempt.reset(token)
+
+    def _decide_next_action_bounded(
         self,
         *,
         user_input: str,
@@ -3194,7 +3205,6 @@ class AgentTurnLoop:
                 "intended patch once, preserving its ID and scope; feedback grants no authority."
             )
         decision_retry: dict[str, Any] | None = None
-        recovery_thinking_enabled: bool | None = None
         for format_attempt in range(1, self.decision_format_max_attempts + 1):
             system_prompt = base_system_prompt
             if decision_retry is not None:
@@ -3233,34 +3243,23 @@ class AgentTurnLoop:
                 ensure_ascii=False,
                 indent=2,
             )
-            budget_decision, control_output_cap = self._child_decision_preflight(
-                system_prompt=system_prompt, user_prompt=user_prompt,
-                observations=observations,
-            )
-            if budget_decision is not None:
-                return budget_decision
-            response = self._complete_text_with_retry(
+            response, budget_decision = self._complete_control_generation(
                 stage="decision",
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
+                observations=observations,
                 prompt_summary=(
                     f"agent_turn_decision observations={len(observations)} "
                     f"format_attempt={format_attempt}"
                 ),
-                max_output_tokens=control_output_cap,
                 llm_events=llm_events,
-                thinking_enabled=recovery_thinking_enabled,
             )
+            if budget_decision is not None:
+                return budget_decision
             if response is None:
                 return None
-            incomplete = (
-                getattr(response, "partial", False) or not response.content.strip()
-                or getattr(response, "status", "completed") != "completed"
-                or str(getattr(response, "finish_reason", "") or "").casefold() in {"length", "max_tokens", "partial"}
-            )
-            if incomplete:
+            if self._control_generation_incomplete(response):
                 if format_attempt < self.decision_format_max_attempts:
-                    recovery_thinking_enabled = self._control_recovery_thinking_flag()
                     decision_retry = {
                         "error": (
                             "previous_decision_output_was_empty" if not response.content.strip()
@@ -3365,17 +3364,119 @@ class AgentTurnLoop:
             return bool(supports(client_name=_turn_llm_client_name.get()))
         return bool(supports)
 
-    def _control_recovery_thinking_flag(self) -> bool | None:
+    def _control_recovery_thinking_flag(self, client_name: str | None = None) -> bool | None:
         """Use only the selected client's explicit capability for one repair."""
-        supports = getattr(self.llm_client, "supports_thinking_control", None)
+        supports = getattr(getattr(self, "llm_client", None), "supports_thinking_control", None)
         if not callable(supports):
             return None
-        client_name, *_ = self._inference_selection()
+        if client_name is None:
+            client_name, *_ = self._inference_selection()
         if isinstance(self.llm_client, LLMService) or "client_name" in inspect.signature(supports).parameters:
             supported = supports(client_name=client_name)
         else:
             supported = client_name is None and supports()
         return False if supported else None
+
+    @staticmethod
+    def _control_generation_incomplete(response: LLMResponse) -> bool:
+        return bool(
+            getattr(response, "partial", False)
+            or getattr(response, "status", "completed") != "completed"
+            or str(getattr(response, "finish_reason", "") or "").casefold()
+            in {"length", "max_tokens", "partial"}
+            or (not response.content.strip() and not getattr(response, "tool_calls", None))
+        )
+
+    def _control_run_thinking_flag(self, identity: tuple[str | None, str | None] | None) -> bool | None:
+        if identity is None or self._control_recovery_thinking_flag(identity[0]) is not False:
+            return None
+        client_name, model = identity
+        state = _control_generation_attempt.get()
+        if (state is not None and state["thinking_enabled"] is False
+                and state.get("thinking_identity") == (client_name, model)):
+            return False
+        manager, run_id = _turn_run_manager.get(), _turn_run_id.get()
+        if manager is None or run_id is None:
+            return None
+        return False if any(
+            event.type == "control_generation_overflow"
+            and event.payload.get("client_name") == client_name
+            and event.payload.get("model") == model
+            and event.payload.get("thinking_enabled") is False
+            for event in manager.list_events(run_id)
+        ) else None
+
+    def _complete_control_generation(
+        self, *, stage: str, system_prompt: str, user_prompt: str,
+        prompt_summary: str, observations: list[dict[str, Any]],
+        llm_events: list[AgentTurnLLMEvent],
+        tools: list[LLMToolDefinition] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+    ) -> tuple[LLMResponse | None, dict[str, Any] | None]:
+        """One shared control boundary; recovery cannot spend delivery's reserve."""
+        self._raise_if_cancel_requested()
+        budget_decision, output_cap = self._child_decision_preflight(
+            system_prompt=system_prompt, user_prompt=user_prompt,
+            observations=observations, tools=tools,
+        )
+        if budget_decision is not None:
+            return None, budget_decision
+        state = _control_generation_attempt.get()
+        if state is not None:
+            if state["calls"] >= 2:
+                reason = "Control generation exhausted its single recovery; no operation was accepted."
+                self._append_run_event(
+                    type="control_generation_recovery_exhausted", stage=stage,
+                    message=reason, payload={"control_calls": state["calls"]},
+                )
+                return None, {"action": "invalid_empty_decision", "reason": reason}
+            state["calls"] += 1
+        identity = None
+        if isinstance(getattr(self, "llm_client", None), LLMService):
+            client_name, model, *_ = self._inference_selection()
+            identity = self.llm_client._resolve_request_identity(LLMRequest(
+                client_name=client_name, model=model, messages=[], prompt_summary="control_identity",
+            ))
+        elif self._control_recovery_thinking_flag() is False:
+            identity = self._inference_selection()[:2]
+        recovery_flag = self._control_recovery_thinking_flag(identity[0] if identity else None)
+        response = self._complete_text_with_retry(
+            stage=stage, system_prompt=system_prompt, user_prompt=user_prompt,
+            prompt_summary=prompt_summary, max_output_tokens=output_cap,
+            llm_events=llm_events,
+            **({"tools": tools, "tool_choice": tool_choice} if tools is not None else {}),
+            thinking_enabled=self._control_run_thinking_flag(identity), max_attempts=1,
+            dispatch_identity=identity if isinstance(getattr(self, "llm_client", None), LLMService) else None,
+        )
+        if (response is not None
+                and str(getattr(response, "finish_reason", "") or "").casefold() == "content_filter"):
+            # Provider refusal is not generation overflow. Its already-recorded
+            # usage remains charged, but neither format repair nor native fallback
+            # may downgrade the reasoning mode and redispatch this request.
+            self._append_run_event(
+                type="control_generation_rejected", stage=stage,
+                message="Provider filtered control generation; recovery is forbidden.",
+                payload={"reason": "content_filter", "error_category": "content_filter",
+                         "is_retriable": False, "provider_request_id": response.provider_request_id},
+            )
+            raise LLMClientError("Provider rejected control generation (content_filter).")
+        if response is not None and self._control_generation_incomplete(response):
+            if state is not None:
+                state["thinking_enabled"] = recovery_flag
+                state["thinking_identity"] = identity
+            if recovery_flag is False:
+                finish = str(getattr(response, "finish_reason", "") or "").casefold()
+                reason = (finish if finish in {"length", "max_tokens", "partial"}
+                          else "partial" if getattr(response, "partial", False)
+                          else "incomplete_status" if getattr(response, "status", "completed") != "completed"
+                          else "empty_control_output")
+                self._append_run_event(
+                    type="control_generation_overflow", stage=stage,
+                    message="Incomplete control generation; only this run's same-client control recovery disables thinking.",
+                    payload={"reason": reason, "client_name": identity[0],
+                             "model": identity[1], "thinking_enabled": recovery_flag},
+                )
+        return response, None
 
     def _can_fork_for_prompt(self) -> bool:
         """Hide unavailable delegation metadata; server validation remains authoritative."""
@@ -3592,30 +3693,21 @@ class AgentTurnLoop:
             ensure_ascii=False,
             indent=2,
         )
-        budget_decision, control_output_cap = self._child_decision_preflight(
-            system_prompt=system_prompt, user_prompt=user_prompt,
-            observations=observations, tools=tools,
-        )
-        if budget_decision is not None:
-            return budget_decision
-        response = self._complete_text_with_retry(
+        response, budget_decision = self._complete_control_generation(
             stage="decision",
             system_prompt=system_prompt,
             user_prompt=user_prompt,
+            observations=observations,
             prompt_summary=f"agent_turn_native_decision observations={len(observations)}",
-            max_output_tokens=control_output_cap,
             llm_events=llm_events,
             tools=tools,
             tool_choice="required" if require_function_call else "auto",
         )
+        if budget_decision is not None:
+            return budget_decision
         if response is None:
             return None
-        if (
-            getattr(response, "partial", False)
-            or getattr(response, "status", "completed") != "completed"
-            or str(getattr(response, "finish_reason", "") or "").casefold()
-            in {"length", "max_tokens", "partial"}
-        ):
+        if self._control_generation_incomplete(response):
             # Syntactically valid arguments are not authorization when the
             # provider marks its generation incomplete. Use bounded JSON repair.
             return None
@@ -3987,15 +4079,17 @@ class AgentTurnLoop:
             ensure_ascii=False,
             indent=2,
         )
-        response = self._complete_text_with_retry(
+        response, budget_decision = self._complete_control_generation(
             stage="decision_repair",
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             prompt_summary="agent_turn_decision_repair",
-            max_output_tokens=self.llm_generation_token_budget,
+            observations=observations,
             llm_events=llm_events,
         )
-        if response is None:
+        if budget_decision is not None:
+            return budget_decision
+        if response is None or self._control_generation_incomplete(response):
             return None
         parsed = self._parse_json_object(response.content, strict=True)
         if not isinstance(parsed, dict) or not parsed:
@@ -5855,6 +5949,8 @@ class AgentTurnLoop:
         llm_call_id: str,
         tools: list[LLMToolDefinition] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
+        thinking_enabled: bool | None = None,
+        dispatch_identity: tuple[str, str] | None = None,
     ) -> LLMResponse:
         if self.llm_client is None:
             raise LLMClientError("No LLM client is configured.")
@@ -5865,6 +5961,8 @@ class AgentTurnLoop:
             client_name, model, reasoning_effort, selection_source, profile_id = (
                 self._inference_selection()
             )
+            if dispatch_identity is not None:
+                client_name, model = dispatch_identity
             metadata = {
                 "stage": stage,
                 "inference_selection_source": selection_source,
@@ -5882,6 +5980,7 @@ class AgentTurnLoop:
                 prompt_summary=prompt_summary,
                 temperature=0.0,
                 reasoning_effort=reasoning_effort,
+                thinking_enabled=thinking_enabled,
                 max_output_tokens=max_output_tokens,
                 require_json=self._llm_stage_requires_json(stage),
                 tools=tools or [],
@@ -6135,6 +6234,7 @@ class AgentTurnLoop:
         tool_choice: str | dict[str, Any] | None = None,
         thinking_enabled: bool | None = None,
         max_attempts: int | None = None,
+        dispatch_identity: tuple[str, str] | None = None,
     ) -> LLMResponse | None:
         if self.llm_client is None:
             return None
@@ -6250,6 +6350,8 @@ class AgentTurnLoop:
                             llm_call_id=llm_call_id,
                             tools=tools,
                             tool_choice=tool_choice,
+                            thinking_enabled=thinking_enabled,
+                            dispatch_identity=dispatch_identity,
                         )
                     else:
                         response = self._complete_text_once(
@@ -6262,6 +6364,7 @@ class AgentTurnLoop:
                             tools=tools,
                             tool_choice=tool_choice,
                             thinking_enabled=thinking_enabled,
+                            dispatch_identity=dispatch_identity,
                         )
             except LLMRateLimitError as exc:
                 duration_ms = self._duration_ms(perf_start)
@@ -6449,12 +6552,15 @@ class AgentTurnLoop:
         tools: list[LLMToolDefinition] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
         thinking_enabled: bool | None = None,
+        dispatch_identity: tuple[str, str] | None = None,
     ) -> LLMResponse:
         if self.llm_client is None:
             raise LLMClientError("No LLM client is configured.")
         client_name, model, reasoning_effort, selection_source, profile_id = (
             self._inference_selection()
         )
+        if dispatch_identity is not None:
+            client_name, model = dispatch_identity
         request_metadata: dict[str, Any] = {
             "stage": stage,
             "inference_selection_source": selection_source,

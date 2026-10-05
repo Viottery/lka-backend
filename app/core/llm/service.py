@@ -16,6 +16,7 @@ from app.core.llm.models import (
     LLMResponse,
     LLMResponseMode,
     LLMStreamEvent,
+    LLMToolDefinition,
 )
 from app.core.llm.registry import LLMClientRegistry
 from app.core.local_config import LLMProviderConfig
@@ -36,15 +37,21 @@ class LLMService:
         self._token_counters: dict[str | None, PromptTokenCounter] = {}
         self._counter_lock = threading.Lock()
 
-    async def complete(self, request: LLMRequest) -> LLMResponse:
+    def _resolve_request_identity(self, request: LLMRequest) -> tuple[str, str]:
+        """Resolve the same configured dispatch identity for control and transport."""
         client_name = self._client_name_for(request)
         client = self.registry.get(client_name)
         if client is None:
             raise LLMClientError(f"LLM client is not registered: {client_name}")
+        return client_name, request.model or client.default_model
+
+    async def complete(self, request: LLMRequest) -> LLMResponse:
+        client_name, model = self._resolve_request_identity(request)
+        client = self.registry.get(client_name)
         request = request.model_copy(
             update={
                 "client_name": client_name,
-                "model": request.model or client.default_model,
+                "model": model,
             }
         )
         request = self._bounded_background_request(request)
@@ -74,6 +81,8 @@ class LLMService:
         model: str | None = None,
         response_mode: LLMResponseMode = LLMResponseMode.TEXT,
         require_json: bool = False,
+        tools: list[LLMToolDefinition] | None = None,
+        tool_choice: str | dict | None = None,
         metadata: dict | None = None,
     ) -> LLMResponse:
         return await self.complete(
@@ -91,19 +100,19 @@ class LLMService:
                 thinking_enabled=thinking_enabled,
                 max_output_tokens=max_output_tokens,
                 require_json=require_json,
+                tools=tools or [],
+                tool_choice=tool_choice,
                 metadata=metadata or {},
             )
         )
 
     async def stream(self, request: LLMRequest) -> AsyncIterator[LLMStreamEvent]:
-        client_name = self._client_name_for(request)
+        client_name, model = self._resolve_request_identity(request)
         client = self.registry.get(client_name)
-        if client is None:
-            raise LLMClientError(f"LLM client is not registered: {client_name}")
         request = request.model_copy(
             update={
                 "client_name": client_name,
-                "model": request.model or client.default_model,
+                "model": model,
             }
         )
         request = self._bounded_background_request(request)

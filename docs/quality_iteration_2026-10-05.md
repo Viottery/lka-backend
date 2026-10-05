@@ -850,3 +850,14 @@ R21-P 复测脚本复用原 parallel_audit 的目标、文件与 32768 child tok
 child、verification、budget 与前后源码指纹，按本次 reservation IDs 统计成本，不用
 共享账本差分误算其他并发测试。字符串 6/6 只是机械覆盖，语义判断单独待审核。
 离线预算/脚本检查 31 项通过；实际调用尚未执行。
+
+R21-D：从真实 Watch trace 可见，三次 1024-token 控制输出全部用于 reasoning、正文为空，
+不是答案太长；旧 repair 又使用 8192 上限且漏传关闭推理。现在 JSON/native/repair
+共用 child 预检、控制输出 cap 与最后回答预留，整次 decision（含 PlanPatch schema
+反馈）最多初次+一次恢复。length/partial/incomplete 操作不能执行；content_filter 明确
+失败审计且不降级/重试。stream 同步传 thinking 参数。仅在选定 provider 明确支持时，
+该 run 的同实际 client/model 后续控制输出关闭 thinking；回答、其他模型和新 run 不继承。
+实际 target 由 LLMService 原选择逻辑解析，审计与 dispatch 一致，不硬编码具体模型。
+独立复核原先暴露 schema feedback 3-dispatch 和 default-target 状态串用两个 P2；修复后
+原复现及 closure 7 项通过，无未闭 P1/P2。实现者定向 150 项通过。每个新 run 的首次
+overflow 仍可能发生；不声称已经消除全部 reasoning 延时，不改变生产预算。
