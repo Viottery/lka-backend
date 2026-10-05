@@ -11,6 +11,11 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 
+def serialize_prompt_payload(payload: Any) -> str:
+    """Encode a constructed payload without changing values or parsing raw text."""
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
 class RequestTokenCounter(Protocol):
     def count_request(
         self, system_prompt: str, user_prompt: str, tools: list[Any] | None = None,
@@ -74,7 +79,7 @@ class PromptBudgeter:
             nonlocal user_prompt, counted
             if omitted:
                 payload["_prompt_budget"] = omitted
-            user_prompt = json.dumps(payload, ensure_ascii=False, indent=2)
+            user_prompt = serialize_prompt_payload(payload)
             counted = self.counter.count_request(system_prompt, user_prompt, tools)
 
         observations = payload.get("observations")

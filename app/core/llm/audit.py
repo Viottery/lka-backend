@@ -9,6 +9,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from app.core.llm.errors import LLMTimeoutError
 
 DEBUG_HEADER_NAMES = [
     "x-request-id",
@@ -158,6 +159,8 @@ def classify_provider_error(
 
 
 def classify_openai_sdk_exception(exc: BaseException) -> tuple[str, bool]:
+    if isinstance(exc, LLMTimeoutError):
+        return "timeout", True
     name = type(exc).__name__
     status_code = getattr(exc, "status_code", None)
     if isinstance(status_code, int):

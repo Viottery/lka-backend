@@ -494,7 +494,9 @@ def test_three_concurrent_tiny_audits_deliver_through_real_child_graph_under_32k
 
 
 def test_byte_upper_bound_soft_finish_is_partial_with_exact_reads_and_unknowns(tmp_path):
-    _run_tiny_audits(tmp_path, counter=PromptTokenCounter(), source_count=4)
+    # Compact transport can now deliver four sources within the same 32k cap.
+    # A fifth source keeps this an actual pressure/unknown scenario.
+    _run_tiny_audits(tmp_path, counter=PromptTokenCounter(), source_count=5)
 
 
 def _run_tiny_audits(tmp_path, *, counter, source_count):
@@ -561,13 +563,15 @@ def _run_tiny_audits(tmp_path, *, counter, source_count):
                 results = [
                     o for o in payload["observations"] if o.get("tool_name") == "evidence.read"
                 ]
-                assert len(results) == 3
+                expected_reads = source_count - 1 if counter.count_text("").conservative else source_count
+                assert len(results) == expected_reads
                 assert [o["result"]["output"]["text"] for o in results] == [
-                    f"Source {index}: fact {index}.\n" for index in range(3)
+                    f"Source {index}: fact {index}.\n" for index in range(expected_reads)
                 ]
-                content = "Cited source findings: fact 0, fact 1, fact 2."
+                content = "Cited source findings: " + ", ".join(
+                    f"fact {index}" for index in range(expected_reads)) + "."
                 if len(results) < source_count:
-                    content += " Unknown/unread: fact 3."
+                    content += f" Unknown/unread: fact {expected_reads}."
                 content += " No independent verification claimed."
             else:
                 raise AssertionError(f"Unexpected model stage: {kwargs['metadata']['stage']}")
@@ -664,7 +668,8 @@ def _run_tiny_audits(tmp_path, *, counter, source_count):
             assert result.missing_requirements == ("child_budget_finish",)
             assert len(finishes) == 1
             assert finishes[0].payload["control_output_allowance"] < 256
-            assert "Unknown/unread: fact 3." in result.summary
+            assert "fact 3" in result.summary
+            assert "Unknown/unread: fact 4." in result.summary
         else:
             assert result.status.value == "completed", result.failure
             assert result.missing_requirements == ()
@@ -678,7 +683,9 @@ def _run_tiny_audits(tmp_path, *, counter, source_count):
             sum(e.payload["budget_token_count"] for e in events if e.type == "llm_completed")
             < 32768
         )
-        assert sum(e.type == "tool_completed" for e in events) == 3
+        assert sum(e.type == "tool_completed" for e in events) == (
+            source_count - 1 if counter.count_text("").conservative else source_count
+        )
         for event in events:
             if event.type == "llm_completed":
                 assert event.payload["input_token_actual"] == event.payload["input_token_estimate"]

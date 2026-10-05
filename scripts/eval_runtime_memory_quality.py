@@ -17,6 +17,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.core.config import Settings
+from app.core.llm import LLMTimeoutError
 from app.core.runtime import LocalKnowledgeAgentRuntime
 from evals.lka_evals.live_budget import LiveBudget, LiveBudgetExceeded, instrument_service
 
@@ -68,6 +69,10 @@ class RecordedClient:
             result = await asyncio.wait_for(self.client.complete(request), 30)
             row["response"] = result.model_dump(mode="json")
             return result
+        except TimeoutError as exc:
+            row["error_type"] = "LLMTimeoutError"
+            row["timeout_source"] = "evaluation_provider_request_deadline"
+            raise LLMTimeoutError("Evaluation provider request exceeded its 30s deadline.") from exc
         except BaseException as exc:
             row["error_type"] = type(exc).__name__
             raise

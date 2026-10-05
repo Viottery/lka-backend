@@ -93,7 +93,12 @@ from app.core.multi_agent_fast_path import (
     standard_fast_path_templates,
 )
 from app.core.multi_agent_replan import PlanPatchRejected, apply_plan_patch
-from app.core.prompt_budget import BudgetedPrompt, PromptBudgeter, PromptBudgetExceeded
+from app.core.prompt_budget import (
+    BudgetedPrompt,
+    PromptBudgeter,
+    PromptBudgetExceeded,
+    serialize_prompt_payload,
+)
 from app.core.prompt_tokens import PromptTokenCounter
 from app.core.runtime_context import current_time_payload
 from app.core.safety import (
@@ -1278,14 +1283,12 @@ class AgentTurnLoop:
             '{"selected_package":"<package name or null>","reason":"...",'
             '"search_query":"optional query hint"}'
         )
-        user_prompt = json.dumps(
+        user_prompt = serialize_prompt_payload(
             {
                 "user_input": user_input,
                 "session_context_window": self._context_window_for_llm(context_window),
                 "package_catalog": self._catalog_for_prompt(package_catalog),
             },
-            ensure_ascii=False,
-            indent=2,
         )
         response = self._complete_text_with_retry(
             stage="route",
@@ -3238,11 +3241,7 @@ class AgentTurnLoop:
                 prompt_payload["child_budget"] = child_budget
             if decision_retry is not None:
                 prompt_payload["decision_retry"] = decision_retry
-            user_prompt = json.dumps(
-                prompt_payload,
-                ensure_ascii=False,
-                indent=2,
-            )
+            user_prompt = serialize_prompt_payload(prompt_payload)
             response, budget_decision = self._complete_control_generation(
                 stage="decision",
                 system_prompt=system_prompt,
@@ -3440,6 +3439,7 @@ class AgentTurnLoop:
         elif self._control_recovery_thinking_flag() is False:
             identity = self._inference_selection()[:2]
         recovery_flag = self._control_recovery_thinking_flag(identity[0] if identity else None)
+        events_before = len(llm_events)
         response = self._complete_text_with_retry(
             stage=stage, system_prompt=system_prompt, user_prompt=user_prompt,
             prompt_summary=prompt_summary, max_output_tokens=output_cap,
@@ -3448,6 +3448,28 @@ class AgentTurnLoop:
             thinking_enabled=self._control_run_thinking_flag(identity), max_attempts=1,
             dispatch_identity=identity if isinstance(getattr(self, "llm_client", None), LLMService) else None,
         )
+        if (response is None and state is not None and state["calls"] < 2
+                and len(llm_events) > events_before
+                and llm_events[-1].error_category == "timeout"
+                and llm_events[-1].is_retriable is True):
+            # A classified request timeout is not proof of reasoning overflow.
+            # This decision's only remaining recovery still passes the child
+            # gate; do not retain a timeout-based downgrade for later decisions.
+            state["thinking_enabled"] = recovery_flag
+            state["thinking_identity"] = identity
+            self._append_run_event(
+                type="control_generation_timeout_recovery", stage=stage,
+                message="One classified control-timeout recovery; cause remains unknown.",
+                payload={"client_name": identity[0] if identity else None,
+                         "model": identity[1] if identity else None,
+                         "thinking_enabled": recovery_flag, "error_category": "timeout",
+                         "recovery_scope": "current_decision_only"},
+            )
+            return self._complete_control_generation(
+                stage=stage, system_prompt=system_prompt, user_prompt=user_prompt,
+                prompt_summary=prompt_summary, observations=observations,
+                llm_events=llm_events, tools=tools, tool_choice=tool_choice,
+            )
         if (response is not None
                 and str(getattr(response, "finish_reason", "") or "").casefold() == "content_filter"):
             # Provider refusal is not generation overflow. Its already-recorded
@@ -3670,7 +3692,7 @@ class AgentTurnLoop:
                 "function_arguments_example. Preserve its ID and scope; do not add type or "
                 "an outer operation envelope to function arguments."
             )
-        user_prompt = json.dumps(
+        user_prompt = serialize_prompt_payload(
             {
                 "user_input": user_input,
                 "session_context_window": self._context_window_for_llm(context_window),
@@ -3690,8 +3712,6 @@ class AgentTurnLoop:
                 **({"child_budget": child_budget}
                    if (child_budget := self._child_budget_for_prompt()) is not None else {}),
             },
-            ensure_ascii=False,
-            indent=2,
         )
         response, budget_decision = self._complete_control_generation(
             stage="decision",
@@ -4068,7 +4088,7 @@ class AgentTurnLoop:
             "malformed output clearly includes the tool name and complete tool input. Do not "
             "invent missing required tool arguments."
         )
-        user_prompt = json.dumps(
+        user_prompt = serialize_prompt_payload(
             {
                 "user_input": user_input,
                 "route_context": self._route_context(route),
@@ -4076,8 +4096,6 @@ class AgentTurnLoop:
                 "observations": observations,
                 "malformed_output": raw_output,
             },
-            ensure_ascii=False,
-            indent=2,
         )
         response, budget_decision = self._complete_control_generation(
             stage="decision_repair",
@@ -5435,11 +5453,7 @@ class AgentTurnLoop:
             "operation is clearly requested by the user, scoped, and consistent with the "
             "tool metadata. Reject ambiguous, destructive, broad, or unsupported operations."
         )
-        user_prompt = json.dumps(
-            {"review": review.model_dump(mode="json")},
-            ensure_ascii=False,
-            indent=2,
-        )
+        user_prompt = serialize_prompt_payload({"review": review.model_dump(mode="json")})
         response = self._complete_text_with_retry(
             stage="safety_review",
             system_prompt=system_prompt,
@@ -5609,7 +5623,7 @@ class AgentTurnLoop:
             'Return only strict JSON: {"status":'
             '"accepted|needs_retry|failed","message":"...","remaining_work":"..."}.'
         )
-        user_prompt = json.dumps(
+        user_prompt = serialize_prompt_payload(
             {
                 "user_input": user_input,
                 "tool_package": tool_package,
@@ -5617,8 +5631,6 @@ class AgentTurnLoop:
                 "tool_result": tool_result.model_dump(mode="json"),
                 "tool_feedback": local_feedback,
             },
-            ensure_ascii=False,
-            indent=2,
         )
         response = self._complete_text_with_retry(
             stage="tool_result_check",
@@ -5740,11 +5752,7 @@ class AgentTurnLoop:
         }
         if output_contract:
             answer_payload["output_contract"] = output_contract
-        user_prompt = json.dumps(
-            answer_payload,
-            ensure_ascii=False,
-            indent=2,
-        )
+        user_prompt = serialize_prompt_payload(answer_payload)
         response = self._complete_answer_with_recovery(
             stage="answer",
             system_prompt=system_prompt,
@@ -5889,14 +5897,12 @@ class AgentTurnLoop:
             "A user-requested data format is a deliverable, not an internal operation envelope; "
             "do not add prose or markup that violates that requested format."
         )
-        user_prompt = json.dumps(
+        user_prompt = serialize_prompt_payload(
             {
                 "user_input": user_input,
                 "route_context": self._route_context(route),
                 "session_context_window": self._context_window_for_llm(context_window),
             },
-            ensure_ascii=False,
-            indent=2,
         )
         response = self._complete_text_with_retry(
             stage="context_answer",
@@ -6103,7 +6109,7 @@ class AgentTurnLoop:
             "trace ids when useful. Do not include tool execution logs, raw prompts, or verbose "
             'transcripts. Return only strict JSON: {"summary":"..."}'
         )
-        user_prompt = json.dumps(
+        user_prompt = serialize_prompt_payload(
             {
                 "existing_summary": summary,
                 "messages_to_summarize": [
@@ -6114,8 +6120,6 @@ class AgentTurnLoop:
                 ],
                 "token_budget": token_budget,
             },
-            ensure_ascii=False,
-            indent=2,
         )
         response = self._complete_text_with_retry(
             stage="context_summarize",
@@ -6379,6 +6383,7 @@ class AgentTurnLoop:
                     duration_ms=duration_ms,
                     llm_call_id=llm_call_id,
                     exc=exc,
+                    dispatch_identity=dispatch_identity,
                 )
                 self._append_run_event(
                     type="llm_failed",
@@ -6421,6 +6426,7 @@ class AgentTurnLoop:
                     duration_ms=duration_ms,
                     llm_call_id=llm_call_id,
                     exc=exc,
+                    dispatch_identity=dispatch_identity,
                 )
                 self._append_run_event(
                     type="llm_failed",
@@ -6630,7 +6636,11 @@ class AgentTurnLoop:
         duration_ms: int,
         llm_call_id: str,
         exc: LLMClientError,
+        dispatch_identity: tuple[str, str] | None = None,
     ) -> AgentTurnLLMEvent:
+        client_name, model = dispatch_identity or (
+            _turn_llm_client_name.get() or "default", _turn_llm_model.get() or "default",
+        )
         if isinstance(exc, LLMProviderStreamError):
             run_context = self._current_run_context()
             call_record = build_stream_error_call_record(
@@ -6638,9 +6648,9 @@ class AgentTurnLoop:
                 stage=stage,
                 started_at=started_at,
                 duration_ms=duration_ms,
-                client_name=_turn_llm_client_name.get() or "default",
+                client_name=client_name,
                 provider=provider,
-                model=_turn_llm_model.get() or "default",
+                model=model,
                 response_mode=_turn_llm_response_mode.get().value,
                 error_event=exc.error_event,
                 partial_content=exc.partial_content,
@@ -6692,9 +6702,9 @@ class AgentTurnLoop:
         call_record = self._llm_call_record(
             llm_call_id=llm_call_id,
             stage=stage,
-            client_name=_turn_llm_client_name.get() or "default",
+            client_name=client_name,
             provider=provider,
-            model=_turn_llm_model.get() or "default",
+            model=model,
             response_mode=_turn_llm_response_mode.get().value,
             status=self._llm_error_status(exc),
             started_at=started_at,
@@ -7095,9 +7105,11 @@ class AgentTurnLoop:
             for event in events if event.type == "llm_started"
             and event.payload.get("llm_call_id")
         }
+        completed_ids = set()
         for event in events:
             if event.type != "llm_completed":
                 continue
+            completed_ids.add(event.payload.get("llm_call_id"))
             count = event.payload.get("budget_token_count")
             audit = event.payload.get("audit_record", {})
             if count is None and isinstance(audit, dict):
@@ -7110,6 +7122,21 @@ class AgentTurnLoop:
                 overhead = max(overhead, delta)
             if isinstance(estimate, int) and isinstance(actual, int):
                 overhead = max(overhead, actual - estimate)
+        # Failed/in-flight dispatches have unknown usage, not zero usage. Hold
+        # their exact pre-dispatch reservations until completed usage settles.
+        pending = {
+            event.payload.get("llm_call_id"): event.payload
+            for event in events if event.type == "llm_started"
+            and event.payload.get("llm_call_id") not in completed_ids
+        }
+        for payload in pending.values():
+            reservation = payload.get("budget_token_reservation")
+            if not isinstance(reservation, int) or isinstance(reservation, bool):
+                reservation = sum(
+                    value for key in ("input_token_estimate", "output_token_reserve")
+                    if isinstance(value := payload.get(key), int) and not isinstance(value, bool)
+                )
+            consumed += max(0, reservation)
         return {
             "max_tokens": max_tokens,
             "consumed_tokens": consumed,
@@ -7156,7 +7183,7 @@ class AgentTurnLoop:
         if output_contract:
             delivery["output_contract"] = output_contract
         fitted = self._budget_llm_prompt(
-            system_prompt="", user_prompt=json.dumps(delivery, ensure_ascii=False, indent=2),
+            system_prompt="", user_prompt=serialize_prompt_payload(delivery),
             max_output_tokens=CHILD_FINISH_OUTPUT_RESERVE_TOKENS, tools=None,
         )
         # Bound the separate answer instructions and finish-control annotation.

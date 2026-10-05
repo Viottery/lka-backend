@@ -12,7 +12,7 @@ import httpx
 import pytest
 from tokenizers import Tokenizer, models, pre_tokenizers
 
-from app.core.llm import LLMResponse, LLMService
+from app.core.llm import LLMResponse, LLMService, LLMTimeoutError
 from app.core.llm.models import LLMMessage, LLMRequest
 from app.core.llm.registry import LLMClientRegistry
 from app.core.local_config import LLMClientConfig, LLMProviderConfig, LocalAppConfig
@@ -346,10 +346,11 @@ def test_provider_timeout_is_30_seconds_and_failed_call_retains_reservation(tmp_
         raise TimeoutError("offline simulated deadline")
 
     monkeypatch.setattr(asyncio, "wait_for", timeout)
-    with pytest.raises(TimeoutError):
+    with pytest.raises(LLMTimeoutError):
         asyncio.run(client.complete(LLMRequest(messages=[LLMMessage(role="user", content="offline")],
             prompt_summary="provider_timeout")))
-    assert timeouts == [30] and records[0]["error_type"] == "TimeoutError"
+    assert timeouts == [30] and records[0]["error_type"] == "LLMTimeoutError"
+    assert records[0]["timeout_source"] == "evaluation_provider_request_deadline"
     assert budget.snapshot()["groups"]["llm"]["known_usage_calls"] == 0
     assert budget.snapshot()["groups"]["llm"]["charged_usd"] > 0
 
