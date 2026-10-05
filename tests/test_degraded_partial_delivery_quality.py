@@ -190,3 +190,30 @@ def test_other_parent_child_cannot_supply_skipped_history(monkeypatch):
 
         monkeypatch.setattr(manager, "list_events", filtered_events)
         assert "OTHER-PARENT-INJECTION" not in loop._unresolved_multi_agent_answer()
+
+
+def test_recovered_results_are_removed_before_missing_count_and_page_limit():
+    with degraded_run() as (loop, manager, parent, _):
+        saved = manager.get_run(parent.run_id)
+        aggregate = deepcopy(saved.metadata["multi_agent_aggregate"])
+        aggregate["missing_step_ids"] = ["skipped-part", "failed-part"] + [f"unread-{i}" for i in range(7)]
+        manager._update_run(parent.run_id, status=saved.status,
+                            metadata_patch={"multi_agent_aggregate": aggregate})
+        answer = loop._unresolved_multi_agent_answer()
+        assert all(f"unread-{i}" in answer for i in range(7))
+        assert "项缺组未展示" not in answer
+
+
+def test_compacted_fork_observation_keeps_degradation_and_historical_evidence():
+    with degraded_run() as (loop, _, _, result):
+        observation = {
+            "action": "fork_subtasks", "execution_status": "degraded", "task_results": [],
+            "historical_task_results": [result.model_copy(update={"summary": "RETAINED-HEAD " + "x" * 10000}).model_dump(mode="json")],
+            "degradation_notes": {"skipped-part": NOTE}, "skipped_step_ids": ["skipped-part"],
+        }
+        bounded = loop._observations_within_prompt_budget([observation], max_chars=2000)
+        kept = bounded[-1]
+        assert kept["degradation_notes"]["skipped-part"] == NOTE
+        assert kept["historical_task_results"][0]["summary"].startswith("RETAINED-HEAD")
+        assert kept["historical_task_results"][0]["historical_only"] is True
+        assert kept["task_results"] == [] and kept["skipped_step_ids"] == ["skipped-part"]

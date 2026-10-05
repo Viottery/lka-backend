@@ -2137,12 +2137,11 @@ class AgentTurnLoop:
                 lines.append("其他冲突详情未展示；请查看完整聚合记录。")
         missing = aggregate.get("missing_step_ids")
         if isinstance(missing, list):
-            missing_ids = [value[:80] for value in missing[:8]
-                           if isinstance(value, str) and value not in latest]
+            missing_ids = [value for value in missing if isinstance(value, str) and value not in latest]
             if missing_ids:
-                lines.append("未取得结果的子任务：" + "、".join(missing_ids))
-            if len(missing) > 8:
-                lines.append(f"另有 {len(missing) - 8} 项缺组未展示；请查看完整聚合记录。")
+                lines.append("未取得结果的子任务：" + "、".join(value[:80] for value in missing_ids[:8]))
+            if len(missing_ids) > 8:
+                lines.append(f"另有 {len(missing_ids) - 8} 项缺组未展示；请查看完整聚合记录。")
         if conflicting:
             lines.append("同次尝试有冲突结果，未选取任何一份：" + "、".join(
                 step_id[:80] for step_id in sorted(conflicting)[:8]
@@ -5118,21 +5117,35 @@ class AgentTurnLoop:
                 "failed_step_ids",
                 "replan_required",
                 "waiting_child_run_ids",
+                "skipped_step_ids",
             )
             if key in observation
         }
-        results = observation.get("task_results")
-        if isinstance(results, list):
-            summary["task_results"] = []
-            for result in results[:20]:
+        notes = observation.get("degradation_notes")
+        if isinstance(notes, dict):
+            summary["degradation_notes"] = {
+                str(key)[:80]: brief(value, 300) for key, value in list(notes.items())[:8]
+            }
+            summary["omitted_degradation_note_count"] = max(0, len(notes) - 8)
+        remaining_result_slots = 20
+        for field in ("task_results", "historical_task_results"):
+            results = observation.get(field)
+            if not isinstance(results, list):
+                continue
+            summary[field] = []
+            selected = results[:remaining_result_slots]
+            remaining_result_slots -= len(selected)
+            for result in selected:
                 if not isinstance(result, dict):
                     continue
                 projected = {
                     key: result.get(key)
-                    for key in ("step_id", "child_run_id", "status", "attempt")
+                    for key in ("step_id", "child_run_id", "status", "attempt", "result_id", "snapshot_id")
                     if key in result
                 }
                 projected["summary"] = brief(result.get("summary"))
+                if field == "historical_task_results":
+                    projected["historical_only"] = True
                 failure = result.get("failure")
                 if isinstance(failure, dict):
                     projected["failure"] = {
@@ -5150,8 +5163,8 @@ class AgentTurnLoop:
                     values = result.get(key)
                     if isinstance(values, list):
                         projected[key] = [brief(item, 160) for item in values[:6]]
-                summary["task_results"].append(projected)
-            summary["omitted_task_result_count"] = max(0, len(results) - 20)
+                summary[field].append(projected)
+            summary[f"omitted_{field[:-1]}_count"] = max(0, len(results) - len(selected))
         aggregate = observation.get("aggregate")
         if isinstance(aggregate, dict):
             summary["aggregate"] = {

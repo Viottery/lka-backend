@@ -88,3 +88,14 @@ SHA-256 `55432e411332f26ed44f2c155b602cb9d759bc87841d70eedca72eacfdb805d8`。
   article/body fallback、长 Unicode 分页、hash 变化拒绝、find→续读、零命中恢复。
 
 均未把这些离线结果当成真实语义闭环，不重写已经有效的补丁；60 分钟压测本轮未跑。
+
+## UX-01 后续 review：两个有损交付边界
+
+独立 review 找到缺失计数在历史结果恢复后仍使用旧列表；另查发现超长 fork 观察
+再次摘要时仅保留当前 task_results，会丢掉独立 historical_task_results / 降级说明。
+两项新增回归先 **2 failed / 0.36s**，未修改原断言来掩盖。
+
+修复：先按已恢复身份过滤缺失列表，再分页/计数；当前与历史共用 20 项摘要限额，
+保留历史标志、result/snapshot 引用、降级说明及省略计数。不增加总体上下文预算。
+保留既有重复缺失项统计语义，不顺手清洗历史数据。
+修复后新旧 partial 交付 **21 passed / 0.41s**，Ruff 通过。
