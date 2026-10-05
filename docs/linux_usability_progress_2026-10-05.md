@@ -48,3 +48,43 @@ mixed/all-skipped recovery 也携带独立 historical_task_results，不作为�
 上下文回答为 2 次；最终回答保持独立 writer。双执行器 + 现有 child 路由 / fork 修复
 检查共 9 项通过，原批次 5.74s；独立低成本代码审查未发现新增具体缺陷。
 这些只证明控制流程，不代表真实模型选择准确率或测得端到端加速。
+
+## UX-03：协调输入瘦身与一次真实重放
+
+有剩余委派深度的 coordinator 也使用紧凑控制视图，仍可合法 fork / plan_patch；
+原冻结角色、权限、子任务 32768 累计预算和回答预留不变。child_budget 增加已知输入/输出、
+未知计费调用、在途保守预留和分阶段调用数，未知 dispatch 不记成免费。
+同执行能力的控制 system prompt：**6943 → 2771 UTF-8 bytes（-60.1%）**。
+不是 provider token 计数；本地 7 个定向检查通过 / 0.53s，Ruff 通过。
+
+原 `parallel_audit` 仅远程重放一次，DeepSeek Flash、共享账本，无搜索：
+
+| 指标 | 本次测量 |
+| --- | --- |
+| 任务耗时 | 80.300s（历史原失败 131.354s；非统计 A/B） |
+| 父+子 dispatch | 22（父 5，子 17；历史 26） |
+| 输入 / 输出 / 缓存读取 | 116536 / 14499 / 33408 tokens |
+| 实际已知费用 | $0.113433728，22 次均已结算，无新增 unknown |
+| 并行情况 | 发布/备份启动相隔 0.147s，确实重叠；第三任务随后启动 |
+| 合同状态 | 1 completed、2 partial 后显式 skip；**不算三合同全部完成** |
+
+原始报告：本地 `data/quality_runs/linux_20261005/parallel-quality-20261005T055551009734-3561daeb/parallel_audit_20261005T055551011294/report.json`，
+SHA-256 `55432e411332f26ed44f2c155b602cb9d759bc87841d70eedca72eacfdb805d8`。
+运行中源码/fixture hash 未变化。人工核对：最终保留发布窗口、待审批、恢复失败分段、
+端口冲突及只读覆盖限制，并披露两个 partial；没有把降级洗成独立验证通过。
+但回答仍偏长，两个 child 在下一次控制输入+回答预留不再同时可容纳时提前停止，
+说明**提示瘦身尚不足以闭合 UX-03**。不因机械 fact_coverage=true 改为 fixed_live。
+
+下一局部 TODO：裁剪累计证据重复与阶段视图，保留合同义务和实际原件路径；
+再评估需要委派/聚焦执行提示。不是简单提高 ceiling 或降低回答预留。
+
+## 已有补丁的有限验收（UX-04 / 06 / 07 / 08 / 09 / 10）
+
+- 邮件低优先级必需行动和 omitted 披露；摘要三次来源继承、跨会话反例、metadata 上限；
+  记忆纠正；SQLite 等待用户重启：7 passed / 6.99s。
+- SQLite journal 发表前失败、发表后恢复、context 绑定前 crash、取消后不派新 attempt：
+  4 passed / 2.04s。只取 retry_step 代表参数，不重复恢复矩阵。
+- 独立低成本 agent 用项目 venv 核验六个网页代表节点：6 passed / 0.17s。包含
+  article/body fallback、长 Unicode 分页、hash 变化拒绝、find→续读、零命中恢复。
+
+均未把这些离线结果当成真实语义闭环，不重写已经有效的补丁；60 分钟压测本轮未跑。

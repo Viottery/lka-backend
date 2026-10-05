@@ -3332,7 +3332,7 @@ class AgentTurnLoop:
             )
         )
         child_budget = self._child_budget_for_prompt()
-        if child_budget is not None and not can_fork:
+        if child_budget is not None:
             base_system_prompt = (
                 "Choose one action for the assigned child task. Use package_catalog, "
                 "decision_hints, expanded_tools and their input_schema as the contracts. "
@@ -3353,8 +3353,31 @@ class AgentTurnLoop:
                 '"tool_input":{}}}. For expansion use operation.type=expand_package and '
                 "package_name. For delivery use operation.type=final_answer with a short "
                 "reason; final prose comes only from the separate answer stage. "
-                "Other stop actions are request_confirmation or no_op. Fork depth is exhausted."
+                "Other stop actions are request_confirmation or no_op."
             )
+            if can_fork:
+                base_system_prompt += (
+                    " Fork only when independent work or explicit user requirements justify "
+                    "child overhead. Choose agent_id by agent_catalog capability; this grants "
+                    "no permissions. fork_subtasks needs operation_id, parent_step_id="
+                    f"{ROOT_COORDINATOR_STEP_ID!r}, and subtasks. Each subtask requires "
+                    "step_id, objective, output_contract, agent_id; optional depends_on, "
+                    "input_refs and verification_criteria are arrays of strings. Omit "
+                    "requested_scope normally: the server derives child permissions. If "
+                    "supplied, use only workspace_paths, source_ids, account_ids, allowed_packages, "
+                    "allowed_tools (string arrays), side_effect_level (none/read/write/external). "
+                    "Never mix fields from other operations. inference_profile_id must be "
+                    f"allowlisted in {self.fork_policy.allowed_inference_profile_ids}; omit "
+                    "when none are allowed. Child results return as observations: use completed "
+                    "evidence without duplicating collection, distinguish execution from "
+                    "verification, and report inconclusive checks honestly. Replan only through "
+                    "plan_patch_contract when present; patches cannot expand scope or budget. "
+                    "Minimal fork example: "
+                    + json.dumps(_fork_subtasks_shape_example(), ensure_ascii=False, separators=(",", ":"))
+                    + ". Copy the shape, not example task text."
+                )
+            else:
+                base_system_prompt += " Fork depth or server role does not allow delegation."
         if fork_repair_feedback is not None:
             base_system_prompt += (
                 " The observations contain fork_subtasks_schema_feedback with field-specific "
@@ -7446,12 +7469,23 @@ class AgentTurnLoop:
             and event.payload.get("llm_call_id")
         }
         completed_ids = set()
+        settled_input_tokens = settled_output_tokens = 0
+        settled_calls = unknown_usage_calls = 0
         for event in events:
             if event.type != "llm_completed":
                 continue
             completed_ids.add(event.payload.get("llm_call_id"))
             count = event.payload.get("budget_token_count")
             audit = event.payload.get("audit_record", {})
+            settled_calls += 1
+            actual_input = audit.get("input_token_count") if isinstance(audit, dict) else None
+            actual_output = audit.get("output_token_count") if isinstance(audit, dict) else None
+            if (type(actual_input) is int and actual_input >= 0
+                    and type(actual_output) is int and actual_output >= 0):
+                settled_input_tokens += actual_input
+                settled_output_tokens += actual_output
+            else:
+                unknown_usage_calls += 1
             if count is None and isinstance(audit, dict):
                 count = audit.get("total_token_count") or audit.get("content_length")
             consumed += int(count or 0)
@@ -7469,6 +7503,7 @@ class AgentTurnLoop:
             for event in events if event.type == "llm_started"
             and event.payload.get("llm_call_id") not in completed_ids
         }
+        pending_reservation_tokens = 0
         for payload in pending.values():
             reservation = payload.get("budget_token_reservation")
             if not isinstance(reservation, int) or isinstance(reservation, bool):
@@ -7477,6 +7512,12 @@ class AgentTurnLoop:
                     if isinstance(value := payload.get(key), int) and not isinstance(value, bool)
                 )
             consumed += max(0, reservation)
+            pending_reservation_tokens += max(0, reservation)
+        calls_by_stage: dict[str, int] = {}
+        for event in events:
+            if event.type == "llm_started":
+                stage = str(event.stage or "unknown")
+                calls_by_stage[stage] = calls_by_stage.get(stage, 0) + 1
         return {
             "max_tokens": max_tokens,
             "consumed_tokens": consumed,
@@ -7487,6 +7528,14 @@ class AgentTurnLoop:
             ),
             "prompt_overhead_tokens": overhead,
             "finish_output_reserve_tokens": CHILD_FINISH_OUTPUT_RESERVE_TOKENS,
+            "usage_breakdown": {
+                "known_input_tokens": settled_input_tokens,
+                "known_output_tokens": settled_output_tokens,
+                "settled_calls": settled_calls,
+                "unknown_usage_calls": unknown_usage_calls,
+                "pending_reservation_tokens": pending_reservation_tokens,
+                "calls_by_stage": calls_by_stage,
+            },
             "instruction": (
                 "Input is charged again on every call. Preserve one call plus input and "
                 "output budget for delivery. Finish once evidence suffices; if collection "
