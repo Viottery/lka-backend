@@ -1216,3 +1216,64 @@ Root预审还纠正“摘要交付=原源句完整literal”的诊断错误：�
 native新10 GREEN/7.62s、Root独立10 GREEN/8.01s、独立review10 GREEN/7.30s且无P1/P2，
 复用入口相关20 GREEN。受限环境2个reservation timeout/零dispatch不作产品缺陷；
 Linux宿主目标全绿。本轮只提交测试入口，remote真实验收下一次单独进行。
+
+R26-K 同parallel真实（`parallel-quality-20261005T032549765274-4f5d2d98`）：131.354s、
+26 actualdispatch/25known/1 SDKtimeout unknown，无pending。known120625input/18352output/
+45952cache/$0.119200032，unknown保守$0.052772，总$0.171972032；未知不是实际收费。
+raw SHA 25f72cd441058a52806202da883f4ab331c411fea0d51daf30b135114822a280，source/goal不变。
+knowledge.search/list_sources实际completed空集合，不再拒绝full空grant；目录/执行语义
+一致的分支已现场触发。parent仍FAILED，3原child partial，不能将此修复报为任务成功。
+三child剩9701/11957/12097 token，下一control＋已有证据answer reserve超出，各按原
+门禁停止；不是全局32-call上限触发。首次发现/索引空检索与controller重复输入仍耗预算。
+一次parent SDK read timeout30.131s，显式thinking=false恢复完整返回并记录confirmed
+cooldown；后续实际参数是否复用待独立核对，不宣称超时根因被确定或普遍延迟变快。
+
+- [ ] R27-D：accepted skip_and_degrade 后已取得的原partial没有消失，但失败交付只看
+  canonical aggregate，将skipped子任务称为“未取得结果”。显示已降级的实际note及
+  validated旧partial（明确历史/未满足当前合同）；保持run failed、current result选择、
+  foreign/duplicate拒绝与5500有界交付，不用文字把业务完成洗白。
+
+R25-B 第一真实（`runtime_background_followup_20261005T033238312609`）：37.051s、
+7 knowncalls、12099input/7304output/$0.033052，无pending/unknown、source不变。正常
+worker watermark4→6；发表版summary1173字符的hash在同会话实际answer请求完整一致，
+旧事实source已在raw tail外，后续回答保留11-06/未批准/安全复核，并正确接受11-09更正；
+前台两轮4.975s/5.005s无写。仍overall false：第一pub为model，第二为local_fallback。
+不能据问答可用掩盖模型摘要链路退化；raw不改，4096不作生产65536/SLA认证。
+
+- [ ] R27-B：第三个compact响应完整合法，source_trace_ids引用此前已发表summary中
+  的trace1与新trace2，但validator只允许当前chunk trace2，误判旧来源并local fallback。
+  跨chunk/跨已发表prefix传递有界server provenance，旧IDs须与本session已covered
+  原始消息验证；不信summary正文或model自己声明IDs，不允许foreign/未covered；
+  publication CAS/lease不弱化，不加模型调用。补真实合法旧来源/伪来源/截断回归后同
+  medium probe重测；provenance membership不等于事实entailment。
+
+### 收尾：用户要求不再继续迭代
+
+2026-10-05 11:57（Asia/Shanghai）停止新增工作，三个Sol工作者已冻结并关闭，未再
+启动付费调用/搜索。完整阶段交付见 [收尾报告](linux_quality_final_report_2026-10-05.md)。
+现有未关闭TODO不批量打勾；原失败和独立审查文件保持不变。
+
+R27-B 已完成server provenance继承：旧summary metadata的IDs只接受同session、
+seq<=covered且与当前watermark一致的原始source membership；跨chunk来源来自真实
+输入而非model自报，64IDs/4096bytes有界，truncation/legacy incomplete明示。CAS/lease、
+预算不改。收尾Root定向73 GREEN/22.68s，Ruff clean；提交1d6acb8。**未再真实复测**，
+所以原R25-B model→fallback失败仍保留，不宣称R27-B真实闭环已完成。
+
+公开benchmark确有遗漏生产query_prefix参数；补显式参数和实际profile记录，旧空默认
+保留，不暗读runtime配置或重复query transform。Root新旧17 GREEN/38.76s；b3dedeb。
+**未重测数据集指标**，前面50题属于旧独立benchmark，不可直接当生产profile成绩。
+
+R27-D停在复现，3 RED/7 GREEN/0.35s：accepted skip后历史partial和degradation note
+丢失，公平交付缺原摘要；生产未修。复现移至ignored
+`data/quality_runs/linux_20261005/degraded_partial_delivery_pending.py`保存，避免把尚未
+实现的RED误放默认tests里；没有改断言/xfail造绿。独立实际review确认1P2/无P1。
+
+宽后台组合76 GREEN/1 FAILED/24.32s：旧usage prune test裸INSERT11值与用户现有
+workload15列schema冲突；不属于来源补丁，没有修改相关user-owned代码。首次收尾
+命令误引用不存在test文件未运行，后已纠正，不计为测试通过。
+
+最终账本1078LLM/1071known/7unknown，5845172input/982202output/2667776cache，
+known费用5.727647616＋未知预留0.4244312＝保守**6.152078816/50**同单位，8Brave。
+2个历史reserved未清零（合计0.1346216），不是现有运行；正式8765服务未重启。
+最后timeout确认关闭推理有直接事件证据，但之后两个request flags未归档；“同run复用”
+仅源码路径及离线回归支持，不能当那两次真实dispatch flag直接观测。
