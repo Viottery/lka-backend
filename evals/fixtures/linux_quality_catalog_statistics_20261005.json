@@ -1,19 +1,19 @@
 {
   "catalog_id": "linux_quality_2026_10_05",
   "as_of": "2026-10-05",
-  "catalog_sha256": "1f69f5bbce203f6a3f706c9b667e9c28af814f74c7aa365cc815511585aa9d57",
+  "catalog_sha256": "714eafbb9131bbdba9f7f0e2a21f729b9b2c48c71fbaed20154f3a5640a714be",
   "catalog_statistics": {
-    "logical_cases": 41,
+    "logical_cases": 43,
     "by_status": {
       "baseline_passed": 4,
       "fixed_live": 17,
-      "fixed_offline": 12,
+      "fixed_offline": 14,
       "open": 8,
       "inconclusive": 0
     },
     "by_tier": {
       "foundation": 4,
-      "regression": 29,
+      "regression": 31,
       "challenge": 8
     },
     "groups": {
@@ -34,10 +34,10 @@
         "inconclusive": 0
       },
       "web": {
-        "total": 5,
+        "total": 6,
         "baseline_passed": 0,
         "fixed_live": 0,
-        "fixed_offline": 2,
+        "fixed_offline": 3,
         "open": 3,
         "inconclusive": 0
       },
@@ -74,10 +74,10 @@
         "inconclusive": 0
       },
       "context_tools": {
-        "total": 7,
+        "total": 8,
         "baseline_passed": 1,
         "fixed_live": 1,
-        "fixed_offline": 3,
+        "fixed_offline": 4,
         "open": 2,
         "inconclusive": 0
       },
@@ -91,21 +91,21 @@
       }
     },
     "unseen_cases": 0,
-    "with_regression_targets": 41,
+    "with_regression_targets": 43,
     "with_replay_entry": 27,
     "label": "Curated logical issues/baselines, NOT run count or current model accuracy"
   },
   "profile_counts": {
-    "focus": 20,
-    "regression": 29,
+    "focus": 22,
+    "regression": 31,
     "foundation": 4,
     "historical_holdout": 10,
-    "all": 41
+    "all": 43
   },
   "plan_statistics": {
     "cases_with_replay": 27,
     "unique_replay_jobs": 20,
-    "unique_regression_targets": 86,
+    "unique_regression_targets": 87,
     "manual_replay_cases": [
       "bash_readonly_arguments",
       "bash_shell_lexing_hooks",
@@ -115,11 +115,13 @@
       "mail_expert_identity_audit",
       "mail_stable_pagination",
       "memory_extractive_grounding",
+      "nested_evidence_delivery_starvation",
       "preexecution_rejection_audit",
       "public_qa_relation_reasoning",
       "public_retrieval_all_hop_regression",
       "replan_atomic_attempt_recovery",
       "tool_discovery_read_truth_table",
+      "web_adjacent_condition_excerpt",
       "web_html_readability"
     ],
     "executed": false

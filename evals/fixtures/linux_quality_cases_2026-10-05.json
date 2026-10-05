@@ -597,14 +597,15 @@
       "status": "open",
       "symptom": "早期只取一页；最终两页三事实有支持，但把长读无条件说成WAL持续增长且1368字。",
       "cause": "证据范围和条件校准未稳定遵从；长读约束checkpoint不自动产生写入。",
-      "optimization": "多页正文交付检查、bounded receipts、通用条件校准；单独验收语义与简洁性。",
+      "optimization": "相邻条件摘录、注册短证据叶子完整保留和有界receipt映射；最新原任务两正文、事务开始快照及checkpoint核心结论改善，但1129字符仍冗长、日期来源叙述待校准，整体保留open。",
       "acceptance": [
         "两官方页支持单写者、读快照、checkpoint影响",
         "WAL持续增长须保留持续写入条件；简短且不声称模型全文读完"
       ],
       "evidence": [
         "docs/quality_iteration_2026-10-05.md — R17：174.039s/14 calls，仅一页，任务失败；R22-T：60.998s/11 calls，两页支持但1120字和整页已读误称",
-        "docs/quality_iteration_2026-10-05.md — R25-V：82.537s/12 calls/0 search；三partial receipts、upstream unknown；独立复核P2条件遗漏/1368字"
+        "docs/quality_iteration_2026-10-05.md — R25-V：82.537s/12 calls/0 search；三partial receipts、upstream unknown；独立复核P2条件遗漏/1368字",
+        "docs/linux_usability_progress_2026-10-05.md — 能力续轮UX-05：首轮54.209s/9 calls仍丢时点/持续写入条件；修复二次截断后84.427s/11 calls，1122字符cached片段完整交付、核心三点改善，非简洁性/整体通过"
       ],
       "regression_tests": [
         "tests/test_eval_runtime_web_quality.py",
@@ -1354,6 +1355,57 @@
         "bounded_current_state",
         "overall_partial"
       ],
+      "exposure": "seen",
+      "data_class": "synthetic"
+    },
+    {
+      "id": "web_adjacent_condition_excerpt",
+      "title": "字面命中摘录丢失相邻限定条件",
+      "group": "web",
+      "tier": "regression",
+      "status": "fixed_offline",
+      "symptom": "命中功能声明但固定400字符窗口未包含同段尾部或下一可读块的仅限/默认不支持条件。",
+      "cause": "按字符截取而非有界保留完整可读块；缺少局部上下文缺失范围，模型容易把声明泛化。",
+      "optimization": "匹配块和相邻块在1200内原样保留；过长退到完整匹配块或片段并披露context范围，沿同hash续读。修复casefold半字符虚假literal，不按领域或限定词猜测。",
+      "acceptance": [
+        "改名/中文任务保留前一块及下一块的原文条件，不语义改写",
+        "放不下显式partial并能同版本续读，变更版本拒绝混合",
+        "Unicode完整命中与所有原文区间精确，不把局部完整当语义或全文验证"
+      ],
+      "evidence": [
+        "docs/linux_usability_progress_2026-10-05.md — 能力续轮UX-05：原400窗口漏条件的显式反例；源范围/hash及最终gate partial验收，非整体网页语义成功"
+      ],
+      "regression_tests": [
+        "tests/test_web_evidence_context_quality.py"
+      ],
+      "replay": null,
+      "tags": ["bounded_source_context", "not_semantic_compliance", "synthetic_generalization"],
+      "exposure": "seen",
+      "data_class": "synthetic"
+    },
+    {
+      "id": "nested_evidence_delivery_starvation",
+      "title": "嵌套元数据耗尽遍历额度导致正文无交付绑定",
+      "group": "context_tools",
+      "tier": "regression",
+      "status": "fixed_offline",
+      "symptom": "五个正文片段在原始artifact中存在，但24节点遍历在元数据和嵌套列表用尽，尚未到snippet就返回空binding。",
+      "cause": "记录数上限被误复用为全树节点上限；缺失mapping不应被当证据已交付。",
+      "optimization": "累计walk≤256、每容器枚举≤24、binding/receipt≤24分开；同run/hash/精确投影认证及最终refit不变。实际SQLite到provider链路保留partial/upstream unknown。",
+      "acceptance": [
+        "嵌套metadata不能挤掉有界正文binding，原宽容器枚举≤24不回归",
+        "抓取片段完整但gate中间内容缺失时，只报告缓存交付partial、上游unknown",
+        "格式合同、权限和原始artifact不变，不把假provider文案当语义准确率"
+      ],
+      "evidence": [
+        "docs/linux_usability_progress_2026-10-05.md — 能力续轮UX-05：空binding反例、宽容器旧断言保护、实际SQLite artifact→answer拟合→provider覆盖记录"
+      ],
+      "regression_tests": [
+        "tests/test_web_evidence_context_quality.py",
+        "tests/test_context_delivery_quality.py"
+      ],
+      "replay": null,
+      "tags": ["bounded_nested_mapping", "not_upstream_verification"],
       "exposure": "seen",
       "data_class": "synthetic"
     }

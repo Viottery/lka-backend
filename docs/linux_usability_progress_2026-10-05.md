@@ -368,3 +368,34 @@ force小结果断言，不让其它工具借用扩大预览；未经注册的同
 最终相关默认/gate/provider/child/native/评测探针定向 **63 passed / 7.25s**，
 Ruff通过；独立审查未发现上述两处残留。评测源码指纹加入影响行为的ToolSpec文件，
 不能因为只改metadata就漏记版本。用户现有tools约束和web权限修改仍分hunk保留。
+
+修复后原任务确认重放 **84.427s / 11 calls / 0 search / $0.076505088**，输入85036、
+输出13813、cache read45568；全部模型调用结算，代码/原任务未改。实际取证了wal与
+transaction两份官方正文，并主动用既有observation.search回查writer/WAL/remembers。
+完整1122字符concurrency窗口进入最终模型prompt，receipt complete/upstream unknown；
+大页仍partial，不暗中宣称上游全文被核验。
+
+人工核心语义检查：单写者、**读事务开始时的固定快照**、checkpoint不能越过活跃读者
+end mark的条件均有实际来源；不再额外声称“长读必然导致WAL增长”，避免首次重放的
+不精确快照时点和未经限定外推。这是原任务的一个有界语义改善样本，并非统计准确率。
+仍bad：回答1129字符、冗长引文/审计说明未满足简短目标；WAL日期来自HTTP
+Last-Modified，却被叙述为“页面标注”，与正文时间的来源类型未区分好。没有额外
+出现WAL增长结论也不证明模型已主动补齐其持续写入条件。日期和必要条件应由任务
+核查项/来源表控制，后续不能继续靠领域事实补prompt。SQLite逻辑案例保留open，
+Python/版本搜索两个旧语义案例本轮未重放，不顺带关闭。
+
+比首轮更慢、调用/token更多：本轮目的为正确性，没有优化或宣称提速，不改输出预算
+来换漂亮指标；不再复跑无变化样本。原件
+`runtime_web_sqlite_20261005T094439708579/heldout_web_sqlite_20261005T094439715866/report.json`，
+SHA-256 `e452732eb90d18861c94a12dd47b7fcb2d818c850ce862d721d31d8d358e35db`。
+本轮付费合计20个DeepSeek Flash调用、1搜索、**$0.12249248**；未使用高开销模型。
+共享账本累计模型$6.622662976 / 1167 dispatch（7条历史未知预留）、9搜索。
+
+评测目录增加两个可独立验收的离线回归问题：相邻条件摘录丢失、嵌套元数据导致正文
+mapping饥饿；不将这两项工具/harness修复洗成网页语义三题成功。现43逻辑项：
+4 baseline / 17 bounded live / 14 offline / 8 open，focus22；基础四项与已确认live项
+仍默认跳过，两个新项均已见合成测试，不伪装heldout准确率。
+
+目录引用和自动统计最终 **2 passed / 0.11s**；源码Ruff与diff check通过。
+本轮所有提交都排除并保留用户既有工具约束/权限和其它并行开发修改；未重启后端、
+未读取或修改真实邮件、未把本地原始prompt/网页快照纳入Git。

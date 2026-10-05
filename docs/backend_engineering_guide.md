@@ -113,6 +113,11 @@ metadata 或工具输出提供额外 summary，但这不是 Agent core 的领域
 分页查看；读取只接受当前 run 的 `tool_result` artifact，跨 run、跨子 Agent 均拒绝。
 子 Agent 还必须在其不可变 ToolView 中获准使用 `observation` package；未获授权时
 仍以普通工具范围检查拒绝，不能凭 artifact ID 扩权。
+注册生产者可以通过 `ToolSpec.output_preview_max_string_chars` 声明有界短证据叶子的
+原样保留阈值（严格整数 700–1200，默认 700），防止已经选出的短段落又被首尾摘录。
+该值只能来自实际 registry spec，且调用名与结果工具名必须一致；工具结果中的同名
+字段不具备配置权。未知工具/MCP 保持默认，整体 gate 序列化 7000 字符上限及原缓存、
+分页、ToolView 边界不变。完整缓存片段进入 prompt 不表示上游全文或结论被验证。
 最终 `answer` 的 provider 发送边界还会生成有界 `context_delivery`：它描述最终拟合
 prompt 中保留的缓存字符串区间，单位为 Unicode codepoints，按 artifact/hash/path
 合并；不是工具扫描量或上游来源完整性的证明。`coverage=complete` 仅表示这个版本
