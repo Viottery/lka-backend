@@ -190,4 +190,3 @@ def test_other_parent_child_cannot_supply_skipped_history(monkeypatch):
 
         monkeypatch.setattr(manager, "list_events", filtered_events)
         assert "OTHER-PARENT-INJECTION" not in loop._unresolved_multi_agent_answer()
-
