@@ -1812,6 +1812,10 @@ PlanStep `input_refs` 可显式指定 `memory:<id>` 或 `memory:<id>@<version>`�
   `{"expected_updated_at":"analysis_job.updated_at"}`，只重试该会话当前失败/取消批次；
   成功返回 `{status:"retried",job:{...}}`，状态冲突或已关闭会话分析返回 409，
   已撤销记录返回 404，全局分析关闭返回 503；保留同一 job_id 和累计用量。
+  可显式附加 `allow_checkpoint_restart:true`，此选项必须携带配对的
+  `LKA_MESSAGES_CONTROL_TOKEN`；允许当前失败的可恢复断点额外重建一次，归档原断点，
+  保留同一工作家庭、累计用量与尝试记录，必要时授予一次额外尝试。
+  不清空或增加工作 token/call 额度，不放开自动恢复上限；省略此字段保持原行为。
 - `POST /messages/conversations/{key}/replay` 接受 `{expected_revision:当前策略revision}`，
   固定请求时的已入库末尾为 `through_seq`，只回放连续水位之后的积压，不重发 cutover 之前历史。
   后台按原有批大小分批推进，绕过通常的数量/间隔触发，不绕过许可、暂停或任何预算。
@@ -1969,9 +1973,13 @@ QQ_MEDIA_IMAGE_MAX_BYTES / QQ_MEDIA_VIDEO_MAX_BYTES 配置。额度不足优先�
   对 v3 恢复耗尽／检查点异常，显式增加工作额度也授予一次额外检查点重建；额度不变不授予。
   该人工操作保持用量，归档、累计恢复次数仍递增，不提高服务或会话的滚动限额。
 
-单 handler 最多一次实际模型调用；有效分片的 checkpoint/完整输出及同 job 让出原子提交，
+单 handler 最多一次实际模型调用；有效分片的 checkpoint/完整输出及同 job 让出原子提交。
+模型校验失败时，修复反馈仅提供已知错误码、字段位置及本地 schema 的允许值或长度限制；
+可空字符串／列表同样提供约束，不回传原始消息、非法值或任意异常正文。
 让出不等于成功，不消费失败重试次数。格式／截断恢复重新排队且计账，已消费的恢复 dispatch
 不能靠普通 retry 再获得。v3 的检查点变化／游标异常／恢复耗尽允许每个 family 有界重建
+（维护期间可配置 `fragment_recovery_enabled=true` 允许每个成功推进的分段各修复一次，
+默认 false 仍为整批一次；同一分段不重复修复，仍消费同一 family 额度）
 （`max_recovery_restarts` 默认1、0禁用、最大3），旧检查点先归档，原 job/family/范围/用量
 不变；重建后的调用仍消费原工作累计额度，非免费恢复。取消、权限变化和工作额度耗尽
 不自动重建。独立错误码为 checkpoint_input_changed/checkpoint_cursor_invalid/

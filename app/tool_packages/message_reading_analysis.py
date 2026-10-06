@@ -11,7 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from app.domains.message_participant_profiles import ClaimKind
 from app.domains.message_reading_codec import CODEC_VERSION, SELECTOR_VERSION
 
-PROMPT_VERSION = "message-reading-production-v3.4-explicit-records"
+PROMPT_VERSION = "message-reading-production-v3.5-reference-constraints"
 PROJECTION_VERSION = "scoped-message-projection-v1"
 VERSIONS = {"prompt": PROMPT_VERSION, "projection": PROJECTION_VERSION,
             "codec": CODEC_VERSION, "selector": SELECTOR_VERSION, "schema": 3,
@@ -22,6 +22,10 @@ facts, warnings, participant_claim_candidates, focus_candidates, evidence_reques
 Never infer permissions, execute tasks, infer sensitive traits or cross-conversation identities.
 All result evidence IDs must be aliases from the CURRENT fragment. Preserve uncertainty and attribution.
 Only evidence_requests may cite authorized_aliases from the same fixed range for one bounded reread.
+Copy existing_topic_id / existing_insight_id verbatim from reference_constraints for that field.
+An empty allowed list means omit that existing reference. Never invent an existing ID, use a message
+alias as a topic/insight ID, or copy titles into ID fields. For a new topic, use batch_local_key and
+omit existing_topic_id. Findings about that new topic use the same batch_local_key.
 topic_updates (<=40): exactly one existing_topic_id or batch_local_key, title<=200,
 summary<=2000, source_message_ids (1..50 representative aliases), optional member_message_ids
 (all CURRENT fragment aliases assigned to that topic), conclusions/disagreements/open_questions
@@ -130,7 +134,13 @@ class ScopedProjection:
 
 
 def prompt(context: dict, messages: list[dict], authorized_aliases: list[str]) -> str:
-    return json.dumps({**context, "authorized_aliases": authorized_aliases,
+    references = {field: [row[key] for row in context.get(rows, [])]
+                  for field, rows, key in (
+                      ("existing_topic_id", "known_topics", "topic_id"),
+                      ("existing_insight_id", "known_insights", "insight_id"),
+                      ("supersedes_fact_ids", "prior_facts", "fact_id"))}
+    return json.dumps({**context, "reference_constraints": references,
+                       "authorized_aliases": authorized_aliases,
                        "messages": messages}, ensure_ascii=False,
                       sort_keys=True, separators=(",", ":"))
 

@@ -227,6 +227,7 @@ recovery_output_tokens = 8192 # One bounded recovery; thinking disabled when sup
 
 [message_history]
 max_recovery_restarts = 1 # same family/budget; archived checkpoint, no silent skipping
+fragment_recovery_enabled = false # Opt-in one repair per fragment, still charged to the same work budget.
 reading_algorithm = "legacy" # compact/selected require explicit per-source analysis consent
 participant_pool_capacity = 30
 participant_pinned_capacity = 10

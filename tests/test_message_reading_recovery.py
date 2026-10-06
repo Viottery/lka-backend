@@ -131,6 +131,328 @@ def test_topic_validator_feedback_contains_only_known_code_and_field_path():
     assert "private" not in str(feedback)
 
 
+def test_literal_recovery_feedback_uses_schema_values_without_private_input():
+    from pydantic import ValidationError
+
+    from app.core.message_analysis import _reading_validation_feedback
+    from app.domains.message_history import AnalysisResult
+    from app.domains.message_reading_results import ReadingFinding
+
+    with pytest.raises(ValidationError) as error:
+        AnalysisResult(schema_version=3, summary="summary", batch_summary="batch",
+                       highlights=[{"text": "private body", "source_message_ids": ["private id"],
+                                    "reason_codes": ["private-invalid-reason"]}])
+    feedback = _reading_validation_feedback(error.value)
+    expected = ReadingFinding.model_json_schema()["properties"]["reason_codes"]["items"]["enum"]
+    assert feedback[0]["allowed_values"] == expected
+    assert "private" not in json.dumps(feedback)
+    assert len(json.dumps(feedback, separators=(",", ":")).encode()) <= 480
+
+
+def test_unknown_reference_feedback_explains_fragment_scope_without_ids():
+    from app.core.message_analysis import _reading_validation_feedback
+
+    feedback = _reading_validation_feedback(ValueError("reading_reference_not_seen"))
+    assert "CURRENT messages" in feedback[0]["hint"]
+    assert "fragment suffixes" in feedback[0]["hint"]
+    assert "Only evidence_requests" in feedback[0]["hint"]
+
+
+def test_source_list_recovery_feedback_exposes_schema_limit_without_ids():
+    from pydantic import ValidationError
+
+    from app.core.message_analysis import _reading_validation_feedback
+    from app.domains.message_history import AnalysisResult
+
+    with pytest.raises(ValidationError) as error:
+        AnalysisResult(schema_version=3, summary="summary", batch_summary="batch", topic_updates=[{
+            "batch_local_key": "private key", "title": "private title", "summary": "private body",
+            "source_message_ids": [f"private id {index}" for index in range(51)],
+        }])
+    feedback = _reading_validation_feedback(error.value)
+    assert feedback[0]["max_items"] == 50
+    assert feedback[0]["min_items"] == 1
+    assert "private" not in json.dumps(feedback)
+
+
+@pytest.mark.parametrize("field,value,minimum,maximum", [
+    ("action_key", "private" * 34, 1, 200),
+    ("action_key", "", 1, 200),
+    ("existing_topic_id", "private" * 21, None, 120),
+], ids=["optional-string-too-long", "optional-string-too-short", "optional-reference-too-long"])
+def test_nullable_string_feedback_uses_schema_limits(field, value, minimum, maximum):
+    from pydantic import ValidationError
+
+    from app.core.message_analysis import _reading_validation_feedback
+    from app.domains.message_history import AnalysisResult
+
+    with pytest.raises(ValidationError) as error:
+        AnalysisResult(schema_version=3, summary="summary", batch_summary="batch", highlights=[{
+            "text": "private body", "source_message_ids": ["private id"], field: value,
+        }])
+    feedback = _reading_validation_feedback(error.value)
+    assert feedback[0]["max_length"] == maximum
+    assert feedback[0].get("min_length") == minimum
+    assert "private" not in json.dumps(feedback)
+    assert len(json.dumps(feedback, separators=(",", ":")).encode()) <= 480
+
+
+def test_nullable_list_feedback_uses_schema_limit_without_private_ids():
+    from pydantic import ValidationError
+
+    from app.core.message_analysis import _reading_validation_feedback
+    from app.domains.message_history import AnalysisResult
+
+    with pytest.raises(ValidationError) as error:
+        AnalysisResult(schema_version=3, summary="summary", batch_summary="batch", topic_updates=[{
+            "batch_local_key": "private key", "title": "private title", "summary": "private body",
+            "source_message_ids": ["private id"], "member_message_ids": ["private id"] * 10001,
+        }])
+    feedback = _reading_validation_feedback(error.value)
+    assert feedback[0]["max_items"] == 10000
+    assert "private" not in json.dumps(feedback)
+    assert len(json.dumps(feedback, separators=(",", ":")).encode()) <= 480
+
+
+def test_schema_lookup_unwraps_nullable_reference_before_list_item():
+    from app.core.message_analysis import _reading_schema_node
+
+    item = {"type": "string", "enum": ["allowed"]}
+    schema = {"properties": {"rows": {"anyOf": [{"$ref": "#/$defs/Rows"}, {"type": "null"}]}},
+              "$defs": {"Rows": {"type": "array", "maxItems": 2, "items": item}}}
+    assert _reading_schema_node(schema, ("rows",))["maxItems"] == 2
+    assert _reading_schema_node(schema, ("rows", 0)) == item
+
+
+def test_schema_lookup_does_not_guess_ambiguous_union_branch():
+    from app.core.message_analysis import _reading_schema_node
+
+    field = {"anyOf": [{"type": "string", "maxLength": 5},
+                       {"type": "array", "maxItems": 3}, {"type": "null"}]}
+    node = _reading_schema_node({"properties": {"value": field}}, ("value",))
+    assert node == field
+    assert "maxLength" not in node and "maxItems" not in node
+
+
+def test_nullable_action_key_recovery_keeps_validation_and_budget(tmp_path):
+    class LengthFeedbackModel(Model):
+        async def complete_text(self, **kwargs):
+            response = await super().complete_text(**kwargs)
+            request = self.requests[-1]
+            feedback = request.get("validation_feedback", [])
+            limit = feedback[0].get("max_length") if feedback else None
+            value = json.loads(response.content)
+            value["highlights"] = [{
+                "text": "Sourced synthetic finding",
+                "source_message_ids": [request["messages"][0]["id"]],
+                "action_key": "x" * (limit if limit is not None else 201),
+            }]
+            response.content = json.dumps(value)
+            return response
+
+    service, store, policy, coordinator, model = pipeline(tmp_path, "selected", LengthFeedbackModel())
+    insert(service, 1)
+    finish(service, policy, coordinator)
+    assert len(model.requests) == 2
+    assert len(store.list(status="succeeded")) == 1
+    assert service.reading_status()["schedules"][0]["analysis_watermark_seq"] == 1
+    job = store.list(status="succeeded")[0]
+    family = store.get(job["job_id"], include_payload=True)["payload"]["work_family_id"]
+    assert coordinator.controller.quota_usage(family)["total_calls"] == 2
+
+
+def test_envelope_recovery_feedback_explains_exact_shape():
+    from app.core.message_analysis import _reading_validation_feedback
+
+    feedback = _reading_validation_feedback(ValueError("invalid_reading_v3_envelope"))
+    assert "integer 3" in feedback[0]["hint"]
+    assert "Do not add summary" in feedback[0]["hint"]
+    assert len(json.dumps(feedback, separators=(",", ":")).encode()) <= 480
+
+
+def test_unknown_existing_reference_feedback_allows_new_topic_without_fabricated_identity(tmp_path):
+    class UnknownTopicModel(Model):
+        async def complete_text(self, **kwargs):
+            response = await super().complete_text(**kwargs)
+            request = self.requests[-1]
+            value = json.loads(response.content)
+            topic = {"title": "Synthetic topic", "summary": "Sourced discussion",
+                     "source_message_ids": [request["messages"][0]["id"]]}
+            feedback = request.get("validation_feedback", [])
+            if feedback:
+                hint = feedback[0]["hint"]
+                assert "known_topics.topic_id" in hint and "known_insights.insight_id" in hint
+                assert "batch_local_key" in hint
+                assert "private-invented-topic-id" not in json.dumps(feedback)
+                assert len(json.dumps(feedback, separators=(",", ":")).encode()) <= 480
+                topic["batch_local_key"] = "new-topic"
+            else:
+                topic["existing_topic_id"] = "private-invented-topic-id"
+            value["topic_updates"] = [topic]
+            response.content = json.dumps(value)
+            return response
+
+    service, store, policy, coordinator, model = pipeline(tmp_path, "selected", UnknownTopicModel())
+    insert(service, 1)
+    finish(service, policy, coordinator)
+    assert len(model.requests) == 2 and store.list(status="succeeded")
+    assert service.reading_status()["schedules"][0]["analysis_watermark_seq"] == 1
+    with service._connection() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM message_reading_topics").fetchone()[0] == 1
+
+
+def test_reference_constraints_copy_only_granted_ids_and_override_untrusted_context():
+    from app.tool_packages.message_reading_analysis import prompt
+
+    context = {"known_topics": [{"topic_id": "granted-topic", "title": "other-title"}],
+               "known_insights": [], "prior_facts": [{"fact_id": "granted-fact"}],
+               "reference_constraints": {"existing_insight_id": ["not-granted"]}}
+    value = json.loads(prompt(context, [], []))
+    assert value["reference_constraints"] == {
+        "existing_topic_id": ["granted-topic"], "existing_insight_id": [],
+        "supersedes_fact_ids": ["granted-fact"]}
+    assert context["reference_constraints"]["existing_insight_id"] == ["not-granted"]
+
+
+def test_processing_revision_change_reports_checkpoint_conflict_then_archives_on_restart(tmp_path):
+    service, store, policy, coordinator, model = pipeline(tmp_path, "selected", BadThenGood())
+    insert(service, 1)
+    finish(service, policy, coordinator)
+    old_job = store.list(status="failed")[0]
+    family = store.get(old_job["job_id"], include_payload=True)["payload"]["work_family_id"]
+    with service._connection() as conn:
+        stale_checkpoint = tuple(conn.execute("SELECT * FROM message_reading_checkpoints WHERE family_id=?", (family,)).fetchone())
+    policy = service.set_policy({**IDENTITY, "record_enabled": True, "analysis_enabled": True,
+        "batch_size": 100, "max_batch_messages": 100, "min_interval_seconds": 0,
+        "timezone": "UTC", "expected_revision": policy["revision"]})
+    # Simulate a persisted checkpoint from an older deployment that did not
+    # fence/remove it when the policy processing revision changed.
+    with service._connection() as conn:
+        conn.execute("INSERT INTO message_reading_checkpoints VALUES(?,?,?,?,?,?,?)", stale_checkpoint)
+    new_job = service.schedule_pending(policy["conversation_key"], force=True)[0]
+    assert new_job["job_id"] != old_job["job_id"]
+    assert coordinator.worker.run_one()
+    failed = store.get(new_job["job_id"])
+    assert failed["error_class"] == "checkpoint_input_changed"
+    assert len(model.requests) == 2
+    with service._connection() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM message_reading_checkpoints WHERE family_id=?", (family,)).fetchone()[0] == 1
+    retried = service.retry_analysis(policy["conversation_key"], failed["updated_at"], allow_checkpoint_restart=True)
+    assert retried["status"] == "retried"
+    finish(service, policy, coordinator)
+    assert store.get(new_job["job_id"])["status"] == "succeeded"
+    assert len(model.requests) == 3
+    assert coordinator.controller.quota_usage(family)["total_calls"] == 3
+    with service._connection() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM message_reading_checkpoint_archives WHERE family_id=?", (family,)).fetchone()[0] == 1
+
+
+def test_explicit_checkpoint_restart_preserves_budget_attempts_and_cas(tmp_path):
+    service, store, policy, coordinator, _model = pipeline(tmp_path, "selected", BadThenGood(4))
+    insert(service, 1)
+    finish(service, policy, coordinator)
+    finish(service, policy, coordinator)
+    failed = store.list(status="failed")[0]
+    family = store.get(failed["job_id"], include_payload=True)["payload"]["work_family_id"]
+    with service._connection() as conn:
+        conn.execute("UPDATE background_jobs SET attempts=max_attempts WHERE job_id=?", (failed["job_id"],))
+    assert service.retry_analysis(policy["conversation_key"], "stale", allow_checkpoint_restart=True)["status"] == "conflict"
+    assert service.retry_analysis(policy["conversation_key"], failed["updated_at"])["status"] == "unsupported"
+    result = service.retry_analysis(policy["conversation_key"], failed["updated_at"], allow_checkpoint_restart=True)
+    assert result["status"] == "retried"
+    assert coordinator.controller.quota_usage(family)["total_calls"] == 4
+    assert store.get(failed["job_id"])["attempts"] == 5
+    assert store.get(failed["job_id"])["max_attempts"] == 6
+    assert service.retry_analysis(policy["conversation_key"], failed["updated_at"], allow_checkpoint_restart=True)["status"] == "missing"
+    finish(service, policy, coordinator)
+    assert store.get(failed["job_id"])["status"] == "succeeded"
+    assert coordinator.controller.quota_usage(family)["total_calls"] == 5
+
+
+@pytest.mark.parametrize("per_fragment", [False, True])
+def test_opt_in_fragment_recovery_keeps_default_bound_and_whole_work_ledger(tmp_path, per_fragment):
+    class EachFragmentNeedsRepair(Model):
+        def __init__(self):
+            super().__init__()
+            self.seen = set()
+
+        async def complete_text(self, **kwargs):
+            response = await super().complete_text(**kwargs)
+            key = tuple(row["id"] for row in self.requests[-1]["messages"])
+            if key not in self.seen:
+                self.seen.add(key)
+                response.content = "invalid-json"
+            return response
+
+    service, store, policy, coordinator, model = pipeline(
+        tmp_path, "compact", EachFragmentNeedsRepair(), fragment_recovery_enabled=per_fragment)
+    insert(service, 1, "synthetic discussion. " * 500)
+    assert len(service.recent()["messages"]) == 1
+    finish(service, policy, coordinator)
+    assert len(model.seen) >= 2
+    if not per_fragment:
+        assert store.list(status="failed") and not store.list(status="succeeded")
+        assert service.reading_status()["schedules"][0]["analysis_watermark_seq"] == 0
+    else:
+        assert store.list(status="succeeded") and not store.list(status="failed")
+        assert len(model.requests) == 2 * len(model.seen)
+        assert service.reading_status()["schedules"][0]["analysis_watermark_seq"] == 1
+        family = store.get(store.list(status="succeeded")[0]["job_id"], include_payload=True)["payload"]["work_family_id"]
+        assert coordinator.controller.quota_usage(family)["total_calls"] == len(model.requests)
+
+
+@pytest.mark.parametrize("split", [False, True])
+def test_complete_message_base_alias_is_canonicalized_but_partial_message_is_rejected(tmp_path, split):
+    class BaseAliasModel(Model):
+        async def complete_text(self, **kwargs):
+            response = await super().complete_text(**kwargs)
+            request = self.requests[-1]
+            value = json.loads(response.content)
+            value["highlights"] = [{"text": "Sourced synthetic finding",
+                                    "source_message_ids": [request["authorized_aliases"][0]]}]
+            response.content = json.dumps(value)
+            return response
+
+    service, store, policy, coordinator, model = pipeline(tmp_path, "compact", BaseAliasModel())
+    insert(service, 1, "synthetic discussion. " * (500 if split else 1))
+    finish(service, policy, coordinator)
+    if split:
+        assert store.list(status="failed") and not store.list(status="succeeded")
+        assert service.reading_status()["schedules"][0]["analysis_watermark_seq"] == 0
+    else:
+        assert len(model.requests) == 1 and store.list(status="succeeded")
+        assert service.reading_status()["schedules"][0]["analysis_watermark_seq"] == 1
+
+
+@pytest.mark.parametrize("bad_reference", [False, True])
+def test_actionable_feedback_repairs_model_output_without_relaxing_validation(tmp_path, bad_reference):
+    class FeedbackModel(Model):
+        async def complete_text(self, **kwargs):
+            response = await super().complete_text(**kwargs)
+            request = self.requests[-1]
+            feedback = request.get("validation_feedback", [])
+            repaired = bool(feedback) and (
+                "CURRENT messages" in feedback[0].get("hint", "") if bad_reference
+                else "worth_reading" in feedback[0].get("allowed_values", [])
+            )
+            value = json.loads(response.content)
+            value["highlights"] = [{
+                "text": "Sourced synthetic finding",
+                "source_message_ids": [request["messages"][0]["id"] if repaired or not bad_reference
+                                       else "unseen-alias"],
+                "reason_codes": ["worth_reading" if repaired or bad_reference else "invalid-reason"],
+            }]
+            response.content = json.dumps(value)
+            return response
+
+    service, store, policy, coordinator, model = pipeline(tmp_path, "selected", FeedbackModel())
+    insert(service, 1)
+    finish(service, policy, coordinator)
+    assert len(model.requests) == 2
+    assert len(store.list(status="succeeded")) == 1
+    assert service.reading_status()["schedules"][0]["analysis_watermark_seq"] == 1
+
+
 def test_rebuilding_checkpoint_does_not_reset_exhausted_call_budget(tmp_path):
     service, store, policy, coordinator, model = pipeline(tmp_path, "selected", BadThenGood())
     insert(service, 1)

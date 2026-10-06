@@ -1045,8 +1045,11 @@ class MessageHistoryService(MessageMetadataMixin, MessageDossierMixin, MessageRe
             conn.commit()
         return jobs
 
-    def retry_analysis(self, conversation_key: str, expected_updated_at: str) -> dict[str, Any]:
+    def retry_analysis(self, conversation_key: str, expected_updated_at: str,
+                       *, allow_checkpoint_restart: bool = False) -> dict[str, Any]:
         """CAS-retry the current revision's failed batch for one conversation."""
+        if type(allow_checkpoint_restart) is not bool:
+            raise ValueError("invalid_restart_authorization")
         with self._connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             policy = conn.execute(
@@ -1069,7 +1072,8 @@ class MessageHistoryService(MessageMetadataMixin, MessageDossierMixin, MessageRe
             if row is not None and row["updated_at"] == expected_updated_at:
                 from app.domains.message_reading_runtime import _RECOVERABLE_READING_ERRORS
                 if self._reading_config.get("reading_algorithm", "legacy") != "legacy" and row["error_class"] in _RECOVERABLE_READING_ERRORS:
-                    recovered = self._recover_failed_reading(conn, row, policy)
+                    recovered = self._recover_failed_reading(conn, row, policy,
+                                                             authorized_restart=allow_checkpoint_restart)
                     conn.commit()
                     return {"status": "retried" if recovered else "unsupported", "job": recovered or self.jobs._public(row)}
         if row is None:

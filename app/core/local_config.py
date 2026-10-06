@@ -439,6 +439,7 @@ class MessageHistoryConfig(BaseModel):
     due_scan_limit: int = Field(default=32, ge=1, le=200)
     yield_delay_seconds: float = Field(default=1, ge=0, le=60)
     max_recovery_restarts: int = Field(default=1, ge=0, le=3)
+    fragment_recovery_enabled: bool = False
     model_prices: list[MessageModelPricing] = Field(default_factory=list, max_length=100)
     # Bounds the encoded raw-message array, not the full prompt. Bounded prior
     # summaries/evidence are additional; LLMService enforces model capacity.

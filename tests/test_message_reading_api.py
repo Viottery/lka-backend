@@ -39,6 +39,24 @@ def test_human_decisions_need_dedicated_identity_not_api_or_body(tmp_path, monke
     assert decisions[0].principal_id.split(":", 1)[1] != "paired"
 
 
+def test_explicit_checkpoint_restart_requires_paired_human_credential(tmp_path, monkeypatch):
+    monkeypatch.setenv("LKA_MESSAGES_API_TOKEN", "reader")
+    monkeypatch.setenv("LKA_MESSAGES_CONTROL_TOKEN", "paired")
+    app, history = client(tmp_path)
+    policy = history.set_policy({"platform": "synthetic", "account_id": "self", "conversation_type": "group",
+                                 "conversation_id": "test", "record_enabled": True, "analysis_enabled": True})
+    calls = []
+    history.retry_analysis = lambda key, **kwargs: calls.append(kwargs) or {"status": "retried", "job": {}}
+    path = f"/messages/conversations/{policy['conversation_key']}/retry"
+    payload = {"expected_updated_at": "synthetic timestamp", "allow_checkpoint_restart": True}
+    assert _request(app, "POST", path, payload=payload, headers={"X-LKA-Messages-Token": "reader"}).status_code == 401
+    assert not calls
+    assert _request(app, "POST", path, payload=payload, headers={"X-LKA-Messages-Token": "paired"}).status_code == 200
+    assert calls == [{"expected_updated_at": "synthetic timestamp", "allow_checkpoint_restart": True}]
+    payload["allow_checkpoint_restart"] = 1
+    assert _request(app, "POST", path, payload=payload, headers={"X-LKA-Messages-Token": "paired"}).status_code == 400
+
+
 def test_profile_attention_strict_forms_and_cas(tmp_path, monkeypatch):
     monkeypatch.setenv("LKA_MESSAGES_CONTROL_TOKEN", "paired")
     app, _ = client(tmp_path)

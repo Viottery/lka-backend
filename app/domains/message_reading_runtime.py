@@ -112,7 +112,7 @@ class MessageReadingRuntimeMixin:
         if (not family or family["end_seq"] != payload.get("end_seq")
                 or (not authorized_restart and family["recovery_count"] >= self._reading_config.get("max_recovery_restarts", 1))
                 or (job["deadline"] is not None and job["deadline"] <= now)
-                or job["attempts"] >= job["max_attempts"]):
+                or (not authorized_restart and job["attempts"] >= job["max_attempts"])):
             return None
         if conn.execute("SELECT COUNT(*) FROM background_jobs WHERE status IN ('queued','running','retry_wait')").fetchone()[0] >= getattr(self.jobs, "max_pending_jobs", 1024):
             return None
@@ -125,7 +125,11 @@ class MessageReadingRuntimeMixin:
         conn.execute("DELETE FROM message_reading_checkpoints WHERE family_id=?", (family["family_id"],))
         conn.execute("UPDATE message_reading_families SET recovery_count=?,revision=revision+1 WHERE family_id=?", (recovery_count, family["family_id"]))
         conn.execute("INSERT INTO message_reading_control_events VALUES(?,?,?,?,?)",
-            (family["family_id"], family["revision"] + 1, "recover_checkpoint", _encode({"error_class": job["error_class"], "recovery_count": recovery_count}), now))
+            (family["family_id"], family["revision"] + 1, "recover_checkpoint", _encode({"error_class": job["error_class"], "recovery_count": recovery_count, "authorized_restart": authorized_restart}), now))
+        if authorized_restart and job["attempts"] >= job["max_attempts"]:
+            # An explicit controlled retry grants one lease; paid usage and the
+            # original attempt ledger stay intact, just like retry_controlled.
+            conn.execute("UPDATE background_jobs SET max_attempts=max_attempts+1 WHERE job_id=?", (job["job_id"],))
         conn.execute("UPDATE background_jobs SET status='queued',available_at=?,updated_at=?,finished_at=NULL,started_at=NULL,error_class=NULL,lease_owner=NULL,lease_expires_at=NULL,lease_epoch=lease_epoch+1 WHERE job_id=?", (now, now, job["job_id"]))
         return self.jobs._public(conn.execute("SELECT * FROM background_jobs WHERE job_id=?", (job["job_id"],)).fetchone(), include_payload=True)
 
@@ -264,7 +268,10 @@ class MessageReadingRuntimeMixin:
         semantic = hashlib.sha256(_encode({k: payload.get(k, policy_values.get(k)) for k in ("conversation_id", "start_seq", "end_seq", "capture_epoch", "analysis_epoch", "processing_revision")}).encode()).hexdigest()
         checkpoint = conn.execute("SELECT * FROM message_reading_checkpoints WHERE family_id=?", (family["family_id"],)).fetchone()
         if checkpoint and checkpoint["semantic_digest"] != semantic:
-            checkpoint = None
+            # The row still owns this family's unique key. Treating it as
+            # absent would later INSERT over it and bypass controlled archival.
+            from app.core.background_jobs import BackgroundJobFailure
+            raise BackgroundJobFailure("checkpoint_input_changed")
         return family, checkpoint, semantic, control["service_epoch"]
 
     def _reading_watermark(self, state):

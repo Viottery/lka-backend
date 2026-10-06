@@ -91,6 +91,23 @@ def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def _reading_schema_node(schema, location):
+    """Follow schema-owned references and unambiguous nullable wrappers."""
+    def unwrap(node):
+        if "$ref" in node:
+            node = schema.get("$defs", {}).get(node["$ref"].rsplit("/", 1)[-1], {})
+        branches = [branch for branch in node.get("anyOf", []) if branch.get("type") != "null"]
+        if len(branches) == 1:
+            return unwrap(branches[0])
+        return node
+
+    node = schema
+    for part in location:
+        node = unwrap(node)
+        node = node.get("items", {}) if type(part) is int else node.get("properties", {}).get(part, {})
+    return unwrap(node)
+
+
 def _reading_validation_feedback(exc):
     """Bounded schema codes/field locations, excluding inputs and extra keys."""
     codes = {"invalid_reading_v3_envelope", "reading_v3_candidate_limit",
@@ -105,13 +122,43 @@ def _reading_validation_feedback(exc):
         errors = []
         for row in exc.errors(include_input=False)[:8]:
             reason = str(row.get("ctx", {}).get("error", ""))
-            errors.append({"code": reason if reason in codes else "schema_validation", "type": row["type"][:60],
+            feedback = {"code": reason if reason in codes else "schema_validation", "type": row["type"][:60],
                 "path": [part if type(part) is int else part if part in fields else "unknown"
-                         for part in row["loc"][:4]]})
+                         for part in row["loc"][:4]]}
+            # Use our schema, never provider input or exception text, to explain
+            # literal failures. A field path alone cannot show the allowed values.
+            if row["type"] in {"literal_error", "too_long", "too_short", "string_too_long", "string_too_short"}:
+                node = _reading_schema_node(schema, row["loc"])
+                allowed = node.get("enum", [node["const"]] if "const" in node else [])
+                if row["type"] == "literal_error" and allowed and len(allowed) <= 16 and all(
+                        isinstance(value, str) and len(value) <= 64 for value in allowed):
+                    feedback["allowed_values"] = allowed
+                for bound, label in (("maxItems", "max_items"), ("minItems", "min_items"),
+                                     ("maxLength", "max_length"), ("minLength", "min_length")):
+                    if type(node.get(bound)) is int:
+                        feedback[label] = node[bound]
+            errors.append(feedback)
     else:
         code = exc.args[0] if exc.args and isinstance(exc.args[0], str) else None
         errors = [{"code": code if code in codes else "invalid_json" if isinstance(exc, json.JSONDecodeError)
                    else "invalid_analysis_result"}]
+        if code == "reading_reference_not_seen":
+            errors[0]["hint"] = (
+                "Result citations must use exact id values from CURRENT messages, including fragment suffixes. "
+                "Only evidence_requests may cite other authorized_aliases; omit unsupported result rows."
+            )
+        elif code == "invalid_reading_v3_envelope":
+            errors[0]["hint"] = (
+                "schema_version must be integer 3. Return exactly schema_version, topic_updates, highlights, "
+                "importance_findings, facts, warnings, participant_claim_candidates, focus_candidates, "
+                "evidence_requests. Do not add summary, batch_summary or other keys."
+            )
+        elif code == "reading_unknown_reference":
+            errors[0]["hint"] = (
+                "existing_topic_id must copy known_topics.topic_id; existing_insight_id must copy "
+                "known_insights.insight_id. For a new topic use batch_local_key and omit existing_topic_id. "
+                "Do not invent existing IDs or use message aliases as topic/insight IDs."
+            )
     while len(_json(errors).encode()) > 480:
         errors.pop()
     return errors
@@ -368,7 +415,7 @@ class MessageAnalysisCoordinator:
             except BackgroundTaskBudgetExceeded:
                 continue
             calls = len(chunks)
-            reserve_calls = 2
+            reserve_calls = len(chunks) + 1 if self.config.fragment_recovery_enabled else 2
             tokens = sum(self.counter.count_request(reading_v3.SYSTEM,
                 reading_v3.prompt(context, rows, authorized)).count + self.config.generation_output_tokens
                 for rows in chunks)
@@ -837,7 +884,7 @@ class MessageAnalysisCoordinator:
             "chunks": chunks, "versions": reading_v3.VERSIONS, "route": self._route(),
             "config": {k: getattr(self.config, k) for k in ("reading_algorithm", "max_input_tokens",
                 "selector_max_messages", "selector_exploration_fraction", "generation_output_tokens",
-                "recovery_output_tokens", "participant_pool_capacity", "participant_pinned_capacity",
+                "recovery_output_tokens", "fragment_recovery_enabled", "participant_pool_capacity", "participant_pinned_capacity",
                 "profile_cold_days", "profile_retention_days")}}).encode()).hexdigest()
         if checkpoint and checkpoint.get("input_snapshot_digest") != fingerprint:
             raise BackgroundJobFailure("checkpoint_input_changed")
@@ -940,6 +987,14 @@ class MessageAnalysisCoordinator:
                 "participant_claim_candidates", "focus_candidates", "evidence_requests")}
             parsed.update(summary=accumulator["summary"], batch_summary=accumulator["batch_summary"])
             allowed = {row["id"] for row in fragments}
+            # A complete one-part message has two known aliases for exactly the
+            # same seen text. Canonicalize that identity only; base aliases of
+            # split/omitted messages must still fail the CURRENT-source check.
+            complete_aliases = {
+                row["id"].removesuffix("f1"): row["id"] for row in fragments
+                if row.get("fragment_index") == 1 and row.get("fragment_count") == 1
+                and row["id"].removesuffix("f1") in authorized
+            }
             for field in ("topic_updates", "highlights", "importance_findings", "facts"):
                 for row in parsed[field]:
                     if (field == "topic_updates" and isinstance(row.get("member_message_ids"), list)
@@ -951,6 +1006,8 @@ class MessageAnalysisCoordinator:
                             row["member_message_ids"] + row["source_message_ids"]))
                     for sources in ("source_message_ids", "member_message_ids"):
                         if sources in row and row[sources] is not None:
+                            if isinstance(row[sources], list):
+                                row[sources] = [complete_aliases.get(source, source) for source in row[sources]]
                             if not set(row[sources]) <= allowed:
                                 raise ValueError("reading_reference_not_seen")
                             row[sources] = list(dict.fromkeys(projection.reverse[s] for s in row[sources]))
@@ -1007,6 +1064,7 @@ class MessageAnalysisCoordinator:
             accumulator["warnings"].append("evidence_request_exceeds_input_budget; unresolved evidence remains unknown")
         if cursor + 1 < len(chunks):
             save(cursor + 1, recovery_pending=False, evidence_pending=False,
+                 recovery_used=bool(checkpoint.get("recovery_used")) and not self.config.fragment_recovery_enabled,
                  fragment_output=result.model_dump(mode="json"), model_seen_spans=seen)
         usage = self.controller.quota_usage(progress["family_id"])
         name, model = self._route()

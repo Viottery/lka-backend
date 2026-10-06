@@ -268,12 +268,17 @@ async def retry(request: Request, conversation_key: str) -> dict[str, Any]:
         raise HTTPException(status_code=503, detail="Message analysis is disabled globally.")
     payload = await _json_object(request)
     expected = payload.get("expected_updated_at")
-    if not isinstance(expected, str) or set(payload) != {"expected_updated_at"}:
+    allow_restart = payload.get("allow_checkpoint_restart", False)
+    if (not isinstance(expected, str) or type(allow_restart) is not bool
+            or set(payload) - {"expected_updated_at", "allow_checkpoint_restart"}):
         raise _failure()
+    if allow_restart:
+        from app.api.routes.message_reading import _human
+        _human(request)
     try:
         result = await asyncio.to_thread(
             runtime.message_history.retry_analysis,
-            conversation_key, expected_updated_at=expected,
+            conversation_key, expected_updated_at=expected, allow_checkpoint_restart=allow_restart,
         )
     except (AttributeError, ValueError, KeyError):
         raise _failure() from None
@@ -317,7 +322,7 @@ def reading_service_status(request: Request) -> dict[str, Any]:
     state["budget"] = coordinator.controller.quota_usage("message_reading")
     state["pricing_known"] = coordinator._pricing() is not None
     state["limits"] = {key: value for key, value in coordinator.config.model_dump(mode="json").items()
-                       if key.endswith("_limit") or key in {"max_job_tokens", "max_job_calls", "max_input_tokens", "max_recovery_restarts"}}
+                       if key.endswith("_limit") or key in {"max_job_tokens", "max_job_calls", "max_input_tokens", "max_recovery_restarts", "fragment_recovery_enabled"}}
     for schedule in state["schedules"]:
         if schedule["active_work_id"]:
             schedule["budget"] = coordinator.controller.quota_usage(schedule["active_work_id"])
