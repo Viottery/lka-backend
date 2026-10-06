@@ -88,6 +88,9 @@ rsync_args=(
   --exclude .bootstrap/
   --exclude .uv-cache/
   --exclude scratch/
+  --exclude /docs/_engineering/
+  --exclude /temp.md
+  --exclude /tmp_*.md
   --exclude /tests/
   --exclude /evals/
   --exclude /scripts/eval_\*

@@ -2,8 +2,8 @@
 
 ## Linux real-task quality catalog (2026-10-05)
 
-Historical badcases, fixes, evidence and remaining failures are documented in
-[the case dossier](../docs/linux_quality_badcases_2026-10-05.md). The reviewed
+Historical investigation notes are workspace-local engineering records and are
+not required to run these evaluations. The reviewed
 [JSON catalog](fixtures/linux_quality_cases_2026-10-05.json) is the source for
 selection/counts; it is evaluator metadata, **never model-visible task hints**.
 
@@ -171,7 +171,7 @@ evaluation and does not measure final answer accuracy. For example:
 
 Curated multi-hop failure IDs, retrieval-stage observations, and annotation
 questions are recorded in `evals/fixtures/knowledge/multihop_rewrite_failcases.json`
-and `docs/rag_multihop_failcases_2026-09-30.md`. The annotation questions need
+with optional investigation notes kept in the local engineering archive. The annotation questions need
 manual review and are not automatic ground-truth assertions.
 
 ```bash

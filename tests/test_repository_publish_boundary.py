@@ -26,6 +26,11 @@ ROOT = Path(__file__).resolve().parents[1]
         ":memory:.ses",
         "temporary.sqlite3-wal",
         "temporary.sqlite3-shm",
+        "docs/_engineering/plans/mvp_todolist.md",
+        "evals/baselines/old/reports/result.json",
+        "tmp_filesystem_agent_sandbox/example.txt",
+        "tmp_llm_call_system_design.md",
+        "temp.md",
     ],
 )
 def test_personal_files_are_ignored(path):
@@ -63,7 +68,11 @@ def test_tracked_paths_do_not_include_personal_installation_state():
     )
     for name in filter(None, result.stdout.split("\0")):
         path = Path(name)
-        assert not name.startswith(("data/", "scratch/", ".venv/", ".bootstrap/", ".uv-cache/"))
+        assert not name.startswith((
+            "data/", "scratch/", ".venv/", ".bootstrap/", ".uv-cache/",
+            "docs/_engineering/", "evals/baselines/", "tmp_",
+        ))
+        assert name != "temp.md"
         assert not (name.startswith(".env") and name != ".env.example")
         assert not (name.startswith("config/") and not name.endswith(".example.toml"))
         assert not path.name.startswith(":memory:")

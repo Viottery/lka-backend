@@ -6,20 +6,23 @@ project-specific rules. Use `docs/` for full architecture details.
 
 This repository file also serves as project guidance for the LKA Agent runtime
 when this repository is its selected workspace. Runtime-wide and scheduled-watch
-guidance live in separate local files; see `docs/agent_instruction_files.md`.
+guidance live in separate local files; see `docs/usage.md`.
 
 ## Source Of Truth
 
 Read these before meaningful changes:
 
-- `docs/project_overview.md`
-- `docs/backend_engineering_guide.md`
-- `docs/backend_implementation_plan.md`
+- `docs/README.md`
+- `docs/architecture.md`
+- `docs/configuration.md`
 - `docs/api_contract.md`
-- `docs/mvp_todolist.md`
+- `docs/maintenance.md`
 
-`docs/mvp_todolist.md` is the current execution queue. `docs/backend_implementation_plan.md`
-is the long-term roadmap, not an automatic task list.
+`docs/` contains published explanations only. Local plans, investigations and
+test reports live under ignored `docs/_engineering/`. When available, read its
+`README.md` and `plans/mvp_todolist.md` for the workspace's current execution queue.
+These local documents are optional in a fresh clone and are not runtime dependencies.
+Do not stage engineering records, historical outputs or private configuration.
 
 ## Backend Startup
 

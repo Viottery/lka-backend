@@ -1,320 +1,348 @@
-# Local Knowledge Agent OS Backend
+<div align="center">
 
-This repository contains the cross-platform Backend Core for Local Knowledge
-Agent OS. It provides a local Agent runtime with SQLite persistence, native
-Windows/Linux execution, mail and knowledge tools, and durable background work.
+<img src="docs/assets/readme-hero.svg" width="100%" alt="LKA — Local Knowledge Agent OS，连接邮件、消息、知识、网络、记忆与持续关注的个人 AI 助手">
 
-## Current Scope
+<h1>让信息成为行动，让协作持续发生。</h1>
 
-- FastAPI Agent turns and SSE, persistent runs, safety reviews, and scoped child agents
-- SQLite-backed sessions, projects, mail, matters, knowledge, and global/project memories
-- Asynchronous memory extraction and context compaction with leases and recovery
-- Optional read-only mail expert, public web search, and scheduled watch briefings
-- Workspace files, command tools, instruction files, and shared frontend defaults
-- Local-only default binding for development
-- Native Windows/Linux backend execution
-- Platform support for workspace path resolution and read-only filesystem scanning
-- Documentation for the current architecture and API contract
+<p>
+一个围绕你的邮件、消息、资料与项目工作的个人 AI 助手。<br>
+从找到信息，到完成任务，再到持续跟进，让每一次协作都有上下文。
+</p>
 
-Start with [current module flows](docs/current_module_flows.md) for the implemented
-system and [the maintenance review](docs/project_maintenance_2026-10-03.md) for
-validation results and remaining issues. The long-term roadmap also contains
-historical stage descriptions; it is not the current feature inventory.
+<p>
+🖥️ 本地优先 &nbsp;&nbsp; · &nbsp;&nbsp; 🪟 Windows / Linux &nbsp;&nbsp; · &nbsp;&nbsp; 🐍 Python 3.12+
+</p>
 
-## Repository Responsibilities
+<p>
+<a href="#capabilities">探索能力</a> &nbsp; / &nbsp;
+<a href="#everyday">日常场景</a> &nbsp; / &nbsp;
+<a href="#engineering">设计思路</a> &nbsp; / &nbsp;
+<a href="#evaluation">评测实践</a> &nbsp; / &nbsp;
+<a href="#roadmap">未来方向</a> &nbsp; / &nbsp;
+<a href="#getting-started">开始使用</a> &nbsp; / &nbsp;
+<a href="#documentation">阅读文档</a>
+</p>
 
-- `app/`: backend application code, including API routes, runtime orchestration, schemas, platform helpers, and storage helpers.
-- `debug_frontend/`: standalone Linux CLI debug frontend that talks to the backend over HTTP/SSE.
-- `docs/`: canonical project documentation, execution rules, API contract, and implementation tracking.
-- `scripts/`: local developer utilities, including smoke-test helpers.
-- `pyproject.toml`: defines package metadata, Python version, runtime dependencies, and developer tooling.
+</div>
 
-## Project Layout
+---
 
-```text
-app/
-  api/
-    main.py          # FastAPI app assembly
-    routes/          # HTTP route handlers
-    schemas.py       # Request and response models
-  core/
-    config.py        # Application settings
-    agent_turn.py    # Main Agent turn loop
-    llm/             # Async LLM clients, service, and audit/error handling
-    tools.py         # Tool registry, specs, and executor contracts
-    runtime_context.py # Deterministic runtime context helpers
-    runtime.py       # Main runtime orchestration
-  domains/
-    mail.py          # Mail domain service and models
-    matters.py       # Matter domain service and models
-    memory.py        # Versioned memories, sources, and project scope
-    projects.py      # Stable project identities and display names
-    watch.py         # Watch definitions, occurrences, and briefings
-  experts/
-    mail.py          # Optional bounded read-only mail ChildExecutor
-  integrations/
-    outlook.py       # Microsoft Graph / Outlook sync integration
-  tool_packages/
-    mail.py          # Agent-visible mail tool package
-    matter.py        # Agent-visible matter tool package
-    runtime.py       # Deterministic runtime context tools
-  platform/
-    detect.py        # Runtime platform detection
-    paths.py         # Workspace path resolution
-    filesystem.py    # Cross-platform workspace metadata scanning
-  storage/
-    db.py            # SQLite bootstrap and connection helpers
-debug_frontend/
-  cli.py             # Standalone Linux HTTP/SSE CLI frontend
-docs/
-  README.md
-  project_overview.md
-  api_contract.md
-  backend_engineering_guide.md
-  backend_implementation_plan.md
-  platform_support.md
-  ai_coding_standard.md
-  mvp_todolist.md
-scripts/
-  run_agent_turn.py  # Run one real agent turn without starting the HTTP API
-```
+## 一个助手，连接你的日常
 
-## Linux CLI Frontend
+重要信息往往分散在不同地方：邮件里的约定、群聊里的变化、项目里的文档，
+还有你已经解释过很多次的偏好。
 
-The package exposes a small HTTP CLI frontend named `lka`. Start the backend
-first, then run CLI commands from another Linux shell:
+**LKA 把这些信息带进同一段协作。** 你提出目标，助手查找相关资料、调用工具，
+整理结果，并通过记忆与后台任务延续这次工作。
+
+本仓库是 LKA 的智能后端。聊天界面与桌宠由独立的前端项目提供，
+这里负责对话、工具执行、知识检索、记忆和持续关注。
+
+<a id="capabilities"></a>
+
+## ✦ 六种能力，一起工作
+
+<table>
+<tr>
+<td width="50%" valign="top">
+
+<h3>📬 邮件与消息</h3>
+<p>从大量往来中找到值得关注的事。</p>
+<p>搜索邮件、批量阅读、按发件人归类，并与已有事项对齐。
+接入消息历史后，可以检索原始对话、整理话题和重要信息，
+查看人物档案及相邻消息。</p>
+
+</td>
+<td width="50%" valign="top">
+
+<h3>📚 私人知识库</h3>
+<p>让回答建立在你自己的资料上。</p>
+<p>连接文档、邮件、消息与工作区，按问题检索相关内容。
+关键词搜索、可选的本地语义召回和重排序共同提供上下文，
+让你能够继续追问出处、细节与原文。</p>
+
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+
+<h3>🌐 网络研究</h3>
+<p>先看重点，需要时再读深入。</p>
+<p>搜索网页与新闻，获取关键摘录，再按需打开正文、定位段落、
+续读已有快照或刷新内容。保留来源和抓取时间，
+方便在后续对话中继续研究。</p>
+
+</td>
+<td width="50%" valign="top">
+
+<h3>🛠️ 项目协作</h3>
+<p>从理解问题，到动手解决。</p>
+<p>在一个项目下开展多个会话，读取资料、分析代码、编辑文件、
+执行命令与测试。复杂任务可开启多 Agent 协作，
+让子 Agent 并行处理独立子问题，再汇总结果。</p>
+
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+
+<h3>🧠 长期记忆</h3>
+<p>少一点重复解释，多一点默契。</p>
+<p>整理对话中有价值的偏好、约定和事实，分别保存到全局或项目记忆。
+记忆可更新、撤回，并保留来源。
+后台整理与上下文摘要，让协作不必每次重新开始。</p>
+
+</td>
+<td width="50%" valign="top">
+
+<h3>🧭 持续关注</h3>
+<p>让“帮我关注一下”有后续。</p>
+<p>设定关注目标、信息来源和每日检查时间，跟进新闻、活动、
+邮件与本地事项。每次检查投递简报时创建新会话，
+你可以直接在这份简报里继续追问。</p>
+
+</td>
+</tr>
+</table>
+
+<a id="everyday"></a>
+
+## 💬 放进真实的一天
+
+### 把收件箱变成清晰的下一步
+
+> 这周的邮件里，哪些事情需要我回复？按事项整理，附上对应邮件。
+
+接入邮箱后，助手可以从邮件中查找依据，整理相关往来，
+结合已有事项帮助你判断下一步。
+
+### 接住消息里的重要变化
+
+> 最近这个群在讨论什么？有哪些值得关注的变化？让我能查看原消息。
+
+不只问一句“总结一下”，也可以进一步查看具体话题、
+相关人物、原始消息和上下文。
+
+### 和项目一起推进，而不是只聊代码
+
+> 结合项目文档和代码，解释这个错误的原因。先分析，再给出修改建议。
+
+围绕同一个项目保持多个会话，使用工作区指导、项目记忆和实际文件，
+把调研、排查与开发接起来。
+
+### 关注一件事，而不必每天重新提起
+
+> 每天看看我关注的活动，有值得关注的变化时整理一份简报，方便我继续追问。
+
+将关注目标保存为定时任务；后端运行期间，按设定时间执行检查，
+把本次结果放进新的会话。
+
+## ◇ 按你的方式使用
+
+**资料在自己的电脑上管理。** 会话、知识、记忆与运行记录主要保存在本地，
+默认服务只监听本机地址。
+
+**模型由你选择。** 配置模型服务、连接自己的数据源，并按需启用邮件专家、
+多 Agent、消息分析与后台任务。
+
+**重要操作由你掌握。** 工具操作经过安全审查，可选择人工确认。
+相关调用、来源和运行过程保留记录，方便回看。
+
+**内容长，也可以接着读。** 大结果保留本地原始内容，先展示重点，
+需要时再读取更多，而不是反复重新获取同一份资料。
+
+<details>
+<summary><strong>🔎 关于数据连接</strong></summary>
+
+使用远程模型时，发送给模型的对话、选取的资料片段和后台整理输入，
+会交给你配置的模型服务；网页搜索会把查询发送给搜索服务。
+
+完整运行日志可能包含个人内容，请妥善保管。
+真实配置、密钥、邮箱授权和运行数据保持本地，仓库只保留无凭据的配置模板。
+
+</details>
+
+<a id="engineering"></a>
+
+## 🧩 好用的背后，是一套怎样的设计？
+
+LKA 的重点不只是接入更多模型或工具，而是让它们在真实任务里配合得更好：
+**读到需要的信息、完成可以检查的工作，并在下一次协作中接得上。**
+
+| 面对的问题 | 设计选择 | 带来的价值 |
+| :--- | :--- | :--- |
+| 工具和资料越来越多，上下文却有限 | 工具按包发现、按需展开；长结果保存原文，先送预览，再按需续读 | 减少无关输入，让重要信息可以找回，而不是一次截断后丢失 |
+| 复杂任务需要并行，但不能失去控制 | 任务计划表达依赖关系；子 Agent 使用独立上下文、工具范围和预算，失败反馈给父任务修订计划 | 让分工、结果交接与失败恢复成为明确流程，而不是简单增加模型调用 |
+| 助手需要长期整理信息，又不能拖慢对话 | 记忆提取和摘要放到后台；持久作业配合租约、检查点及发布前版本校验 | 减少前台等待，支持中断后继续处理，避免旧任务覆盖新结果 |
+| 不同任务、模型和平台需要持续扩展 | 通用 Agent 核心与领域服务分离；工具输入校验、操作审查和运行记录统一处理 | 邮件、网页、文件等能力可以独立演进，Windows / Linux 共用主要运行逻辑 |
+
+这些机制已经有对应实现。可以从 [系统说明](docs/architecture.md) 了解全貌，
+也可以直接阅读 [多 Agent 调度](app/core/multi_agent_scheduler.py)、
+[工具结果处理](app/core/tool_result_gate.py) 和 [后台作业](app/core/background_jobs.py)。
+
+<a id="evaluation"></a>
+
+## 🧪 不只测试能回答，更测试能完成
+
+一次工具调用成功，不等于任务完成。LKA 将接口回归、目标驱动任务和公开检索评测分开，
+同时观察结果、来源、实际操作、耗时与模型消耗。
+
+<div align="center">
+
+<strong>17 套评测定义 · 56 个套件案例 · 29 个目标驱动场景 · 1,128 条公开多跳查询</strong><br>
+<sub>仓库评测资产统计 · 2026-10-06 · 各类资产分别计数，不合并为通过率</sub>
+
+</div>
+
+| 评测视角 | 关注什么 | 可查看的内容 |
+| :--- | :--- | :--- |
+| 日常任务 | 文件是否真正整理好、代码是否通过原有测试、邮件是否漏掉发件人；不在用户任务中指定工具路线 | [目标驱动场景与执行器](scripts/eval_realworld.py) |
+| 长期运行 | 进程中断后能否恢复、重复执行是否产生重复记录、摘要与记忆是否保持正确来源和项目归属 | [真实进程退出测试](tests/test_background_crash_recovery.py) · [记忆回归评测](scripts/eval_memory_release.py) |
+| 信息获取 | 搜索预览能否恢复完整内容、后续阅读是否复用快照、旧缓存是否被误当成最新信息 | [网页快照测试](tests/test_web_snapshots.py) · [缓存场景测试](tests/test_observation_cache_scenarios.py) |
+| 检索与问答 | 相关文档与多跳证据是否召回，排序质量、最终答案与检索延迟分别如何 | [公开数据清单](evals/datasets/public_multihop/manifest.json) · [评测方法](evals/README.md) |
+
+公开检索样本来自 **HotpotQA、2WikiMultiHopQA、MuSiQue 和 MultiHop-RAG**。
+检索侧记录 Recall@k、MRR、nDCG、多跳证据覆盖和 p50 / p95 延迟；
+问答侧另行检查答案与引用，不把“搜到了文档”当成“回答正确”。
+任务回放还记录模型调用次数、Token 用量、工具轨迹和文件变化，便于分析质量与开销的取舍。
+
+<details>
+<summary><strong>🔬 从失败案例到可复验的改进</strong></summary>
+
+历史质量迭代整理了 [43 个案例、9 个能力分组](evals/fixtures/linux_quality_cases_2026-10-05.json)，
+每个条目记录现象、原因、改进方法、验收要求和回归入口。
+基础检查、已修复回归与困难案例可分别选择，避免每次都重复跑低信息量测试。
+
+例如，长内容阅读要检查是否能回到原文；网页刷新要区分新结果与旧快照；
+多 Agent 任务要检查各项子任务是否交付，而不只检查最终答案里有没有关键词。
+
+截至 **2026-10-05 的历史目录**，17 个条目有修复后的现场验证，14 个只完成离线回归，
+8 个仍标记为待解决，另有 4 个基线通过条目。它们不是当前版本的总体准确率，
+离线通过也不代表真实模型任务已完成；复杂任务交付、网页证据表达与多跳问答仍需继续验证。
+
+可以先生成选例和回放计划，不调用模型、不读取私人邮件：
 
 ```bash
-uv run uvicorn app.api.main:app --host 127.0.0.1 --port 8765
-uv run lka health
-uv run lka capabilities
-uv run lka sessions list
-uv run lka ask --session-id cli_smoke "搜索一下NTUSO的audition要求，我要怎么做？"
+uv run python scripts/eval_quality_catalog.py --profile all --inventory --json
+uv run python scripts/eval_quality_catalog.py --group multi_agent --group web
 ```
 
-`lka ask` uses `POST /agent/turn/stream` by default. Final answer token deltas
-are printed to stdout as they arrive; Agent progress goes to stderr. Control
-process visibility with:
+完整运行方式、指标口径与真实模型测试的启用条件见 [评测指南](evals/README.md)。
+私人邮件、个人消息和完整运行日志不随仓库发布。
 
-```bash
-uv run lka ask --agent-events hidden "只显示最终回答"
-uv run lka ask --agent-events collapsed "显示折叠过程和最终回答"
-uv run lka ask --agent-events expanded "显示完整事件 payload"
-```
+</details>
 
-For a full debug run, use expanded Agent events. Answer text is printed only
-when real `llm_delta` chunks or the final answer arrive from the backend:
+<a id="roadmap"></a>
 
-```bash
-uv run lka ask --agent-events expanded "展示完整运行过程"
-```
+## 🗺️ 从完成一次任务，到持续成为可靠的搭档
 
-Interactive mode keeps a session across turns and supports `/agent
-hidden|collapsed|expanded` plus `/quit`:
+当前已具备通用 Agent、工具与检索、多 Agent、记忆、后台作业和定时关注的主要实现。
+接下来的计划以实际使用体验为先，不以增加功能数量为目标，也不把规划当成已交付能力。
 
-```bash
-uv run lka chat --session-id cli_chat
-```
+| 阶段 | 重点方向 | 如何判断进步 |
+| :--- | :--- | :--- |
+| **近期 · 更可靠地完成** | 补齐复杂任务的遗漏、部分成功与失败恢复；优化首轮响应、缓存续读和结果交付 | 在固定困难案例中检查任务完成情况，对比首答时间、总耗时、重复调用与 Token 消耗 |
+| **中期 · 更持续地理解** | 优化长期对话中的摘要、记忆纠正与过期管理，让后台关注更准确地识别值得通知的变化 | 在多轮纠正、任务中断及重复检查场景中，验证信息不复活、工作能恢复、简报不重复 |
+| **长期 · 更自然地扩展** | 将验证过的工作流沉淀为可复用技能，探索 MCP 与更多数据源接入，完善多客户端使用与迁移体验 | 新能力可独立接入并复验，不依赖在通用核心里增加特定任务提示词；迁移后已有协作可以继续 |
 
-## Quick Start: Linux
+多跳检索、查询改写与本地重排序作为持续研究方向，
+用相同数据与配置比较证据覆盖、答案质量和延迟，服务于上面的真实任务目标。
 
-```bash
-cp .env.example .env
-uv sync
-uv run python scripts/start_backend.py personal
-```
+<a id="getting-started"></a>
 
-The default `LKA_DATA_DIR=./data/runtime` is the personal runtime boundary: it
-contains the SQLite database, imported documents, local mail state, run logs,
-tokens, and local embedding models. Test fixtures live under `evals/fixtures/`
-and tests/evaluations use temporary data directories, so do not import test
-samples into `data/runtime`.
+## 🚀 开始使用
 
-## Backend Profiles
+需要 **Python 3.12+**。Windows 使用 PowerShell，Linux 另需安装 `uv`；
+两者都以原生 Python 运行，无需 Docker。
 
-Use the profile launcher instead of manually exporting runtime variables:
+先准备后端，再连接模型和一个常用数据源，就可以开始第一段对话。
 
-```bash
-# Personal data, real config/local.toml, default port 8765.
-uv run python scripts/start_backend.py personal
+<details open>
+<summary><strong>🪟 Windows</strong></summary>
 
-# Ephemeral test data, mock provider/mail config, default port 8766.
-uv run python scripts/start_backend.py test
-
-# Keep an inspectable but isolated test database after the server exits.
-uv run python scripts/start_backend.py test --test-data-dir ./data/test-runtime
-```
-
-`test` always overrides `LKA_DATA_DIR` and `LKA_LOCAL_CONFIG`; it cannot use
-`--reload`. This prevents test requests from syncing personal mail, using a
-real LLM provider, or writing to `data/runtime`. `personal --reload` is allowed
-for local development.
-
-## Quick Start: Windows PowerShell
+在克隆后的仓库目录中安装：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup_windows.ps1
+```
+
+脚本准备依赖，仅在缺失时创建 `.env` 和 `config/local.toml`，保留已有配置。
+填写本地模型连接与密钥后，启动：
+
+```powershell
 .\.venv\Scripts\python.exe scripts\start_backend.py personal
 ```
 
-Run these commands from the project directory with native Windows Python 3.12+
-and Windows PowerShell 5.1. The setup script uses an installed `uv`, or installs
-it into a local `.bootstrap` environment, then installs locked runtime dependencies
-into `.venv`. It copies `.env` and `config/local.toml` only when missing and keeps
-existing personal configuration. Use `-Python` to select a Python executable.
+</details>
 
-Check the service from another PowerShell window:
+<details>
+<summary><strong>🐧 Linux</strong></summary>
 
-```powershell
-Invoke-RestMethod http://127.0.0.1:8765/health
-```
-
-The service listens on `http://127.0.0.1:8765` by default. Background terminals
-require Windows 10 1809+ or Windows Server 2019+ (ConPTY). The `bash.*` tool names
-remain compatible; Windows commands use PowerShell syntax, such as `Get-Location`
-and `Get-Content`, with `$env:WORKSPACE_ROOT` for environment variables.
-
-## Agent Turn Smoke Test
-
-Run one real agent turn from the backend workspace without starting the HTTP API
-or frontend:
+在仓库目录中准备依赖和配置：
 
 ```bash
-uv run python scripts/run_agent_turn.py --session-id smoke_ntuso "搜索一下NTUSO的audition要求，我要怎么做？"
+uv sync --locked
+test -f .env || cp .env.example .env
+test -f config/local.toml || cp config/local.example.toml config/local.toml
 ```
 
-Use `--json` to print the full structured `AgentTurnResult`, including decision
-events, tool events, progress events, and the local run log path. By default the
-script does not call `runtime.start()`, so configured startup/background mail
-sync will not run during the smoke test. Add `--start-runtime` only when that is
-the behavior being tested.
-
-## Quick Start: Native Windows Frontend And Pet
-
-The prepared Windows frontend starts the native backend, frontend and Java pet
-from Windows PowerShell:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass `
-  -File 'D:\agent-bot-frontend\run-lka-native-windows.ps1' `
-  -BackendRoot 'C:\Users\xc133\projects\lka_backend'
-```
-
-The backend listens at `http://127.0.0.1:8765` and the frontend at
-`http://127.0.0.1:8780`. Add `-NoPet` to use a browser, or `-NoPet -NoOpen`
-to start services only. These are this machine's paths; both projects need their
-own native environment. The older `run-lka-windows.ps1` still starts a WSL backend.
-
-For another Windows computer, extract the delivered portable ZIP and run
-`Start-LKA.cmd`; stop it with `Stop-LKA.cmd`. See the
-[Windows operations guide](docs/windows_operations.md) for synchronization,
-installation, stopping, configuration, migration and troubleshooting, and the
-[portable delivery record](docs/windows_portable_delivery.md) for the package and verification.
-
-## Local Provider Config
-
-Provider, mail, and embedding settings live in a local TOML file:
+填写本地模型配置后，启动：
 
 ```bash
-cp config/local.example.toml config/local.toml
+uv run python scripts/start_backend.py personal
 ```
 
-`config/local.toml` is ignored by git. Use it for local provider choices and
-secret environment variable names:
-
-- `llm`: named LLM clients, default/fallback client, model options, base URL,
-  response mode, stream capability, and API key env var. A request can override
-  `client_name` and `model` when the user switches models.
-- `mail.outlook`: Microsoft Graph Device Code Flow settings. Outlook does not
-  require storing an email password for this path.
-- `mail.imap`: optional IMAP settings for providers that require an app password.
-- `embedding`: local embedding provider config. The default is
-  `BAAI/bge-small-zh-v1.5`, with model files cached under
-  `./data/runtime/models`.
-
-On Windows PowerShell, set secrets outside the TOML file:
-
-```powershell
-$env:OPENAI_API_KEY="..."
-$env:MS_GRAPH_CLIENT_ID="..."
-```
-
-On Linux/macOS:
+在另一终端使用命令行客户端：
 
 ```bash
-export OPENAI_API_KEY="..."
-export MS_GRAPH_CLIENT_ID="..."
+uv run lka chat --session-id my-assistant
 ```
 
-Windows workspace paths should be sent as backend-local paths. Prefer `/` in
-JSON to avoid escaping:
+</details>
 
-```json
-{
-  "workspace": "C:/Users/chuan/Documents/NTU",
-  "source_frontend": "windows-native"
-}
-```
+> **首次配置**<br>
+> 模板使用 mock 模型；接入真实模型后，再按需配置邮箱、搜索和消息来源。
+> 多 Agent 与邮件专家需单独开启。当前搜索使用 Brave Search API，
+> QQ 消息依赖独立采集器。
 
-Linux workspace example:
+默认服务地址：`http://127.0.0.1:8765`，启动后可访问 `/health` 检查状态。
 
-```json
-{
-  "workspace": "/home/chuan/Documents/NTU",
-  "source_frontend": "linux-native"
-}
-```
+想使用聊天界面与桌宠，请另外准备前端项目。Windows 的完整操作与另一台电脑的更新步骤，
+分别见 [安装指南](docs/getting_started.md) 和 [更新与维护](docs/maintenance.md)。
 
-## WSL to Windows Sync
+<details>
+<summary><strong>☕ 使用小贴士</strong></summary>
 
-For one-way application sync from the WSL repo into a Windows-local copy:
+- 邮件和消息功能以读取、分析与整理为主，当前不提供自动发信或消息回复。
+- 网页工具读取公开网页文本；需要登录或依赖 JavaScript 的页面，建议在浏览器中查看。
+- 大批量分析在后台分批进行，达到配额时等待后续执行；可以查看处理进度。
+- 定时关注需要后端持续运行。会话简报已有后端支持，桌面推送需前端配套。
+- 文件与命令工具会在本机执行，启用前请设置工作区和确认方式；不是操作系统级隔离环境。
+- 重要日期、金额和票务状态，建议沿着来源再核对一次。
+- 项目仍在持续迭代。本仓库提供后端源码；自动更新与跨电脑数据同步需另行准备。
+- 已有私人便携包含账号凭据，仅适合私下迁移，不作为公开发行包。
 
-```bash
-scripts/sync_to_windows.sh /mnt/c/Users/xc133/projects/lka_backend
-scripts/sync_to_windows.sh /mnt/c/Users/xc133/projects/lka_backend --apply
-```
+</details>
 
-The default mode is a dry run. Add `--delete` only when the WSL copy is the
-source of truth and the Windows target should mirror deletions.
-The application and `uv.lock` are copied. Tests, evaluations, development caches,
-virtual environments, local data, and secrets such as `config/local.toml` and
-`.env` are excluded. Run `scripts/setup_windows.ps1` in the Windows copy to
-prepare its native environment and missing configuration. This sync does not
-update the separate frontend or an existing portable ZIP. Follow the
-[Windows operations guide](docs/windows_operations.md) for the complete update cycle.
+<a id="documentation"></a>
 
-## Implemented APIs
+## 📖 继续探索
 
-- `GET /health`
-- `POST /workspaces/index`
-- `GET /capabilities`
-- `POST /runtime/debug`
-- `POST /agent/turn`
-- `GET /sessions`
-- `POST /sessions`
-- `POST /mail/import`
-- `GET /mail/search`
-- `GET /mail/matters`
-- `POST /mail/outlook/auth/start`
-- `POST /mail/outlook/auth/complete`
-- `POST /mail/outlook/sync`
-- `GET /matters`
-- `POST /matters`
+| 想了解什么 | 从这里开始 |
+| :--- | :--- |
+| 安装、运行与迁移 | [安装指南](docs/getting_started.md) · [更新与维护](docs/maintenance.md) |
+| 模型与功能配置 | [配置说明](docs/configuration.md) · [本地配置模板](config/local.example.toml) |
+| 会话、记忆与持续关注 | [日常使用](docs/usage.md) |
+| 系统如何工作 | [系统说明](docs/architecture.md) |
+| 评测集、指标与复验 | [评测指南](evals/README.md) · [历史质量案例](evals/fixtures/linux_quality_cases_2026-10-05.json) |
+| 接入自己的界面 | [API 文档](docs/api_contract.md) |
+| 全部文档 | [文档导航](docs/README.md) |
 
-## Platform Support
+---
 
-See `docs/platform_support.md` for the Windows/Linux native support strategy,
-configuration, shell behavior, file access boundaries, and validation status.
+<div align="center">
 
-## Notes
+<strong>每一次帮助有依据，每一次协作有延续。</strong><br>
+<sub>LKA · Local Knowledge Agent OS</sub>
 
-- The runtime is intentionally lightweight and does not perform task planning or execution.
-- The docs in `docs/` are organized as:
-  - `project_overview.md` for the mission and vision
-  - `backend_engineering_guide.md` for backend architecture
-  - `backend_implementation_plan.md` for delivery stages
-  - `platform_support.md` for native Windows/Linux support
-  - `windows_operations.md` for Windows sync, startup, configuration and portable migration
-  - `api_contract.md` for the HTTP interface
-  - `ai_coding_standard.md` for coding and reporting rules
-  - `mvp_todolist.md` for the implementation checklist
+</div>

@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="380" viewBox="0 0 1200 380" role="img" aria-labelledby="title description">
+  <title id="title">LKA — Local Knowledge Agent OS</title>
+  <desc id="description">A personal AI assistant connecting mail, messages, knowledge, web research, memory and ongoing watches.</desc>
+  <defs>
+    <pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse">
+      <circle cx="1" cy="1" r="1" fill="#cad6e2" opacity="0.45"/>
+    </pattern>
+  </defs>
+  <rect x="1" y="1" width="1198" height="378" rx="20" fill="#f6f9fc" stroke="#cad6e2"/>
+  <path d="M614 1H1180Q1199 1 1199 20V360Q1199 379 1180 379H614Z" fill="url(#grid)"/>
+
+  <g transform="translate(54 48)" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <rect width="54" height="54" rx="15" fill="#4169d1"/>
+    <path d="M17 14V37H37" stroke="#ffffff" stroke-width="4"/>
+    <path d="M29 15H38V24" stroke="#ffffff" stroke-width="3"/>
+    <circle cx="29" cy="28" r="3" fill="#ffffff"/>
+  </g>
+
+  <g font-family="Segoe UI, Helvetica, Arial, sans-serif" fill="#152c45">
+    <text x="52" y="200" font-size="88" font-weight="700" letter-spacing="-4">LKA</text>
+    <text x="56" y="239" font-size="24" font-weight="500">Local Knowledge Agent OS</text>
+    <text x="56" y="291" font-size="19" fill="#52667d">Personal intelligence, locally grounded.</text>
+    <path d="M56 323H150" stroke="#168f87" stroke-width="3" stroke-linecap="round"/>
+  </g>
+
+  <g fill="none" stroke="#cad6e2" stroke-width="2">
+    <path d="M900 160C900 103 824 75 776 75"/>
+    <path d="M956 160C956 103 1028 75 1075 75"/>
+    <path d="M882 190H776"/>
+    <path d="M974 190H1075"/>
+    <path d="M900 220C900 273 824 304 776 304"/>
+    <path d="M956 220C956 273 1028 304 1075 304"/>
+  </g>
+  <circle cx="928" cy="190" r="59" fill="none" stroke="#4169d1" stroke-width="1" opacity="0.22"/>
+  <circle cx="928" cy="190" r="44" fill="#4169d1"/>
+  <text x="928" y="199" text-anchor="middle" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="24" font-weight="700" fill="#ffffff">LKA</text>
+
+  <g fill="#f6f9fc" stroke="#cad6e2">
+    <circle cx="752" cy="75" r="24"/>
+    <circle cx="1099" cy="75" r="24"/>
+    <circle cx="752" cy="190" r="24"/>
+    <circle cx="1099" cy="190" r="24"/>
+    <circle cx="752" cy="304" r="24"/>
+    <circle cx="1099" cy="304" r="24"/>
+  </g>
+  <g fill="none" stroke="#4169d1" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="739" y="67" width="26" height="17" rx="3"/>
+    <path d="M740 69L752 77 764 69"/>
+    <path d="M1088 65H1110V80H1098L1092 85V80H1088Z"/>
+    <path d="M741 181H762V200H741Z M741 181V178H750L753 181 M746 187H757 M746 192H754"/>
+    <circle cx="1099" cy="190" r="12"/>
+    <ellipse cx="1099" cy="190" rx="5" ry="12"/>
+    <path d="M1087 190H1111"/>
+    <path d="M744 294H760V314H744Z M749 300H756 M749 305H756 M739 298V318H755"/>
+    <circle cx="1099" cy="304" r="12"/>
+    <path d="M1099 297V304L1105 307"/>
+  </g>
+  <g font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" fill="#52667d" text-anchor="middle">
+    <text x="752" y="117">Mail</text>
+    <text x="1099" y="117">Messages</text>
+    <text x="752" y="232">Knowledge</text>
+    <text x="1099" y="232">Web</text>
+    <text x="752" y="347">Memory</text>
+    <text x="1099" y="347">Watches</text>
+  </g>
+</svg>

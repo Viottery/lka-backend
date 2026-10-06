@@ -28,5 +28,11 @@ config/secrets*.toml
 config/tokens*.json
 config/cache/
 scratch/
+# Local working notes and historical run outputs are not release documentation.
+/docs/_engineering/
+/evals/baselines/
+/tmp_*/
+/tmp_*.md
+/temp.md
 evals/reports/*.json
 evals/reports/*.md

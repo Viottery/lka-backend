@@ -1,13 +1,12 @@
-# Local Knowledge Agent OS：HTTP API Contract
+# LKA：API 接口说明
 
-> 本文档定义 Backend Core 与 Windows/Linux Frontend 之间的最小 HTTP API 契约。
->
-> 当前阶段保留基础服务能力，并新增第一版本地会话 API，用于支撑平行会话、
-> 多轮消息记录和后续 session-scoped trace。
+本文档供客户端和集成方使用，说明会话、Agent、工具、知识、邮件、消息、记忆及后台控制接口。
+安装与功能配置见 [安装指南](getting_started.md) 和 [配置说明](configuration.md)。
+本文不记录某台电脑的上线状态或测试过程；运行配置和有效授权决定可用功能。
 
 ## Base URL
 
-MVP 默认：
+默认地址：
 
 ```text
 http://127.0.0.1:8765
@@ -1675,8 +1674,7 @@ Agent 可展开 `web` 包，再调用只读 `web.search`（参数 `query`、`mod
   `rendered_visibility=alternative_hidden_structured_text` 与提取方法；不执行脚本，
   不等同于浏览器可见全文。允许 `text/x-wiki` 原始文本，其他非白名单MIME仍拒绝。
 
-详情与离线验证见 [渐进检索 TODO／报告](web_progressive_retrieval_todolist.md)、
-[工具上下文交付 TODO／报告](tool_context_delivery_todolist.md)。
+使用方式与缓存分工见 [日常使用](usage.md) 和 [系统说明](architecture.md)。
 
 `POST /watches` 创建每日关注项，主体包含 `title`、`goal`、IANA `timezone`、本地 `daily_time`、`categories` 与显式 `scope`（如 `web_enabled`、`source_ids`、`account_ids`）。响应给出稳定 `watch_id`，不创建固定会话。每次触发都会产生新的 `Occurrence` 和独立 `session_id`，可以在那次会话继续通过通用 Agent 入口追问。`GET /watches`、`GET /watches/{watch_id}`、`PATCH /watches/{watch_id}`、`DELETE /watches/{watch_id}` 管理关注项；`POST /watches/{watch_id}/pause|resume|run-now` 控制触发，`GET /watches/{watch_id}/runs` 查询执行记录。
 
@@ -1765,19 +1763,19 @@ Agent 读取使用只读 `memory.search` / `memory.read`；`memory.remember(cont
 `extraction_context_messages` 默认 12（2..40）、`extraction_context_chars` 默认 12000
 （2000..24000）、`auto_publish_min_confidence` 默认 0.85（0.5..1）；这些字段通过既有
 `/background/config` 和 schema 管理，保存后重启生效，不增加新接口。普通提取在后台；
-明确立即保存时可能增加一次模型整理等待。详见 [本轮实现与验收](contextual_memory_2026-10-06.md)。
+明确立即保存时可能增加一次模型整理等待。使用方式见 [记忆与指导文件说明](usage.md)。
 
 自动记忆不是 `AGENTS.md`，不授权写工具或扩大权限。子 Agent 不隐式继承记忆：
 PlanStep `input_refs` 可显式指定 `memory:<id>` 或 `memory:<id>@<version>`，服务端校验父作用域、
 状态、有效来源与版本，ContextDriver 有界装入冻结快照。读取工具仅允许快照内引用，并重新
 检查撤回/来源失效。会话软删除撤回相应来源，无其他有效来源的派生记忆失效；原始会话/审计行
-保留，恢复不自动重新发布。完整边界见 [实现说明](memory_background_implementation.md)。
+保留，恢复不自动重新发布。后台工作方式见 [系统说明](architecture.md)。
 
 ## 跨平台消息历史
 
 此模块只管理本地收到的消息，不连接 QQ、不暴露 OneBot action，不自动发消息、创建事项
 或写入个人长期记忆。采集在 Windows 前端本地服务执行，浏览器只访问后端历史/控制 API。
-当前工作与实机验收边界见 [消息历史 TODO](message_history_todolist.md)。
+采集和分析配置见 [配置说明](configuration.md)。
 
 ### 白名单与本地控制
 
@@ -2002,7 +2000,7 @@ Agent 包为 `messages`，包含 `messages.list_conversations`、`recent`、`sea
 
 #### 阅读结果、人工候选与评测（R3–R6）
 
-新增接口在代码中实现；Windows 持续采集进程尚未部署此版本。新阅读接口强制使用
+阅读接口强制使用
 `LKA_MESSAGES_API_TOKEN` 或独立 `LKA_MESSAGES_CONTROL_TOKEN`，即使 peer 为 loopback 也不降级。
 写入阅读状态／关注配置／候选／决定和本地 badcase 必须使用 CONTROL token。
 前端本地服务持有 CONTROL token，通过受限 `/plugins/message-reading/...` 代理调用；
@@ -2042,7 +2040,7 @@ Agent 包为 `messages`，包含 `messages.list_conversations`、`recent`、`sea
 Agent 新增 `messages.overview/topics/insights/read_insight/topic_sources`，全部只读，
 返回 source_policy、untrusted_data、coverage 与分页。聚合先应用 source/account 权限再计算。
 
-#### 活跃人物与自动群侧重点（A2–A5，代码已实现，未部署新版）
+#### 活跃人物与自动群侧重点
 
 新接口沿用以上读取 API/CONTROL 分权、loopback/Host/Origin 校验和 no-store。
 未知或无记录许可的来源均返回 opaque 404，旧 revision 为409，非法字段为422。
@@ -2104,16 +2102,43 @@ label 为 missed_importance/false_positive/topic_split/topic_merge/deadline_corr
 
 #### 会话 metadata、统一消息检索与持久档案（后端接口）
 
-详细路径、请求字段、身份边界与前端代理交接见
-[message_search_interfaces.md](message_search_interfaces.md)。本轮不实现 UI、不重启线上采集。
+下面描述消息检索及人物档案的接口。前端应通过自己的安全代理转发，
+不向页面或模型暴露管理及导入凭据。
 
-新增 `/messages/conversations/resolve`、`/messages/conversations/{key}/metadata`、
-`/integrations/messages/conversations/metadata`、`/messages/records/{id}[ /context ]`、
-`/messages/reading/dossiers[ /{key}/{sender_id}[ /sources ] ]`。
+会话身份是 `platform + account_id + conversation_type + conversation_id`，服务端生成
+`conversation_key`。人物身份是 `conversation_key + sender_id`，不能按昵称跨会话合并。
+名称按人工别名、人工显示名、导入缓存群名依次选择；后端不主动获取平台群信息。
+
+- `GET /messages/conversations/resolve?query=项目组`：归一化匹配名称、别名或平台 ID，
+  返回 `matches/ambiguous/has_more`。重名时由用户选择，不默认使用第一项。
+- `GET /messages/conversations/{conversation_key}/metadata`：平台、账号、类型、真实 ID、
+  显示名、各类名称来源、cache_provenance、revision 与更新时间。
+- `PATCH` 同一 metadata 路径：`{expected_revision,user_alias?,display_name?}`。
+  revision 是人工标签 CAS 版本；导入缓存不覆盖人工标签。
+- `POST /integrations/messages/conversations/metadata`：最多100项、128KiB，
+  `{metadata:[{platform,account_id,conversation_type,conversation_id,capture_epoch,
+  platform_name?,display_name?,cache_provenance?}]}`，返回 accepted/rejected。
+  不创建或扩大白名单。
+- `GET /messages/search?query=...`：支持 conversation_key、sender_id、sender、
+  since/until（Unix秒）；时间优先 sent_at，否则 received_at。结果是本地分页。
+- `GET /messages/records/{message_id}`：内部稳定 ID，对应原文、回复引用和会话 metadata。
+- `GET /messages/records/{message_id}/context?before=10&after=10`：前后各最多25条，
+  按采集 seq 排列；返回 anchor_message_id、gap、has_more 与 capture coverage。
+- `GET /messages/reading/dossiers?conversation_key=...&limit=30&offset=0`：持久档案目录。
+- `GET /messages/reading/dossiers/{conversation_key}/{sender_id}?limit=30&offset=0`：
+  有来源的 claims 与待核实 machine_notes；返回 source_count、observation_count、
+  has_more/next_offset 及人工纠正状态。
+- `GET .../dossiers/{conversation_key}/{sender_id}/sources?limit=30&offset=0`：
+  证据分页，最大50条；不返回内部文件路径，不读取独立人工 notes.md。
 GET 需 API／CONTROL 配对读取，人工 metadata PATCH 需 CONTROL + expected_revision；
 IMPORT 上报必须绑定现有白名单和 capture_epoch，不能自授权。
 
 消息作为 `source_type=chat_message` 接入 `knowledge.search/load_chunks/load_document`。
+可使用 `GET /knowledge/search?q=...&source_type=chat_message&limit=10` 仅查消息，
+或带读取凭据进行邮件、知识与消息混合检索；没有凭据的旧接口排除消息来源。
+`POST /knowledge/chunks/load` 以 chunk_ids 与 offset 读取消息正文；
+`GET /knowledge/documents/{document_id}?include_text=true` 返回会话最新消息页，
+不是完整聊天导出，应检查 metadata.coverage。
 保护读取要求现有本机 Host／Origin 与消息配对凭据；未配对通用搜索排除消息而保留原文档行为。
 知识结果 metadata 保留原会话、作者和时间；消息检索是实时本地关键词，不承诺 embedding。
 人物档案分页区分 claims／machine_notes，并从 SQLite 即时执行隐藏、删除和人工纠正控制；
