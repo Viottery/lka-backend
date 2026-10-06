@@ -2,25 +2,18 @@
 
 from __future__ import annotations
 
+import atexit
 import os
 import re
-import select
 import shlex
-import signal
-import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-try:
-    import pty
-except ImportError:  # pragma: no cover - Windows fallback path.
-    pty = None  # type: ignore[assignment]
-
 from app.core.tools import ToolContext, ToolInvocation, ToolPackageSpec, ToolResult, ToolSpec
-
+from app.platform.commands import IS_WINDOWS, SHELL_NAME, run_sync, start_terminal
 
 DEFAULT_SYNC_TIMEOUT_SECONDS = 30
 MAX_SYNC_TIMEOUT_SECONDS = 300
@@ -63,7 +56,7 @@ SHELL_CONTROL_TOKENS = {"&&", "||", ";", "|"}
 BASH_PACKAGE = ToolPackageSpec(
     name="bash",
     description=(
-        "Run bash commands in configured workspace roots. Supports synchronous commands, "
+        f"Run native {SHELL_NAME} commands in configured workspace roots (bash.* API names remain compatible). Supports synchronous commands, "
         "background terminal sessions, output polling, stdin writes, Ctrl-C, termination, "
         "active session listing, workspace-relative cwd values, and injected workspace "
         "environment variables."
@@ -75,14 +68,14 @@ BASH_PACKAGE = ToolPackageSpec(
         "Use filesystem.read_file/edit_file for precise file reading or targeted file edits when possible.",
     ],
     decision_hints=[
-        "Prefer read-only commands first, such as pwd, printenv, ls, find, rg, grep, cat, sed, head, tail, wc, git status, git diff, git log, and git show.",
+        ("The actual shell is Windows PowerShell 5.1. Use PowerShell syntax (Get-Location, Get-ChildItem, Get-Content, Select-String); environment variables use $env:WORKSPACE_ROOT. Bash scripts and Unix command options are not supported." if IS_WINDOWS else "The actual shell is bash. Prefer read-only commands first, such as pwd, printenv, ls, find, rg, grep, cat, sed, head, tail, wc, git status, git diff, git log, and git show."),
         "Commands outside the read-only whitelist are treated as non-read-only and must pass safety review.",
         "Read-only classification also checks arguments and shell expansion. Writing options, process hooks, arbitrary programs and executable paths require review; use literal quoted patterns and quoted workspace-root variables for inspection.",
         "Use mode=background for long-running or interactive commands, then poll with bash.read_session.",
         "Use bash.write_session to send stdin to a background terminal, bash.interrupt_session for Ctrl-C, and bash.terminate_session to stop it.",
-        "The default cwd is the first configured workspace root. Relative cwd values are resolved inside that workspace root.",
+        "The default cwd is the session workspace, otherwise the first configured workspace root. Relative cwd values resolve inside that root.",
         "Commands receive workspace_root, WORKSPACE_ROOT, LKA_WORKSPACE_ROOT, and LKA_WORKSPACE_ROOTS environment variables.",
-        "Use relative paths from cwd or the injected $workspace_root variable; do not invent placeholder paths.",
+        ("Use relative paths from cwd or $env:WORKSPACE_ROOT; do not invent placeholder paths." if IS_WINDOWS else "Use relative paths from cwd or the injected $workspace_root variable; do not invent placeholder paths."),
         "Always inspect command status and output before claiming completion.",
     ],
 )
@@ -140,6 +133,8 @@ class BashAccessPolicy:
 
     def expand_workspace_variables(self, value: str) -> str:
         root = self.default_root.as_posix()
+        for name in ("workspace_root", "WORKSPACE_ROOT", "LKA_WORKSPACE_ROOT"):
+            value = value.replace(f"$env:{name}", root).replace("${env:" + name + "}", root)
         return (
             value.replace("$workspace_root", root)
             .replace("${workspace_root}", root)
@@ -166,8 +161,7 @@ class BashSession:
     cwd: Path
     workspace_root: Path
     read_only: bool
-    process: subprocess.Popen[bytes]
-    master_fd: int
+    process: Any
     started_at: float
     owner_run_id: str | None = None
     output: bytearray = field(default_factory=bytearray)
@@ -180,6 +174,7 @@ class BashSessionManager:
         self._lock = threading.RLock()
         self._sessions: dict[str, BashSession] = {}
         self._next_id = 1
+        atexit.register(self.close)
 
     def start(
         self,
@@ -191,22 +186,7 @@ class BashSessionManager:
         env: dict[str, str],
         owner_run_id: str | None = None,
     ) -> BashSession:
-        if pty is None:
-            raise RuntimeError("background bash sessions require POSIX pty support.")
-        master_fd, slave_fd = pty.openpty()
-        try:
-            process = subprocess.Popen(
-                ["/bin/bash", "-lc", command],
-                cwd=cwd,
-                stdin=slave_fd,
-                stdout=slave_fd,
-                stderr=slave_fd,
-                env=env,
-                start_new_session=True,
-                close_fds=True,
-            )
-        finally:
-            os.close(slave_fd)
+        process = start_terminal(command, cwd=cwd, env=env)
         with self._lock:
             session_id = f"bash_session_{self._next_id:06d}"
             self._next_id += 1
@@ -217,7 +197,6 @@ class BashSessionManager:
                 workspace_root=workspace_root,
                 read_only=read_only,
                 process=process,
-                master_fd=master_fd,
                 started_at=time.time(),
                 owner_run_id=owner_run_id,
             )
@@ -283,47 +262,37 @@ class BashSessionManager:
         session = self.get(session_id, owner_run_id=owner_run_id)
         if session.process.poll() is not None:
             raise RuntimeError(f"bash session is not running: {session_id}")
-        return os.write(session.master_fd, text.encode("utf-8"))
+        return session.process.write(text.encode("utf-8"))
 
     def interrupt(self, *, session_id: str, owner_run_id: str | None = None) -> None:
         session = self.get(session_id, owner_run_id=owner_run_id)
         if session.process.poll() is None:
-            os.killpg(session.process.pid, signal.SIGINT)
+            session.process.interrupt()
 
     def terminate(self, *, session_id: str, owner_run_id: str | None = None) -> None:
         session = self.get(session_id, owner_run_id=owner_run_id)
         if session.process.poll() is None:
-            os.killpg(session.process.pid, signal.SIGTERM)
+            session.process.terminate()
+
+    def close(self) -> None:
+        for session in self.list():
+            session.process.terminate()
+        atexit.unregister(self.close)
 
     def _reader_loop(self, session: BashSession) -> None:
         try:
-            while True:
-                ready, _, _ = select.select([session.master_fd], [], [], 0.1)
-                if ready:
-                    try:
-                        chunk = os.read(session.master_fd, 4096)
-                    except OSError:
-                        break
-                    if not chunk:
-                        break
-                    with self._lock:
-                        session.output.extend(chunk)
-                        if len(session.output) > SESSION_BUFFER_BYTES:
-                            overflow = len(session.output) - SESSION_BUFFER_BYTES
-                            del session.output[:overflow]
-                            session.output_start_offset += overflow
-                if session.process.poll() is not None:
-                    ready, _, _ = select.select([session.master_fd], [], [], 0)
-                    if not ready:
-                        break
+            for chunk in session.process.chunks():
+                with self._lock:
+                    session.output.extend(chunk)
+                    if len(session.output) > SESSION_BUFFER_BYTES:
+                        overflow = len(session.output) - SESSION_BUFFER_BYTES
+                        del session.output[:overflow]
+                        session.output_start_offset += overflow
         except Exception as exc:  # pragma: no cover - defensive reader path.
             with self._lock:
                 session.reader_error = str(exc)
         finally:
-            try:
-                os.close(session.master_fd)
-            except OSError:
-                pass
+            session.process.close()
 
     def _session_status_payload(self, session: BashSession) -> dict[str, Any]:
         exit_code = session.process.poll()
@@ -346,10 +315,11 @@ class BashRunTool:
 
     spec = ToolSpec(
         name="bash.run",
+        unrestricted_execution=True,
         package="bash",
         type="local_tool",
         description=(
-            "Run a bash command in sync or background mode. The command is classified "
+            f"Run a native {SHELL_NAME} command in sync or background mode. The command is classified "
             "per invocation as read_only only for whitelisted commands with safe arguments; "
             "otherwise it is non-read-only and requires safety review."
         ),
@@ -463,24 +433,9 @@ class BashRunTool:
     ) -> dict[str, Any]:
         timeout = min(max(1, timeout_seconds), MAX_SYNC_TIMEOUT_SECONDS)
         byte_limit = min(max(1, max_output_bytes), MAX_OUTPUT_BYTES)
-        timed_out = False
-        try:
-            completed = subprocess.run(
-                ["/bin/bash", "-lc", command],
-                cwd=cwd,
-                env=self._env(policy, read_only=read_only),
-                capture_output=True,
-                timeout=timeout,
-                check=False,
-            )
-            stdout_raw = completed.stdout
-            stderr_raw = completed.stderr
-            exit_code = completed.returncode
-        except subprocess.TimeoutExpired as exc:
-            timed_out = True
-            stdout_raw = exc.stdout or b""
-            stderr_raw = exc.stderr or b""
-            exit_code = None
+        stdout_raw, stderr_raw, exit_code, timed_out = run_sync(
+            command, cwd=cwd, env=self._env(policy, read_only=read_only), timeout=timeout
+        )
         stdout = _decode_limited(stdout_raw, byte_limit)
         stderr = _decode_limited(stderr_raw, byte_limit)
         return {
@@ -535,7 +490,10 @@ class BashRunTool:
         }
 
     def _env(self, policy: BashAccessPolicy, *, read_only: bool = False) -> dict[str, str]:
-        env = dict(os.environ)
+        # Human control credentials must never reach an Agent-owned process.
+        env = {key: value for key, value in os.environ.items() if key not in {
+            "LKA_MESSAGES_CONTROL_TOKEN", "LKA_MESSAGES_API_TOKEN", "LKA_MESSAGES_IMPORT_TOKEN"
+        }}
         if read_only:
             # Startup files, exported functions and rg --pre can run code even
             # when argv is read-only. Reviewed commands retain those semantics.
@@ -552,9 +510,10 @@ class BashListSessionsTool:
 
     spec = ToolSpec(
         name="bash.list_sessions",
+        unrestricted_execution=True,
         package="bash",
         type="local_tool",
-        description="List bash terminal sessions, optionally only active/running sessions.",
+        description=f"List native {SHELL_NAME} terminal sessions, optionally only active/running sessions.",
         risk="low",
         requires_confirmation=False,
         read_only=True,
@@ -589,9 +548,10 @@ class BashReadSessionTool:
 
     spec = ToolSpec(
         name="bash.read_session",
+        unrestricted_execution=True,
         package="bash",
         type="local_tool",
-        description="Read buffered output and status from a background bash terminal session.",
+        description=f"Read buffered output and status from a background {SHELL_NAME} terminal session.",
         risk="low",
         requires_confirmation=False,
         read_only=True,
@@ -653,9 +613,10 @@ class BashWriteSessionTool:
 
     spec = ToolSpec(
         name="bash.write_session",
+        unrestricted_execution=True,
         package="bash",
         type="local_tool",
-        description="Write stdin text to a running background bash terminal session.",
+        description=f"Write stdin text to a running background {SHELL_NAME} terminal session.",
         risk="medium",
         requires_confirmation=False,
         read_only=False,
@@ -701,9 +662,10 @@ class BashInterruptSessionTool:
 
     spec = ToolSpec(
         name="bash.interrupt_session",
+        unrestricted_execution=True,
         package="bash",
         type="local_tool",
-        description="Send Ctrl-C/SIGINT to a running background bash terminal session.",
+        description=f"Send Ctrl-C to a running background {SHELL_NAME} terminal session (SIGINT on POSIX).",
         risk="medium",
         requires_confirmation=False,
         read_only=False,
@@ -742,9 +704,10 @@ class BashTerminateSessionTool:
 
     spec = ToolSpec(
         name="bash.terminate_session",
+        unrestricted_execution=True,
         package="bash",
         type="local_tool",
-        description="Send SIGTERM to a running background bash terminal session.",
+        description=f"Terminate a background {SHELL_NAME} process tree (Job termination on Windows, SIGTERM then SIGKILL on POSIX).",
         risk="medium",
         requires_confirmation=False,
         read_only=False,
@@ -778,6 +741,8 @@ class BashTerminateSessionTool:
 
 
 def is_read_only_command(command: str) -> bool:
+    if IS_WINDOWS:
+        return is_read_only_powershell_command(command)
     segments = _shell_command_segments(command)
     if not segments:
         return False
@@ -995,3 +960,26 @@ def _decode_limited(raw: bytes, max_bytes: int) -> str:
 def _child_run_id(context: ToolContext) -> str | None:
     view = context.tool_view
     return view.child_run_id if view is not None else None
+
+
+def is_read_only_powershell_command(command: str) -> bool:
+    """A literal-only subset, deliberately rejecting PowerShell expression syntax.
+
+    Do not reuse POSIX shlex: PowerShell interprets script blocks, expandable
+    strings, escape characters, providers and invocation operators differently.
+    Anything outside this subset must pass the normal safety review gate.
+    """
+    if not command.strip() or any(char in command for char in "`$(){}@&><;|\n\r\x00"):
+        return False
+    # Only ordinary literal arguments and non-interpolated quoted strings.
+    token_pattern = r"(?:'[^']*'|\"[^\"]*\"|[^\s'\"]+)"
+    tokens = re.findall(token_pattern, command)
+    if " ".join(tokens).split() != command.split():
+        return False
+    if not tokens:
+        return False
+    return tokens[0].lower() in {
+        "get-location", "pwd", "get-childitem", "ls", "dir", "gci",
+        "get-content", "cat", "gc", "get-item", "gi", "test-path",
+        "select-string", "get-process", "get-date",
+    }

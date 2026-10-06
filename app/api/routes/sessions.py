@@ -116,8 +116,17 @@ def rename_session(
 
 
 @router.delete("/{session_id}", status_code=204)
-def delete_session(session_id: str, request: Request) -> None:
-    deleted = request.app.state.runtime.delete_session(session_id=session_id)
+def delete_session(
+    session_id: str, request: Request, only_if_empty: bool = False,
+    expected_updated_at: str | None = None,
+) -> None:
+    try:
+        deleted = request.app.state.runtime.delete_session(
+            session_id=session_id, only_if_empty=only_if_empty,
+            expected_updated_at=expected_updated_at,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     if not deleted:
         raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
 

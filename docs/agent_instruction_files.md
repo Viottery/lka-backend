@@ -15,7 +15,18 @@
 指导文件是用户维护的规则，和后台学习的派生记忆分开。普通偏好表达、纠正或撤回记忆
 不等同于要求改写 `AGENTS.md`；启用后的后台记忆机制负责这类对话学习。只有用户明确
 要求编辑持久指导文件时才使用更新工具，保留无关规则。此区分写在工具包元数据与工具
-描述中，不在 Agent core 硬编码意图；它改善模型决策，不替代执行器的权限与安全检查。
+描述中，不在 Agent core 硬编码意图。`instructions.update` 还在工具侧核对本轮已持久化的
+用户消息：仅接受明确的指导文件编辑请求；普通偏好、引用、疑问和无当前来源的调用拒绝，
+子 Agent 不能借该入口改写全局指导。这个保守目标检查不代替执行器的权限与安全审查；
+含糊编辑请求可能需要澄清，并不是任意自然语言授权识别器。
+
+明确要求立即保存偏好时可用 `memory.remember(evidence)`，`evidence` 必须精确匹配本轮
+用户原文中的完整、受本地提取支持的断言；不能使用网页资料、模型概括或剪掉条件的片段。
+回执分别报告记忆状态（active/candidate/retracted 等）与 `MEMORY.md` 同步状态，不能把
+candidate 或文件冲突称为已生效。普通对话仍走后台学习；此工具不新增模型提取调用。
+
+全局默认模板也遵守此区分。启动时只自动升级内容完全未改动的旧默认模板；已追加偏好、
+手工规则或其他内容的文件保持原样，须核对原请求与目标后单独迁移，避免覆盖用户数据。
 
 `instructions.search(kind="global"|"watch", query)` 和 `instructions.search_project(path, query)` 查找相关分块并返回偏移量。`instructions.read(kind, offset)` 与 `instructions.read_project(path, offset)` 每次最多返回 16 KiB，按 `next_offset` 续读直到 `truncated=false`；它们不会因源文件总长度而拒绝读取。项目工具只允许读取当前工作区指导文件链中的 `AGENTS.md`。`instructions.read` 还返回完整文件的 SHA；`instructions.update(kind, content, expected_sha256)` 以完整新内容替换，只有 SHA 匹配且单次更新不超过 1 MB 时成功；更新先写临时文件再原子替换。更大的用户文件仍可分页读取，但目前不能通过这个整文件替换工具一次写入。更新工具标记为非只读，经过既有安全审查门并留下工具审计记录。关注任务可使用只读指导检索工具，不能自改指导文件；用户可在普通会话中明确要求 Agent 更新。项目文件继续通过已有 `filesystem.edit_file` 修改，也受工作区和安全审查约束。可直接在本地用编辑器修改这三类文件；下次 turn 或 occurrence 会检测变更并重建索引。
 

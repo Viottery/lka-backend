@@ -113,6 +113,11 @@ def test_schema_exposes_limits_but_no_provider_credentials(tmp_path, monkeypatch
     response = call(app, "GET", "/background/config/schema")
     assert response.status_code == 200
     assert response.json()["memory"]["properties"]["generation_output_tokens"]["minimum"] == 256
+    properties = response.json()["memory"]["properties"]
+    assert properties["allow_remote_extraction"]["default"] is True
+    assert properties["extraction_context_messages"]["default"] == 12
+    assert properties["extraction_context_chars"]["maximum"] == 24000
+    assert properties["auto_publish_min_confidence"]["default"] == 0.85
     assert "api_key" not in response.text
     assert call(app, "GET", "/background/config/schema", host="192.0.2.1").status_code == 403
 

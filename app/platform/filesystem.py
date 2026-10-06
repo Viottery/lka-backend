@@ -9,6 +9,7 @@ from pathlib import Path
 
 from app.platform.base import PlatformInfo
 from app.platform.paths import ResolvedWorkspacePath
+from app.platform.safe_files import is_link_or_reparse
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,21 @@ class FilesystemScanner:
         def onerror(error: OSError) -> None:
             skipped_paths.append(getattr(error, "filename", str(error)))
 
+        def without_links(parent: Path, names: list[str]) -> list[str]:
+            kept = []
+            for name in names:
+                candidate = parent / name
+                try:
+                    linked = is_link_or_reparse(candidate.lstat())
+                except OSError as exc:
+                    onerror(exc)
+                    continue
+                if linked:
+                    skipped_paths.append(str(candidate))
+                else:
+                    kept.append(name)
+            return kept
+
         for current_root, dirs, files in os.walk(
             root,
             topdown=True,
@@ -68,6 +84,11 @@ class FilesystemScanner:
             followlinks=scan_options.allow_symlinks,
         ):
             current_path = Path(current_root)
+            if not scan_options.allow_symlinks:
+                # os.walk(followlinks=False) still descends Windows junctions.
+                # Prune all reparse points, as well as file symlinks, explicitly.
+                dirs[:] = without_links(current_path, dirs)
+                files = without_links(current_path, files)
             if scan_options.skip_hidden:
                 dirs[:] = [name for name in sorted(dirs) if not self._is_hidden(current_path / name)]
                 files = [name for name in sorted(files) if not self._is_hidden(current_path / name)]
@@ -128,7 +149,7 @@ class FilesystemScanner:
             return False
 
         try:
-            attrs = path.stat().st_file_attributes
+            attrs = path.lstat().st_file_attributes
         except (AttributeError, OSError):
             return False
         return bool(attrs & stat.FILE_ATTRIBUTE_HIDDEN)

@@ -16,9 +16,13 @@ class Settings(BaseSettings):
 
     app_name: str = Field(default="local-knowledge-agent-os", alias="LKA_APP_NAME")
     version: str = Field(default="0.1.0", alias="LKA_VERSION")
+    deployment_id: str | None = Field(default=None, alias="LKA_DEPLOYMENT_ID", pattern=r"^[a-f0-9]{64}$")
     host: str = Field(default="127.0.0.1", alias="LKA_HOST")
     port: int = Field(default=8765, alias="LKA_PORT")
     data_dir: Path = Field(default=Path("./data/runtime"), alias="LKA_DATA_DIR")
+    messages_media_cache_dir: Path | None = Field(
+        default=None, alias="LKA_MESSAGES_MEDIA_CACHE_DIR"
+    )
     platform: str = Field(default="auto", alias="LKA_PLATFORM")
     default_shell: str = Field(default="auto", alias="LKA_DEFAULT_SHELL")
     workspace_roots: str = Field(default="", alias="LKA_WORKSPACE_ROOTS")

@@ -14,6 +14,7 @@ from app.domains.knowledge import (
     KnowledgeService,
     KnowledgeSourceInput,
 )
+from app.platform.safe_files import is_link_or_reparse, open_file_no_follow
 
 
 class WorkspaceKnowledgeResult(BaseModel):
@@ -66,7 +67,7 @@ class WorkspaceKnowledgeIndexer:
             result.discovered_files += 1
             try:
                 canonical = candidate.resolve(strict=True)
-                if not self._is_within(canonical, requested_root) or candidate.is_symlink():
+                if not self._is_within(canonical, requested_root) or is_link_or_reparse(candidate.lstat()):
                     result.skipped_files += 1
                     continue
                 stat = canonical.stat()
@@ -77,7 +78,8 @@ class WorkspaceKnowledgeIndexer:
                     result.skipped_files += 1
                     result.errors.append(f"{candidate.name}: aggregate byte limit reached")
                     continue
-                raw = canonical.read_bytes()
+                with os.fdopen(open_file_no_follow(canonical), "rb") as reader:
+                    raw = reader.read(self._max_file_bytes + 1)
                 if len(raw) > self._max_file_bytes or result.bytes_read + len(raw) > self._max_total_bytes:
                     result.skipped_files += 1
                     result.errors.append(f"{candidate.name}: byte limit exceeded while reading")
@@ -145,7 +147,14 @@ class WorkspaceKnowledgeIndexer:
         errors: list[OSError] = []
         for directory, dirs, files in os.walk(root, followlinks=False, onerror=errors.append):
             current = Path(directory)
-            dirs[:] = sorted(name for name in dirs if not (current / name).is_symlink())
+            safe_dirs = []
+            for name in dirs:
+                try:
+                    if not is_link_or_reparse((current / name).lstat()):
+                        safe_dirs.append(name)
+                except OSError as exc:
+                    errors.append(exc)
+            dirs[:] = sorted(safe_dirs)
             for name in sorted(files):
                 candidate = current / name
                 if candidate.suffix.lower() in {".md", ".txt"}:

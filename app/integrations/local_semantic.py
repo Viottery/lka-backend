@@ -365,15 +365,25 @@ class SQLiteVecSemanticIndex(SemanticIndex):
         import sqlite_vec
 
         conn = self._conn_factory()
-        sqlite_vec.load(conn)
-        conn.execute(
-            f"""
-            CREATE VIRTUAL TABLE IF NOT EXISTS {self._table_name} USING vec0(
-                vector_id INTEGER PRIMARY KEY,
-                embedding float[{self._model_info.dimensions}] distance_metric=cosine
+        try:
+            # Windows Python disables extension loading by default. Authorize
+            # only this trusted packaged extension, then close the loading gate.
+            conn.enable_load_extension(True)
+            try:
+                sqlite_vec.load(conn)
+            finally:
+                conn.enable_load_extension(False)
+            conn.execute(
+                f"""
+                CREATE VIRTUAL TABLE IF NOT EXISTS {self._table_name} USING vec0(
+                    vector_id INTEGER PRIMARY KEY,
+                    embedding float[{self._model_info.dimensions}] distance_metric=cosine
+                )
+                """
             )
-            """
-        )
+        except BaseException:
+            conn.close()
+            raise
         return conn
 
     def _serialize(self, vector: Sequence[float]) -> bytes:

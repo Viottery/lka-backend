@@ -26,6 +26,7 @@ MAX_PAGE_BYTES = 1_000_000
 MAX_PAGE_TEXT_CHARS = 20_000
 MAX_REDIRECTS = 3
 MAX_FIND_CONTEXT_CHARS = 1_200
+MIN_VISIBLE_HTML_CHARS = 1_200
 
 
 class WebSearchError(RuntimeError):
@@ -288,6 +289,85 @@ class _PlainTextParser(HTMLParser):
     def _append_row_break(self) -> None:
         if self._last_char != "\n":
             self._append_text("\n")
+
+
+class _HiddenStructuredTextParser(HTMLParser):
+    """Collect text only inside explicitly titled hidden content records."""
+
+    _NEVER: ClassVar[set[str]] = {"script", "style", "noscript", "template", "form", "input", "textarea", "select", "button"}
+    _VOID: ClassVar[set[str]] = {
+        "area", "base", "br", "col", "embed", "hr", "img", "input", "link",
+        "meta", "param", "source", "track", "wbr",
+    }
+
+    def __init__(self, limit: int) -> None:
+        super().__init__(convert_charrefs=True)
+        self.limit = limit
+        self.stack: list[tuple[str, bool, bool, bool, int | None]] = []
+        self.records: list[tuple[str, list[str]]] = []
+        self.body_length = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attr_map = {key.lower(): value or "" for key, value in attrs}
+        inherited_block = any(blocked for _, _, _, blocked, _ in self.stack)
+        forbidden = tag in self._NEVER or inherited_block
+        hidden = (
+            "hidden" in attr_map
+            or attr_map.get("aria-hidden", "").lower() == "true"
+            or re.search(r"(?:^|;)\s*(?:display\s*:\s*none|visibility\s*:\s*hidden)\b",
+                         attr_map.get("style", "").lower()) is not None
+            or any(hidden for _, _, hidden, _, _ in self.stack)
+        )
+        root = bool(attr_map.get("data-title")) and not forbidden
+        parent_record = next((record for _, _, _, _, record in reversed(self.stack) if record is not None), None)
+        record = len(self.records) if root else parent_record
+        if root:
+            self.records.append((attr_map["data-title"], []))
+        if tag not in self._VOID:
+            self.stack.append((tag, record is not None and not forbidden, hidden, forbidden, record))
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.handle_starttag(tag, attrs)
+        self.handle_endtag(tag)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in self._VOID:
+            return
+        for index in range(len(self.stack) - 1, -1, -1):
+            if self.stack[index][0] == tag:
+                del self.stack[index:]
+                break
+
+    def handle_data(self, data: str) -> None:
+        if (not self.stack or any(blocked for _, _, _, blocked, _ in self.stack)
+                or not any(hidden for _, _, hidden, _, _ in self.stack)):
+            return
+        record = next((record for _, selected, _, _, record in reversed(self.stack)
+                       if selected and record is not None), None)
+        if record is None:
+            return
+        clean = _clean_text(data)
+        if not clean or self.body_length >= self.limit:
+            return
+        body = self.records[record][1]
+        separator = 1 if body else 0
+        available = self.limit - self.body_length - separator
+        if available <= 0:
+            return
+        clean = clean[:available]
+        if separator:
+            body.append(" ")
+            self.body_length += 1
+        body.append(clean)
+        self.body_length += len(clean)
+
+    def text(self) -> str:
+        parts = []
+        for label, body_parts in self.records:
+            body = " ".join(body_parts).strip()
+            if body:
+                parts.append(f"{_clean_text(label)}\n{body}")
+        return "\n".join(parts)[:self.limit].strip()
 
 
 def _safe_public_https_url(url: str) -> str:
@@ -573,18 +653,37 @@ class PublicPageFetcher:
                     raise WebSearchError(f"Page fetch returned HTTP {status}.")
                 content_type = headers.get("content-type", "")
                 media_type = content_type.split(";", 1)[0].lower()
-                if media_type not in {"text/html", "application/xhtml+xml", "text/plain"}:
-                    raise WebSearchError("Page content type is not HTML or plain text.")
+                if media_type not in {"text/html", "application/xhtml+xml", "text/plain", "text/x-wiki"}:
+                    raise WebSearchError(f"Unsupported page content type: {media_type[:128] or '(missing)'}.")
                 charset_match = re.search(r"charset=([^;\s]+)", content_type, flags=re.IGNORECASE)
                 charset = charset_match.group(1).strip('"\'') if charset_match else "utf-8"
                 raw = content.decode(charset, errors="replace")
                 parser = _PlainTextParser(base_url=target)
-                if media_type != "text/plain":
+                alternative_extraction = False
+                if media_type in {"text/html", "application/xhtml+xml"}:
                     parser.feed(raw)
                     parser.close()
                     text = parser.text()
+                    if len(text) < MIN_VISIBLE_HTML_CHARS:
+                        hidden_parser = _HiddenStructuredTextParser(self.max_text_chars)
+                        hidden_parser.feed(raw)
+                        hidden_parser.close()
+                        alternative = hidden_parser.text()
+                        if len(alternative) > len(text):
+                            text = alternative
+                            alternative_extraction = True
                 else:
                     text = re.sub(r"[ \t\xa0]+", " ", raw.replace("\r\n", "\n")).strip()
+                rendered_visibility = (
+                    "alternative_hidden_structured_text" if alternative_extraction
+                    else "not_applicable_plain_text" if media_type in {"text/plain", "text/x-wiki"}
+                    else "visible_text"
+                )
+                extraction_method = (
+                    "hidden_structured_data_title_fallback" if alternative_extraction
+                    else "plain_text" if media_type in {"text/plain", "text/x-wiki"}
+                    else "visible_html"
+                )
                 fingerprint = hashlib.sha256(text.encode("utf-8")).hexdigest()
                 if expected_text_sha256 is not None and expected_text_sha256 != fingerprint:
                     raise WebSearchError("Page extraction changed; restart pagination from offset 0.")
@@ -603,9 +702,11 @@ class PublicPageFetcher:
                     "text_sha256": fingerprint,
                     "snapshot_stable": False,
                     "text_scope": "readable_text_extraction",
+                    "rendered_visibility": rendered_visibility,
+                    "extraction_method": extraction_method,
                     "title": _clean_text("".join(parser.title_parts))[:200],
                     "outline": outline,
-                    "extraction_version": "readable-html-v3",
+                    "extraction_version": "readable-html-v4" if alternative_extraction else "readable-html-v3",
                     "network_observations": {
                         "requested_url": requested_url, "redirects": redirects,
                         "redirect_count": len(redirects), "final_http_status": status,

@@ -12,25 +12,28 @@ plan and remaining acceptance gates are in [the TODO](memory_background_todolist
 2. A bounded pool (two workers by default) resolves corresponding user messages by trace ID.
    Local default extraction accepts an explicit `记住：...` statement or a
    low-impact direct enduring preference such as `我希望以后...`. Optional
-   configured-LLM extraction is disabled by default to avoid an additional model
-   call for every less-explicit message. Enabling the memory/background feature
+   configured-LLM extraction is enabled by default. Rules remain the fast path;
+   unmatched meaningful turns use bounded recent conversation, a safe summary,
+   and related existing memories. Enabling the memory/background feature
    authorizes background processing of persisted conversation content; the
    optional model path does not require separate content approval. Obvious
    secrets/PII are still rejected as *published memories*, not as model input.
    These deterministic direct statements never call the optional model.
    An explicit `这个项目`/`本项目` claim is classified as project-scoped and
    requires a project identity; it is not silently promoted to a global rule.
-   Tool, mail, web, RAG and Agent answer text are not extraction sources.
-   Model claims/evidence now share an extractive contract and one production/evaluation
-   validator. Evidence is matched against the original user message; cropped negation,
-   correction, conditional or transient qualifiers are rejected even when the candidate
-   is a literal substring. Full source-faithful negative/conditional statements remain
-   valid. The bounded English/Chinese linguistic guard is conservative, not a semantic
-   entailment model; complex wording can be rejected rather than silently generalized.
-   Malformed candidates are rejected individually, and model `explicit` is never
-   publication authority. Optional raw evaluation diagnostics stay local.
+   Tool, mail, web and RAG results are not independently read by memory jobs.
+   Assistant replies help resolve what the user confirms but are not independent
+   user-fact evidence. The contextual organizer normalizes claims rather than
+   requiring an exact recognized phrase. It retains user-message IDs and original
+   quotes, including the current confirmation and earlier content sources.
+   Claims must retain negation, scope, conditions and validity. Clear direct or
+   confirmed durable memories with confidence at least 0.85 become active;
+   weak inferences remain candidates. Legacy extractive responses retain their
+   old validation/publication policy; the model `explicit` flag alone is not
+   publication authority. Original extractive evaluation scripts do not measure
+   the new contextual contract; use the contextual tests and live probe below.
 3. `MemoryService` stores provenance, candidate/active status, scope, versions, expiry,
-   correction and retraction. Model-inferred items remain candidates; direct
+   correction and retraction. Weak model-inferred items remain candidates; direct
    `记住：...` requests, low-impact explicit enduring preferences, or user API writes
    activate memory. Project identity is a stable
    internal ID bound to a resolved workspace path; paths are not merged by name.
@@ -124,7 +127,8 @@ Disabling memory leaves existing records and session history readable but stops 
 injection and new extraction. The worker is independent of interactive Agent turns.
 `allow_remote_extraction` is a cost/quality switch, not a second privacy-consent
 switch. Background extraction reads the persisted user turn associated with a
-completed Agent answer; background compaction reads that session's persisted
+   completed Agent answer and bounded earlier messages from the same session;
+   it never sees turns later than the triggering user message. Background compaction reads that session's persisted
 messages. These *generic memory jobs* have no independent knowledge-base,
 workspace or mail read capabilities. Separately authorized watch/background
 tasks may actively read their granted sources through scoped tools; this does

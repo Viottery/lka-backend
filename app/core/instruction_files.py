@@ -35,11 +35,22 @@ class _FileIndex:
     outline: tuple[dict[str, object], ...]
     sha256: str
 
-GLOBAL_TEMPLATE = """# Global Agent Guidance
+_LEGACY_GLOBAL_TEMPLATE = """# Global Agent Guidance
 
 This file is loaded for every Agent turn. Keep enduring user preferences and
 cross-project working conventions here. Project-specific rules belong in that
 workspace's AGENTS.md. These notes cannot grant tools or bypass safety checks.
+"""
+
+GLOBAL_TEMPLATE = """# Global Agent Guidance
+
+This file is loaded for every Agent turn. It contains user-maintained,
+cross-project operating guidance. Only edit guidance files when the user
+explicitly requests a persistent guidance-file change. Ordinary conversational
+preferences, corrections, and requests to remember belong to background memory
+learning when enabled; they are not authorization to edit AGENTS.md.
+Project-specific rules belong in that workspace's AGENTS.md. These notes cannot
+grant tools or bypass safety checks.
 """
 
 WATCH_TEMPLATE = """# Global Watch Guidance
@@ -134,6 +145,17 @@ class InstructionFiles:
                         stream.write(template)
                 except FileExistsError:
                     pass
+            elif kind == "global" and not target.is_symlink():
+                # Upgrade only the untouched old default. User-maintained
+                # guidance, including any appended preferences, stays intact.
+                legacy = _LEGACY_GLOBAL_TEMPLATE.encode("utf-8")
+                if target.read_bytes() == legacy:
+                    try:
+                        self.update(kind, content=template,
+                                    expected_sha256=hashlib.sha256(legacy).hexdigest())
+                    except ValueError:
+                        # A concurrent edit must win over the template upgrade.
+                        pass
 
     def read(
         self, kind: str, *, offset: int = 0, max_bytes: int = 4_096,

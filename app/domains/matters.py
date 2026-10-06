@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Callable
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from hashlib import sha1
+from hashlib import sha1, sha256
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -70,6 +72,7 @@ class MatterRecord(BaseModel):
     source_links: list[MatterSourceLink] = Field(default_factory=list)
     created_at: str
     updated_at: str
+    revision: int = 1
 
 
 class MatterList(BaseModel):
@@ -85,11 +88,21 @@ class MatterSearchResultItem(BaseModel):
     due_at: str | None = None
     tags: list[str] = Field(default_factory=list)
     snippet: str
+    revision: int = 1
 
 
 class MatterSearchResult(BaseModel):
     query: str
     matters: list[MatterSearchResultItem]
+
+
+@dataclass(frozen=True)
+class _MessageMutationReceipt:
+    token: object
+    conn: sqlite3.Connection
+    action: str
+    matter_id: str | None
+    digest: str
 
 
 class MatterService:
@@ -100,12 +113,92 @@ class MatterService:
 
     def __init__(self, conn_factory: Callable[[], sqlite3.Connection]) -> None:
         self._conn_factory = conn_factory
+        self.__receipt_token = object()
+        with self._write_connection() as conn:
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(matters)")}
+            if "revision" not in columns:
+                conn.execute("ALTER TABLE matters ADD COLUMN revision INTEGER NOT NULL DEFAULT 1")
+
+    @contextmanager
+    def _write_connection(self, conn: sqlite3.Connection | None = None):
+        owns = conn is None
+        if owns:
+            conn = self._conn_factory()
+            conn.execute("BEGIN IMMEDIATE")
+        elif not conn.in_transaction:
+            raise ValueError("Caller-owned matter connection requires an active transaction.")
+        try:
+            yield conn
+            if owns:
+                conn.commit()
+        except BaseException:
+            if owns:
+                conn.rollback()
+            raise
+        finally:
+            if owns:
+                conn.close()
+
+    def _issue_message_receipt(self, conn, *, action: str, matter_id: str | None, payload: Any):
+        """Private capability used only by the authenticated proposal transaction."""
+        return _MessageMutationReceipt(
+            self.__receipt_token, conn, action, matter_id, self._mutation_digest(payload)
+        )
+
+    @staticmethod
+    def _mutation_digest(payload: Any) -> str:
+        data = payload.model_dump(mode="json") if isinstance(payload, BaseModel) else payload
+        return sha256(
+            json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        ).hexdigest()
+
+    def _check_message_receipt(self, conn, *, action, matter_id, payload, receipt, links=()):
+        existing = (
+            conn.execute(
+                "SELECT 1 FROM matter_source_links WHERE matter_id=? "
+                "AND lower(trim(source_type))='message_history_message' LIMIT 1",
+                (matter_id,),
+            ).fetchone()
+            if matter_id
+            else None
+        )
+        requires = existing or any(
+            link.source_type.strip().lower() == "message_history_message" for link in links
+        )
+        # A real message identity cannot be disguised as "local_evidence" or
+        # another source type to evade the dedicated proposal transaction.
+        has_messages = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='message_history_messages'"
+        ).fetchone()
+        if has_messages:
+            for link in links:
+                if conn.execute("SELECT 1 FROM message_history_messages WHERE internal_message_id=?",
+                                (link.source_id,)).fetchone():
+                    if link.source_type != "message_history_message":
+                        raise PermissionError("message_source_requires_canonical_type")
+                    requires = True
+        if not requires:
+            return
+        if not (
+            isinstance(receipt, _MessageMutationReceipt)
+            and receipt.token is self.__receipt_token
+            and receipt.conn is conn
+            and conn.in_transaction
+            and receipt.action == action
+            and receipt.matter_id == (None if action == "create" else matter_id)
+            and receipt.digest == self._mutation_digest(payload)
+        ):
+            raise PermissionError("message_matter_proposal_receipt_required")
 
     def create_matter(
-        self, payload: MatterCreateInput, *,
+        self,
+        payload: MatterCreateInput,
+        *,
         source_ids: tuple[str, ...] | None = None,
         account_ids: tuple[str, ...] | None = None,
         allow_unattributed: bool = True,
+        conn: sqlite3.Connection | None = None,
+        _receipt: Any = None,
     ) -> MatterRecord:
         if (
             (source_ids is not None or account_ids is not None)
@@ -127,31 +220,30 @@ class MatterService:
             json.dumps(tags, ensure_ascii=False, sort_keys=True),
             now,
         )
-        conn = self._conn_factory()
-        try:
+        with self._write_connection(conn) as transaction:
+            self._check_message_receipt(
+                transaction,
+                action="create",
+                matter_id=matter_id,
+                payload=payload,
+                receipt=_receipt,
+                links=payload.source_links,
+            )
             if source_ids is not None or account_ids is not None:
-                conn.execute("BEGIN IMMEDIATE")
                 self.validate_source_links_scope(
-                    source_links=payload.source_links, source_ids=source_ids,
-                    account_ids=account_ids, allow_unattributed=allow_unattributed,
-                    conn=conn,
+                    source_links=payload.source_links,
+                    source_ids=source_ids,
+                    account_ids=account_ids,
+                    allow_unattributed=allow_unattributed,
+                    conn=transaction,
                 )
-            conn.execute(
+            transaction.execute(
                 """
                 INSERT INTO matters(
                     matter_id, title, summary, status, priority, due_at,
                     tags, metadata, created_at, updated_at
                 )
                 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(matter_id) DO UPDATE SET
-                    title=excluded.title,
-                    summary=excluded.summary,
-                    status=excluded.status,
-                    priority=excluded.priority,
-                    due_at=excluded.due_at,
-                    tags=excluded.tags,
-                    metadata=excluded.metadata,
-                    updated_at=excluded.updated_at
                 """,
                 (
                     matter_id,
@@ -166,25 +258,23 @@ class MatterService:
                     now,
                 ),
             )
-            self._upsert_fts(conn, matter_id, title, summary, tags)
+            self._upsert_fts(transaction, matter_id, title, summary, tags)
             self._replace_source_links(
-                conn,
+                transaction,
                 matter_id=matter_id,
                 source_links=payload.source_links,
                 now=now,
             )
-            conn.commit()
-        finally:
-            conn.close()
-        return self.get_matter(matter_id=matter_id)
+            return self.get_matter(matter_id=matter_id, conn=transaction)
 
-    def get_matter(self, *, matter_id: str) -> MatterRecord:
-        conn = self._conn_factory()
+    def get_matter(self, *, matter_id: str, conn: sqlite3.Connection | None = None) -> MatterRecord:
+        owns = conn is None
+        conn = conn or self._conn_factory()
         try:
             row = conn.execute(
                 """
                 SELECT matter_id, title, summary, status, priority, due_at,
-                       tags, metadata, created_at, updated_at
+                       tags, metadata, created_at, updated_at, revision
                 FROM matters
                 WHERE matter_id = ?
                 """,
@@ -194,7 +284,8 @@ class MatterService:
                 raise KeyError(f"Matter not found: {matter_id}")
             source_links = self._load_source_links(conn, matter_id=matter_id)
         finally:
-            conn.close()
+            if owns:
+                conn.close()
         return self._record_from_row(row, source_links=source_links)
 
     def _matter_in_scope(
@@ -228,14 +319,37 @@ class MatterService:
                     return False
                 if (
                     source_ids is not None
-                    and MailKnowledgeMirror.source_id_for_account(owner["account_id"]) not in sources
+                    and MailKnowledgeMirror.source_id_for_account(owner["account_id"])
+                    not in sources
                 ):
                     return False
                 if account_ids is not None and owner["account_id"] not in accounts:
                     return False
+            elif source_type == "message_history_message":
+                owner = self._message_source_owner(conn, source_id)
+                if owner is None or not owner["record_enabled"]:
+                    return False
+                if source_ids is not None and owner["source_id"] not in sources:
+                    return False
+                if account_ids is not None and owner["account_scope_id"] not in accounts:
+                    return False
             else:
                 return False
         return True
+
+    @staticmethod
+    def _message_source_owner(conn, message_id):
+        # Tables may be absent for legacy consumers that initialize only matters.
+        if not conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='message_history_messages'"
+        ).fetchone():
+            return None
+        return conn.execute(
+            "SELECT p.source_id,p.account_scope_id,p.record_enabled FROM message_history_messages m "
+            "JOIN message_history_policies p ON p.conversation_key=m.conversation_key "
+            "WHERE m.internal_message_id=?",
+            (message_id,),
+        ).fetchone()
 
     def validate_source_links_scope(
         self,
@@ -261,16 +375,37 @@ class MatterService:
                         (source_id,),
                     ).fetchone()
                     if owner is None:
-                        raise PermissionError("Matter source ownership cannot be verified for this child run.")
+                        raise PermissionError(
+                            "Matter source ownership cannot be verified for this child run."
+                        )
                     if (
                         source_ids is not None
-                        and MailKnowledgeMirror.source_id_for_account(owner["account_id"]) not in sources
+                        and MailKnowledgeMirror.source_id_for_account(owner["account_id"])
+                        not in sources
                     ):
-                        raise PermissionError("Matter source link is outside the child source scope.")
+                        raise PermissionError(
+                            "Matter source link is outside the child source scope."
+                        )
                     if account_ids is not None and owner["account_id"] not in accounts:
-                        raise PermissionError("Matter source link is outside the child account scope.")
+                        raise PermissionError(
+                            "Matter source link is outside the child account scope."
+                        )
+                elif kind == "message_history_message":
+                    owner = self._message_source_owner(conn, source_id)
+                    if owner is None or not owner["record_enabled"]:
+                        raise PermissionError("message_history_not_allowed")
+                    if source_ids is not None and owner["source_id"] not in sources:
+                        raise PermissionError(
+                            "Matter source link is outside the child source scope."
+                        )
+                    if account_ids is not None and owner["account_scope_id"] not in accounts:
+                        raise PermissionError(
+                            "Matter source link is outside the child account scope."
+                        )
                 else:
-                    raise PermissionError("Matter source type cannot be verified for this child scope.")
+                    raise PermissionError(
+                        "Matter source type cannot be verified for this child scope."
+                    )
         finally:
             if owns_connection:
                 conn.close()
@@ -293,7 +428,7 @@ class MatterService:
                 rows = conn.execute(
                     f"""
                     SELECT matter_id, title, summary, status, priority, due_at,
-                           tags, metadata, created_at, updated_at
+                           tags, metadata, created_at, updated_at, revision
                     FROM matters
                     WHERE status = ?
                     ORDER BY
@@ -310,7 +445,7 @@ class MatterService:
                 rows = conn.execute(
                     f"""
                     SELECT matter_id, title, summary, status, priority, due_at,
-                           tags, metadata, created_at, updated_at
+                           tags, metadata, created_at, updated_at, revision
                     FROM matters
                     ORDER BY
                         due_at IS NULL,
@@ -321,10 +456,14 @@ class MatterService:
                     (limit,) if limit_sql else (),
                 ).fetchall()
             rows = [
-                row for row in rows
+                row
+                for row in rows
                 if self._matter_in_scope(
-                    conn, matter_id=row["matter_id"], source_ids=source_ids,
-                    account_ids=account_ids, allow_unattributed=allow_unattributed,
+                    conn,
+                    matter_id=row["matter_id"],
+                    source_ids=source_ids,
+                    account_ids=account_ids,
+                    allow_unattributed=allow_unattributed,
                 )
             ][:limit]
             links_by_matter = self._load_source_links_for_rows(conn, rows)
@@ -341,7 +480,10 @@ class MatterService:
         )
 
     def search_matters(
-        self, *, query: str, limit: int = 10,
+        self,
+        *,
+        query: str,
+        limit: int = 10,
         source_ids: tuple[str, ...] | None = None,
         account_ids: tuple[str, ...] | None = None,
         allow_unattributed: bool = True,
@@ -363,6 +505,7 @@ class MatterService:
                         m.priority,
                         m.due_at,
                         m.tags,
+                        m.revision,
                         snippet(matters_fts, 2, '[', ']', '...', 12) AS snippet
                     FROM matters_fts
                     JOIN matters m ON m.matter_id = matters_fts.matter_id
@@ -377,7 +520,7 @@ class MatterService:
             else:
                 rows = conn.execute(
                     f"""
-                    SELECT matter_id, title, summary, status, priority, due_at, tags,
+                    SELECT matter_id, title, summary, status, priority, due_at, tags, revision,
                            summary AS snippet
                     FROM matters
                     ORDER BY
@@ -389,10 +532,14 @@ class MatterService:
                     (limit,) if limit_sql else (),
                 ).fetchall()
             rows = [
-                row for row in rows
+                row
+                for row in rows
                 if self._matter_in_scope(
-                    conn, matter_id=row["matter_id"], source_ids=source_ids,
-                    account_ids=account_ids, allow_unattributed=allow_unattributed,
+                    conn,
+                    matter_id=row["matter_id"],
+                    source_ids=source_ids,
+                    account_ids=account_ids,
+                    allow_unattributed=allow_unattributed,
                 )
             ][:limit]
         finally:
@@ -410,6 +557,7 @@ class MatterService:
                     due_at=row["due_at"],
                     tags=self._json_list(row["tags"]),
                     snippet=self._trim_snippet(row["snippet"]),
+                    revision=row["revision"],
                 )
                 for row in rows
             ],
@@ -423,14 +571,28 @@ class MatterService:
         source_ids: tuple[str, ...] | None = None,
         account_ids: tuple[str, ...] | None = None,
         allow_unattributed: bool = True,
+        conn: sqlite3.Connection | None = None,
+        _receipt: Any = None,
     ) -> MatterRecord:
-        current = self.get_matter(matter_id=matter_id)
+        with self._write_connection(conn) as transaction:
+            self._check_message_receipt(
+                transaction, action="update", matter_id=matter_id, payload=payload, receipt=_receipt
+            )
+            return self._update_matter_transaction(
+                transaction,
+                matter_id=matter_id,
+                payload=payload,
+                source_ids=source_ids,
+                account_ids=account_ids,
+                allow_unattributed=allow_unattributed,
+            )
+
+    def _update_matter_transaction(
+        self, conn, *, matter_id, payload, source_ids, account_ids, allow_unattributed
+    ):
+        current = self.get_matter(matter_id=matter_id, conn=conn)
         title = payload.title.strip() if payload.title is not None else current.title
-        summary = (
-            payload.summary.strip()
-            if payload.summary is not None
-            else current.summary
-        )
+        summary = payload.summary.strip() if payload.summary is not None else current.summary
         status = (
             self._normalized_status(payload.status)
             if payload.status is not None
@@ -442,57 +604,38 @@ class MatterService:
             else current.priority
         )
         due_at = payload.due_at if payload.due_at is not None else current.due_at
-        tags = (
-            self._normalized_tags(payload.tags)
-            if payload.tags is not None
-            else current.tags
-        )
+        tags = self._normalized_tags(payload.tags) if payload.tags is not None else current.tags
         metadata = payload.metadata if payload.metadata is not None else current.metadata
         now = _now_iso()
-        conn = self._conn_factory()
-        try:
-            if source_ids is not None or account_ids is not None:
-                conn.execute("BEGIN IMMEDIATE")
-                if not self._matter_in_scope(
-                    conn, matter_id=matter_id, source_ids=source_ids,
-                    account_ids=account_ids, allow_unattributed=allow_unattributed,
-                ):
-                    raise PermissionError("Matter is outside the child source/account scope.")
-            conn.execute(
-                """
+        if (source_ids is not None or account_ids is not None) and not self._matter_in_scope(
+            conn,
+            matter_id=matter_id,
+            source_ids=source_ids,
+            account_ids=account_ids,
+            allow_unattributed=allow_unattributed,
+        ):
+            raise PermissionError("Matter is outside the child source/account scope.")
+        conn.execute(
+            """
                 UPDATE matters
                 SET title = ?, summary = ?, status = ?, priority = ?, due_at = ?,
-                    tags = ?, metadata = ?, updated_at = ?
+                    tags = ?, metadata = ?, updated_at = ?, revision = revision + 1
                 WHERE matter_id = ?
                 """,
-                (
-                    title or "Untitled matter",
-                    summary or title or "Untitled matter",
-                    status,
-                    priority,
-                    due_at,
-                    self._json_dumps(tags),
-                    self._json_dumps(metadata),
-                    now,
-                    matter_id,
-                ),
-            )
-            self._upsert_fts(conn, matter_id, title, summary, tags)
-            conn.commit()
-        finally:
-            conn.close()
-        updated = self.get_matter(matter_id=matter_id)
-        if source_ids is not None or account_ids is not None:
-            conn = self._conn_factory()
-            try:
-                if not self._matter_in_scope(
-                    conn, matter_id=matter_id, source_ids=source_ids,
-                    account_ids=account_ids, allow_unattributed=allow_unattributed,
-                ):
-                    raise PermissionError("Matter is outside the child source/account scope.")
-            finally:
-                conn.close()
-        return updated
+            (
+                title or "Untitled matter",
+                summary or title or "Untitled matter",
+                status,
+                priority,
+                due_at,
+                self._json_dumps(tags),
+                self._json_dumps(metadata),
+                now,
+                matter_id,
+            ),
+        )
+        self._upsert_fts(conn, matter_id, title, summary, tags)
+        return self.get_matter(matter_id=matter_id, conn=conn)
 
     def link_source(
         self,
@@ -502,24 +645,37 @@ class MatterService:
         source_ids: tuple[str, ...] | None = None,
         account_ids: tuple[str, ...] | None = None,
         allow_unattributed: bool = True,
+        conn: sqlite3.Connection | None = None,
+        _receipt: Any = None,
     ) -> MatterRecord:
-        self.get_matter(matter_id=matter_id)
         now = _now_iso()
-        conn = self._conn_factory()
-        try:
+        with self._write_connection(conn) as transaction:
+            self.get_matter(matter_id=matter_id, conn=transaction)
+            self._check_message_receipt(
+                transaction,
+                action="link",
+                matter_id=matter_id,
+                payload=source_link,
+                receipt=_receipt,
+                links=[source_link],
+            )
             if source_ids is not None or account_ids is not None:
-                conn.execute("BEGIN IMMEDIATE")
                 self.validate_source_links_scope(
-                    source_links=[source_link], source_ids=source_ids,
-                    account_ids=account_ids, allow_unattributed=allow_unattributed,
-                    conn=conn,
+                    source_links=[source_link],
+                    source_ids=source_ids,
+                    account_ids=account_ids,
+                    allow_unattributed=allow_unattributed,
+                    conn=transaction,
                 )
                 if not self._matter_in_scope(
-                    conn, matter_id=matter_id, source_ids=source_ids,
-                    account_ids=account_ids, allow_unattributed=allow_unattributed,
+                    transaction,
+                    matter_id=matter_id,
+                    source_ids=source_ids,
+                    account_ids=account_ids,
+                    allow_unattributed=allow_unattributed,
                 ):
                     raise PermissionError("Matter is outside the child source/account scope.")
-            conn.execute(
+            transaction.execute(
                 """
                 INSERT INTO matter_source_links(
                     matter_id, source_type, source_id, reason, created_at
@@ -536,21 +692,11 @@ class MatterService:
                     now,
                 ),
             )
-            conn.commit()
-        finally:
-            conn.close()
-        linked = self.get_matter(matter_id=matter_id)
-        if source_ids is not None or account_ids is not None:
-            conn = self._conn_factory()
-            try:
-                if not self._matter_in_scope(
-                    conn, matter_id=matter_id, source_ids=source_ids,
-                    account_ids=account_ids, allow_unattributed=allow_unattributed,
-                ):
-                    raise PermissionError("Matter is outside the child source/account scope.")
-            finally:
-                conn.close()
-        return linked
+            transaction.execute(
+                "UPDATE matters SET revision=revision+1, updated_at=? WHERE matter_id=?",
+                (now, matter_id),
+            )
+            return self.get_matter(matter_id=matter_id, conn=transaction)
 
     def _upsert_fts(
         self,
@@ -633,9 +779,7 @@ class MatterService:
         ).fetchall()
         links_by_matter: dict[str, list[MatterSourceLink]] = {}
         for row in link_rows:
-            links_by_matter.setdefault(row["matter_id"], []).append(
-                self._source_link_from_row(row)
-            )
+            links_by_matter.setdefault(row["matter_id"], []).append(self._source_link_from_row(row))
         return links_by_matter
 
     def _record_from_row(
@@ -656,6 +800,7 @@ class MatterService:
             source_links=source_links,
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            revision=row["revision"],
         )
 
     def _source_link_from_row(self, row: sqlite3.Row) -> MatterSourceLink:

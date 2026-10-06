@@ -5,9 +5,22 @@ from __future__ import annotations
 import ipaddress
 import os
 import stat
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path, PureWindowsPath
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
+
+from app.platform.safe_files import (
+    NotRegularFileError,
+    is_link_or_reparse,
+    locked_windows_directory,
+    open_file_no_follow,
+    scandir_windows_handle,
+)
+from app.platform.safe_files import (
+    open_posix_path_no_follow as _open_posix_path_no_follow,
+)
 
 router = APIRouter(prefix="/sessions/{session_id}", tags=["session files"])
 
@@ -74,6 +87,11 @@ def _relative_parts(path: str) -> tuple[str, ...]:
     parts = tuple(part for part in normalized.split("/") if part not in ("", "."))
     if any(part == ".." for part in parts):
         raise HTTPException(status_code=400, detail="Path traversal is not allowed.")
+    if os.name == "nt" and any(
+        ":" in part or part.endswith((" ", ".")) or PureWindowsPath(part).is_reserved()
+        for part in parts
+    ):
+        raise HTTPException(status_code=400, detail="Invalid Windows path component.")
     return parts
 
 
@@ -89,7 +107,7 @@ def _resolve_workspace_path(root: Path, relative: str) -> Path:
             raise HTTPException(
                 status_code=400, detail="Workspace path cannot be accessed."
             ) from exc
-        if stat.S_ISLNK(metadata.st_mode):
+        if is_link_or_reparse(metadata):
             raise HTTPException(status_code=403, detail="Symbolic links are not browsable.")
         try:
             resolved = current.resolve(strict=True)
@@ -101,51 +119,41 @@ def _resolve_workspace_path(root: Path, relative: str) -> Path:
 
 
 def _file_descriptor_no_follow(path: Path) -> int:
-    flags = os.O_RDONLY
-    # A workspace entry may be a FIFO, including after a path-check race.
-    # Open without waiting for a writer, then verify the opened object below.
-    if hasattr(os, "O_NONBLOCK"):
-        flags |= os.O_NONBLOCK
-    if hasattr(os, "O_BINARY"):
-        flags |= os.O_BINARY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
     try:
-        if os.name == "posix":
-            descriptor = _open_posix_path_no_follow(path, flags)
-        else:
-            # Windows retains path-based opening. Equivalent protection against
-            # ancestor reparse-point replacement requires native handle APIs.
-            descriptor = os.open(path, flags)
+        return open_file_no_follow(path)
+    except NotRegularFileError as exc:
+        raise HTTPException(status_code=400, detail="Path is not a regular file.") from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail="Workspace file not found.") from exc
     except OSError as exc:
         raise HTTPException(
             status_code=403, detail="Workspace file cannot be opened safely."
         ) from exc
-    try:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            raise HTTPException(status_code=400, detail="Path is not a regular file.")
-    except BaseException:
-        os.close(descriptor)
-        raise
-    return descriptor
 
 
-def _open_posix_path_no_follow(path: Path, flags: int) -> int:
-    """Open an already resolved absolute path without following any symlinks."""
-    if not path.is_absolute():
-        raise OSError("Safe file opening requires an absolute path.")
-    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    directory = os.open(path.anchor, directory_flags)
+@contextmanager
+def _directory_scan_target(directory: Path) -> Iterator[Path | int]:
+    if os.name == "nt":
+        try:
+            with locked_windows_directory(directory) as target:
+                yield target
+        except OSError as exc:
+            raise HTTPException(
+                status_code=403, detail="Workspace directory cannot be opened safely."
+            ) from exc
+        return
     try:
-        for part in path.parts[1:-1]:
-            child = os.open(part, directory_flags, dir_fd=directory)
-            os.close(directory)
-            directory = child
-        return os.open(path.name or ".", flags, dir_fd=directory)
+        descriptor = _open_posix_path_no_follow(
+            directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+    except OSError as exc:
+        raise HTTPException(
+            status_code=403, detail="Workspace directory cannot be opened safely."
+        ) from exc
+    try:
+        yield descriptor
     finally:
-        os.close(directory)
+        os.close(descriptor)
 
 
 @router.get("/files")
@@ -162,51 +170,11 @@ def list_session_files(
     if not directory.is_dir():
         raise HTTPException(status_code=400, detail="Path is not a directory.")
 
-    entries: list[dict] = []
-    directory_descriptor: int | None = None
     try:
-        scan_target: Path | int = directory
-        if os.name == "posix":
-            try:
-                directory_descriptor = _open_posix_path_no_follow(
-                    directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                )
-            except OSError as exc:
-                raise HTTPException(
-                    status_code=403, detail="Workspace directory cannot be opened safely."
-                ) from exc
-            scan_target = directory_descriptor
-        with os.scandir(scan_target) as iterator:
-            for item in iterator:
-                try:
-                    metadata = item.stat(follow_symlinks=False)
-                except FileNotFoundError:
-                    continue
-                mode = metadata.st_mode
-                if stat.S_ISLNK(mode):
-                    kind = "symlink"
-                    size = None
-                elif stat.S_ISDIR(mode):
-                    kind = "directory"
-                    size = None
-                elif stat.S_ISREG(mode):
-                    kind = "file"
-                    size = metadata.st_size
-                else:
-                    kind = "other"
-                    size = None
-                child_path = "/".join((*_relative_parts(path), item.name))
-                entries.append(
-                    {
-                        "name": item.name,
-                        "path": child_path,
-                        "type": kind,
-                        "size_bytes": size,
-                        "modified_at": metadata.st_mtime,
-                    }
-                )
-                if len(entries) > MAX_DIRECTORY_ENTRIES:
-                    break
+        with _directory_scan_target(directory) as scan_target:
+            scanner = scandir_windows_handle if os.name == "nt" else os.scandir
+            with scanner(scan_target) as iterator:
+                return _listed_entries(session_id, path, iterator)
     except PermissionError as exc:
         raise HTTPException(
             status_code=403, detail="Workspace directory cannot be listed."
@@ -215,9 +183,40 @@ def list_session_files(
         raise HTTPException(
             status_code=400, detail="Workspace directory cannot be listed."
         ) from exc
-    finally:
-        if directory_descriptor is not None:
-            os.close(directory_descriptor)
+
+
+def _listed_entries(session_id: str, path: str, iterator) -> dict:
+    entries: list[dict] = []
+    for item in iterator:
+        try:
+            metadata = item.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        mode = metadata.st_mode
+        if is_link_or_reparse(metadata):
+            kind = "symlink"
+            size = None
+        elif stat.S_ISDIR(mode):
+            kind = "directory"
+            size = None
+        elif stat.S_ISREG(mode):
+            kind = "file"
+            size = metadata.st_size
+        else:
+            kind = "other"
+            size = None
+        child_path = "/".join((*_relative_parts(path), item.name))
+        entries.append(
+            {
+                "name": item.name,
+                "path": child_path,
+                "type": kind,
+                "size_bytes": size,
+                "modified_at": metadata.st_mtime,
+            }
+        )
+        if len(entries) > MAX_DIRECTORY_ENTRIES:
+            break
 
     truncated = len(entries) > MAX_DIRECTORY_ENTRIES
     return {

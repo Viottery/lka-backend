@@ -78,7 +78,7 @@ def test_aggregate_budget_retains_omitted_artifact_handles():
         {"result": ["x" * 5_000] * 3, "_result_cache": {"artifact_id": "tool_result_old"}},
         {"result": ["y" * 5_000] * 3, "_result_cache": {"artifact_id": "tool_result_new"}},
     ]
-    bounded = loop._observations_within_prompt_budget(observations)
+    bounded = loop._observations_within_prompt_budget(observations, max_chars=16_000)
     assert bounded[0]["omitted_result_artifacts"] == ["tool_result_old"]
     assert bounded[1]["_result_cache"]["artifact_id"] == "tool_result_new"
 

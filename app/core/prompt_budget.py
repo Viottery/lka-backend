@@ -10,6 +10,8 @@ import json
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from app.core.observation_context import valid_resource_descriptor
+
 
 def serialize_prompt_payload(payload: Any) -> str:
     """Encode a constructed payload without changing values or parsing raw text."""
@@ -110,6 +112,16 @@ class PromptBudgeter:
                     break
                 if artifact_id not in refs:
                     refs.append(artifact_id)
+            resources = []
+            if isinstance(old, dict):
+                if projection is not None:
+                    resources = old.get("omitted_resources", [])
+                elif valid_resource_descriptor(old.get("_resource")):
+                    resources = [old["_resource"]]
+            for resource in resources:
+                kept = omitted.setdefault("observation_resources", [])
+                if len(kept) < 4 and not any(item["identity"] == resource["identity"] for item in kept):
+                    kept.append(resource)
             recount()
 
         window = payload.get("session_context_window")
@@ -173,7 +185,7 @@ class PromptBudgeter:
             "older_observations", "compacted_fork_results", "lower_ranked_memories",
             "older_context_messages", "instruction_previews",
         }
-        if not isinstance(value, dict) or set(value) - (counters | {"observation_artifact_ids"}):
+        if not isinstance(value, dict) or set(value) - (counters | {"observation_artifact_ids", "observation_resources"}):
             return {}
         if any(type(value[key]) is not int or value[key] <= 0 for key in counters & value.keys()):
             return {}
@@ -182,6 +194,9 @@ class PromptBudgeter:
             not isinstance(refs, list) or len(refs) > 20
             or any(not isinstance(ref, str) or not 1 <= len(ref) <= 200 for ref in refs)
         ):
+            return {}
+        resources = value.get("observation_resources", [])
+        if not isinstance(resources, list) or len(resources) > 4 or not all(valid_resource_descriptor(item) for item in resources):
             return {}
         result = dict(value)
         if "observation_artifact_ids" in result:
@@ -196,7 +211,7 @@ class PromptBudgeter:
         action; neither can impersonate this exact top-level envelope. Handles
         remain continuation hints, not permissions or evidence endorsements.
         """
-        if not isinstance(observation, dict) or set(observation) != {
+        if not isinstance(observation, dict) or set(observation) - {"omitted_resources"} != {
             "_prompt_compacted", "summary", "omitted_observation_count", "omitted_result_artifacts",
         }:
             return None
@@ -208,6 +223,9 @@ class PromptBudgeter:
             or not isinstance(count, int) or isinstance(count, bool) or count <= 0
             or not isinstance(refs, list) or len(refs) > 20
             or any(not isinstance(ref, str) or not 1 <= len(ref) <= 200 for ref in refs)
+            or not isinstance(observation.get("omitted_resources", []), list)
+            or len(observation.get("omitted_resources", [])) > 4
+            or not all(valid_resource_descriptor(item) for item in observation.get("omitted_resources", []))
         ):
             return None
         return count, refs

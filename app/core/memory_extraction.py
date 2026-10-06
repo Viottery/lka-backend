@@ -102,7 +102,7 @@ _HIGH_IMPACT_ACTION = re.compile(
     re.IGNORECASE,
 )
 _DIRECT_DURABLE_PREFERENCE = re.compile(
-    r"(?:^|[，,。！？!?；;\n])\s*(?:我(?:(?:希望|偏好|习惯)(?P<durable>以后|今后|每次|总是|默认)|"
+    r"(?:^|[，,。！？!?；;\n])\s*(?:我(?:(?:希望|偏好|习惯)(?:你|您)?(?P<durable>以后|今后|每次|总是|默认)|"
     r"(?P<habitual>平时|通常|每次|总是)(?:更)?(?:喜欢|偏好|习惯))|(?P<future>以后|今后)(?:请)?)(?:(?P<repeated>通常|平时|每次|总是|默认))?"
     r"(?P<statement>[^，,。！？!?；;\n]{3,180})",
 )
@@ -368,21 +368,26 @@ def _extend_preference_clause(
     message: str, statement: str, end: int, *, allow_follow_on: bool = False,
 ) -> tuple[str, int]:
     """Keep coordinate actions and task conditions attached to their exact evidence."""
-    while end < len(message) and message[end] in "，,":
+    while end < len(message) and message[end] in "，,。":
         continuation = re.match(
-            r"[，,]\s*(?P<part>[^，,。！？!?；;\n]{2,160})", message[end:],
+            r"(?P<separator>[，,。]\s*)(?P<part>[^，,。！？!?；;\n]{2,160})", message[end:],
         )
         if continuation is None:
             break
         part = continuation.group("part").strip()
+        # A full stop only joins an explicitly coordinated follow-on constraint,
+        # never an independent next task. Keep the original punctuation/wording.
+        if message[end] == "。" and not re.match(r"^(?:同时|并且|而且|还要)", part):
+            break
         if not (
             re.match(r"^(?:并|同时|且|以及|而且|还要|并且)", part)
             or re.match(r"^(?:请|先|只|仅|不(?:记录|保存|包含|要|应))", part)
             or (allow_follow_on and re.match(r"^再", part))
+            or (allow_follow_on and re.match(r"^(?:代入|保持|保留)", part))
             or re.search(r"(?:时|中|里)$", statement)
         ):
             break
-        statement += "，" + part
+        statement += continuation.group("separator") + part
         end += continuation.end()
     return statement, end
 
@@ -420,6 +425,11 @@ def _ordinary_preference_candidates(*, source_id: str, message: str) -> list[Mem
                 or re.search(r"(?:今天|这次|临时|现在|当前|刚才|暂时|本轮)", phrase)):
             continue
         verb = match.group("verb")
+        # A wish addressed to the assistant is a task request unless it carries
+        # an enduring qualifier (handled by the direct path above). Do not invent
+        # "以后" for "我希望你..." one-turn work.
+        if verb == "希望" and re.match(r"^(?:你|您|请|帮我)", match.group("object").strip()):
+            continue
         claim = ("以后" if verb == "希望" else "") + (match.group("context") or "") + ("" if verb == "希望" else verb) + match.group("object").strip()
         if not _may_be_memory_claim(claim) or not safe_to_store_memory(claim):
             continue
@@ -435,6 +445,17 @@ def _ordinary_preference_candidates(*, source_id: str, message: str) -> list[Mem
 def _is_untrusted_or_reported_source(message: str) -> bool:
     """Do not promote quoted or attributed external text as the user's own claim."""
 
+    # Short quoted labels/names are not quoted assertions. Do not discard an
+    # otherwise explicit preference merely because a preceding task names an
+    # entity in quotes. Attributed statements and quoted commands still fail
+    # closed; this bounded distinction is not a semantic entailment claim.
+    message = re.sub(
+        r'["“「『](?P<label>[A-Za-z0-9_\u3400-\u9fff -]{1,16})["”」』]',
+        lambda match: match.group("label") if not re.search(
+            r"我|你|您|请|记住|以后|今后|必须|不要|忽略|\b(?:I|you|remember|must|ignore)\b",
+            match.group("label"), re.IGNORECASE,
+        ) else match.group(), message,
+    )
     return bool(_QUOTED_OR_REPORTED_PATTERN.search(message))
 
 

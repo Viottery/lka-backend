@@ -153,12 +153,26 @@ for local development.
 ## Quick Start: Windows PowerShell
 
 ```powershell
-Copy-Item .env.example .env
-uv sync
-uv run python scripts/start_backend.py personal
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup_windows.ps1
+.\.venv\Scripts\python.exe scripts\start_backend.py personal
 ```
 
-The service listens on `http://127.0.0.1:8765` by default.
+Run these commands from the project directory with native Windows Python 3.12+
+and Windows PowerShell 5.1. The setup script uses an installed `uv`, or installs
+it into a local `.bootstrap` environment, then installs locked runtime dependencies
+into `.venv`. It copies `.env` and `config/local.toml` only when missing and keeps
+existing personal configuration. Use `-Python` to select a Python executable.
+
+Check the service from another PowerShell window:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8765/health
+```
+
+The service listens on `http://127.0.0.1:8765` by default. Background terminals
+require Windows 10 1809+ or Windows Server 2019+ (ConPTY). The `bash.*` tool names
+remain compatible; Windows commands use PowerShell syntax, such as `Get-Location`
+and `Get-Content`, with `$env:WORKSPACE_ROOT` for environment variables.
 
 ## Agent Turn Smoke Test
 
@@ -175,18 +189,27 @@ script does not call `runtime.start()`, so configured startup/background mail
 sync will not run during the smoke test. Add `--start-runtime` only when that is
 the behavior being tested.
 
-## Quick Start: Windows Pet Frontend With WSL Backend
+## Quick Start: Native Windows Frontend And Pet
 
-The current backend still runs in WSL. The adapted pet frontend should be
-started from Windows PowerShell:
+The prepared Windows frontend starts the native backend, frontend and Java pet
+from Windows PowerShell:
 
 ```powershell
-D:\agent-bot-frontend\run-lka-windows.ps1
+powershell -NoProfile -ExecutionPolicy Bypass `
+  -File 'D:\agent-bot-frontend\run-lka-native-windows.ps1' `
+  -BackendRoot 'C:\Users\xc133\projects\lka_backend'
 ```
 
-The script starts this backend inside WSL at `http://127.0.0.1:8765`, serves
-the Windows-side pet chat frontend at `http://127.0.0.1:8780`, and opens the
-chat UI with `backend=http://127.0.0.1:8765`.
+The backend listens at `http://127.0.0.1:8765` and the frontend at
+`http://127.0.0.1:8780`. Add `-NoPet` to use a browser, or `-NoPet -NoOpen`
+to start services only. These are this machine's paths; both projects need their
+own native environment. The older `run-lka-windows.ps1` still starts a WSL backend.
+
+For another Windows computer, extract the delivered portable ZIP and run
+`Start-LKA.cmd`; stop it with `Stop-LKA.cmd`. See the
+[Windows operations guide](docs/windows_operations.md) for synchronization,
+installation, stopping, configuration, migration and troubleshooting, and the
+[portable delivery record](docs/windows_portable_delivery.md) for the package and verification.
 
 ## Local Provider Config
 
@@ -244,17 +267,21 @@ Linux workspace example:
 
 ## WSL to Windows Sync
 
-For one-way sync from the WSL repo into a Windows-local test copy:
+For one-way application sync from the WSL repo into a Windows-local copy:
 
 ```bash
-scripts/sync_to_windows.sh /mnt/c/Users/chuan/projects/lka_backend
-scripts/sync_to_windows.sh /mnt/c/Users/chuan/projects/lka_backend --apply
+scripts/sync_to_windows.sh /mnt/c/Users/xc133/projects/lka_backend
+scripts/sync_to_windows.sh /mnt/c/Users/xc133/projects/lka_backend --apply
 ```
 
 The default mode is a dry run. Add `--delete` only when the WSL copy is the
 source of truth and the Windows target should mirror deletions.
-Local secrets such as `config/local.toml`, token files, and `.env` are excluded;
-create a separate `config/local.toml` on Windows when needed.
+The application and `uv.lock` are copied. Tests, evaluations, development caches,
+virtual environments, local data, and secrets such as `config/local.toml` and
+`.env` are excluded. Run `scripts/setup_windows.ps1` in the Windows copy to
+prepare its native environment and missing configuration. This sync does not
+update the separate frontend or an existing portable ZIP. Follow the
+[Windows operations guide](docs/windows_operations.md) for the complete update cycle.
 
 ## Implemented APIs
 
@@ -277,7 +304,7 @@ create a separate `config/local.toml` on Windows when needed.
 ## Platform Support
 
 See `docs/platform_support.md` for the Windows/Linux native support strategy,
-configuration, path handling rules, and test matrix.
+configuration, shell behavior, file access boundaries, and validation status.
 
 ## Notes
 
@@ -287,6 +314,7 @@ configuration, path handling rules, and test matrix.
   - `backend_engineering_guide.md` for backend architecture
   - `backend_implementation_plan.md` for delivery stages
   - `platform_support.md` for native Windows/Linux support
+  - `windows_operations.md` for Windows sync, startup, configuration and portable migration
   - `api_contract.md` for the HTTP interface
   - `ai_coding_standard.md` for coding and reporting rules
   - `mvp_todolist.md` for the implementation checklist

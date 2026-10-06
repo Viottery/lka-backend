@@ -34,10 +34,11 @@ def test_root_answer_retains_earlier_evidence_within_whole_prompt_gate(tmp_path)
 def test_child_delivery_keeps_existing_conservative_observation_limit(tmp_path):
     loop, _, manager = make_loop(tmp_path, [response("supported")])
     with scope(manager, child_budget={"max_tokens": 200000, "max_llm_calls": 10}):
-        selected = loop._observations_for_answer_prompt(observations())
-        control = loop._observations_within_prompt_budget(observations())
+        evidence = observations() * 3
+        selected = loop._observations_for_answer_prompt(evidence)
+        control = loop._observations_within_prompt_budget(evidence)
         assert selected == control
-        assert len(selected) < len(observations())
+        assert len(selected) < len(evidence)
 
 
 def test_larger_delivery_view_is_still_bounded_and_preserves_omitted_handles(tmp_path):

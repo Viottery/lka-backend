@@ -8,8 +8,10 @@ import os
 import re
 import signal
 import stat
-import subprocess
 from pathlib import Path
+
+from app.platform.processes import WindowsAsyncProcess, start_stdio_process
+from app.platform.safe_files import is_link_or_reparse
 
 
 class CodexTransportError(RuntimeError):
@@ -20,12 +22,14 @@ def _codex_process_env() -> dict[str, str]:
     """Keep backend credentials and instrumentation out of the expert process."""
     allowed = {
         "PATH", "HOME", "USER", "LOGNAME", "LANG", "TMPDIR", "TEMP", "TMP",
-        "TERM", "SystemRoot", "WINDIR", "APPDATA", "LOCALAPPDATA", "USERPROFILE",
+        "TERM", "SYSTEMROOT", "WINDIR", "APPDATA", "LOCALAPPDATA", "USERPROFILE",
+        "COMSPEC", "PATHEXT", "SYSTEMDRIVE", "PROGRAMFILES", "PROGRAMFILES(X86)",
+        "PROGRAMW6432",
     }
     return {
         key: value
         for key, value in os.environ.items()
-        if key in allowed or key.startswith("LC_")
+        if key.upper() in allowed or key.startswith("LC_")
     }
 
 
@@ -39,7 +43,7 @@ def _prepare_codex_state_home(path: str | Path) -> Path:
         info = state_home.lstat()
     except OSError as exc:
         raise ValueError("Codex state home could not be created or inspected.") from exc
-    if not stat.S_ISDIR(info.st_mode):
+    if not stat.S_ISDIR(info.st_mode) or is_link_or_reparse(info):
         raise ValueError("Codex state home must be a real directory, not a symlink.")
     if os.name != "nt":
         if info.st_uid != os.getuid():
@@ -56,7 +60,7 @@ class CodexSubprocessTransport:
 
     def __init__(
         self,
-        process: asyncio.subprocess.Process,
+        process: asyncio.subprocess.Process | WindowsAsyncProcess,
         *,
         stderr_limit_bytes: int,
         terminate_grace_seconds: float,
@@ -96,6 +100,8 @@ class CodexSubprocessTransport:
             raise ValueError("Codex binary_path must be an absolute configured path.")
         if not executable.is_file():
             raise ValueError("Configured Codex binary does not exist or is not a file.")
+        if os.name == "nt" and executable.suffix.lower() in {".cmd", ".bat", ".ps1"}:
+            raise ValueError("Codex binary_path must name the native executable (.exe) on Windows.")
         if os.name != "nt" and not os.access(executable, os.X_OK):
             raise ValueError("Configured Codex binary is not executable.")
         if not workdir.is_absolute() or not workdir.is_dir():
@@ -139,12 +145,8 @@ class CodexSubprocessTransport:
             "limit": 1024 * 1024,
             "env": process_env,
         }
-        if os.name == "nt":
-            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-        else:
-            kwargs["start_new_session"] = True
         try:
-            process = await asyncio.create_subprocess_exec(
+            process = await start_stdio_process(
                 *arguments, **kwargs
             )
         except (OSError, ValueError) as exc:
@@ -202,41 +204,66 @@ class CodexSubprocessTransport:
         if self._closed:
             return
         self._closed = True
-        if self._process.stdin is not None:
-            self._process.stdin.close()
-            try:
-                await self._process.stdin.wait_closed()
-            except (BrokenPipeError, ConnectionResetError, OSError):
-                pass
-
         try:
-            await asyncio.wait_for(
-                asyncio.shield(self._process.wait()),
-                timeout=self._terminate_grace_seconds,
-            )
-        except TimeoutError:
-            await self._terminate_process_group()
-        if not self._stderr_task.done():
+            deadline = asyncio.get_running_loop().time() + self._terminate_grace_seconds
+
+            def remaining_grace() -> float:
+                return max(0.0, deadline - asyncio.get_running_loop().time())
+
+            if self._process.stdin is not None:
+                self._process.stdin.close()
+                try:
+                    await asyncio.wait_for(
+                        self._process.stdin.wait_closed(),
+                        timeout=remaining_grace(),
+                    )
+                except (TimeoutError, BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+
             try:
                 await asyncio.wait_for(
-                    asyncio.shield(self._stderr_task),
-                    timeout=max(0.1, self._terminate_grace_seconds),
+                    asyncio.shield(self._process.wait()),
+                    timeout=remaining_grace(),
                 )
             except TimeoutError:
-                self._stderr_task.cancel()
-                await asyncio.gather(self._stderr_task, return_exceptions=True)
+                await self._terminate_process_group()
+            if isinstance(self._process, WindowsAsyncProcess):
+                # The root can exit while descendants still own output pipes. End
+                # its Job before awaiting stream EOF, including on normal shutdown.
+                await asyncio.to_thread(self._process.terminate)
+                try:
+                    await asyncio.wait_for(
+                        self._process.stdin.wait_closed(),
+                        timeout=max(0.1, self._terminate_grace_seconds),
+                    )
+                except (TimeoutError, BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+            if not self._stderr_task.done():
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(self._stderr_task),
+                        timeout=max(0.1, self._terminate_grace_seconds),
+                    )
+                except TimeoutError:
+                    self._stderr_task.cancel()
+                    await asyncio.gather(self._stderr_task, return_exceptions=True)
+        finally:
+            if isinstance(self._process, WindowsAsyncProcess):
+                # Also release the Job and handles if a stream raises or this
+                # close coroutine is cancelled during its grace period.
+                await asyncio.to_thread(self._process.close)
 
     async def _terminate_process_group(self) -> None:
         if self._process.returncode is not None:
             return
         try:
             if os.name == "nt":
-                self._process.send_signal(signal.CTRL_BREAK_EVENT)
+                await asyncio.to_thread(self._process.terminate)
             else:
                 os.killpg(self._process.pid, signal.SIGTERM)
         except (ProcessLookupError, OSError, ValueError):
             if os.name == "nt" and self._process.returncode is None:
-                self._process.terminate()
+                await asyncio.to_thread(self._process.terminate)
         try:
             await asyncio.wait_for(
                 asyncio.shield(self._process.wait()),
@@ -247,7 +274,7 @@ class CodexSubprocessTransport:
             pass
         try:
             if os.name == "nt":
-                self._process.kill()
+                await asyncio.to_thread(self._process.kill)
             else:
                 os.killpg(self._process.pid, signal.SIGKILL)
         except ProcessLookupError:

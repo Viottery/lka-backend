@@ -99,6 +99,7 @@ class MultiAgentScheduler:
         max_concurrency: int = 2,
         max_global_concurrency: int = 8,
         max_retries: int = 1,
+        executor_guard: Callable[[Any, Any], str | None] | None = None,
     ) -> None:
         if max_concurrency < 1 or max_global_concurrency < 1 or max_retries < 0:
             raise ValueError("Scheduler concurrency must be positive and retries non-negative.")
@@ -110,6 +111,7 @@ class MultiAgentScheduler:
         self.max_concurrency = max_concurrency
         self.max_global_concurrency = max_global_concurrency
         self.max_retries = max_retries
+        self.executor_guard = executor_guard
         self._parent_locks: dict[str, threading.Lock] = {}
         self._admission_guard = threading.Lock()
         self._global_slots = threading.BoundedSemaphore(max_global_concurrency)
@@ -554,6 +556,11 @@ class MultiAgentScheduler:
                         self._assert_parent_active(parent_run_id)
                         await asyncio.sleep(0.05)
                     acquired_session = True
+                    definition, _ = self._resolved_executor(step)
+                    denial = self.executor_guard(child, definition) if self.executor_guard else None
+                    if denial:
+                        self.run_manager.fail_child_run(child.run_id, error_type="source_constraint", error=denial)
+                        return attempt, self._blocked_result(child, step, denial, code="source_constraint")
                     executor = self._executor_for(step.model_copy(update={"agent_version": snapshot.agent_version}))
                     if child.status == AgentRunStatus.RUNNING:
                         resume = getattr(executor, "resume", None)

@@ -22,7 +22,7 @@
 | 记忆与侧写文件 | `domains/memory.py`、`memory_context.py`、`memory_extraction.py`、`memory_files.py` | 用户来源 → 候选/确认/冲突/撤回 → 全局/项目 recall、MEMORY.md | 长期记忆不授予工具权限；child 只收到明确分配的固定版本引用 |
 | 后台作业 | `background_jobs.py`、`memory_background.py`、`background_llm.py`、`domains/memory_settings.py` | 抽取/压缩队列、租约、重试、取消、恢复、配置/健康/SSE | 发布需 lease epoch 与水位/CAS；控制 API 不返回 payload；系统配置重启生效 |
 | 网页与关注 | `integrations/web_search.py`、`tool_packages/web.py`、`watch_scheduler.py`、`watch_execution.py`、`domains/watch*.py` | Brave 搜索、公开 HTTPS 文本；每日 occurrence → 新会话 → 只读 child → 简报 | 网页 DNS/IP/重定向校验；搜索配额；私有账户与外部搜索混用需显式授权 |
-| 工作区文件与命令 | `platform/`、`tool_packages/filesystem.py`、`bash.py`、`api/routes/session_files.py` | 路径/扫描、预览、SHA 文件编辑、终端及 stdin | 文件按工作区限制；bash 的 cwd 限制不是 OS sandbox，命令动态只读分类 |
+| 工作区文件与命令 | `platform/`（`commands.py`、`windows_process.py`、`processes.py`、`safe_files.py`）、`tool_packages/filesystem.py`、`bash.py`、`api/routes/session_files.py` | 路径/扫描、预览、SHA 文件编辑；Windows PowerShell/ConPTY/Job、POSIX bash/PTY | 预览以目录句柄链拒绝链接/reparse；bash 的 cwd 限制不是 OS sandbox，命令动态只读分类 |
 | 前端偏好 | `api/routes/ui_preferences.py`、`agent_ui_preferences` 表 | 模型、stream、安全模式、workspace parent 的本机默认值 | 不改现有会话；前端偏好不能降低后端安全门 |
 
 表中仅写文件名的 core 文件位于 `app/core/`。详细设计入口：
@@ -99,7 +99,10 @@ owner/lease epoch → 本地抽取或显式启用的模型抽取 / 有界摘要 
 - 新记忆/后台/项目接口有本机或 Bearer token 限制，文件预览有本机限制；
   历史 API 未统一应用同等鉴权。默认只绑定 `127.0.0.1`，CORS 不提供身份认证。
 - 邮件专家、真实模型、Brave 和 Outlook 的本地测试替身验证不等于真实 provider 验收；
-  模型质量评估、远程成本和 Windows 原生平台仍需要各自验证。
+  模型质量评估和远程成本仍需要各自验证。Windows 原生实现与本轮验收状态见
+  [平台支持](platform_support.md)及 [迁移清单](windows_native_todolist.md)；
+  已有本地 NTFS 原生执行记录，UNC/SMB 和 macOS 未在本轮验收。真实 Codex 未安装/认证，
+  stdio 协议与退出检查不代表真实 provider 验收。
 - `watch_execution.py`、`watch_scheduler.py` 含领域编排与具体工具名，当前位于 core；
   与通用 core 的领域无关原则存在架构债。本轮记录边界，未做跨层迁移。
 - Skill Evolution、通用历史运行检索、日历集成及 OS 级命令隔离仍未完成。

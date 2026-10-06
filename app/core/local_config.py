@@ -387,7 +387,10 @@ class MemoryConfig(BaseModel):
     # Controls whether background learning spends an additional model call.
     # Enabling memory/background processing authorizes use of conversation data;
     # this flag is a workload/quality choice, not a privacy-consent gate.
-    allow_remote_extraction: bool = False
+    allow_remote_extraction: bool = True
+    extraction_context_messages: int = Field(default=12, ge=2, le=40)
+    extraction_context_chars: int = Field(default=12_000, ge=2000, le=24_000)
+    auto_publish_min_confidence: float = Field(default=0.85, ge=0.5, le=1.0)
     max_recalled_items: int = Field(default=8, ge=0, le=30)
     max_recalled_chars: int = Field(default=2400, ge=0, le=12000)
     extraction_debounce_seconds: float = Field(default=5, ge=0, le=300)
@@ -396,6 +399,61 @@ class MemoryConfig(BaseModel):
     recovery_output_tokens: int = Field(default=8192, ge=256, le=131_072)
     background_client_name: str | None = None
     background_model: str | None = None
+
+
+class MessageModelPricing(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    client_name: str = Field(min_length=1, max_length=100)
+    model: str = Field(min_length=1, max_length=200)
+    revision: str = Field(min_length=1, max_length=100)
+    input_cost_per_million: float = Field(ge=0, allow_inf_nan=False)
+    output_cost_per_million: float = Field(ge=0, allow_inf_nan=False)
+
+
+class MessageHistoryConfig(BaseModel):
+    """Opt-in per-conversation analysis; no platform credentials live here."""
+
+    schema_version: Literal[1] = 1
+    # New analysis is opt-in; enabling a pipeline does not grant any source.
+    reading_algorithm: Literal["legacy", "compact", "selected"] = "legacy"
+    participant_pool_capacity: int = Field(default=30, ge=1, le=100)
+    participant_pinned_capacity: int = Field(default=10, ge=0, le=20)
+    profile_cold_days: int = Field(default=14, ge=1, le=90)
+    profile_retention_days: int = Field(default=30, ge=1, le=365)
+    selector_max_messages: int = Field(default=40, ge=1, le=200)
+    selector_exploration_fraction: float = Field(default=0.1, ge=0, le=1)
+    enabled: bool = True
+    background_enabled: bool = True
+    worker_count: int = Field(default=1, ge=1, le=4)
+    max_job_tokens: int = Field(default=32_768, ge=8192, le=500_000)
+    max_job_calls: int = Field(default=4, ge=1, le=1000)
+    max_input_tokens: int = Field(default=8192, ge=1024, le=131_072)
+    service_hourly_token_limit: int = Field(default=40_000, ge=0)
+    service_daily_token_limit: int = Field(default=200_000, ge=0)
+    service_hourly_call_limit: int = Field(default=8, ge=0)
+    service_daily_call_limit: int = Field(default=48, ge=0)
+    conversation_hourly_token_limit: int = Field(default=20_000, ge=0)
+    conversation_daily_token_limit: int = Field(default=80_000, ge=0)
+    conversation_hourly_call_limit: int = Field(default=4, ge=0)
+    conversation_daily_call_limit: int = Field(default=24, ge=0)
+    due_scan_limit: int = Field(default=32, ge=1, le=200)
+    yield_delay_seconds: float = Field(default=1, ge=0, le=60)
+    max_recovery_restarts: int = Field(default=1, ge=0, le=3)
+    model_prices: list[MessageModelPricing] = Field(default_factory=list, max_length=100)
+    # Bounds the encoded raw-message array, not the full prompt. Bounded prior
+    # summaries/evidence are additional; LLMService enforces model capacity.
+    input_chunk_bytes: int = Field(default=12_000, ge=1024, le=32_768)
+    generation_output_tokens: int = Field(default=2048, ge=256, le=32_768)
+    recovery_output_tokens: int = Field(default=4096, ge=256, le=32_768)
+    background_client_name: str | None = None
+    background_model: str | None = None
+
+    @model_validator(mode="after")
+    def unique_model_prices(self):
+        keys = [(row.client_name, row.model) for row in self.model_prices]
+        if len(set(keys)) != len(keys):
+            raise ValueError("duplicate message model pricing")
+        return self
 
 
 class BackgroundConfig(BaseModel):
@@ -430,11 +488,22 @@ class LocalAppConfig(BaseModel):
     query_rewrite: QueryRewriteConfig = Field(default_factory=QueryRewriteConfig)
     web_search: WebSearchConfig = Field(default_factory=WebSearchConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
+    message_history: MessageHistoryConfig = Field(default_factory=MessageHistoryConfig)
     background: BackgroundConfig = Field(default_factory=BackgroundConfig)
 
     @model_validator(mode="after")
     def inference_profiles_match_llm_clients(self) -> LocalAppConfig:
         clients = {client.name: client for client in self.llm.client_configs()}
+        messages = self.message_history
+        message_client_name = messages.background_client_name or self.llm.default_client
+        message_client = clients.get(message_client_name) if message_client_name else next(iter(clients.values()), None)
+        if messages.background_client_name and message_client is None:
+            raise ValueError("Message analysis references an unknown LLM client")
+        if messages.background_model and (
+            message_client is None
+            or messages.background_model not in [message_client.default_model, *message_client.available_models]
+        ):
+            raise ValueError("Message analysis model is unavailable for its client")
         for profile in self.agent.inference_profiles:
             client = clients.get(profile.client_name)
             if client is None:

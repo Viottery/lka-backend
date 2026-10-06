@@ -11,13 +11,14 @@ KNOWLEDGE_PACKAGE = ToolPackageSpec(
     name="knowledge",
     description=(
         "Search and load source-agnostic local knowledge evidence from imported "
-        "documents, notes, webpage snapshots, and future mirrored mail chunks."
+        "documents, notes, webpage snapshots, mirrored mail chunks, and currently enabled captured chats."
     ),
     risk="low_to_medium",
     requires_expansion=True,
     routing_hints=[
-        "Use this package when the user asks about imported local documents, notes, wiki snapshots, or general knowledge evidence.",
+        "Use this package to retrieve cross-source evidence from imported documents, notes, webpage snapshots, mirrored mail, and enabled captured messages.",
         "Use this package when the task needs retrieval across source types rather than a mail-specific mailbox query.",
+        "Captured chat results use bounded native keyword search; check their sender, group, time, and capture_epoch metadata. Conversation document loads expose a bounded latest-message page; follow pagination or load individual chunks when the required evidence is outside that page.",
         "This package only reads locally indexed evidence; it does not crawl websites or modify files.",
     ],
     decision_hints=[
@@ -28,7 +29,8 @@ KNOWLEDGE_PACKAGE = ToolPackageSpec(
         "Use knowledge.load_chunks for a small number of relevant chunk ids before final answering. Its default is a partial 420-character view; inspect truncated/total_chars and request up to 6000 characters per chunk when the evidence needs full context. Follow each chunk's next_offset with that chunk ID to recover the rest of its privacy-filtered text.",
         "Use knowledge.load_document mainly for metadata and chunk ids; request text only when needed.",
         "For factual claims grounded in knowledge, cite the returned source_ref; if evidence is insufficient or conflicting, say so instead of inventing an answer.",
-        "If the task becomes an open-loop task or reminder, switch to a registered action package after gathering evidence.",
+        "If evidence carries source_policy.constraint_id, retain that constraint in any follow-up: message evidence can support only the dedicated human matter-proposal workflow, not direct matter creation or unrestricted execution.",
+        "If the task becomes an open-loop task or reminder, switch to a registered action package after gathering evidence while honoring any source_policy constraints.",
     ],
     observation_cache={
         "tool_names": ["knowledge.search", "knowledge.load_chunks"],
@@ -71,6 +73,8 @@ class ListKnowledgeSourcesTool:
             source_ids=_authorized_knowledge_source_ids(self.knowledge_service, context),
             source_types=[str(item) for item in invocation.input.get("source_types", [])] or None,
             limit=int(invocation.input.get("limit") or 100),
+            provider_account_ids=(list(scope.allowed_account_ids) if scope is not None and scope.child_run_id is not None
+                                  else (list(scope.allowed_account_ids) if scope and scope.allowed_account_ids else None)),
         )
         return ToolResult(
             invocation_id=invocation.invocation_id,
@@ -165,6 +169,10 @@ class SearchKnowledgeTool:
             "mode": str(invocation.input.get("mode") or "") or None,
             "source_ids": source_ids,
             "account_ids": list(scope.allowed_account_ids) if scope and scope.allowed_account_ids else None,
+            "provider_account_ids": (
+                list(scope.allowed_account_ids) if scope is not None and scope.child_run_id is not None
+                else (list(scope.allowed_account_ids) if scope and scope.allowed_account_ids else None)
+            ),
             "cache_namespace": f"{context.session_id}:{scope.snapshot_id if scope else 'parent'}",
             "keyword_candidate_k": invocation.input.get("keyword_candidate_k"),
             "semantic_candidate_k": invocation.input.get("semantic_candidate_k"),
@@ -213,6 +221,12 @@ class SearchKnowledgeTool:
             status="completed",
             output=output,
         )
+
+    def resolve_origin_constraints(self, *, invocation: ToolInvocation, context: ToolContext) -> list[str]:
+        return self.knowledge_service.resolve_origin_constraints(invocation=invocation, context=context)
+
+    def allow_cached_observation(self, *, tool_input: dict, result: object, context: ToolContext) -> bool:
+        return self.knowledge_service.allow_cached_observation(result=result, context=context)
 
 
 class LoadKnowledgeChunksTool:
@@ -266,6 +280,8 @@ class LoadKnowledgeChunksTool:
             tool_name=self.spec.name,
             source_ids=_authorized_knowledge_source_ids(self.knowledge_service, context),
             account_ids=list(scope.allowed_account_ids) if scope and scope.allowed_account_ids else None,
+            provider_account_ids=(list(scope.allowed_account_ids) if scope is not None and scope.child_run_id is not None
+                                  else (list(scope.allowed_account_ids) if scope and scope.allowed_account_ids else None)),
         )
         return ToolResult(
             invocation_id=invocation.invocation_id,
@@ -273,6 +289,12 @@ class LoadKnowledgeChunksTool:
             status="completed",
             output=result.model_dump(mode="json"),
         )
+
+    def resolve_origin_constraints(self, *, invocation: ToolInvocation, context: ToolContext) -> list[str]:
+        return self.knowledge_service.resolve_origin_constraints(invocation=invocation, context=context)
+
+    def allow_cached_observation(self, *, tool_input: dict, result: object, context: ToolContext) -> bool:
+        return self.knowledge_service.allow_cached_observation(result=result, context=context)
 
 
 class LoadKnowledgeDocumentTool:
@@ -328,6 +350,8 @@ class LoadKnowledgeDocumentTool:
                 tool_name=self.spec.name,
                 source_ids=_authorized_knowledge_source_ids(self.knowledge_service, context),
                 account_ids=list(scope.allowed_account_ids) if scope and scope.allowed_account_ids else None,
+                provider_account_ids=(list(scope.allowed_account_ids) if scope is not None and scope.child_run_id is not None
+                                      else (list(scope.allowed_account_ids) if scope and scope.allowed_account_ids else None)),
             )
         except ValueError as exc:
             return ToolResult(
@@ -343,6 +367,9 @@ class LoadKnowledgeDocumentTool:
             output=record.model_dump(mode="json"),
         )
 
+    def resolve_origin_constraints(self, *, invocation: ToolInvocation, context: ToolContext) -> list[str]:
+        return self.knowledge_service.resolve_origin_constraints(invocation=invocation, context=context)
+
 
 def _child_knowledge_scope_error(scope) -> str | None:
     if scope is None or scope.child_run_id is None:
@@ -355,10 +382,15 @@ def _child_knowledge_scope_error(scope) -> str | None:
 def _authorized_knowledge_source_ids(
     knowledge_service: KnowledgeService, context: ToolContext
 ) -> list[str]:
+    scope = context.tool_view
+    provider_account_ids = (
+        list(scope.allowed_account_ids) if scope is not None and scope.child_run_id is not None
+        else (list(scope.allowed_account_ids) if scope and scope.allowed_account_ids else None)
+    )
     authorized = set(knowledge_service.list_authorized_source_ids(
         workspace_path=context.workspace_root, session_id=context.session_id,
+        provider_account_ids=provider_account_ids,
     ))
-    scope = context.tool_view
     if (
         scope is not None and scope.child_run_id is not None
         and (scope.allowed_source_ids or not scope.full_data_authority)

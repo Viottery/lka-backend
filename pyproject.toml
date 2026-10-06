@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "lka-backend"
 version = "0.1.0"
-description = "Local Knowledge Agent OS Linux backend"
+description = "Local Knowledge Agent OS native Windows and Linux backend"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -18,6 +18,7 @@ dependencies = [
   "pydantic-settings>=2.4.0",
   "sqlite-vec>=0.1.9",
   "socksio>=1.0.0",
+  "tzdata>=2024.1; sys_platform == 'win32'",
   "uvicorn[standard]>=0.30.0",
 ]
 

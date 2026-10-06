@@ -66,6 +66,7 @@ class HealthResponse(BaseModel):
     status: str = "ok"
     version: str
     service: str = "local-knowledge-agent-os"
+    deployment_id: str | None = None
 
 
 class WorkspaceIndexRequest(BaseModel):

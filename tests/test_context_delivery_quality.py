@@ -111,7 +111,7 @@ def test_read_page_reports_exact_unicode_cache_origin_and_interval(tmp_path):
     payload = {"output": {"a/b~c": text}}
     store, artifact = _store(tmp_path, payload)
     result = _invoke(ObservationReadTool(store), artifact_id="cached-page",
-                     path=path, offset=7, limit=1)
+                     path=path, offset=7, limit=1, max_chars=4000)
     assert result.status == "completed"
     assert result.output["text"] == text[7:4007]
     assert result.output["next_offset"] == 4007
@@ -361,7 +361,7 @@ def test_registered_reader_callback_maps_gated_page_back_to_original_cache(tmp_p
     text = "原文🙂e\u0301" * 2000
     store, artifact = _store(tmp_path, {"output": {"text": text}})
     tool = ObservationReadTool(store)
-    result = _invoke(tool, artifact_id="cached-page", path="/output/text", offset=7)
+    result = _invoke(tool, artifact_id="cached-page", path="/output/text", offset=7, max_chars=4000)
     view = {"result": tool_result_gate.preview(result.model_dump(mode="json"))}
     bindings = _callback(tool, result, view)
     assert len(bindings) == 1
@@ -403,7 +403,7 @@ def test_callback_rejects_forged_complete_boolean_ranges_and_invalid_view(tmp_pa
     text = "original" * 1000
     store, _ = _store(tmp_path, {"output": {"text": text}})
     tool = ObservationReadTool(store)
-    result = _invoke(tool, artifact_id="cached-page", path="/output/text")
+    result = _invoke(tool, artifact_id="cached-page", path="/output/text", max_chars=4000)
     for update in ({"ranges": [[0, len(text)]], "covered_chars": len(text), "coverage": "complete"},
                    {"ranges": [[False, 4000]]}, {"covered_chars": True}):
         description = {**result.output["_delivery_view"][0], **update}

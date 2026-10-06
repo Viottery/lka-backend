@@ -5,6 +5,8 @@
 #
 # Prefer *_env fields for secrets. For example, set OPENAI_API_KEY in your
 # shell or .env, then reference it here as api_key_env = "OPENAI_API_KEY".
+# Windows paths: use forward slashes ("C:/Users/name/project") or TOML literal
+# strings ('C:\Users\name\project'); double-quoted backslashes need escaping.
 # Microsoft Graph client IDs are not secrets, so Outlook can use client_id
 # directly or client_id_env for environment-variable based configuration.
 
@@ -59,6 +61,8 @@ mail_expert_enabled = false
 # workspace; staged edits are not applied to the source workspace automatically.
 codex_expert_enabled = false
 # codex_binary_path = "/absolute/path/to/codex"
+# Windows must point to the native executable, e.g. "C:/Tools/Codex/codex.exe".
+# .cmd, .bat and .ps1 launchers are rejected; install/authenticate Codex separately.
 # codex_workspace_base = "/absolute/path/outside/source/workspaces"
 # Optional: private Codex app-server SQLite state directory. When configured,
 # it is created with private permissions and passed as a sqlite_home override.
@@ -206,7 +210,10 @@ enabled = true
 background_enabled = true
 # Use the configured LLM to consider less explicit long-term memories. This
 # increases background model calls; it is not an additional consent switch.
-allow_remote_extraction = false
+allow_remote_extraction = true
+extraction_context_messages = 12
+extraction_context_chars = 12000
+auto_publish_min_confidence = 0.85
 max_recalled_items = 8
 max_recalled_chars = 2400
 extraction_debounce_seconds = 5
@@ -217,6 +224,47 @@ recovery_output_tokens = 8192 # One bounded recovery; thinking disabled when sup
 # Optional separate low-cost route; must declare its context_window_tokens.
 # background_client_name = "background"
 # background_model = "your-configured-model"
+
+[message_history]
+max_recovery_restarts = 1 # same family/budget; archived checkpoint, no silent skipping
+reading_algorithm = "legacy" # compact/selected require explicit per-source analysis consent
+participant_pool_capacity = 30
+participant_pinned_capacity = 10
+profile_cold_days = 14
+profile_retention_days = 30
+selector_max_messages = 40
+selector_exploration_fraction = 0.1
+schema_version = 1 # Local configuration schema, distinct from message import v1/v2.
+# No message is imported without an explicit per-conversation whitelist.
+# Recording and model analysis are separate policy switches; analysis defaults off.
+enabled = true
+background_enabled = true
+worker_count = 1
+max_job_tokens = 32768 # Cumulative family allowance: retries/restarts cannot reset it.
+max_job_calls = 4
+max_input_tokens = 8192 # Full system + summary/evidence views + raw fragments.
+input_chunk_bytes = 12000 # Secondary raw-array bound, never the full-input budget.
+generation_output_tokens = 2048
+recovery_output_tokens = 4096
+service_hourly_token_limit = 40000
+service_daily_token_limit = 200000
+service_hourly_call_limit = 8
+service_daily_call_limit = 48
+conversation_hourly_token_limit = 20000
+conversation_daily_token_limit = 80000
+conversation_hourly_call_limit = 4
+conversation_daily_call_limit = 24
+due_scan_limit = 32
+yield_delay_seconds = 1
+# Rolling limits use 0 for unlimited. Work-family allowances must remain positive.
+# Optional per-model pricing; unknown prices stay unknown, not zero cost.
+# model_prices = [{client_name="background", model="your-model", revision="2026-10-04", input_cost_per_million=1.0, output_cost_per_million=2.0}]
+# Optional independent model selection (otherwise the configured default):
+# background_client_name = "background"
+# background_model = "your-configured-model"
+# Service-to-service import requires LKA_MESSAGES_IMPORT_TOKEN in the environment.
+# Optional separate UI/control credential: LKA_MESSAGES_API_TOKEN.
+# Neither credential is a NapCat token. Never send the import credential to JS.
 
 [background]
 request_timeout_seconds = 30

@@ -108,6 +108,38 @@ def test_complete_answer_needs_no_recovery(tmp_path):
     assert provider.requests[0].thinking_enabled is None
 
 
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("first", [response(""), response("unfinished", reason="length")])
+def test_context_answer_recovers_empty_or_truncated_reply(tmp_path, stream, first):
+    loop, provider, manager = make_loop(tmp_path, [first, response("Complete chat reply.")],
+                                       selected_thinking="deepseek")
+    events = []
+    with scope(manager, stream=stream) as run:
+        result = loop._answer_from_context_with_llm(
+            user_input="Anything to say before we finish?", route={"selected_package": None},
+            context_window={}, llm_events=events,
+        )
+        recovery = [e for e in manager.list_events(run.run_id)
+                    if e.type == "answer_generation_recovery_started"]
+    assert result == "Complete chat reply."
+    assert len(provider.requests) == 2
+    assert len(recovery) == 1
+    assert all(e.stage == "context_answer" for e in events)
+    assert provider.requests[1].thinking_enabled is False
+    assert provider.requests[1].response_mode == LLMResponseMode.TEXT
+    assert provider.requests[0].max_output_tokens == provider.requests[1].max_output_tokens == 1024
+
+
+def test_context_answer_recovery_exhaustion_raises_instead_of_claiming_no_tools(tmp_path):
+    loop, provider, manager = make_loop(tmp_path, [response(""), response("")])
+    with scope(manager) as run, pytest.raises(LLMClientError, match="incomplete"):
+        loop._answer_from_context_with_llm(user_input="Goodbye.", route={},
+                                          context_window={}, llm_events=[])
+    assert len(provider.requests) == 2
+    assert any(e.type == "answer_generation_incomplete" for e in manager.list_events(run.run_id))
+    assert not any(e.type == "final_answer" for e in manager.list_events(run.run_id))
+
+
 @pytest.mark.parametrize("first", [
     response("truncated table |", reason="length"),
     response("", reason="length"), response("   "), response(partial=True),

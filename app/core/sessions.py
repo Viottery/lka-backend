@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import sqlite3
@@ -296,6 +297,23 @@ class SessionService:
             messages=[self._message_from_row(row) for row in rows],
         )
 
+    def get_turn_user_message(self, *, session_id: str, trace_id: str) -> AgentSessionMessage | None:
+        """Resolve server-persisted input, never model-supplied evidence or history."""
+        if not trace_id:
+            return None
+        conn = self._conn_factory()
+        try:
+            row = conn.execute(
+                "SELECT m.message_id,m.session_id,m.role,m.content,m.payload,m.created_at "
+                "FROM agent_session_messages m JOIN agent_sessions s ON s.session_id=m.session_id "
+                "WHERE m.session_id=? AND m.role='user' AND s.status!='deleted' "
+                "AND json_extract(m.payload,'$.trace_id')=? ORDER BY m.rowid DESC LIMIT 1",
+                (session_id, trace_id),
+            ).fetchone()
+            return self._message_from_row(row) if row else None
+        finally:
+            conn.close()
+
     def rename_session(self, *, session_id: str, title: str) -> AgentSessionDetail:
         """Persist a user-selected title without changing other session metadata."""
 
@@ -492,6 +510,75 @@ class SessionService:
         finally:
             conn.close()
         return persisted
+
+    def memory_conversation(
+        self, *, session_id: str, user_message_id: str,
+        max_messages: int = 12, max_chars: int = 12_000,
+        project_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Bounded, read-only snapshot ending at the triggering user message.
+
+        Never expose future turns to a queued job. Summaries are context, not
+        evidence; exact message IDs remain available for provenance.
+        """
+        conn = self._conn_factory()
+        try:
+            conn.execute("BEGIN")
+            anchor = conn.execute(
+                "SELECT m.rowid,m.created_at FROM agent_session_messages m "
+                "JOIN agent_sessions s USING(session_id) WHERE m.message_id=? "
+                "AND m.session_id=? AND m.role='user' AND s.status='active'",
+                (user_message_id, session_id),
+            ).fetchone()
+            if anchor is None:
+                return {"messages": [], "summary": "", "omitted": False}
+            rows = conn.execute(
+                "SELECT m.message_id,m.role,substr(m.content,1,?) AS content,"
+                "length(m.content) AS original_chars,m.payload,m.created_at "
+                "FROM agent_session_messages m WHERE m.session_id=? "
+                "AND m.rowid<=? AND m.role IN ('user','agent') "
+                "ORDER BY m.rowid DESC LIMIT ?",
+                (20_001, session_id, anchor["rowid"], max_messages + 1),
+            ).fetchall()
+            has_state = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_session_context_state'",
+            ).fetchone()
+            summary_row = None
+            if has_state:
+                summary_row = conn.execute(
+                    "SELECT substr(w.summary,1,2000) AS summary FROM agent_session_context_windows w "
+                    "JOIN agent_session_context_state s USING(session_id) WHERE w.session_id=? "
+                    "AND NOT EXISTS (SELECT 1 FROM agent_session_context_messages m "
+                    "WHERE m.session_id=w.session_id AND m.seq<=s.covered_seq AND m.created_at>?)",
+                    (session_id, anchor["created_at"]),
+                ).fetchone()
+            if summary_row and conn.execute(
+                "SELECT 1 FROM agent_session_messages WHERE session_id=? AND rowid<=? "
+                "AND json_extract(payload,'$.memory_project_id') IS NOT NULL "
+                "AND json_extract(payload,'$.memory_project_id')<>? LIMIT 1",
+                (session_id, anchor["rowid"], project_id or ""),
+            ).fetchone():
+                summary_row = None
+            kept, remaining = [], max_chars
+            omitted = len(rows) > max_messages
+            for row in rows[:max_messages]:
+                if remaining <= 0:
+                    omitted = True
+                    break
+                text = row["content"][:min(4000, remaining)]
+                omitted |= len(text) < row["original_chars"]
+                kept.append({"message_id": row["message_id"], "role": row["role"],
+                             "content": text, "created_at": row["created_at"],
+                             "payload": json.loads(row["payload"] or "{}"),
+                             "checksum": hashlib.sha256(row["content"].encode()).hexdigest()
+                             if row["original_chars"] <= 20_000 else None,
+                             "truncated": len(text) < row["original_chars"]})
+                remaining -= len(text)
+            return {"messages": list(reversed(kept)),
+                    "summary": summary_row["summary"] if summary_row else "",
+                    "omitted": omitted}
+        finally:
+            conn.close()
 
     def get_context_window(
         self,

@@ -23,6 +23,7 @@ from app.core.llm.errors import (
     LLMContextCapacityError,
     LLMNetworkError,
     LLMProviderHTTPError,
+    LLMResponseParseError,
     LLMTimeoutError,
 )
 from app.core.llm_workloads import BackgroundBudgetDeferred, BackgroundTaskBudgetExceeded
@@ -31,7 +32,7 @@ STATUSES = ("queued", "running", "retry_wait", "succeeded", "failed", "cancelled
 _TERMINAL = {"succeeded", "failed", "cancelled"}
 _MAX_PAYLOAD_BYTES = 4096
 _ID_KEYS = frozenset({
-    "id", "*_id", "*_ids", "revision", "*_seq", "*_version", "limit", "offset",
+    "id", "*_id", "*_ids", "revision", "*_revision", "*_epoch", "*_seq", "*_version", "limit", "offset",
     "mode", "*_mode", "force", "include_*", "*_count",
 })
 
@@ -446,11 +447,19 @@ class BackgroundJobStore:
             result["payload"] = json.loads(row["payload_json"])
         return result
 
-    def claim(self, owner: str, lease_seconds: float) -> dict[str, Any] | None:
+    def claim(
+        self, owner: str, lease_seconds: float, *, kinds: tuple[str, ...] | None = None,
+    ) -> dict[str, Any] | None:
         if not isinstance(owner, str) or not owner or len(owner) > 256:
             raise ValueError("owner must be a non-empty string up to 256 chars")
         if not math.isfinite(lease_seconds) or lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
+        if kinds is not None:
+            if not kinds:
+                return None
+            if len(kinds) > 128 or any(not isinstance(kind, str) or not kind or len(kind) > 256 for kind in kinds):
+                raise ValueError("kinds must contain bounded job kind names")
+        kind_filter = "" if kinds is None else " AND j.kind IN (" + ",".join("?" for _ in kinds) + ")"
         now = datetime.now(UTC)
         stamp = _stamp(now)
         expiry = _stamp(now + timedelta(seconds=lease_seconds))
@@ -479,10 +488,10 @@ class BackgroundJobStore:
                    AND NOT EXISTS (SELECT 1 FROM background_jobs active
                        WHERE active.kind=j.kind AND active.scope_id=j.scope_id
                        AND active.job_id!=j.job_id AND active.status='running'
-                       AND active.lease_expires_at>?)
+                       AND active.lease_expires_at>?)""" + kind_filter + """
                    ORDER BY j.priority + MIN(10, CAST((julianday(?) - julianday(j.created_at))*1440 AS INTEGER)) DESC,
                        j.available_at, j.created_at LIMIT 1""",
-                (stamp, stamp, stamp, stamp),
+                (stamp, stamp, stamp, *(kinds or ()), stamp),
             ).fetchone()
             if row is None:
                 conn.commit()
@@ -781,6 +790,22 @@ class BackgroundJobStore:
         }
 
 
+class BackgroundJobYielded(Exception):
+    """A handler atomically persisted progress and released its lease to queued."""
+
+
+class BackgroundJobFailure(Exception):
+    """Handler-owned, payload-free failure code; no domain policy in the worker."""
+
+    def __init__(self, error_class: str, *, retryable: bool = False):
+        if not error_class or len(error_class) > 80 or any(
+            char not in "abcdefghijklmnopqrstuvwxyz0123456789_" for char in error_class
+        ):
+            raise ValueError("invalid_background_failure_code")
+        super().__init__(error_class)
+        self.error_class, self.retryable = error_class, retryable
+
+
 class BackgroundJobWorker:
     """Small bounded thread pool runner; handlers run outside queue transactions."""
 
@@ -799,7 +824,9 @@ class BackgroundJobWorker:
 
     def run_one(self, owner: str | None = None) -> bool:
         worker_owner = owner or self._owner
-        job = self.store.claim(worker_owner, self.lease_seconds)
+        # Independent domain workers may share the durable queue. Never take
+        # a job this worker cannot execute (including during lease recovery).
+        job = self.store.claim(worker_owner, self.lease_seconds, kinds=tuple(self.handlers))
         if job is None:
             return False
         handler = self.handlers.get(job["kind"])
@@ -809,6 +836,10 @@ class BackgroundJobWorker:
             else:
                 handler(job)
                 self.store.complete(job["job_id"], worker_owner, job["lease_epoch"])
+        except BackgroundJobYielded:
+            # The handler's transaction already moved the same job to queued.
+            # This is neither success nor a failed/retried provider attempt.
+            pass
         except BackgroundBudgetDeferred:
             self.store.defer(job["job_id"], worker_owner, job["lease_epoch"])
         except Exception as exc:  # noqa: BLE001 - worker boundary classifies failures.
@@ -847,10 +878,12 @@ class BackgroundJobWorker:
 
 def _classify_worker_error(exc: Exception) -> tuple[str, bool]:
     """Return a stable, payload-free failure class and retry policy."""
+    if isinstance(exc, BackgroundJobFailure):
+        return exc.error_class, exc.retryable
     if isinstance(exc, BackgroundBudgetDeferred):
         return "background_budget_deferred", True
     if isinstance(exc, BackgroundTaskBudgetExceeded):
-        return "background_task_budget_exceeded", False
+        return getattr(exc, "error_category", "background_task_budget_exceeded"), False
     if isinstance(exc, LLMContextCapacityError):
         return exc.error_category, False
     if isinstance(exc, LLMProviderHTTPError):
@@ -865,6 +898,8 @@ def _classify_worker_error(exc: Exception) -> tuple[str, bool]:
         return "provider_timeout", True
     if isinstance(exc, LLMNetworkError):
         return "provider_network", True
+    if isinstance(exc, LLMResponseParseError):
+        return "model_output_invalid", False
     if isinstance(exc, LLMClientError) and getattr(exc, "error_category", None) == "incomplete_generation":
         # Immediate generation recovery has already been exhausted. Repeating
         # the same job would merely reset its two-call recovery allowance.

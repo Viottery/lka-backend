@@ -41,6 +41,7 @@ from app.core.llm_workloads import LLMWorkloadController
 from app.core.memory_background import MemoryBackgroundCoordinator
 from app.core.memory_context import MemoryContextProvider, MemoryPreTurnGate
 from app.core.memory_files import MemoryFiles
+from app.core.message_analysis import MessageAnalysisCoordinator
 from app.core.multi_agent import (
     GENERAL_AGENT_ID,
     ContextSnapshot,
@@ -69,7 +70,8 @@ from app.core.sessions import (
     SessionService,
     SessionWorkspace,
 )
-from app.core.tools import MockToolExecutor, ToolExecutor, ToolRegistry
+from app.core.tool_constraints import ToolConstraintStore
+from app.core.tools import MockToolExecutor, ToolContext, ToolExecutor, ToolRegistry
 from app.core.tracing import TraceRecorder
 from app.core.watch_scheduler import WatchScheduler
 from app.domains.knowledge import (
@@ -100,6 +102,11 @@ from app.domains.matters import (
 )
 from app.domains.memory import MemoryService, MemorySourceInput
 from app.domains.memory_settings import MemorySettingsStore
+from app.domains.message_history import MessageHistoryService
+from app.domains.message_knowledge import MessageKnowledgeAdapter
+from app.domains.message_matter_proposals import MessageMatterProposalService
+from app.domains.message_reading_configuration import bind_reading_configuration
+from app.domains.message_reading_evaluation import MessageReadingEvaluationService
 from app.domains.projects import ProjectService
 from app.domains.watch import WatchService
 from app.domains.workspace_knowledge import WorkspaceKnowledgeIndexer
@@ -166,7 +173,18 @@ from app.tool_packages.matter import (
     SearchMattersTool,
     UpdateMatterTool,
 )
-from app.tool_packages.memory import MEMORY_PACKAGE, ReadMemoryTool, SearchMemoryTool
+from app.tool_packages.memory import (
+    MEMORY_PACKAGE,
+    ReadMemoryTool,
+    RememberMemoryTool,
+    SearchMemoryTool,
+)
+from app.tool_packages.message_reading_analysis import VERSIONS as MESSAGE_READING_VERSIONS
+from app.tool_packages.messages import (
+    MESSAGES_PACKAGE,
+    build_message_tools,
+    register_message_constraints,
+)
 from app.tool_packages.observation import (
     OBSERVATION_PACKAGE,
     ObservationReadTool,
@@ -211,24 +229,24 @@ class LocalKnowledgeAgentRuntime:
         try:
             if saved_settings["invalid"]:
                 raise ValueError("invalid_saved_configuration")
-            if not isinstance(overrides, dict) or set(overrides) - {"memory", "background"}:
+            if not isinstance(overrides, dict) or set(overrides) - {"memory", "background", "message_history"}:
                 raise ValueError("invalid_saved_configuration")
-            for section in ("memory", "background"):
+            for section in ("memory", "background", "message_history"):
                 model = type(getattr(self.local_app_config, section))
                 values = overrides.get(section, {})
                 if not isinstance(values, dict) or set(values) - model.model_fields.keys():
                     raise ValueError("invalid_saved_configuration")
                 merged = {**getattr(self.local_app_config, section).model_dump(), **values}
                 setattr(self.local_app_config, section, model.model_validate(merged, strict=True))
-            memory = self.local_app_config.memory
             clients = self.local_app_config.llm.client_configs()
-            selected_name = memory.background_client_name or self.local_app_config.llm.default_client
-            selected = next((client for client in clients if client.name == selected_name), None) if selected_name else (clients[0] if clients else None)
-            if (memory.background_client_name and selected is None) or (
-                memory.background_model and (selected is None or memory.background_model not in
-                    [selected.default_model, *selected.available_models])
-            ):
-                raise ValueError("invalid_saved_configuration")
+            for selection in (self.local_app_config.memory, self.local_app_config.message_history):
+                selected_name = selection.background_client_name or self.local_app_config.llm.default_client
+                selected = next((client for client in clients if client.name == selected_name), None) if selected_name else (clients[0] if clients else None)
+                if (selection.background_client_name and selected is None) or (
+                    selection.background_model and (selected is None or selection.background_model not in
+                        [selected.default_model, *selected.available_models])
+                ):
+                    raise ValueError("invalid_saved_configuration")
         except ValueError:
             # Corrupt overrides must not prevent local recovery/config reset.
             self.local_app_config = self.memory_settings_base.model_copy(deep=True)
@@ -281,8 +299,35 @@ class LocalKnowledgeAgentRuntime:
         self.memory_files = MemoryFiles(self.memory_service, settings.data_dir)
         self.background_job_store = BackgroundJobStore(self.db_path, max_pending_jobs=self.local_app_config.background.max_pending_jobs)
         self.background_job_store.ensure_schema()
+        self.message_history = MessageHistoryService(self.db_path, self.background_job_store)
+        self.message_history.ensure_schema()
+        reading_config = self.local_app_config.message_history
+        reading_client = next(
+            (client for client in clients if client.name ==
+             (reading_config.background_client_name or llm_config.default_client)),
+            default_client,
+        )
+        bind_reading_configuration(
+            self.message_history,
+            provider={key: getattr(reading_client, key, None)
+                      for key in ("name", "provider", "base_url", "api_key_env")},
+            processing={"model": reading_config.background_model or
+                        getattr(reading_client, "default_model", llm_config.model),
+                        "schema_version": reading_config.schema_version,
+                        "prompt_version": MessageAnalysisCoordinator.PROCESSING_VERSION,
+                        "analysis_versions": MESSAGE_READING_VERSIONS
+                        if reading_config.reading_algorithm != "legacy" else {},
+                        **{key: getattr(reading_config, key) for key in
+                           ("input_chunk_bytes", "max_input_tokens", "generation_output_tokens", "recovery_output_tokens",
+                            "reading_algorithm", "participant_pool_capacity", "participant_pinned_capacity",
+                            "profile_cold_days", "profile_retention_days", "selector_max_messages",
+                            "selector_exploration_fraction")}},
+        )
         self.mail_service = MailService(self._conn)
         self.matter_service = MatterService(self._conn)
+        self.message_matter_proposals = MessageMatterProposalService(self.message_history, self.matter_service)
+        self.message_history.matter_proposals = self.message_matter_proposals
+        self.message_reading_evaluation = MessageReadingEvaluationService(self.message_history)
         self.watch_service = WatchService(self._conn)
         self.watch_service.initialize()
         self.instruction_files = InstructionFiles(settings.data_dir, settings.parsed_workspace_roots())
@@ -326,6 +371,8 @@ class LocalKnowledgeAgentRuntime:
             reranker=reranker,
             workspace_roots=tuple(settings.parsed_workspace_roots()),
         )
+        if self.local_app_config.message_history.enabled:
+            self.knowledge_service.register_source_provider(MessageKnowledgeAdapter(self.message_history))
         self.mail_knowledge_mirror = MailKnowledgeMirror(
             mail_service=self.mail_service,
             knowledge_service=self.knowledge_service,
@@ -349,6 +396,10 @@ class LocalKnowledgeAgentRuntime:
         self.tool_registry.register_package(INSTRUCTIONS_PACKAGE)
         if self.local_app_config.memory.enabled:
             self.tool_registry.register_package(MEMORY_PACKAGE)
+        if self.local_app_config.message_history.enabled:
+            self.tool_registry.register_package(MESSAGES_PACKAGE)
+            for message_tool in build_message_tools(self.message_history):
+                self.tool_registry.register_tool(message_tool)
         register_web_tools(
             self.tool_registry, api_key=self.local_app_config.web_search.resolved_api_key(),
             conn_factory=self._conn, config=self.local_app_config.web_search,
@@ -384,10 +435,14 @@ class LocalKnowledgeAgentRuntime:
         self.tool_registry.register_tool(ReadProjectInstructionsTool(self.instruction_files))
         self.tool_registry.register_tool(SearchInstructionsTool(self.instruction_files))
         self.tool_registry.register_tool(SearchProjectInstructionsTool(self.instruction_files))
-        self.tool_registry.register_tool(UpdateInstructionsTool(self.instruction_files))
+        self.tool_registry.register_tool(UpdateInstructionsTool(self.instruction_files, self.session_service))
         if self.local_app_config.memory.enabled:
             self.tool_registry.register_tool(SearchMemoryTool(self.memory_service))
             self.tool_registry.register_tool(ReadMemoryTool(self.memory_service))
+            self.tool_registry.register_tool(RememberMemoryTool(
+                self.memory_service, self.session_service, self.memory_files,
+                contextual_remember=lambda *args, **kwargs: self.memory_background.remember_from_context(*args, **kwargs),
+            ))
         bash_policy = BashAccessPolicy.from_workspace_roots(
             self.settings.parsed_workspace_roots()
         )
@@ -408,9 +463,11 @@ class LocalKnowledgeAgentRuntime:
             BashTerminateSessionTool(self.bash_session_manager)
         )
         self.tool_executor = ToolExecutor(self.tool_registry)
+        register_message_constraints(self.tool_registry)
+        self.tool_executor.constraint_store = ToolConstraintStore(self._conn)
         self.agent_run_store = SqliteAgentRunStore(self.db_path)
         self.tool_registry.register_tool(ObservationReadTool(self.agent_run_store))
-        self.tool_registry.register_tool(ObservationSearchTool(self.agent_run_store))
+        self.tool_registry.register_tool(ObservationSearchTool(self.agent_run_store, self.tool_registry))
         self.tool_registry.register_tool(ObservationGroupTool(self.agent_run_store))
         self.agent_run_manager = InMemoryAgentRunManager(
             durable_store=self.agent_run_store
@@ -483,6 +540,9 @@ class LocalKnowledgeAgentRuntime:
             store=self.background_job_store, session_service=self.session_service,
             llm_client=self.agent_llm_client,
             allow_remote_extraction=memory_config.allow_remote_extraction,
+            extraction_context_messages=memory_config.extraction_context_messages,
+            extraction_context_chars=memory_config.extraction_context_chars,
+            auto_publish_min_confidence=memory_config.auto_publish_min_confidence,
             memory_files=self.memory_files,
             max_job_tokens=memory_config.max_job_tokens,
             generation_output_tokens=memory_config.generation_output_tokens,
@@ -493,6 +553,10 @@ class LocalKnowledgeAgentRuntime:
             background_model=memory_config.background_model,
         )
         self.memory_background.initialize_recovery()
+        self.message_analysis = MessageAnalysisCoordinator(
+            service=self.message_history, store=self.background_job_store,
+            config=self.local_app_config.message_history, llm_client=self.agent_llm_client,
+        )
         self.last_background_error: str | None = None
         self.agent_turn_loop = AgentTurnLoop(
             unified_entry_enabled=self.local_app_config.agent.unified_entry_enabled,
@@ -674,6 +738,12 @@ class LocalKnowledgeAgentRuntime:
             max_concurrency=self.local_app_config.agent.multi_agent_max_concurrency,
             max_global_concurrency=self.local_app_config.agent.multi_agent_global_max_concurrency,
             max_retries=self.local_app_config.agent.multi_agent_max_retries,
+            executor_guard=lambda child, definition: (
+                "Unrestricted executors are unavailable in source-constrained runs."
+                if definition is not None and definition.scope_mode == "workspace_sandbox"
+                and self.tool_executor.unrestricted_execution_denied(
+                    ToolContext(session_id=child.session_id, run_id=child.run_id)) else None
+            ),
         )
         self._multi_agent_resume_locks: dict[str, threading.Lock] = {}
         self.debug_loop = RuntimeLoop(
@@ -764,12 +834,16 @@ class LocalKnowledgeAgentRuntime:
         self.watch_scheduler.start()
         if self.local_app_config.memory.enabled and self.local_app_config.memory.background_enabled:
             self.memory_background.start()
+        if self.local_app_config.message_history.enabled and self.local_app_config.message_history.background_enabled:
+            self.message_analysis.start()
 
     def stop(self) -> None:
         """Stop runtime background services."""
 
         self.watch_scheduler.stop()
         self.memory_background.stop()
+        self.message_analysis.stop()
+        self.bash_session_manager.close()
         self.instruction_files.close()
         self._mail_sync_stop_event.set()
         if self._mail_sync_thread and self._mail_sync_thread.is_alive():
@@ -844,11 +918,14 @@ class LocalKnowledgeAgentRuntime:
     def health(self) -> dict[str, str]:
         """Return a small health payload used by the `/health` route."""
 
-        return {
+        payload = {
             "status": "ok",
             "version": self.settings.version,
             "service": self.settings.app_name,
         }
+        if self.settings.deployment_id:
+            payload["deployment_id"] = self.settings.deployment_id
+        return payload
 
     def _upsert_workspace(
         self,
@@ -1076,7 +1153,8 @@ class LocalKnowledgeAgentRuntime:
             if session is not None and session.workspace is not None
             else configured_paths
         )
-        account_ids = self.mail_service.list_authorized_account_ids()
+        mail_account_ids = self.mail_service.list_authorized_account_ids()
+        account_ids = tuple(sorted({*mail_account_ids, *self._message_account_inventory()}))
         visible_sources = set()
         for path in selected_paths or (None,):
             visible_sources.update(self.knowledge_service.list_authorized_source_ids(
@@ -1084,7 +1162,8 @@ class LocalKnowledgeAgentRuntime:
             ))
         source_ids = tuple(sorted({
             *visible_sources,
-            *(self.mail_knowledge_mirror.source_id_for_account(account_id) for account_id in account_ids),
+            *self._message_source_inventory(),
+            *(self.mail_knowledge_mirror.source_id_for_account(account_id) for account_id in mail_account_ids),
         }))
         workspace_scope = ScopeGrant(
             workspace_paths=selected_paths,
@@ -1119,6 +1198,12 @@ class LocalKnowledgeAgentRuntime:
         )
         return effective_parent, session_scope, workspace_scope
 
+    def _message_source_inventory(self) -> tuple[str, ...]:
+        return tuple(item["source_id"] for item in self.message_history.source_inventory()) if self.local_app_config.message_history.enabled else ()
+
+    def _message_account_inventory(self) -> tuple[str, ...]:
+        return tuple(item["account_scope_id"] for item in self.message_history.account_inventory()) if self.local_app_config.message_history.enabled else ()
+
     def _live_fork_policy(self) -> ForkPolicy | None:
         """Refresh trusted local inventories while preserving static fork limits."""
         base = self.agent_turn_loop.fork_policy
@@ -1135,12 +1220,13 @@ class LocalKnowledgeAgentRuntime:
             )
         sources = tuple(sorted({
             *visible_sources,
+            *self._message_source_inventory(),
             *(self.mail_knowledge_mirror.source_id_for_account(account_id) for account_id in accounts),
         }))
         updated_scope = base.allowed_scope.model_copy(update={
             "workspace_paths": tuple(sorted(root.as_posix() for root in self.settings.parsed_workspace_roots())),
             "source_ids": sources,
-            "account_ids": accounts,
+            "account_ids": tuple(sorted({*accounts, *self._message_account_inventory()})),
             "allowed_packages": tuple(sorted({tool.package for tool in tools if tool.package})),
             "allowed_tools": tuple(sorted(tool.name for tool in tools)),
         })
@@ -1189,6 +1275,7 @@ class LocalKnowledgeAgentRuntime:
             max_chars_per_chunk=420,
             source_ids=list(source_ids),
             account_ids=list(account_ids) if account_ids else None,
+            provider_account_ids=list(account_ids),
         )
         by_id = {chunk.chunk_id: chunk for chunk in loaded.chunks}
         candidates: list[EvidenceCandidate] = []
@@ -1614,6 +1701,8 @@ class LocalKnowledgeAgentRuntime:
         query: str,
         limit: int = 10,
         source_types: list[str] | None = None,
+        source_ids: list[str] | None = None,
+        account_ids: list[str] | None = None,
         mode: str | None = None,
     ) -> KnowledgeSearchResult:
         """Search local source-agnostic knowledge chunks."""
@@ -1622,6 +1711,9 @@ class LocalKnowledgeAgentRuntime:
             query=query,
             limit=limit,
             source_types=source_types,
+            source_ids=source_ids,
+            account_ids=account_ids,
+            provider_account_ids=account_ids,
             mode=mode,
         )
 
@@ -1638,6 +1730,8 @@ class LocalKnowledgeAgentRuntime:
         chunk_ids: list[str],
         max_chars_per_chunk: int = 420,
         offset: int = 0,
+        source_ids: list[str] | None = None,
+        account_ids: list[str] | None = None,
     ) -> KnowledgeChunkLoadResult:
         """Load selected privacy-filtered local knowledge chunks."""
 
@@ -1645,6 +1739,9 @@ class LocalKnowledgeAgentRuntime:
             chunk_ids=chunk_ids,
             max_chars_per_chunk=max_chars_per_chunk,
             offset=offset,
+            source_ids=source_ids,
+            account_ids=account_ids,
+            provider_account_ids=account_ids,
         )
 
     def load_knowledge_document(
@@ -1653,6 +1750,8 @@ class LocalKnowledgeAgentRuntime:
         document_id: str,
         include_text: bool = False,
         max_chars: int = 12000,
+        source_ids: list[str] | None = None,
+        account_ids: list[str] | None = None,
     ) -> KnowledgeDocumentRecord:
         """Load one local knowledge document record."""
 
@@ -1660,6 +1759,9 @@ class LocalKnowledgeAgentRuntime:
             document_id=document_id,
             include_text=include_text,
             max_chars=max_chars,
+            source_ids=source_ids,
+            account_ids=account_ids,
+            provider_account_ids=account_ids,
         )
 
     def create_session(
@@ -1723,7 +1825,10 @@ class LocalKnowledgeAgentRuntime:
 
         return self.session_service.rename_session(session_id=session_id, title=title)
 
-    def delete_session(self, *, session_id: str) -> bool:
+    def delete_session(
+        self, *, session_id: str, only_if_empty: bool = False,
+        expected_updated_at: str | None = None,
+    ) -> bool:
         """Hide a session and immediately suppress memories derived from it.
 
         Raw conversation/audit rows remain available for recycle-bin restore; derived
@@ -1734,11 +1839,25 @@ class LocalKnowledgeAgentRuntime:
         try:
             conn.execute("BEGIN IMMEDIATE")
             current = conn.execute(
-                "SELECT status FROM agent_sessions WHERE session_id=?", (session_id,),
+                "SELECT status,updated_at FROM agent_sessions WHERE session_id=?", (session_id,),
             ).fetchone()
             if current is None or current["status"] == "deleted":
                 conn.rollback()
                 return False
+            if only_if_empty:
+                # The frontend's earlier empty preview is not authoritative:
+                # another window may have started a turn since it was read.
+                if not expected_updated_at or current["updated_at"] != expected_updated_at:
+                    raise ValueError("empty_session_cleanup_conflict")
+                has_messages = conn.execute(
+                    "SELECT 1 FROM agent_session_messages WHERE session_id=? LIMIT 1",
+                    (session_id,),
+                ).fetchone()
+                has_runs = conn.execute(
+                    "SELECT 1 FROM agent_runs WHERE session_id=? LIMIT 1", (session_id,),
+                ).fetchone()
+                if has_messages or has_runs:
+                    raise ValueError("session_is_not_empty")
             user_messages = conn.execute(
                 "SELECT message_id,content FROM agent_session_messages "
                 "WHERE session_id=? AND role='user'",

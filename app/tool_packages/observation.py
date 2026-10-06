@@ -23,12 +23,14 @@ OBSERVATION_PACKAGE = ToolPackageSpec(
         "When repeated labels or links crowd search hits, use distinct_contexts=true to page through different text windows, then read from snippet_start. complete describes the cached text only, not an upstream truncated source.",
         "_delivery_view describes original-character windows of a cached value, not fetched or fully read upstream documents. Later prompt trimming can reduce that view further.",
         "For an array of records, use read with fields to retain the requested shallow keys rather than generic first-key previews. Follow next_offset to cover further records; report incomplete coverage when stopping early.",
-        "Array has_more=false ends record pagination only. Truncated fields include read_path and next_offset; read that exact string path (omit fields) to recover omitted text. Text windows up to 1200 characters are less likely to be compacted again.",
+        "Array has_more=false ends record pagination only. Truncated fields include read_path and next_offset; read that exact string path (omit fields) to recover omitted text. Selected text pages default to 8000 characters and can reach 16000, subject to the model request budget; inspect actual delivery ranges if the page is still folded.",
+        "Prefer an original resource's declared local reader when available. A zero-match receipt has no hidden matches. Search defaults to registered content fields; scope=raw explicitly inspects request echoes and metadata, which are not source evidence.",
         "For exact counts by a scalar field, use group on the cached raw array instead of adding counts from remembered previews. Group counts cover that entire array before group paging; they do not cover other artifacts or source pages. Follow next_offset to see every group and inspect skipped record counts.",
     ],
 )
 
-_MAX_STRING_CHARS = 4000
+_DEFAULT_STRING_CHARS = 8000
+_MAX_STRING_CHARS = 16000
 _PREVIEW_ITEMS = 5
 _PREVIEW_DEPTH = 3
 _PAGE_PREVIEW_CHARS = 5_000
@@ -256,8 +258,9 @@ class ObservationReadTool:
             "For an array of records, fields selects relevant shallow keys. Offset is an array index, "
             "object-key index, or character offset for strings; inspect has_more and next_offset. "
             "Array has_more=false does not mean projected fields are complete. Use a truncated field's "
-            "read_path with fields omitted to read its text; max_chars controls string pages (up to 4000, "
-            "1200 recommended for evidence delivery). next_offset on that field skips its visible prefix."
+            "read_path with fields omitted to read its text; max_chars controls string pages (default 8000, "
+            "up to 16000). Selected pages are delivered intact when the model request budget permits; "
+            "inspect any remaining partial markers before advancing. next_offset on that field skips its visible prefix."
         ),
         risk="low",
         requires_confirmation=False,
@@ -265,6 +268,7 @@ class ObservationReadTool:
         side_effects=["read_local_db"],
         output_preview_max_string_chars=1200,
         output_preview_text_mode="contiguous_pages",
+        output_selected_content=True,
         output_preview_priority_fields=["text", "items", "entries", "path", "value_type", "has_more",
                                         "next_offset", "total", "projected_fields", "_delivery_view",
                                         "value", "keys"],
@@ -276,7 +280,7 @@ class ObservationReadTool:
                 "path": {"type": "string", "default": ""},
                 "offset": {"type": "integer", "minimum": 0, "default": 0},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 5},
-                "max_chars": {"type": "integer", "minimum": 1, "maximum": 4000,
+                "max_chars": {"type": "integer", "minimum": 1, "maximum": 16000, "default": 8000,
                               "description": "String page size only; does not change record pagination."},
                 "fields": {
                     "type": "array", "minItems": 1, "maxItems": 12,
@@ -310,7 +314,7 @@ class ObservationReadTool:
         offset = invocation.input.get("offset", 0)
         limit = invocation.input.get("limit", 5)
         fields = invocation.input.get("fields")
-        max_chars = invocation.input.get("max_chars", _MAX_STRING_CHARS)
+        max_chars = invocation.input.get("max_chars", _DEFAULT_STRING_CHARS)
         if not isinstance(artifact_id, str) or not artifact_id:
             return rejected("artifact_id must be a non-empty string.")
         if not isinstance(path, str):
@@ -320,7 +324,7 @@ class ObservationReadTool:
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 20:
             return rejected("limit must be an integer from 1 through 20.")
         if type(max_chars) is not int or not 1 <= max_chars <= _MAX_STRING_CHARS:
-            return rejected("max_chars must be an integer from 1 through 4000.")
+            return rejected("max_chars must be an integer from 1 through 16000.")
         if "fields" in invocation.input and (
             not isinstance(fields, list)
             or not 1 <= len(fields) <= 12
@@ -452,8 +456,9 @@ class ObservationReadTool:
 class ObservationSearchTool:
     """Find literal text in a bounded portion of a current-run cached result."""
 
-    def __init__(self, store: Any) -> None:
+    def __init__(self, store: Any, registry: Any = None) -> None:
         self.store = store
+        self.registry = registry
 
     def context_delivery_bindings(self, *, result_payload, view_payload, context, check_cancel=None):
         return _context_delivery_bindings(
@@ -470,6 +475,9 @@ class ObservationSearchTool:
             "Use distinct_contexts=true to skip nearby hits well covered by the preceding snippet "
             "in the same string; offset/limit then count context windows rather than occurrences. "
             "Search is bounded; inspect complete and scan_limited before treating no matches as conclusive."
+            " Default scope=content searches only registered source/candidate fields when declared. "
+            "Unknown producers retain structural search with unknown evidence semantics. "
+            "scope=raw explicitly includes request echoes and metadata; those hits are not source evidence."
         ),
         risk="low",
         requires_confirmation=False,
@@ -483,6 +491,7 @@ class ObservationSearchTool:
                 "query": {"type": "string", "minLength": 1, "maxLength": 200},
                 "distinct_contexts": {"type": "boolean", "default": False},
                 "path": {"type": "string", "default": ""},
+                "scope": {"type": "string", "allowed_values": ["content", "raw"], "default": "content"},
                 "offset": {"type": "integer", "minimum": 0, "default": 0},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 10, "default": 5},
             },
@@ -516,6 +525,7 @@ class ObservationSearchTool:
         query = invocation.input.get("query")
         distinct_contexts = invocation.input.get("distinct_contexts", False)
         path = invocation.input.get("path", "")
+        scope = invocation.input.get("scope", "content")
         offset = invocation.input.get("offset", 0)
         limit = invocation.input.get("limit", 5)
         if not isinstance(artifact_id, str) or not artifact_id:
@@ -526,6 +536,8 @@ class ObservationSearchTool:
             return rejected("distinct_contexts must be a boolean.")
         if not isinstance(path, str):
             return rejected("path must be a JSON Pointer string.")
+        if scope not in ("content", "raw"):
+            return rejected("scope must be content or raw.")
         if len(path) > _SEARCH_MAX_PATH_CHARS or len(json.dumps(path, ensure_ascii=False)) > 512:
             return rejected("path exceeds the maximum searchable JSON Pointer length.")
         if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
@@ -541,6 +553,26 @@ class ObservationSearchTool:
         except (KeyError, IndexError, ValueError, TypeError):
             return rejected("path does not identify a value in the tool result.")
 
+        resolve = getattr(self.registry, "get_tool_or_none", None)
+        producer_name = payload.get("tool_name")
+        producer = resolve(producer_name) if callable(resolve) and isinstance(producer_name, str) else None
+        roles = getattr(getattr(producer, "spec", None), "output_evidence_roles", [])
+        declared = bool(roles) and scope == "content"
+        patterns = ["/output" + role.path for role in roles
+                    if role.role in ("source_content", "search_candidate")]
+
+        def eligible(value_path: str, *, container: bool = False) -> bool:
+            if not declared:
+                return True
+            parts = value_path.split("/")[1:]
+            for pattern in patterns:
+                wanted_parts = pattern.split("/")[1:]
+                compared = min(len(parts), len(wanted_parts))
+                if (all(a == b or b == "*" for a, b in zip(parts[:compared], wanted_parts[:compared]))
+                    and (container or len(parts) >= len(wanted_parts))):
+                    return True
+            return False
+
         folded_query = query.casefold()
         wanted = offset + limit + 1
         total_matches = 0
@@ -552,7 +584,8 @@ class ObservationSearchTool:
         scan_limited = False
         complete = False
         seen_containers: set[int] = set()
-        stack: list[tuple[Any, str]] = [(root, path)]
+        path_excluded = not eligible(path, container=isinstance(root, (dict, list)))
+        stack: list[tuple[Any, str]] = [] if path_excluded else [(root, path)]
 
         while stack:
             value, value_path = stack.pop()
@@ -561,6 +594,8 @@ class ObservationSearchTool:
                 scan_limited = True
                 break
             if isinstance(value, str):
+                if not eligible(value_path):
+                    continue
                 remaining = _SEARCH_MAX_CHARS - chars_scanned
                 if remaining <= 0:
                     scan_limited = True
@@ -600,6 +635,7 @@ class ObservationSearchTool:
                 children = [
                     (item, _pointer_child(value_path, key))
                     for key, item in raw_children
+                    if eligible(_pointer_child(value_path, key), container=isinstance(item, (dict, list)))
                 ]
                 if any(
                     len(child_path) > _SEARCH_MAX_PATH_CHARS
@@ -616,7 +652,7 @@ class ObservationSearchTool:
                 nodes_scheduled += len(children)
                 stack.extend(reversed(children))
         else:
-            complete = not scan_limited
+            complete = not scan_limited and not path_excluded
 
         has_more: bool | None
         if len(matches) > limit:
@@ -628,6 +664,9 @@ class ObservationSearchTool:
         output = {
             "path": path,
             "query": query,
+            "search_scope": "registered_content" if declared else ("raw" if scope == "raw" else "unknown_structure"),
+            "evidence_role": "declared_content_not_semantic_verification" if declared else "unknown",
+            "path_excluded_by_content_scope": path_excluded,
             "distinct_contexts": distinct_contexts,
             "matches": matches[:limit],
             "offset": offset,

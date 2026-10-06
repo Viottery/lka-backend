@@ -27,6 +27,7 @@ from app.domains.knowledge_retrieval import (
     SemanticCandidateRetriever,
     SemanticIndex,
 )
+from app.domains.knowledge_sources import KnowledgeSourceProvider
 
 KnowledgeSensitivity = Literal["public", "personal", "sensitive", "secret"]
 KnowledgeRemotePolicy = Literal["allow", "redact", "confirm", "deny"]
@@ -109,6 +110,7 @@ class KnowledgeSearchItem(BaseModel):
     retrieval_score: float | None = None
     rerank_score: float | None = None
     untrusted_data: bool = True
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class KnowledgeSearchResult(BaseModel):
@@ -128,6 +130,7 @@ class KnowledgeSourceRecord(BaseModel):
     display_name: str
     uri: str | None = None
     document_count: int
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class KnowledgeChunkRecord(BaseModel):
@@ -150,6 +153,7 @@ class KnowledgeChunkRecord(BaseModel):
     truncated: bool = False
     offset: int = 0
     next_offset: int | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class KnowledgeChunkLoadResult(BaseModel):
@@ -215,6 +219,49 @@ class KnowledgeService:
         self._cache_lock = Lock()
         self._cache_ttl_seconds = 30.0
         self._cache_capacity = 128
+        self._source_providers: list[KnowledgeSourceProvider] = []
+
+    def register_source_provider(self, provider: KnowledgeSourceProvider) -> None:
+        """Register a live source adapter without coupling the service to its domain."""
+        if any(item.source_type == provider.source_type for item in self._source_providers):
+            raise ValueError(f"knowledge source provider already registered: {provider.source_type}")
+        self._source_providers.append(provider)
+
+    def resolve_origin_constraints(self, *, invocation: Any, context: Any) -> list[str]:
+        """Ask providers whether the requested evidence IDs carry origin constraints."""
+        constraints: set[str] = set()
+        payload = getattr(invocation, "input", {})
+        for provider in self._source_providers:
+            resolver = getattr(provider, "resolve_origin_constraints", None)
+            if resolver is not None:
+                constraints.update(resolver(input=payload, context=context))
+        return sorted(constraints)
+
+    def allow_cached_observation(self, *, result: Any, context: Any = None) -> bool:
+        """Do not replay cached evidence whose provider can revoke it dynamically."""
+        payload = getattr(result, "output", result)
+
+        def has_live_id(value: Any) -> bool:
+            if isinstance(value, str):
+                return any(provider.handles_id(value) for provider in self._source_providers)
+            if isinstance(value, dict):
+                return any(has_live_id(item) for item in value.values())
+            if isinstance(value, (list, tuple)):
+                return any(has_live_id(item) for item in value)
+            return False
+
+        return not has_live_id(payload)
+
+    @staticmethod
+    def _effective_provider_accounts(
+        account_ids: list[str] | None, provider_account_ids: list[str] | None
+    ) -> list[str] | None:
+        """Preserve explicit account denials and intersect independent grants."""
+        if account_ids == [] or provider_account_ids == []:
+            return []
+        if account_ids is not None and provider_account_ids is not None:
+            return sorted(set(account_ids).intersection(provider_account_ids))
+        return account_ids if account_ids is not None else provider_account_ids
 
     def _retrieval_version(self) -> tuple[Any, ...]:
         conn = self._conn_factory()
@@ -250,7 +297,8 @@ class KnowledgeService:
                 self._candidate_cache.popitem(last=False)
 
     def list_authorized_source_ids(
-        self, *, workspace_path: str | None = None, session_id: str | None = None
+        self, *, workspace_path: str | None = None, session_id: str | None = None,
+        provider_account_ids: list[str] | None = None,
     ) -> tuple[str, ...]:
         """Return active sources whose persisted access scope allows this context.
 
@@ -264,12 +312,16 @@ class KnowledgeService:
             ).fetchall()
         finally:
             conn.close()
-        return tuple(
+        ids = [
             str(row["source_id"]) for row in rows
             if self._source_access_allowed(
                 row["access_scope"], workspace_path=workspace_path, session_id=session_id
             )
-        )
+        ]
+        provider_accounts = self._effective_provider_accounts(None, provider_account_ids)
+        for provider in self._source_providers:
+            ids.extend(source.source_id for source in provider.list_sources(source_ids=None, account_ids=provider_accounts))
+        return tuple(sorted(set(ids)))
 
     @staticmethod
     def _source_access_allowed(
@@ -318,6 +370,7 @@ class KnowledgeService:
         source_ids: list[str] | None = None,
         source_types: list[str] | None = None,
         limit: int = 100,
+        provider_account_ids: list[str] | None = None,
     ) -> list[KnowledgeSourceRecord]:
         clauses = ["s.status = 'active'"]
         params: list[Any] = []
@@ -346,7 +399,12 @@ class KnowledgeService:
             ).fetchall()
         finally:
             conn.close()
-        return [KnowledgeSourceRecord.model_validate(dict(row)) for row in rows]
+        records = [KnowledgeSourceRecord.model_validate(dict(row)) for row in rows]
+        provider_accounts = self._effective_provider_accounts(None, provider_account_ids)
+        for provider in self._source_providers:
+            if source_types is None or provider.source_type in source_types:
+                records.extend(provider.list_sources(source_ids=source_ids, account_ids=provider_accounts))
+        return records[:min(max(1, limit), 200)]
 
     def import_text_document(self, payload: KnowledgeDocumentInput) -> KnowledgeImportResult:
         source = payload.source
@@ -602,6 +660,7 @@ class KnowledgeService:
         distinct_documents: bool = False,
         source_ids: list[str] | None = None,
         account_ids: list[str] | None = None,
+        provider_account_ids: list[str] | None = None,
         cache_namespace: str | None = None,
         keyword_candidate_k: int | None = None,
         semantic_candidate_k: int | None = None,
@@ -712,6 +771,26 @@ class KnowledgeService:
                     retrieval_score=candidate.score,
                 )
             )
+        provider_results: list[KnowledgeSearchItem] = []
+        for provider in self._source_providers:
+            if source_types is not None and provider.source_type not in source_types:
+                continue
+            provider_accounts = self._effective_provider_accounts(account_ids, provider_account_ids)
+            sources = provider.list_sources(source_ids=source_ids, account_ids=provider_accounts)
+            provider_ids = [source.source_id for source in sources]
+            provider_results.extend(provider.search(
+                query=query, limit=max(limit * 4, candidate_limits["keyword"]),
+                source_ids=provider_ids, account_ids=provider_accounts,
+                max_snippet_chars=max_snippet_chars,
+            ))
+        if provider_results:
+            ranked = list(results)
+            ranked.extend(provider_results)
+            for rank, item in enumerate(results, start=1):
+                item.retrieval_score = 1.0 / (60 + rank)
+            for rank, item in enumerate(provider_results, start=1):
+                item.retrieval_score = 1.0 / (60 + rank)
+            results = sorted(ranked, key=lambda item: (-float(item.retrieval_score or 0), item.chunk_id))
         rerank_applied = False
         rerank_warning: str | None = None
         # A time-ordered listing must not be reordered by relevance scores.
@@ -1027,12 +1106,27 @@ class KnowledgeService:
         tool_name: str | None = None,
         source_ids: list[str] | None = None,
         account_ids: list[str] | None = None,
+        provider_account_ids: list[str] | None = None,
     ) -> KnowledgeChunkLoadResult:
         if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
             raise ValueError("offset must be a nonnegative character index")
         query_id = _stable_id("knowledge_load", ",".join(chunk_ids), _now_iso())
         if not chunk_ids:
             return KnowledgeChunkLoadResult(query_id=query_id, chunks=[])
+        chunk_ids = chunk_ids[:MAX_LOAD_CHUNKS]
+        provider_chunks: list[KnowledgeChunkRecord] = []
+        provider_ids = [value for value in chunk_ids if any(p.handles_id(value) for p in self._source_providers)]
+        for provider in self._source_providers:
+            selected = [value for value in provider_ids if provider.handles_id(value)]
+            if selected:
+                provider_chunks.extend(provider.load_chunks(
+                    chunk_ids=selected, max_chars_per_chunk=max_chars_per_chunk, offset=offset,
+                    source_ids=source_ids,
+                    account_ids=self._effective_provider_accounts(account_ids, provider_account_ids),
+                ))
+        chunk_ids = [value for value in chunk_ids if value not in provider_ids]
+        if not chunk_ids:
+            return KnowledgeChunkLoadResult(query_id=query_id, chunks=provider_chunks[:MAX_LOAD_CHUNKS])
         limited_ids = chunk_ids[:MAX_LOAD_CHUNKS]
         placeholders = ", ".join("?" for _ in limited_ids)
         scope_clause, scope_params = self._source_filter_sql(
@@ -1108,7 +1202,7 @@ class KnowledgeService:
         )
         return KnowledgeChunkLoadResult(
             query_id=query_id,
-            chunks=chunks,
+            chunks=[*chunks, *provider_chunks][:MAX_LOAD_CHUNKS],
             filtered_count=filtered_count,
         )
 
@@ -1121,7 +1215,18 @@ class KnowledgeService:
         tool_name: str | None = None,
         source_ids: list[str] | None = None,
         account_ids: list[str] | None = None,
+        provider_account_ids: list[str] | None = None,
     ) -> KnowledgeDocumentRecord:
+        for provider in self._source_providers:
+            if provider.handles_id(document_id):
+                record = provider.load_document(
+                    document_id=document_id, include_text=include_text, max_chars=max_chars,
+                    source_ids=source_ids,
+                    account_ids=self._effective_provider_accounts(account_ids, provider_account_ids),
+                )
+                if record is None:
+                    raise ValueError(f"knowledge document not found: {document_id}")
+                return record
         conn = self._conn_factory()
         scope_clause, scope_params = self._source_filter_sql(
             source_types=None, source_ids=source_ids, account_ids=account_ids,

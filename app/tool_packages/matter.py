@@ -128,6 +128,7 @@ class CreateMatterTool:
         risk="medium",
         requires_confirmation=False,
         read_only=False,
+        effect_domains=("matter",),
         side_effects=["write_local_db"],
         **_MATTER_CHILD_SCOPE,
         input_schema=MATTER_CREATE_SCHEMA,
@@ -161,6 +162,7 @@ class CreateManyMattersTool:
 
     spec = ToolSpec(
         name="matter.create_many",
+        effect_domains=("matter",),
         package="matter",
         type="local_tool",
         description="Create multiple independent local matters in one controlled batch.",
@@ -311,6 +313,7 @@ class UpdateMatterTool:
 
     spec = ToolSpec(
         name="matter.update",
+        effect_domains=("matter",),
         package="matter",
         type="local_tool",
         description="Update an independent local matter by id.",
@@ -372,6 +375,7 @@ class LinkMatterSourceTool:
 
     spec = ToolSpec(
         name="matter.link_source",
+        effect_domains=("matter",),
         package="matter",
         type="local_tool",
         description="Link an existing matter to a source object such as a mail message.",

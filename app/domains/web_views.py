@@ -67,20 +67,41 @@ def _query_hits(source: str, paragraphs: list[tuple[int, int]], terms: list[str]
             # Prefer anchoring on the most discriminative matched query term.
             anchor = max(positions, default=(0.0, start))[1]
             hits.append({"index": index, "start": start, "end": end, "score": score,
-                         "hit": anchor})
+                         "hit": anchor, "exact_label": any(term == paragraph.strip() for term in terms)})
     return sorted(hits, key=lambda hit: (-hit["score"], hit["index"]))
 
 
 def _context_window(source: str, paragraphs: list[tuple[int, int]], hit: dict,
-                    limit: int) -> tuple[int, int, int, int]:
+                    limit: int, headings: list[dict] | None = None) -> tuple[int, int, int, int]:
     index = hit["index"]
+    paragraph_start, paragraph_end = paragraphs[index]
+    label = source[paragraph_start:paragraph_end].strip()
+    first_line = label.splitlines()[0]
+    # Heading identity comes from extraction, not task/domain keywords. A short
+    # exact block can also be a section label; longer prose retains neighbors.
+    is_heading = any(isinstance(item, dict) and isinstance(item.get("text"), str)
+                     and item["text"].strip() == first_line
+                     and type(item.get("start")) is int
+                     and paragraph_start <= item["start"] < paragraph_end
+                     for item in headings or [])
+    is_heading = is_heading or (label == first_line and len(label) <= 100
+                                and not re.search(r"[。！？.!?:：]", label)
+                                and hit.get("exact_label") is True)
+    if is_heading and index + 1 < len(paragraphs):
+        context_start = paragraph_start
+        context_end = paragraphs[min(len(paragraphs) - 1, index + 3)][1]
+        following = [item["start"] for item in headings or []
+                     if isinstance(item, dict) and type(item.get("start")) is int
+                     and paragraph_end < item["start"] < context_end]
+        if following:
+            context_end = min(following)
+        return context_start, min(context_end, context_start + limit), context_start, context_end
     context_start = paragraphs[max(0, index - 1)][0]
     context_end = paragraphs[min(len(paragraphs) - 1, index + 1)][1]
     if context_end - context_start <= limit:
         return context_start, context_end, context_start, context_end
     # The requested adjacent context remains explicit, while returned text stays
     # a bounded contiguous window centered on the source occurrence.
-    paragraph_start, paragraph_end = paragraphs[index]
     hit_end = min(paragraph_end, hit["hit"] + limit)
     start = max(paragraph_start, hit_end - limit)
     return start, hit_end, context_start, context_end
@@ -133,7 +154,7 @@ def build_page_view(
             for hit in hits:
                 if len(selections) >= 2:
                     break
-                win = _context_window(source, paras, hit, primary_limit)
+                win = _context_window(source, paras, hit, primary_limit, page.get("outline"))
                 if any(win[0] < old[0][1] and old[0][0] < win[1] for old in selections):
                     continue
                 selections.append((win, hit))
@@ -168,7 +189,7 @@ def build_page_view(
                     if cap <= 0 or len(excerpt_items) >= _MAX_EXCERPTS:
                         break
                     if ex_end - ex_start > cap:
-                        ex_start, ex_end, ex_context_start, ex_context_end = _context_window(source, paras, hit, cap)
+                        ex_start, ex_end, ex_context_start, ex_context_end = _context_window(source, paras, hit, cap, page.get("outline"))
                     snippet = source[ex_start:ex_end]
                     overlaps_excerpt = any(
                         ex_start < item["snippet_end"] and item["snippet_start"] < ex_end

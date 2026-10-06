@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import re
+
 from app.core.instruction_files import InstructionFiles
+from app.core.sessions import SessionService
 from app.core.tools import ToolContext, ToolInvocation, ToolPackageSpec, ToolResult, ToolSpec
 
 INSTRUCTIONS_PACKAGE = ToolPackageSpec(
@@ -135,8 +138,9 @@ class SearchProjectInstructionsTool:
 
 
 class UpdateInstructionsTool:
-    def __init__(self, files: InstructionFiles) -> None:
+    def __init__(self, files: InstructionFiles, sessions: SessionService | None = None) -> None:
         self.files = files
+        self.sessions = sessions
 
     spec = ToolSpec(
         name="instructions.update", package="instructions", type="local_tool",
@@ -151,6 +155,16 @@ class UpdateInstructionsTool:
     )
 
     def invoke(self, *, invocation: ToolInvocation, context: ToolContext) -> ToolResult:
+        message = self.sessions.get_turn_user_message(
+            session_id=context.session_id, trace_id=context.trace_id or "",
+        ) if self.sessions is not None and context.tool_view is None else None
+        if message is None or not _requests_guidance_edit(message.content):
+            return ToolResult(
+                invocation_id=invocation.invocation_id, tool_name=self.spec.name,
+                status="rejected", execution_started=False,
+                error="The current user message must explicitly request editing a guidance file. "
+                      "Conversational preferences belong in memory, not AGENTS.md.",
+            )
         try:
             output = self.files.update(str(invocation.input["kind"]),
                                        content=str(invocation.input["content"]),
@@ -160,3 +174,21 @@ class UpdateInstructionsTool:
         except (KeyError, OSError, UnicodeError, ValueError) as exc:
             return ToolResult(invocation_id=invocation.invocation_id, tool_name=self.spec.name,
                               status="failed", error=str(exc))
+
+
+def _requests_guidance_edit(content: str) -> bool:
+    """Conservative tool-owned target check, not a general intent classifier.
+
+    Only the persisted current user input is examined. Ambiguous requests must
+    be clarified rather than turning a learned preference into operating rules.
+    """
+    content = re.sub(r"[“\"](AGENTS?\.md)[”\"]", r"\1", content, flags=re.IGNORECASE)
+    content = re.sub(r"```[\s\S]*?```|[“「『\"][\s\S]*?[”」』\"]", "", content)
+    for clause in re.split(r"[。！？!?；;\n]", content):
+        target = re.search(r"\bAGENTS?\.md\b|(?:全局|项目|关注)?指导文件", clause, re.IGNORECASE)
+        edit = re.search(r"修改|编辑|更新|写入|写进|保存到|保存进|追加|维护|替换|重置|\b(?:edit|update|write|append|replace|reset)\b", clause, re.IGNORECASE)
+        if target is not None and edit is not None and not re.search(
+            r"不要|不应|不得|不能|禁止|无需|不必|别|不会|没有|写道|写着|引用|\b(?:not|never|don't|cannot|says|said|quoted)\b|[？?]|怎么|如何|whether|how\b", clause, re.IGNORECASE,
+        ):
+            return True
+    return False

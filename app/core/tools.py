@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from app.core.answer_evidence import OutputEvidenceRole
 from app.core.context import TaskContext
 from app.core.context_driver import ToolView
+from app.core.tool_constraints import ToolConstraintStore
 
 
 def _scope_values(value: Any) -> tuple[str, ...]:
@@ -55,6 +56,9 @@ class ToolSpec(BaseModel):
     # Execution must still classify and authorize the actual invocation input.
     supports_read_only_invocations: bool = False
     side_effects: list[str] = Field(default_factory=list)
+    effect_domains: tuple[str, ...] = ()
+    origin_constraints: tuple[str, ...] = ()
+    unrestricted_execution: bool = False
     resource_lock_group: str | None = None
     resource_lock_fields: tuple[str, ...] = ()
     scope_path_fields: tuple[str, ...] = ()
@@ -70,6 +74,9 @@ class ToolSpec(BaseModel):
     # Preserve bounded evidence leaves without changing the overall gate cap.
     output_preview_max_string_chars: int = Field(default=700, strict=True, ge=700, le=1200)
     output_preview_text_mode: Literal["head_tail", "contiguous_pages"] = "head_tail"
+    # Registered explicit readers may deliver a larger, already selected page.
+    # Not an authorization flag; whole-request fitting remains authoritative.
+    output_selected_content: bool = Field(default=False, strict=True)
     # Ordered top-level output fields, trusted only from the registered producer.
     # Persisted JSON key order is not a delivery policy. Unknown tools opt out.
     output_preview_priority_fields: list[
@@ -148,6 +155,13 @@ class ToolRegistry:
     def __init__(self) -> None:
         self._packages: dict[str, ToolPackageSpec] = {}
         self._tools: dict[str, Tool] = {}
+        self.effect_constraints: dict[str, dict[str, Any]] = {}
+
+    def register_effect_constraint(self, constraint_id: str, *, blocked_domains: tuple[str, ...],
+                                   block_unrestricted: bool = True, review_path: str = "") -> None:
+        self.effect_constraints[constraint_id] = {"blocked_domains": blocked_domains,
+                                                  "block_unrestricted": block_unrestricted,
+                                                  "review_path": review_path}
 
     def register_package(self, package: ToolPackageSpec) -> None:
         self._packages[package.name] = package
@@ -204,6 +218,38 @@ class ToolExecutor:
     def __init__(self, registry: ToolRegistry) -> None:
         self.registry = registry
         self.run_manager: Any | None = None
+        self.constraint_store = ToolConstraintStore()
+
+    def _constraint_subjects(self, context: ToolContext) -> list[tuple[str, str]]:
+        subjects = [("session", context.session_id)]
+        run_id = (context.tool_view.child_run_id if context.tool_view else None) or context.run_id
+        visited: set[str] = set()
+        while run_id and run_id not in visited:
+            visited.add(run_id)
+            subjects.append(("run", run_id))
+            run = self.run_manager.get_run(run_id) if self.run_manager else None
+            if run is None:
+                break
+            if run.session_id:
+                subjects.append(("session", run.session_id))
+            run_id = run.parent_run_id
+        return subjects
+
+    def unrestricted_execution_denied(self, context: ToolContext) -> bool:
+        for constraint_id in self.constraint_store.get(self._constraint_subjects(context)):
+            policy = self.registry.effect_constraints.get(constraint_id)
+            if policy is None or policy["block_unrestricted"]:
+                return True
+        return False
+
+    def _effect_denial(self, tool: Tool, context: ToolContext) -> dict[str, Any] | None:
+        for constraint_id in self.constraint_store.get(self._constraint_subjects(context)):
+            policy = self.registry.effect_constraints.get(constraint_id)
+            if policy is None or bool(set(tool.spec.effect_domains) & set(policy["blocked_domains"])) or (
+                tool.spec.unrestricted_execution and policy["block_unrestricted"]
+            ):
+                return {"human_review_required": True, "review_path": policy["review_path"] if policy else ""}
+        return None
 
     def execute(
         self,
@@ -270,6 +316,13 @@ class ToolExecutor:
                 error=scope_error,
                 execution_started=False,
             )
+        subjects = self._constraint_subjects(context)
+        # Unknown persisted policies fail closed rather than disappear on upgrade.
+        denial = self._effect_denial(tool, context)
+        if denial:
+            return ToolResult(invocation_id=invocation_id, tool_name=tool_name, status="rejected",
+                              error="Source-derived actions require the dedicated human review workflow.", output=denial,
+                              execution_started=False)
         if read_only is not True and not context.safety_review_approved:
             return ToolResult(
                 invocation_id=invocation_id,
@@ -332,6 +385,27 @@ class ToolExecutor:
                         error=failure,
                         execution_started=False,
                     )
+                denial = self._effect_denial(tool, context)
+                if denial:
+                    return ToolResult(invocation_id=invocation_id, tool_name=tool_name, status="rejected",
+                                      error="Source-derived actions require the dedicated human review workflow.", output=denial,
+                                      execution_started=False)
+                # Commit before exposing source data, including streams/errors. Never
+                # trust a model-provided output field to grant or clear this constraint.
+                origin_constraints = set(tool.spec.origin_constraints)
+                resolve_constraints = getattr(tool, "resolve_origin_constraints", None)
+                if callable(resolve_constraints):
+                    # Only registered implementation code can derive additional
+                    # source constraints; model arguments/results cannot clear
+                    # existing constraints or self-certify authority.
+                    resolved = resolve_constraints(invocation=invocation, context=context)
+                    if not isinstance(resolved, (set, frozenset, tuple, list)) or any(
+                        not isinstance(value, str) or not value for value in resolved
+                    ):
+                        raise ValueError("Invalid registered source constraint resolver")
+                    origin_constraints.update(resolved)
+                if origin_constraints:
+                    self.constraint_store.add(subjects, origin_constraints)
                 execution_started = True
                 result = tool.invoke(invocation=invocation, context=context)
                 return result.model_copy(update={"execution_started": True})

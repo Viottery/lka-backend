@@ -16,9 +16,11 @@ import subprocess
 import tempfile
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import MappingProxyType
 from typing import Literal
+
+from app.platform.safe_files import is_link_or_reparse, open_file_no_follow, scandir_no_follow
 
 
 class CodexWorkspaceError(RuntimeError):
@@ -292,7 +294,7 @@ class CodexWorkspaceFactory:
             except FileNotFoundError:
                 # A tracked path deleted in the source is not part of its snapshot.
                 continue
-            if stat.S_ISLNK(info.st_mode):
+            if is_link_or_reparse(info):
                 # Links are intentionally absent from both the copy and manifest.
                 continue
             if not stat.S_ISREG(info.st_mode):
@@ -412,6 +414,10 @@ def _validate_relative_path(relative_path: str) -> None:
         or "\0" in relative_path
         or any(part in {"", ".", ".."} for part in relative_path.split("/"))
         or pure.is_absolute()
+        or (os.name == "nt" and any(
+            ":" in part or part.endswith((".", " ")) or PureWindowsPath(part).is_reserved()
+            for part in relative_path.split("/")
+        ))
     ):
         raise CodexWorkspaceUnsupportedError("Git returned an unsafe relative path.")
 
@@ -450,8 +456,7 @@ def _is_sensitive_path(relative_path: str) -> bool:
 def _copy_regular_file(
     source: Path, destination: Path, *, max_bytes: int
 ) -> tuple[str, int, int, int]:
-    source_flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(source, source_flags)
+    fd = open_file_no_follow(source)
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
@@ -476,8 +481,7 @@ def _copy_regular_file(
 
 
 def _read_file_identity(path: Path) -> CodexFileSnapshot:
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(path, flags)
+    fd = open_file_no_follow(path)
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
@@ -502,8 +506,7 @@ def _read_regular_bytes(path: Path, max_bytes: int) -> bytes:
     identity = _read_file_identity(path)
     if identity.size_bytes > max_bytes:
         raise CodexWorkspaceUnsupportedError("A workspace file exceeds the configured size limit.")
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(path, flags)
+    fd = open_file_no_follow(path)
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_size > max_bytes:
@@ -519,7 +522,7 @@ def _read_regular_bytes(path: Path, max_bytes: int) -> bytes:
 
 def _identity_from_bytes(data: bytes, path: Path) -> CodexFileSnapshot:
     info = path.lstat()
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+    if is_link_or_reparse(info) or not stat.S_ISREG(info.st_mode):
         raise CodexWorkspaceUnsupportedError("A source path changed to a non-regular file.")
     return CodexFileSnapshot(
         sha256=hashlib.sha256(data).hexdigest(),
@@ -536,50 +539,54 @@ def _scan_working_copy(
     max_total_bytes: int,
     max_file_bytes: int,
 ) -> dict[str, CodexFileSnapshot]:
-    resolved_root = root.resolve(strict=True)
+    # Keep the lease's pathname: resolve() could silently follow a replaced root.
+    scan_root = root.absolute()
     output: dict[str, CodexFileSnapshot] = {}
     total_bytes = 0
 
     def visit(directory: Path, prefix: str) -> None:
         nonlocal total_bytes
-        with os.scandir(directory) as entries:
+        with scandir_no_follow(directory) as entries:
             ordered = sorted(entries, key=lambda entry: entry.name)
-        for entry in ordered:
-            relative = f"{prefix}/{entry.name}" if prefix else entry.name
-            _validate_relative_path(relative)
-            path = directory / entry.name
-            info = entry.stat(follow_symlinks=False)
-            if stat.S_ISLNK(info.st_mode):
-                raise CodexWorkspaceUnsupportedError(f"Codex created a symlink: {relative}")
-            if _is_sensitive_path(relative):
-                # Current Codex versions create an empty top-level .codex
-                # directory when starting a thread. It is not an artifact;
-                # any content under it remains forbidden.
-                if relative == ".codex" and stat.S_ISDIR(info.st_mode):
-                    with os.scandir(path) as children:
-                        if not any(children):
-                            continue
-                raise CodexWorkspaceUnsupportedError(
-                    f"Codex created a path excluded from workspace snapshots: {relative}"
-                )
-            if stat.S_ISDIR(info.st_mode):
-                visit(path, relative)
-                continue
-            if not stat.S_ISREG(info.st_mode):
-                raise CodexWorkspaceUnsupportedError(f"Codex created a non-regular file: {relative}")
-            if info.st_size > max_file_bytes:
-                raise CodexWorkspaceUnsupportedError(f"Codex output exceeds the file size limit: {relative}")
-            if len(output) >= max_files:
-                raise CodexWorkspaceUnsupportedError("Codex output exceeds the file count limit.")
-            snapshot = _read_file_identity(path)
-            if snapshot.size_bytes > max_file_bytes:
-                raise CodexWorkspaceUnsupportedError(f"Codex output exceeds the file size limit: {relative}")
-            output[relative] = snapshot
-            total_bytes += snapshot.size_bytes
-            if total_bytes > max_total_bytes:
-                raise CodexWorkspaceUnsupportedError("Codex output exceeds the total byte limit.")
+            for entry in ordered:
+                relative = f"{prefix}/{entry.name}" if prefix else entry.name
+                _validate_relative_path(relative)
+                path = directory / entry.name
+                info = entry.stat(follow_symlinks=False)
+                if is_link_or_reparse(info):
+                    raise CodexWorkspaceUnsupportedError(f"Codex created a symlink or reparse point: {relative}")
+                if _is_sensitive_path(relative):
+                    # Current Codex versions create an empty top-level .codex
+                    # directory when starting a thread. It is not an artifact;
+                    # any content under it remains forbidden.
+                    if relative == ".codex" and stat.S_ISDIR(info.st_mode):
+                        with scandir_no_follow(path) as children:
+                            if not any(children):
+                                continue
+                    raise CodexWorkspaceUnsupportedError(
+                        f"Codex created a path excluded from workspace snapshots: {relative}"
+                    )
+                if stat.S_ISDIR(info.st_mode):
+                    visit(path, relative)
+                    continue
+                if not stat.S_ISREG(info.st_mode):
+                    raise CodexWorkspaceUnsupportedError(f"Codex created a non-regular file: {relative}")
+                if info.st_size > max_file_bytes:
+                    raise CodexWorkspaceUnsupportedError(f"Codex output exceeds the file size limit: {relative}")
+                if len(output) >= max_files:
+                    raise CodexWorkspaceUnsupportedError("Codex output exceeds the file count limit.")
+                snapshot = _read_file_identity(path)
+                if snapshot.size_bytes > max_file_bytes:
+                    raise CodexWorkspaceUnsupportedError(f"Codex output exceeds the file size limit: {relative}")
+                output[relative] = snapshot
+                total_bytes += snapshot.size_bytes
+                if total_bytes > max_total_bytes:
+                    raise CodexWorkspaceUnsupportedError("Codex output exceeds the total byte limit.")
 
-    visit(resolved_root, "")
+    try:
+        visit(scan_root, "")
+    except OSError as exc:
+        raise CodexWorkspaceUnsupportedError("Codex workspace cannot be scanned safely.") from exc
     return output
 
 

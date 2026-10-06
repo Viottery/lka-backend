@@ -33,6 +33,35 @@ def test_local_explicit_memory_and_secret_gate():
     assert not safe_to_store_memory("mail me at somebody@example.com")
 
 
+@pytest.mark.parametrize("name", ["真理", "阿尔法"])
+def test_mixed_current_task_and_addressed_durable_preference_keeps_constraints(name):
+    message = (f"我希望你联网搜索一下角色“{name}”的相关信息。"
+               f"我希望你以后可以进行{name}的角色扮演，代入她的性格和口吻与我对话。"
+               "同时保持现有的工作能力")
+    remote = FakeClient("not json")
+    result = extract_user_memories(source_id="mixed", content=message,
+                                  llm_client=remote, allow_remote=True)
+    assert len(result) == 1
+    assert result[0].claim == (f"以后可以进行{name}的角色扮演，代入她的性格和口吻与我对话。"
+                               "同时保持现有的工作能力")
+    assert result[0].explicit and result[0].claim in result[0].evidence in message
+    assert remote.calls == 0
+
+
+@pytest.mark.parametrize("message", [
+    "我希望你联网搜索一下资料", "我希望你整理这些文件", "我希望你今天回答温柔一点",
+])
+def test_addressed_one_turn_wish_does_not_invent_future_preference(message):
+    assert extract_user_memories(source_id="task", content=message) == []
+
+
+def test_durable_follow_on_does_not_absorb_next_independent_request():
+    result = extract_user_memories(source_id="mixed", content=(
+        "我希望你以后回答简洁。同时保持来源可查。请帮我查询资料。"
+    ))
+    assert [item.claim for item in result] == ["以后回答简洁。同时保持来源可查"]
+
+
 def test_explicit_memory_does_not_need_optional_remote_model():
     remote = FakeClient("not json")
     result = extract_user_memories(

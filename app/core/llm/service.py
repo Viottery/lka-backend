@@ -56,6 +56,9 @@ class LLMService:
         )
         request = self._bounded_background_request(request)
         async with self._admission(request) as ticket:
+            from app.core.llm_workloads import current_workload
+
+            await current_workload().check_dispatch()
             if ticket is not None:
                 ticket.dispatched = True
             try:
@@ -117,6 +120,9 @@ class LLMService:
         )
         request = self._bounded_background_request(request)
         async with self._admission(request) as ticket:
+            from app.core.llm_workloads import current_workload
+
+            await current_workload().check_dispatch()
             if ticket is not None:
                 ticket.dispatched = True
             try:
@@ -147,6 +153,13 @@ class LLMService:
 
     @asynccontextmanager
     async def _admission(self, request: LLMRequest):
+        from app.core.llm_workloads import BackgroundBudgetDeferred, current_workload
+
+        pricing = current_workload().pricing
+        if pricing is not None and (pricing.client_name != request.client_name or pricing.model != request.model):
+            exc = BackgroundBudgetDeferred("request model does not match budget pricing")
+            exc.category = exc.error_category = "pricing_unknown"
+            raise exc
         if self.workloads is None:
             yield None
             return

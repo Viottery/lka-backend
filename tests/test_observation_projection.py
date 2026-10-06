@@ -95,6 +95,6 @@ def test_truncated_field_read_path_escapes_keys_and_string_pages_continue(tmp_pa
     tail = _invoke(tool, artifact_id="rows", path=field["read_path"],
                    offset=page.output["next_offset"], max_chars=1200)
     assert tail.output["text"] == text[1700:] and tail.output["has_more"] is False
-    for invalid in (0, 4001, True):
+    for invalid in (0, 16001, True):
         assert _invoke(tool, artifact_id="rows", path=field["read_path"], max_chars=invalid).status == "rejected"
     assert _invoke(tool, artifact_id="rows", path="/output/a~1b", max_chars=1200).status == "rejected"

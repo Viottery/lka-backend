@@ -14,7 +14,10 @@ router = APIRouter(prefix="/matters", tags=["matters"])
 
 @router.post("", response_model=MatterRecordResponse)
 def create_matter(payload: MatterCreateRequest, request: Request) -> MatterRecordResponse:
-    result = request.app.state.runtime.create_matter(payload=payload)
+    try:
+        result = request.app.state.runtime.create_matter(payload=payload)
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="This mutation requires its dedicated human review workflow.") from None
     return MatterRecordResponse(**result.model_dump())
 
 
@@ -51,6 +54,8 @@ def update_matter(
         )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="This mutation requires its dedicated human review workflow.") from None
     return MatterRecordResponse(**result.model_dump())
 
 
@@ -67,4 +72,6 @@ def link_matter_source(
         )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="This mutation requires its dedicated human review workflow.") from None
     return MatterRecordResponse(**result.model_dump())

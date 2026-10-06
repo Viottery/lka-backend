@@ -16,7 +16,7 @@ from app.core.agent_graph import AgentGraphRunner
 from app.core.agent_runs import AgentRunCancelled
 from app.core.agent_turn import LLM_OBSERVATION_MAX_TOTAL_CHARS
 from app.core.config import get_settings
-from app.core.llm import LLMRateLimitError, LLMResponse, LLMResponseMode, LLMStreamEvent
+from app.core.llm import LLMClientError, LLMRateLimitError, LLMResponse, LLMResponseMode, LLMStreamEvent
 from app.core.multi_agent_fast_path import FastPathEvent, project_fast_path_metrics
 from app.core.tools import ToolContext, ToolExecutor, ToolRegistry, ToolResult, ToolSpec
 from app.domains.mail import MailAccountInput, MailMessageInput
@@ -790,25 +790,34 @@ def test_agent_turn_records_provider_stream_error_as_partial_failed(
     request = SimpleNamespace(app=app)
     app.state.runtime.agent_turn_loop.llm_client = _ProviderStreamErrorLLM()
 
-    response = run_agent_turn(
-        AgentTurnRequest(
-            session_id="session_stream_error_audit",
-            user_input="直接根据上下文回答",
-            llm={"response_mode": "stream"},
-        ),
-        request,
-    )
+    with pytest.raises(LLMClientError, match="generation failed"):
+        run_agent_turn(
+            AgentTurnRequest(
+                session_id="session_stream_error_audit",
+                user_input="直接根据上下文回答",
+                llm={"response_mode": "stream"},
+            ),
+            request,
+        )
 
-    failed = next(event for event in response.llm_events if event.status == "partial_failed")
-    assert failed.stage == "context_answer"
-    assert failed.output == "partial answer"
-    assert failed.partial is True
-    assert failed.provider_request_id == "req_stream_failed"
-    assert failed.provider_error_type == "invalid_request_error"
-    assert failed.provider_error_code == "bad_stream"
-    assert failed.provider_error_param == "input"
-    assert failed.error_category == "bad_request"
-    assert failed.audit_record["metadata"]["headers"]["x-request-id"] == "req_stream_failed"
+    with app.state.runtime._conn() as conn:
+        run = conn.execute("SELECT run_id, status FROM agent_runs WHERE session_id=?",
+                           ("session_stream_error_audit",)).fetchone()
+    assert run["status"] == "failed"
+    events = app.state.runtime.agent_run_manager.list_events(run["run_id"])
+    failed = next(event for event in events if event.type == "llm_failed"
+                  and event.stage == "context_answer")
+    audit = failed.payload["audit_record"]
+    assert audit["status"] == "partial_failed"
+    assert audit["partial"] is True
+    assert audit["content_length"] == len("partial answer")
+    assert audit["provider_request_id"] == "req_stream_failed"
+    assert audit["provider_error_type"] == "invalid_request_error"
+    assert audit["provider_error_code"] == "bad_stream"
+    assert audit["provider_error_param"] == "input"
+    assert audit["error_category"] == "bad_request"
+    assert audit["metadata"]["headers"]["x-request-id"] == "req_stream_failed"
+    assert not any(event.type in {"final_answer", "run_completed"} for event in events)
 
 
 def test_agent_turn_passes_request_llm_options_to_client(tmp_path, monkeypatch):

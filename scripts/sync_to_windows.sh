@@ -13,6 +13,7 @@ Examples:
 
 Behavior:
   - Default mode is dry-run. It prints what would change.
+  - Copies the application and lockfile; excludes tests, evaluations, local data and environments.
   - --apply writes files to the target path.
   - --delete mirrors removals into the target. Use it only when WSL is the source of truth.
 EOF
@@ -82,7 +83,18 @@ rsync_args=(
   --exclude .git/
   --exclude .agents/
   --exclude .codex/
+  --exclude .aws/
   --exclude .venv/
+  --exclude .bootstrap/
+  --exclude .uv-cache/
+  --exclude scratch/
+  --exclude /tests/
+  --exclude /evals/
+  --exclude /scripts/eval_\*
+  --exclude /scripts/benchmark_\*
+  --exclude /scripts/probe_\*
+  --exclude /scripts/study_\*
+  --exclude /scripts/experiment_\*
   --exclude __pycache__/
   --exclude .pytest_cache/
   --exclude .ruff_cache/
@@ -97,11 +109,12 @@ rsync_args=(
   --exclude "coverage.xml"
   --exclude htmlcov/
   --exclude .env
+  --exclude ':memory:*'
+  --exclude /tmp_\*/
   --exclude config/local.toml
   --exclude "config/secrets*.toml"
   --exclude "config/tokens*.json"
   --exclude config/cache/
-  --exclude uv.lock
 )
 
 if [[ "$delete" == true ]]; then

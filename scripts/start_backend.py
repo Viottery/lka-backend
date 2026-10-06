@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import re
 import sys
 import tempfile
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Literal
-
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ProfileName = Literal["personal", "test"]
@@ -44,14 +45,27 @@ def configure_profile(
     """Set process-local environment required by the requested startup profile."""
 
     if profile == "personal":
+        # Import/control credentials are consumed by integrations via os.environ.
+        # Loading Settings alone does not export the private .env into that mapping.
+        from dotenv import load_dotenv
+
+        load_dotenv(REPO_ROOT / ".env", override=False)
         os.environ.setdefault("LKA_DATA_DIR", str(REPO_ROOT / "data" / "runtime"))
         os.environ.setdefault("LKA_LOCAL_CONFIG", str(REPO_ROOT / "config" / "local.toml"))
-        return Path(os.environ["LKA_DATA_DIR"])
+        data_dir = Path(os.environ["LKA_DATA_DIR"])
+        manifest = data_dir / "production_release.json"
+        if manifest.is_file():
+            release = json.loads(manifest.read_text(encoding="utf-8"))["release_id"]
+            if not isinstance(release, str) or not re.fullmatch(r"[a-f0-9]{64}", release):
+                raise ValueError("Invalid production release identity")
+            os.environ["LKA_DEPLOYMENT_ID"] = release
+        return data_dir
 
     data_dir = test_data_dir or Path(tempfile.mkdtemp(prefix="lka_test_backend_"))
     os.environ["LKA_DATA_DIR"] = str(data_dir)
     # Do not allow a real local provider/mail config to be read in test mode.
     os.environ["LKA_LOCAL_CONFIG"] = str(data_dir / "missing-local.toml")
+    os.environ.pop("LKA_DEPLOYMENT_ID", None)
     return data_dir
 
 

@@ -12,7 +12,6 @@ from typing import Any
 
 from app.core.background_jobs import BackgroundJobStore, BackgroundJobWorker
 from app.core.background_llm import (
-    BatchedExtractionClient,
     IncompleteGenerationError,
     SelectedBackgroundClient,
     _estimate_prompt_tokens,
@@ -25,7 +24,8 @@ from app.core.llm_workloads import (
     workload_scope,
 )
 from app.core.memory_extraction import direct_durable_preferences, extract_user_memories
-from app.core.memory_files import MemoryFileError, MemoryFiles
+from app.core.memory_files import MemoryFileConflictError, MemoryFileError, MemoryFiles
+from app.core.memory_learning import ContextualMemoryLearning
 from app.core.sessions import SessionRecentMessage, SessionService
 from app.domains.memory import (
     MemoryInput,
@@ -104,12 +104,14 @@ class MemoryBackgroundCoordinator:
     def __init__(
         self, *, db_path: str, memory: MemoryService, store: BackgroundJobStore,
         session_service: SessionService, llm_client: Any = None,
-        allow_remote_extraction: bool = False,
+        allow_remote_extraction: bool = True,
         memory_files: MemoryFiles | None = None,
         max_job_tokens: int = 32_768, debounce_seconds: float = 0,
         worker_count: int = 2,
         background_client_name: str | None = None, background_model: str | None = None,
         generation_output_tokens: int = 4096, recovery_output_tokens: int = 8192,
+        extraction_context_messages: int = 12, extraction_context_chars: int = 12_000,
+        auto_publish_min_confidence: float = 0.85,
     ) -> None:
         self.db_path = db_path
         self.memory = memory
@@ -124,6 +126,10 @@ class MemoryBackgroundCoordinator:
         self.generation_output_tokens = generation_output_tokens
         self.recovery_output_tokens = recovery_output_tokens
         self._compaction_state = threading.local()
+        self.learning = ContextualMemoryLearning(
+            memory, session_service, memory_files, context_messages=extraction_context_messages,
+            context_chars=extraction_context_chars, min_confidence=auto_publish_min_confidence,
+        )
         self.worker = BackgroundJobWorker(
             store, {"memory_extract": self._bounded_extract, "context_compact": self._bounded_compact},
             worker_count=worker_count,
@@ -155,6 +161,16 @@ class MemoryBackgroundCoordinator:
             initial_output_tokens=self.generation_output_tokens,
             recovery_output_tokens=self.recovery_output_tokens,
         ) if self.llm_client is not None else None
+
+    def remember_from_context(self, user, *, project_id=None, requested_memory=""):
+        if not self.allow_remote_extraction:
+            return [], "not_saved"
+        with workload_scope("interactive", task_id=f"memory_save:{user.message_id}",
+                            max_tokens=self.max_job_tokens):
+            return self.learning.organize(
+                user, client=self._selected_client(), project_id=project_id,
+                requested_memory=requested_memory,
+            )
 
     def _model_selection(self) -> tuple[str | None, str | None]:
         registry = getattr(self.llm_client, "registry", None)
@@ -489,32 +505,9 @@ class MemoryBackgroundCoordinator:
             return
         completed = self.store.completed_inputs(job["job_id"])
         ids = [message_id for message_id in ids if message_id not in completed]
-        contents: list[str] = []
-        conn = sqlite3.connect(self.db_path, timeout=10)
-        try:
-            for message_id in ids:
-                row = conn.execute(
-                    "SELECT substr(u.content,1,20001),a.payload FROM agent_session_messages a "
-                    "JOIN agent_session_messages u ON u.session_id=a.session_id AND u.role='user' "
-                    "AND json_extract(u.payload,'$.trace_id')=json_extract(a.payload,'$.trace_id') "
-                    "JOIN agent_sessions s ON s.session_id=a.session_id AND s.status='active' "
-                    "JOIN agent_runs r ON r.run_id=json_extract(a.payload,'$.run_id') "
-                    "AND r.session_id=a.session_id AND r.status='completed' "
-                    "WHERE a.message_id=? AND a.session_id=? AND a.role='agent' ORDER BY u.rowid DESC LIMIT 1", (message_id, job["scope_id"]),
-                ).fetchone()
-                if row:
-                    metadata = json.loads(row[1] or "{}")
-                    project_id = metadata.get("memory_project_id")
-                    if project_id and not self.memory.learning_enabled(scope="project", project_id=project_id):
-                        continue
-                if row and len(row[0]) <= 20000 and not extract_user_memories(source_id=message_id, content=row[0]):
-                    contents.append(row[0])
-        finally:
-            conn.close()
         client = self._selected_client()
-        batch_client = BatchedExtractionClient(client, contents) if client is not None else None
         for message_id in ids:
-            self._extract_one({**job, "payload": {"message_id": message_id}}, batch_client)
+            self._extract_one({**job, "payload": {"message_id": message_id}}, client)
             if not self.store.complete_input(job["job_id"], job["lease_owner"], job["lease_epoch"], message_id):
                 return
 
@@ -578,10 +571,16 @@ class MemoryBackgroundCoordinator:
         candidates = extract_user_memories(source_id=user["message_id"], content=user["content"])
         used_local = bool(candidates)
         if not candidates:
-            candidates = extract_user_memories(
-                source_id=user["message_id"], content=user["content"],
-                llm_client=remote_client, allow_remote=self.allow_remote_extraction,
-            )
+            if self.allow_remote_extraction and len(user["content"]) <= 20000:
+                persisted_user = self.session_service.get_turn_user_message(
+                    session_id=answer["session_id"], trace_id=trace_id,
+                )
+                if persisted_user is not None:
+                    self.learning.organize(
+                        persisted_user, client=remote_client, project_id=project_id_for_policy,
+                        publication_lease=(job["job_id"], job["lease_owner"], job["lease_epoch"]),
+                    )
+            return
         if not candidates:
             return
         source_id = self.memory.register_source(MemorySourceInput(
@@ -614,7 +613,7 @@ class MemoryBackgroundCoordinator:
             for scope, project_id in changed_scopes:
                 try:
                     self.memory_files.generate(scope=scope, project_id=project_id)
-                except (MemoryFileError, OSError) as exc:
+                except (MemoryFileError, MemoryFileConflictError, OSError) as exc:
                     # A manually edited view wins; the published database
                     # memory remains visible through local conflict controls.
                     self.last_file_error = type(exc).__name__

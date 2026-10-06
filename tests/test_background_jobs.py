@@ -55,6 +55,20 @@ def test_payload_rejects_sensitive_or_unbounded_data(tmp_path):
         store.enqueue("memory.extract", "s", "k", {"session_id": "s", "other": "x" * 5000})
 
 
+def test_domain_workers_only_claim_registered_kinds(tmp_path):
+    store = make_store(tmp_path)
+    other = add(store)
+    own = store.enqueue("message_analysis", "conversation-1", "range-1", {"start_seq": 1})
+    seen = []
+    worker = BackgroundJobWorker(store, {"message_analysis": lambda job: seen.append(job["job_id"])})
+    assert worker.run_one()
+    assert seen == [own["job_id"]]
+    assert not worker.run_one()
+    assert store.get(other["job_id"])["status"] == "queued"
+    assert not BackgroundJobWorker(store, {}).run_one()
+    assert store.claim("memory-worker", 30, kinds=("memory.extract",))["job_id"] == other["job_id"]
+
+
 def test_enqueue_can_join_callers_atomic_outbox_transaction(tmp_path):
     store = make_store(tmp_path)
     conn = sqlite3.connect(tmp_path / "jobs.sqlite3", isolation_level=None)

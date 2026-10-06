@@ -107,6 +107,7 @@ class ReadFileTool:
 
     spec = ToolSpec(
         name="filesystem.read_file",
+        unrestricted_execution=True,
         package="filesystem",
         type="local_tool",
         description=(
@@ -177,6 +178,7 @@ class EditFileTool:
 
     spec = ToolSpec(
         name="filesystem.edit_file",
+        unrestricted_execution=True,
         package="filesystem",
         type="local_tool",
         description=(

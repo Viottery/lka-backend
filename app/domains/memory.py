@@ -825,8 +825,60 @@ class MemoryService:
         finally:
             conn.close()
 
+    def add_source(self, memory_id: str, *, source_id: str, expected_version: int,
+                   publication_lease: tuple[str, str, int] | None = None,
+                   user_confirmed: bool = False) -> MemoryRecord:
+        """Link equivalent evidence without depending on model paraphrase hashes."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            if publication_lease is not None:
+                self._validate_publication_lease(conn, publication_lease)
+            row = conn.execute("SELECT * FROM memory_entries WHERE memory_id=?", (memory_id,)).fetchone()
+            if row is None:
+                raise KeyError(memory_id)
+            if int(row["version"]) != expected_version:
+                raise MemoryConflictError("Memory changed while reconciling its sources")
+            if row["status"] in {"retracted", "superseded"}:
+                raise MemoryPublicationSuppressed("Cannot revive an inactive memory")
+            payload = MemoryInput(
+                content=row["content"], memory_type=row["memory_type"], scope=row["scope"],
+                project_id=row["project_id"], source_id=source_id, confidence=row["confidence"],
+                sensitivity=row["sensitivity"], expires_at=row["expires_at"],
+                dedupe_key=row["dedupe_key"], metadata=json.loads(row["metadata"]),
+                user_confirmed=user_confirmed,
+            )
+            now = _now()
+            source = conn.execute("SELECT * FROM memory_sources WHERE source_id=?", (source_id,)).fetchone()
+            if source is None or not self._source_valid(source, now):
+                raise MemoryPublicationSuppressed("Reconciliation source is unavailable")
+            self._check_correction_fences(conn, source, payload)
+            linked = conn.execute("SELECT 1 FROM memory_entry_sources WHERE memory_id=? AND source_id=?",
+                                  (memory_id, source_id)).fetchone()
+            promote = user_confirmed and row["status"] == "candidate" and not payload.metadata.get("needs_review")
+            if not linked or promote:
+                self._snapshot(conn, row)
+                conn.execute("INSERT OR IGNORE INTO memory_entry_sources VALUES(?,?)", (memory_id, source_id))
+                conn.execute("UPDATE memory_entries SET version=version+1,updated_at=?,status=? WHERE memory_id=?",
+                             (now, "active" if promote else row["status"], memory_id))
+                self._record_event(conn, memory_id, expected_version + 1,
+                                   "promoted_by_confirmation" if promote else "duplicate_source_linked",
+                                   {"source_id": source_id})
+            if publication_lease is not None:
+                self._validate_publication_lease(conn, publication_lease)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        return self.get(memory_id)
+
     def correct(self, memory_id: str, *, content: str, expected_version: int,
-                source_id: str | None = None, user_confirmed: bool = True) -> MemoryRecord:
+                source_id: str | None = None, user_confirmed: bool = True,
+                publication_lease: tuple[str, str, int] | None = None,
+                metadata: dict[str, Any] | None = None,
+                expires_at: str | None = None, require_active: bool = False) -> MemoryRecord:
         """Create a new version and preserve the old claim as superseded history."""
         content = content.strip()
         if not content:
@@ -834,15 +886,26 @@ class MemoryService:
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
+            if publication_lease is not None:
+                self._validate_publication_lease(conn, publication_lease)
             old = conn.execute("SELECT * FROM memory_entries WHERE memory_id=?", (memory_id,)).fetchone()
             if old is None:
                 raise KeyError(f"Memory not found: {memory_id}")
             if int(old["version"]) != expected_version:
                 raise MemoryConflictError(f"Expected version {expected_version}, found {old['version']}")
+            if require_active and old["status"] != "active":
+                raise MemoryPublicationSuppressed("Reconciliation requires an active target")
+            if publication_lease is not None and old["status"] in {"retracted", "superseded"}:
+                raise MemoryPublicationSuppressed("Cannot revive an inactive memory")
             if source_id:
                 source = conn.execute("SELECT * FROM memory_sources WHERE source_id=?", (source_id,)).fetchone()
                 if source is None or not self._source_valid(source,_now()):
                     raise ValueError("Correction source is unavailable")
+                if publication_lease is not None:
+                    self._check_correction_fences(conn, source, MemoryInput(
+                        content=content, source_id=source_id, scope=old["scope"],
+                        project_id=old["project_id"], metadata=metadata or {},
+                    ))
             old_record = self._record(conn,old)
             self._snapshot(conn,old)
             conn.execute("UPDATE memory_entries SET status='superseded',version=version+1,updated_at=? WHERE memory_id=? AND version=?", (_now(),memory_id,expected_version))
@@ -859,10 +922,13 @@ class MemoryService:
             corrected_metadata = json.loads(old["metadata"])
             for key in ("needs_review", "conflict_ids", "conflict_hints"):
                 corrected_metadata.pop(key, None)
+            corrected_metadata.update(metadata or {})
             conn.execute("""INSERT INTO memory_entries VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (new_id,old["memory_type"],content,old["scope"],old["project_id"],status,old["confidence"],old["sensitivity"],old["expires_at"],dedupe,1,memory_id,old["extraction_model"],_json(corrected_metadata),now,now))
+                (new_id,old["memory_type"],content,old["scope"],old["project_id"],status,old["confidence"],old["sensitivity"],expires_at if metadata is not None else old["expires_at"],dedupe,1,memory_id,old["extraction_model"],_json(corrected_metadata),now,now))
             conn.execute("INSERT INTO memory_entry_sources VALUES(?,?)",(new_id,new_source))
             self._record_event(conn,new_id,1,"created_by_correction",{"supersedes_id":memory_id,"source_id":new_source,"content":content})
+            if publication_lease is not None:
+                self._validate_publication_lease(conn, publication_lease)
             conn.commit()
             return self.get(new_id)
         except Exception:

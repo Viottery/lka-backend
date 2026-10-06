@@ -1,4 +1,6 @@
 .venv/
+.bootstrap/
+.uv-cache/
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -12,7 +14,15 @@ build/
 *.egg-info/
 data/
 *.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+:memory:*
 .env
+.env.*
+!.env.example
+# Only credential-free configuration templates belong in the repository.
+config/*
+!config/*.example.toml
 config/local.toml
 config/secrets*.toml
 config/tokens*.json

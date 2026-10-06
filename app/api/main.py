@@ -12,6 +12,9 @@ from app.api.routes.mail import router as mail_router
 from app.api.routes.matters import router as matters_router
 from app.api.routes.memories import router as memories_router
 from app.api.routes.memory_settings import router as memory_settings_router
+from app.api.routes.message_metadata import router as message_metadata_router
+from app.api.routes.message_reading import router as message_reading_router
+from app.api.routes.messages import router as messages_router
 from app.api.routes.projects import router as projects_router
 from app.api.routes.runtime_debug import router as runtime_debug_router
 from app.api.routes.session_files import router as session_files_router
@@ -58,6 +61,9 @@ def create_app() -> FastAPI:
     app.include_router(session_files_router)
     app.include_router(knowledge_router)
     app.include_router(mail_router)
+    app.include_router(messages_router)
+    app.include_router(message_reading_router)
+    app.include_router(message_metadata_router)
     app.include_router(memories_router)
     app.include_router(memory_settings_router)
     app.include_router(projects_router)
