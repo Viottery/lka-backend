@@ -25,8 +25,11 @@ MESSAGE_ORIGIN_CONSTRAINT = "message_evidence_human_matter"
 
 
 def register_message_constraints(registry: Any) -> None:
-    registry.register_effect_constraint(MESSAGE_ORIGIN_CONSTRAINT, blocked_domains=("matter",),
-                                        block_unrestricted=True, review_path="/messages/matter-proposals")
+    # Old durable source labels remain readable, but never disable a session's
+    # tools. Each invocation is reviewed; source-linked writes still enforce
+    # their domain receipt and human-proposal contract.
+    registry.register_effect_constraint(MESSAGE_ORIGIN_CONSTRAINT, blocked_domains=(),
+                                        block_unrestricted=False)
 
 
 class _MessageReadTool:

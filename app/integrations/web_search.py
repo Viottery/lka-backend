@@ -95,6 +95,15 @@ class BraveSearchAdapter:
             raise WebSearchError("freshness must be pd, pw, pm, or py")
         if country is not None and not re.fullmatch(r"[A-Z]{2}", country):
             raise WebSearchError("country must be a two-letter uppercase country code")
+        if search_lang is not None:
+            search_lang = search_lang.strip().lower().replace("_", "-")
+            # Brave accepts script-specific Chinese codes, not generic ISO `zh`.
+            if search_lang == "zh":
+                search_lang = "zh-hant" if country in {"TW", "HK", "MO"} else "zh-hans"
+            else:
+                search_lang = {"zh-cn": "zh-hans", "zh-sg": "zh-hans",
+                               "zh-tw": "zh-hant", "zh-hk": "zh-hant", "zh-mo": "zh-hant"}.get(
+                                   search_lang, search_lang)
         if search_lang is not None and not re.fullmatch(r"[a-z]{2,8}(?:-[a-z]{2,8})?", search_lang):
             raise WebSearchError("search_lang must be a language code")
         if not self.api_key:

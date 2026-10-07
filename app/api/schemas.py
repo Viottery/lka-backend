@@ -388,6 +388,7 @@ class SafetyReviewResponse(BaseModel):
     child_run_id: str | None = None
     input_fields: list[str] = Field(default_factory=list)
     invocation_fingerprint: str = ""
+    workspace_access: list[str] = Field(default_factory=list)
 
     @classmethod
     def from_record(cls, record: SafetyReviewRecord) -> SafetyReviewResponse:

@@ -32,6 +32,7 @@ class ToolLifecycleState(TypedDict, total=False):
     tool_input: dict[str, Any]
     phase: str
     approved_review_id: str | None
+    approved_paths: list[str]
     result_artifact_ref: dict[str, Any]
     execution_source: str
 
@@ -119,6 +120,7 @@ class AgentToolLifecycleGraph:
             "approved_review_id": (
                 approved_review.review_id if approved_review is not None else None
             ),
+            "approved_paths": list(approved_review.workspace_access) if approved_review is not None else [],
         }
 
     def _execute_tool(self, state: ToolLifecycleState) -> ToolLifecycleState:
@@ -131,6 +133,7 @@ class AgentToolLifecycleGraph:
                 update={
                     "safety_review_approved": True,
                     "safety_review_id": approved_review_id,
+                    "approved_paths": state.get("approved_paths", []),
                 }
             )
         claim = self._claim(state)

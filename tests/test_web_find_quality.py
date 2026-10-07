@@ -106,7 +106,7 @@ def test_registered_find_is_readonly_bounded_and_query_never_leaves_process():
 def test_find_obeys_existing_source_constraint_before_any_network_request():
     requests = []
     registry = ToolRegistry()
-    registry.register_effect_constraint("restricted_source", blocked_domains=(), block_unrestricted=True)
+    registry.register_effect_constraint("restricted_source", blocked_domains=("external_read",), block_unrestricted=True)
     registry.register_tool(WebFindTool(PublicPageFetcher(transport=httpx.MockTransport(
         lambda request: requests.append(request)))))
     executor = ToolExecutor(registry)

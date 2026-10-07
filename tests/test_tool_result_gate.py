@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from app.api.main import create_app
 from app.core.agent_turn import AgentTurnLoop
 from app.core.config import get_settings
+from app.core.safety import SafetyReviewDecision, SafetyReviewMode, SafetyReviewRequest
 from app.core.tool_result_gate import bounded_preview, needs_gate
 from app.core.tools import ToolContext, ToolResult
 
@@ -97,20 +98,36 @@ def test_registered_reader_uses_executor_and_rejects_other_runs(tmp_path, monkey
     )
     assert runtime.tool_registry.get_tool_or_none("observation.read") is not None
     assert runtime.tool_registry.get_tool_or_none("observation.search") is not None
-    result = runtime.tool_executor.execute(
+
+    def reviewed_execute(*, context, **kwargs):
+        review = runtime.agent_run_manager.create_safety_review(SafetyReviewRequest(
+            review_id=f"review-{kwargs['invocation_id']}", run_id=context.run_id,
+            session_id=context.session_id, trace_id="test", invocation_id=kwargs["invocation_id"],
+            tool_name=kwargs["tool_name"], tool_input=kwargs["tool_input"], read_only=True,
+            mode=SafetyReviewMode.SKIP, reason="Test authorizes one cached read", created_at=datetime.now(UTC).isoformat(),
+        ))
+        runtime.agent_run_manager.decide_safety_review(
+            review_id=review.review_id, decision=SafetyReviewDecision.APPROVE,
+            decided_by="test", reason="Explicit read of this run's artifact",
+        )
+        return runtime.tool_executor.execute(context=context.model_copy(update={
+            "safety_review_approved": True, "safety_review_id": review.review_id,
+        }), **kwargs)
+
+    result = reviewed_execute(
         invocation_id="read-gate", tool_name="observation.read",
         tool_input={"artifact_id": "tool_result_gate", "path": "/output/ids", "limit": 5},
         context=ToolContext(session_id="gate-session", run_id=first.run_id),
     )
     assert result.status == "completed"
     assert result.output["items"] == [0, 1, 2, 3, 4]
-    denied = runtime.tool_executor.execute(
+    denied = reviewed_execute(
         invocation_id="read-other", tool_name="observation.read",
         tool_input={"artifact_id": "tool_result_gate"},
         context=ToolContext(session_id="gate-session", run_id=second.run_id),
     )
     assert denied.status == "rejected"
-    found = runtime.tool_executor.execute(
+    found = reviewed_execute(
         invocation_id="search-gate", tool_name="observation.search",
         tool_input={"artifact_id": "tool_result_gate", "query": "not in numeric results"},
         context=ToolContext(session_id="gate-session", run_id=first.run_id),
@@ -124,14 +141,14 @@ def test_registered_reader_uses_executor_and_rejects_other_runs(tmp_path, monkey
         payload={"output": {"rows": [{"team": "a"}, {"team": "a"}, {"team": "b"}]}},
         summary="group test", created_at=datetime.now(UTC).isoformat(),
     )
-    grouped = runtime.tool_executor.execute(
+    grouped = reviewed_execute(
         invocation_id="group-gate", tool_name="observation.group",
         tool_input={"artifact_id": "tool_result_groups", "path": "/output/rows", "field": "team"},
         context=ToolContext(session_id="gate-session", run_id=first.run_id),
     )
     assert grouped.status == "completed"
     assert [group["count"] for group in grouped.output["groups"]] == [2, 1]
-    denied_group = runtime.tool_executor.execute(
+    denied_group = reviewed_execute(
         invocation_id="group-other", tool_name="observation.group",
         tool_input={"artifact_id": "tool_result_groups", "path": "/output/rows", "field": "team"},
         context=ToolContext(session_id="gate-session", run_id=second.run_id),

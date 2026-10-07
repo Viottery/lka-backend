@@ -14,6 +14,7 @@ from typing import Any
 
 from app.core.tools import ToolContext, ToolInvocation, ToolPackageSpec, ToolResult, ToolSpec
 from app.platform.commands import IS_WINDOWS, SHELL_NAME, run_sync, start_terminal
+from app.platform.workspace_access import approved_path, require_child_path_scope
 
 DEFAULT_SYNC_TIMEOUT_SECONDS = 30
 MAX_SYNC_TIMEOUT_SECONDS = 300
@@ -69,7 +70,7 @@ BASH_PACKAGE = ToolPackageSpec(
     ],
     decision_hints=[
         ("The actual shell is Windows PowerShell 5.1. Use PowerShell syntax (Get-Location, Get-ChildItem, Get-Content, Select-String); environment variables use $env:WORKSPACE_ROOT. Bash scripts and Unix command options are not supported." if IS_WINDOWS else "The actual shell is bash. Prefer read-only commands first, such as pwd, printenv, ls, find, rg, grep, cat, sed, head, tail, wc, git status, git diff, git log, and git show."),
-        "Commands outside the read-only whitelist are treated as non-read-only and must pass safety review.",
+        "Every invocation passes the configured safety review. The read-only whitelist classifies command risk; it does not bypass review.",
         "Read-only classification also checks arguments and shell expansion. Writing options, process hooks, arbitrary programs and executable paths require review; use literal quoted patterns and quoted workspace-root variables for inspection.",
         "Use mode=background for long-running or interactive commands, then poll with bash.read_session.",
         "Use bash.write_session to send stdin to a background terminal, bash.interrupt_session for Ctrl-C, and bash.terminate_session to stop it.",
@@ -101,7 +102,7 @@ class BashAccessPolicy:
             raise PermissionError("session workspace is outside allowed workspace roots")
         return BashAccessPolicy(roots=[root])
 
-    def resolve_cwd(self, cwd_value: str | None) -> Path:
+    def resolve_cwd(self, cwd_value: str | None, *, allow_outside: bool = False) -> Path:
         if cwd_value and cwd_value.strip():
             path = Path(self.expand_workspace_variables(cwd_value)).expanduser()
             if not path.is_absolute():
@@ -109,7 +110,7 @@ class BashAccessPolicy:
             resolved = path.resolve(strict=False)
         else:
             resolved = self.default_root
-        if not self._is_allowed(resolved):
+        if not self._is_allowed(resolved) and not allow_outside:
             allowed = ", ".join(root.as_posix() for root in self.roots)
             raise PermissionError(f"cwd is outside allowed workspace roots: {allowed}")
         if not resolved.exists():
@@ -117,6 +118,9 @@ class BashAccessPolicy:
         if not resolved.is_dir():
             raise ValueError(f"cwd is not a directory: {resolved}")
         return resolved
+
+    def is_allowed(self, path: Path) -> bool:
+        return self._is_allowed(path.resolve(strict=False))
 
     @property
     def default_root(self) -> Path:
@@ -321,7 +325,7 @@ class BashRunTool:
         description=(
             f"Run a native {SHELL_NAME} command in sync or background mode. The command is classified "
             "per invocation as read_only only for whitelisted commands with safe arguments; "
-            "otherwise it is non-read-only and requires safety review."
+            "otherwise it is non-read-only. Every invocation requires the configured safety review."
         ),
         risk="high",
         requires_confirmation=False,
@@ -361,6 +365,16 @@ class BashRunTool:
     def is_read_only_invocation(self, tool_input: dict[str, Any]) -> bool:
         return is_read_only_command(str(tool_input.get("command") or ""))
 
+    def workspace_access_request(self, tool_input: dict[str, Any], context: ToolContext) -> list[str]:
+        """Return an out-of-root cwd for review; command operands are not fenced."""
+        try:
+            policy = self.policy.for_session_workspace(context.workspace_root)
+            cwd = policy.resolve_cwd(tool_input.get("cwd"), allow_outside=True)
+            require_child_path_scope(cwd, context)
+        except (OSError, ValueError, PermissionError):
+            return []
+        return [] if policy.is_allowed(cwd) else [str(cwd)]
+
     def invoke(self, *, invocation: ToolInvocation, context: ToolContext) -> ToolResult:
         if (
             _child_run_id(context) is not None
@@ -383,7 +397,12 @@ class BashRunTool:
             if not command.strip():
                 raise ValueError("command is required.")
             policy = self.policy.for_session_workspace(context.workspace_root)
-            cwd = policy.resolve_cwd(invocation.input.get("cwd"))
+            cwd = policy.resolve_cwd(invocation.input.get("cwd"), allow_outside=True)
+            require_child_path_scope(cwd, context)
+            if not policy.is_allowed(cwd):
+                canonical = cwd.expanduser().resolve(strict=False)
+                if canonical != cwd or not approved_path(canonical, context):
+                    raise PermissionError("cwd is outside allowed workspace roots and was not approved for this invocation")
             if mode == "background":
                 payload = self._run_background(
                     command=command,

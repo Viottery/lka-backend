@@ -128,6 +128,7 @@ class ToolContext(BaseModel):
     workspace_root: str | None = None
     safety_review_approved: bool = False
     safety_review_id: str | None = None
+    approved_paths: list[str] = Field(default_factory=list)
     tool_view: ToolView | None = None
     run_id: str | None = None
 
@@ -200,6 +201,22 @@ def effective_tool_read_only(tool: Tool, tool_input: dict[str, Any]) -> bool | N
     return tool.spec.read_only
 
 
+def effective_tool_effect_domains(tool: Tool, tool_input: dict[str, Any]) -> set[str]:
+    """Registered tools may narrow their declared effects for local-only inputs."""
+    declared = set(tool.spec.effect_domains)
+    classifier = getattr(tool, "effect_domains_for_invocation", None)
+    if callable(classifier):
+        try:
+            domains = classifier(tool_input)
+            if isinstance(domains, (tuple, list, set, frozenset)) and all(
+                isinstance(domain, str) and domain in declared for domain in domains
+            ):
+                return set(domains)
+        except Exception:  # noqa: BLE001 - classification failure retains all declared effects.
+            return declared
+    return declared
+
+
 class ToolExecutor:
     """Execute registered tools and normalize failures into ToolResult."""
 
@@ -242,13 +259,27 @@ class ToolExecutor:
                 return True
         return False
 
-    def _effect_denial(self, tool: Tool, context: ToolContext) -> dict[str, Any] | None:
-        for constraint_id in self.constraint_store.get(self._constraint_subjects(context)):
+    def _effect_denial(self, tool: Tool, context: ToolContext, tool_input: dict[str, Any]) -> dict[str, Any] | None:
+        domains = effective_tool_effect_domains(tool, tool_input)
+        for constraint_id in sorted(self.constraint_store.get(self._constraint_subjects(context))):
             policy = self.registry.effect_constraints.get(constraint_id)
-            if policy is None or bool(set(tool.spec.effect_domains) & set(policy["blocked_domains"])) or (
-                tool.spec.unrestricted_execution and policy["block_unrestricted"]
-            ):
-                return {"human_review_required": True, "review_path": policy["review_path"] if policy else ""}
+            blocked = domains & set(policy["blocked_domains"]) if policy else set()
+            unrestricted = bool(policy and tool.spec.unrestricted_execution and policy["block_unrestricted"])
+            if policy is None or blocked or unrestricted:
+                review_path = policy["review_path"] if policy and blocked and not unrestricted else ""
+                reason = "unknown_source_policy" if policy is None else (
+                    "unrestricted_execution_blocked" if unrestricted else "effect_domain_blocked"
+                )
+                output = {
+                    "source_constraint_denial": {
+                        "constraint_id": constraint_id, "reason": reason,
+                        "blocked_effect_domains": sorted(blocked), "retryable": False,
+                    },
+                    "human_review_required": bool(review_path),
+                }
+                if review_path:
+                    output["review_path"] = review_path
+                return output
         return None
 
     def execute(
@@ -318,12 +349,16 @@ class ToolExecutor:
             )
         subjects = self._constraint_subjects(context)
         # Unknown persisted policies fail closed rather than disappear on upgrade.
-        denial = self._effect_denial(tool, context)
+        denial = self._effect_denial(tool, context, tool_input)
         if denial:
             return ToolResult(invocation_id=invocation_id, tool_name=tool_name, status="rejected",
-                              error="Source-derived actions require the dedicated human review workflow.", output=denial,
+                              error=("Source-derived actions require the dedicated human review workflow."
+                                     if denial["human_review_required"] else
+                                     "Tool capability is blocked by a persisted source constraint."), output=denial,
                               execution_started=False)
-        if read_only is not True and not context.safety_review_approved:
+        access_request = getattr(tool, "workspace_access_request", None)
+        requested_paths = access_request(tool_input, context) if callable(access_request) else []
+        if (context.run_id or read_only is not True or requested_paths) and not context.safety_review_approved:
             return ToolResult(
                 invocation_id=invocation_id,
                 tool_name=tool_name,
@@ -334,9 +369,19 @@ class ToolExecutor:
                     "risk": tool.spec.risk,
                     "side_effects": tool.spec.side_effects,
                 },
-                error="Non-read-only tools require an approved safety review.",
+                error="Agent tool calls require an approved safety review.",
                 execution_started=False,
             )
+        if context.run_id:
+            review = (self.run_manager.get_safety_review(context.safety_review_id)
+                      if self.run_manager and context.safety_review_id else None)
+            if (review is None or review.status.value != "approved"
+                    or review.invocation_id != invocation_id or review.tool_name != tool_name
+                    or review.tool_input != tool_input or review.session_id != context.session_id
+                    or review.run_id != context.run_id or review.workspace_root != context.workspace_root):
+                return ToolResult(invocation_id=invocation_id, tool_name=tool_name, status="rejected",
+                                  error="Safety approval does not match this invocation.", execution_started=False)
+            context = context.model_copy(update={"approved_paths": list(review.workspace_access)})
         guard_failure = self._run_guard(context=context, tool_view=tool_view)
         if guard_failure is not None:
             return ToolResult(
@@ -385,10 +430,12 @@ class ToolExecutor:
                         error=failure,
                         execution_started=False,
                     )
-                denial = self._effect_denial(tool, context)
+                denial = self._effect_denial(tool, context, tool_input)
                 if denial:
                     return ToolResult(invocation_id=invocation_id, tool_name=tool_name, status="rejected",
-                                      error="Source-derived actions require the dedicated human review workflow.", output=denial,
+                                      error=("Source-derived actions require the dedicated human review workflow."
+                                             if denial["human_review_required"] else
+                                             "Tool capability is blocked by a persisted source constraint."), output=denial,
                                       execution_started=False)
                 # Commit before exposing source data, including streams/errors. Never
                 # trust a model-provided output field to grant or clear this constraint.

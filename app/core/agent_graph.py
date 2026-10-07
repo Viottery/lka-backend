@@ -987,6 +987,9 @@ class AgentGraphRunner:
                     ws.pending_decision = {}
                     return self._save(s, ws, data, "operation_rejected")
             return self._save(s, ws, data, "operation_answer")
+        if action in {"request_confirmation", "no_op"}:
+            ws.terminal_answer = self.turn_loop._control_stop_answer(x)
+            return self._save(s, ws, data, "operation_answer")
         if action != "call_tool":
             ws.terminal_reason = (
                 x.get("reason")
@@ -1297,6 +1300,7 @@ class AgentGraphRunner:
         answer = (
             self.turn_loop._unresolved_multi_agent_answer()
             if self.turn_loop._multi_agent_replan_pending(ws.run_id)
+            else ws.terminal_answer if ws.pending_decision.get("action") in {"request_confirmation", "no_op"}
             else (
                 self.turn_loop._answer_from_context_with_llm(
                     user_input=ws.user_input,

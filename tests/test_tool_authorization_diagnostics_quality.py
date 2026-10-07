@@ -8,6 +8,7 @@ import pytest
 from app.core.agent_runs import InMemoryAgentRunManager
 from app.core.context_driver import ToolView
 from app.core.multi_agent import SideEffectLevel
+from app.core.safety import SafetyReviewDecision, SafetyReviewMode, SafetyReviewRequest
 from app.core.tools import ToolContext, ToolExecutor, ToolRegistry, ToolResult, ToolSpec
 
 
@@ -158,7 +159,9 @@ def test_legal_read_still_cannot_bypass_user_source_constraint():
     before = frozen.model_dump(mode="json")
     rejected = invoke(executor, frozen, {"mode": "read"})
     assert rejected.status == "rejected" and rejected.execution_started is False
-    assert rejected.output["human_review_required"] is True
+    assert rejected.output["human_review_required"] is False
+    assert rejected.output["source_constraint_denial"]["reason"] == "unrestricted_execution_blocked"
+    assert "review_path" not in rejected.output
     assert "authorization_denial" not in rejected.output
     assert "retry_within_existing_grant" not in rejected.output
     assert tool.calls == 0 and frozen.model_dump(mode="json") == before
@@ -170,11 +173,18 @@ def test_legal_read_still_cannot_bypass_cancelled_run():
     manager = InMemoryAgentRunManager()
     run = manager.create_run(session_id="sample", user_input="Read evidence")
     manager.mark_running(run.run_id)
+    approval = manager.create_safety_review(SafetyReviewRequest(
+        review_id="cancelled-read-review", run_id=run.run_id, session_id="sample",
+        trace_id=run.trace_id, invocation_id="inv", tool_name="sample.action",
+        tool_input={"mode": "read"}, read_only=True, mode=SafetyReviewMode.SKIP,
+        reason="Approve this scoped read before cancellation", created_at=run.created_at))
+    manager.decide_safety_review(review_id=approval.review_id, decision=SafetyReviewDecision.APPROVE,
+                                decided_by="test", reason="Read-only inspection")
     manager.request_cancel(run.run_id, reason="stop")
     executor.run_manager = manager
     frozen = view()
     before = frozen.model_dump(mode="json")
-    rejected = invoke(executor, frozen, {"mode": "read"}, run_id=run.run_id)
+    rejected = invoke(executor, frozen, {"mode": "read"}, run_id=run.run_id, safety_review_id=approval.review_id)
     assert rejected.status == "rejected" and rejected.execution_started is False
     assert "cancelled or terminal" in rejected.error
     assert "authorization_denial" not in rejected.output

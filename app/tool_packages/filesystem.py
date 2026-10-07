@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from app.core.tools import ToolContext, ToolInvocation, ToolPackageSpec, ToolResult, ToolSpec
-
+from app.platform.workspace_access import approved_path, is_path_within, require_child_path_scope
 
 DEFAULT_READ_MAX_LINES = 200
 DEFAULT_READ_MAX_BYTES = 32_768
@@ -23,8 +23,8 @@ MAX_EDIT_FILE_BYTES = 1_000_000
 FILESYSTEM_PACKAGE = ToolPackageSpec(
     name="filesystem",
     description=(
-        "Read and edit specific text files inside configured workspace roots. "
-        "Relative paths resolve inside the first configured workspace root. This package "
+        "Read and edit specific text files, using the session workspace as the default root. "
+        "An outside-workspace target requires exact-path approval for that invocation. This package "
         "is for explicit file access, not workspace indexing, search, or summaries."
     ),
     risk="medium",
@@ -37,6 +37,7 @@ FILESYSTEM_PACKAGE = ToolPackageSpec(
     decision_hints=[
         "Read a file before editing it so you can provide expected_sha256.",
         "Use relative paths from the default workspace root, or the injected $workspace_root variable.",
+        "For an outside-workspace file, provide its path; the normal per-call review evaluates that exact target.",
         "Use edit_file for targeted old_text to new_text replacements only.",
         "If old_text is not unique, read more context and retry with a longer unique snippet.",
         "Do not use edit_file to create new files or replace large files wholesale.",
@@ -64,7 +65,7 @@ class FileAccessPolicy:
             raise PermissionError("session workspace is outside allowed workspace roots")
         return FileAccessPolicy(roots=[root])
 
-    def resolve(self, path_value: str) -> Path:
+    def resolve(self, path_value: str, *, allow_outside: bool = False) -> Path:
         if not path_value.strip():
             raise ValueError("path is required.")
         path = Path(self.expand_workspace_variables(path_value)).expanduser()
@@ -72,9 +73,14 @@ class FileAccessPolicy:
             path = self.default_root / path
         resolved = path.resolve(strict=False)
         if not self._is_allowed(resolved):
+            if allow_outside:
+                return resolved
             allowed = ", ".join(root.as_posix() for root in self.roots)
             raise PermissionError(f"path is outside allowed workspace roots: {allowed}")
         return resolved
+
+    def is_allowed(self, path: Path) -> bool:
+        return self._is_allowed(path.resolve(strict=False))
 
     @property
     def default_root(self) -> Path:
@@ -105,6 +111,9 @@ class ReadFileTool:
     def __init__(self, policy: FileAccessPolicy) -> None:
         self.policy = policy
 
+    def workspace_access_request(self, tool_input: dict[str, Any], context: ToolContext) -> list[str]:
+        return workspace_access_request(tool_input, context, self.policy)
+
     spec = ToolSpec(
         name="filesystem.read_file",
         unrestricted_execution=True,
@@ -112,7 +121,8 @@ class ReadFileTool:
         type="local_tool",
         description=(
             "Read a bounded UTF-8 text file slice by path. Returns line metadata, "
-            "truncation status, and full-file sha256 for later edit_file calls."
+            "truncation status, and full-file sha256 for later edit_file calls. "
+            "An outside-workspace path requires approval for this invocation."
         ),
         risk="low",
         requires_confirmation=False,
@@ -148,8 +158,9 @@ class ReadFileTool:
         try:
             policy = self.policy.for_session_workspace(context.workspace_root)
             requested_path = str(invocation.input.get("path") or "")
-            resolved = policy.resolve(requested_path)
+            resolved = policy.resolve(requested_path, allow_outside=True)
             _require_child_path_scope(resolved, context)
+            _require_approved_external_path(resolved, policy, context)
             payload = read_file_slice(
                 path=resolved,
                 requested_path=requested_path,
@@ -176,6 +187,9 @@ class EditFileTool:
     def __init__(self, policy: FileAccessPolicy) -> None:
         self.policy = policy
 
+    def workspace_access_request(self, tool_input: dict[str, Any], context: ToolContext) -> list[str]:
+        return workspace_access_request(tool_input, context, self.policy)
+
     spec = ToolSpec(
         name="filesystem.edit_file",
         unrestricted_execution=True,
@@ -183,7 +197,8 @@ class EditFileTool:
         type="local_tool",
         description=(
             "Apply targeted old_text to new_text replacements to an existing UTF-8 text file. "
-            "Requires expected_sha256 from read_file and requires each old_text to match exactly once by default."
+            "Requires expected_sha256 from read_file and requires each old_text to match exactly once by default. "
+            "An outside-workspace path requires approval for this invocation."
         ),
         risk="medium",
         requires_confirmation=False,
@@ -226,8 +241,9 @@ class EditFileTool:
         try:
             policy = self.policy.for_session_workspace(context.workspace_root)
             requested_path = str(invocation.input.get("path") or "")
-            resolved = policy.resolve(requested_path)
+            resolved = policy.resolve(requested_path, allow_outside=True)
             _require_child_path_scope(resolved, context)
+            _require_approved_external_path(resolved, policy, context)
             payload = edit_file(
                 path=resolved,
                 requested_path=requested_path,
@@ -252,20 +268,32 @@ class EditFileTool:
 def _require_child_path_scope(path: Path, context: ToolContext) -> None:
     """Recheck the snapshot path ceiling even when the base policy is broader."""
 
-    view = context.tool_view
-    if view is None or view.child_run_id is None:
-        return
-    allowed = tuple(Path(value).expanduser().resolve(strict=False) for value in view.allowed_paths)
-    if not allowed or not any(_is_path_within(path, root) for root in allowed):
-        raise PermissionError("path is outside the child ContextSnapshot workspace scope")
+    require_child_path_scope(path, context)
 
 
-def _is_path_within(path: Path, root: Path) -> bool:
+def workspace_access_request(tool_input: dict[str, Any], context: ToolContext, policy: FileAccessPolicy) -> list[str]:
+    """Return canonical out-of-root targets for executor review without reading them."""
+
     try:
-        path.resolve(strict=False).relative_to(root.resolve(strict=False))
-        return True
-    except ValueError:
-        return False
+        active = policy.for_session_workspace(context.workspace_root)
+        target = active.resolve(str(tool_input.get("path") or ""), allow_outside=True)
+        _require_child_path_scope(target, context)
+    except (OSError, ValueError, PermissionError):
+        return []
+    return [] if active.is_allowed(target) else [str(target)]
+
+
+def _require_approved_external_path(path: Path, policy: FileAccessPolicy, context: ToolContext) -> None:
+    active_policy = policy.for_session_workspace(context.workspace_root)
+    if active_policy.is_allowed(path):
+        return
+    # Re-resolve immediately before use so a symlink retarget invalidates the grant.
+    canonical = path.expanduser().resolve(strict=False)
+    if canonical != path or not approved_path(canonical, context):
+        raise PermissionError("path is outside allowed workspace roots and was not approved for this invocation")
+
+
+_is_path_within = is_path_within
 
 
 def read_file_slice(

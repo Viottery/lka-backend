@@ -3,9 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 
 from app.core.config import get_settings
-from app.core.runtime import LocalKnowledgeAgentRuntime
 from app.core.context_driver import ToolView
 from app.core.multi_agent import SideEffectLevel
+from app.core.runtime import LocalKnowledgeAgentRuntime
 from app.core.tools import ToolContext
 
 
@@ -100,8 +100,9 @@ def test_filesystem_read_rejects_paths_outside_workspace(tmp_path, monkeypatch):
         context=ToolContext(session_id="session_filesystem"),
     )
 
-    assert result.status == "failed"
-    assert "outside allowed workspace roots" in (result.error or "")
+    assert result.status == "rejected"
+    assert result.output["safety_review_required"] is True
+    assert result.execution_started is False
 
 
 def test_filesystem_tool_executor_rejects_paths_outside_narrow_child_scope(tmp_path, monkeypatch):

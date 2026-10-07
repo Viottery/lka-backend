@@ -190,6 +190,39 @@ def test_search_freshness_and_bad_provider_payload():
         adapter.search("tickets", mode="news", freshness="pw", country="DE", search_lang="de")
 
 
+@pytest.mark.parametrize("mode", ["web", "news"])
+@pytest.mark.parametrize("language,country,expected", [
+    ("zh", "CN", "zh-hans"), ("zh", None, "zh-hans"),
+    ("zh", "TW", "zh-hant"), ("zh", "HK", "zh-hant"), ("zh", "MO", "zh-hant"),
+    ("zh-CN", "US", "zh-hans"), ("zh_SG", None, "zh-hans"),
+    ("zh-TW", "CN", "zh-hant"), ("zh-HK", None, "zh-hant"), ("zh-MO", None, "zh-hant"),
+    ("zh-Hans", "TW", "zh-hans"), ("zh-hant", "CN", "zh-hant"), ("de", "DE", "de"),
+])
+def test_brave_normalizes_chinese_language_before_single_request(mode, language, country, expected):
+    calls = []
+
+    def respond(request):
+        calls.append(request)
+        assert request.url.params["search_lang"] == expected
+        return httpx.Response(200, json={"web": {"results": []}} if mode == "web" else {"results": []})
+
+    output = BraveSearchAdapter("test-key", transport=httpx.MockTransport(respond)).search(
+        "public guide", mode=mode, search_lang=language, country=country,
+    )
+    assert len(calls) == 1 and output["search_lang"] == expected
+
+
+def test_invalid_language_does_not_consume_quota_or_make_request():
+    class Quota:
+        def reserve(self):
+            pytest.fail("Invalid language consumed search quota")
+
+    adapter = BraveSearchAdapter("test-key", quota=Quota(), transport=httpx.MockTransport(
+        lambda request: pytest.fail("Invalid language reached provider")))
+    with pytest.raises(WebSearchError, match="language code"):
+        adapter.search("public guide", search_lang="zh-hans&unsafe=true")
+
+
 def test_monthly_search_quota_persists_and_blocks_before_network(tmp_path):
     db_path = get_db_path(tmp_path / "data")
     quota = BraveSearchQuota(lambda: connect(db_path), monthly_limit=1)

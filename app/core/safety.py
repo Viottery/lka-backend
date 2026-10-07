@@ -41,6 +41,11 @@ class SafetyReviewRequest(BaseModel):
     invocation_id: str
     tool_name: str
     tool_input: dict[str, Any] = Field(default_factory=dict)
+    # Local audit context, never reconstructed from model-visible source text.
+    user_request: str = ""
+    workspace_access: list[str] = Field(default_factory=list)
+    workspace_root: str | None = None
+    unrestricted_execution: bool = False
     tool_risk: str = "low"
     side_effects: list[str] = Field(default_factory=list)
     read_only: bool | None = None

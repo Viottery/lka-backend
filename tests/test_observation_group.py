@@ -194,4 +194,5 @@ def test_validates_arguments_and_enforces_current_run_child_scope(tmp_path):
         tool_input={**base, "limit": 21}, context=ToolContext(session_id="session-1", run_id="run-1"),
     )
     assert executor_result.status == "rejected"
-    assert "limit" in (executor_result.error or "")
+    assert executor_result.output["safety_review_required"] is True
+    assert executor_result.execution_started is False

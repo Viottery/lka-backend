@@ -886,7 +886,7 @@ class InMemoryAgentRunManager:
         self.append_event(
             review.run_id,
             "safety_review_decided",
-            f"Safety review {review.status.value}.",
+            f"Safety review {review.status.value}: {review.decision_reason or review.reason}",
             stage="safety_review",
             payload={"review": review.model_dump(mode="json")},
         )
@@ -1051,7 +1051,7 @@ class InMemoryAgentRunManager:
             sequence=0,
             type="safety_review_decided",
             stage="safety_review",
-            message=f"Safety review {review.status.value}.",
+            message=f"Safety review {review.status.value}: {review.decision_reason or review.reason}",
             payload={"review": review.model_dump(mode="json")},
             created_at=_now_iso(),
         )

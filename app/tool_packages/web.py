@@ -82,6 +82,14 @@ _PAGE_REFERENCE_FIELDS = {
 class _WebResourceContract:
     """Backend-owned source routes; cached text cannot grant capabilities."""
 
+    def effect_domains_for_invocation(self, tool_input: dict) -> tuple[str, ...]:
+        """Fixed snapshot/search-ID continuation does not perform network I/O."""
+        identity = "search_id" if self.spec.name == "web.search" else "snapshot_id"
+        network_fields = ("query",) if identity == "search_id" else ("url", "ref_id")
+        if tool_input.get(identity) and not any(tool_input.get(key) for key in network_fields):
+            return ()
+        return self.spec.effect_domains
+
     def context_resource(self, *, tool_input, result):
         if result.get("status") != "completed":
             return None
@@ -127,7 +135,7 @@ class WebSearchTool(_WebResourceContract):
         name="web.search", package="web", type="local_tool",
         output_preview_priority_fields=["results", "search_id", "query", "mode", "result_count",
                                         "possible_more", "queried_at", "cache_hit"],
-        unrestricted_execution=True,
+        effect_domains=("external_read",),
         description="Search public web/news with query, or locally reread a saved search_id (omit query/filter fields). Compact snippets by default; view=full restores saved provider snippets. No result-page fetch or summary model call. Candidates are not verified facts.",
         risk="low", requires_confirmation=False, read_only=True,
         side_effects=["external_read"],
@@ -147,7 +155,8 @@ class WebSearchTool(_WebResourceContract):
             "limit": {"type": "integer", "minimum": 1, "maximum": 10},
             "freshness": {"type": "string", "allowed_values": ["pd", "pw", "pm", "py"]},
             "country": {"type": "string", "minLength": 2, "maxLength": 2},
-            "search_lang": {"type": "string", "minLength": 2, "maxLength": 17},
+            "search_lang": {"type": "string", "minLength": 2, "maxLength": 17,
+                            "description": "Content language, e.g. en, de, zh-hans or zh-hant. Generic zh defaults to Simplified, or Traditional for country TW/HK/MO; common zh region aliases are normalized."},
         }},
         output_schema={"query": "string", "mode": "string", "results": "array", "result_count": "integer",
                        "possible_more": "boolean"},
@@ -161,6 +170,7 @@ class WebSearchTool(_WebResourceContract):
         try:
             if self.resources is not None:
                 output = self.resources.search(self.adapter, invocation.input, context)
+                output["untrusted_data"] = True
                 return ToolResult(invocation_id=invocation.invocation_id, tool_name=self.spec.name,
                                   status="completed", output=output)
             output = self.adapter.search(
@@ -175,7 +185,7 @@ class WebSearchTool(_WebResourceContract):
             return ToolResult(invocation_id=invocation.invocation_id, tool_name=self.spec.name,
                               status="failed", error=str(exc))
         return ToolResult(invocation_id=invocation.invocation_id, tool_name=self.spec.name,
-                          status="completed", output=output)
+                          status="completed", output={**output, "untrusted_data": True})
 
 
 class WebOpenTool(_WebResourceContract):
@@ -185,7 +195,7 @@ class WebOpenTool(_WebResourceContract):
 
     spec = ToolSpec(
         name="web.open", package="web", type="local_tool",
-        unrestricted_execution=True,
+        effect_domains=("external_read",),
         output_preview_max_string_chars=1200,
         output_preview_text_mode="contiguous_pages",
         output_preview_priority_fields=["text", "excerpts", "snapshot_id", "text_sha256", "url",
@@ -251,7 +261,7 @@ class WebOpenTool(_WebResourceContract):
             return ToolResult(invocation_id=invocation.invocation_id, tool_name=self.spec.name,
                               status="failed", error=str(exc))
         return ToolResult(invocation_id=invocation.invocation_id, tool_name=self.spec.name,
-                          status="completed", output=output)
+                          status="completed", output={**output, "untrusted_data": True})
 
 
 class WebFindTool(_WebResourceContract):
@@ -261,7 +271,7 @@ class WebFindTool(_WebResourceContract):
         output_preview_priority_fields=["matches", "recovery_preview", "snapshot_id", "text_sha256",
                                         "url", "query", "offset", "total_chars", "has_more",
                                         "next_offset", "complete", "fetched_at"],
-        unrestricted_execution=True,
+        effect_domains=("external_read",),
         description=(
             "Provide exactly one URL, search ref_id, or snapshot_id. Find a case-insensitive literal in full readable text, "
             "including beyond web.open's first 20k characters. Returns bounded matching snippets "
@@ -348,7 +358,7 @@ class WebFindTool(_WebResourceContract):
             return ToolResult(invocation_id=invocation.invocation_id, tool_name=self.spec.name,
                               status="failed", error=str(exc))
         return ToolResult(invocation_id=invocation.invocation_id, tool_name=self.spec.name,
-                          status="completed", output=output)
+                          status="completed", output={**output, "untrusted_data": True})
 
 
 def register_web_tools(registry, *, api_key: str | None, quota: BraveSearchQuota | None = None,

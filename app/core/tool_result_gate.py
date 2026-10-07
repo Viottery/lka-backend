@@ -7,8 +7,11 @@ from datetime import UTC, datetime
 from itertools import islice
 from typing import Any
 
+from app.core.external_content_gate import inspect_external_content
+
 _DELIVERY_LIMIT = 24
 _DELIVERY_WALK_LIMIT = 256
+_PREVIEW_TOTAL_CHAR_LIMIT = 7_000
 _MISSING = object()
 
 
@@ -384,7 +387,7 @@ def preview_text_fields(value: Any, *, max_string_chars: int = 700, text_mode: s
             return [visit(child, pointer(path, index), depth + 1) for index, child in enumerate(item)]
         return item
 
-    return visit(value, "", 0)
+    return _with_external_content_warning(value, visit(value, "", 0))
 
 
 def bounded_preview(value: Any, *, max_string_chars: int = 700,
@@ -396,19 +399,20 @@ def bounded_preview(value: Any, *, max_string_chars: int = 700,
     if (not isinstance(output_priority_fields, (tuple, list)) or len(output_priority_fields) > 16
         or any(not isinstance(key, str) or not 0 < len(key) <= 64 for key in output_priority_fields)):
         raise ValueError("registered preview priorities must be at most 16 bounded output fields")
+    finding = inspect_external_content(value)
     result = preview(value, max_string_chars=max_string_chars,
                      output_priority_fields=output_priority_fields, text_mode=text_mode)
-    if len(json.dumps(result, ensure_ascii=False, default=str)) <= 7_000:
-        return result
-    if output_priority_fields:
-        # Drop diagnostics before evidence, then page fewer records. Never raise
-        # the overall cap or slice serialized JSON into an unusable fragment.
-        for max_items in (4, 3, 2, 1):
-            result = preview(value, max_string_chars=max_string_chars,
-                             output_priority_fields=output_priority_fields,
-                             max_items=max_items, priority_only=True, text_mode=text_mode)
-            if len(json.dumps(result, ensure_ascii=False, default=str)) <= 7_000:
-                return result
+    if _preview_fits(result, finding):
+        return _with_external_content_warning(value, result, finding=finding)
+    # Reserve warning space while reducing visible list items. Preserve the
+    # existing structural projection and resource paths so the remainder stays
+    # available through the normal cache/read route.
+    for max_items in (4, 3, 2, 1):
+        result = preview(value, max_string_chars=max_string_chars,
+                         output_priority_fields=output_priority_fields,
+                         max_items=max_items, priority_only=bool(output_priority_fields), text_mode=text_mode)
+        if _preview_fits(result, finding):
+            return _with_external_content_warning(value, result, finding=finding)
     # Adversarially wide/nested output must not evict the cache handle itself.
     if isinstance(value, dict):
         fallback = {
@@ -424,12 +428,56 @@ def bounded_preview(value: Any, *, max_string_chars: int = 700,
         }
         # Never truncate a pointer into a different address. The root remains
         # readable by object pagination when an individual key is too long.
-        while len(json.dumps(fallback, ensure_ascii=False, default=str)) > 7_000:
+        while not _preview_fits(fallback, finding):
             fallback["fields"].pop()
             fallback["omitted_keys"] += 1
-        return fallback
-    return {"_type": type(value).__name__, "path": "",
-            "size": len(value) if isinstance(value, (str, list)) else None}
+        return _with_external_content_warning(value, fallback, finding=finding)
+    return _with_external_content_warning(value, {"_type": type(value).__name__, "path": "",
+            "size": len(value) if isinstance(value, (str, list)) else None}, finding=finding)
+
+
+def external_content_findings(value: Any) -> dict[str, Any]:
+    """Inspect raw result content before compaction; never mutate or replace it."""
+    return inspect_external_content(value) or {
+        "risk": "unknown", "signals": [], "scan_complete": False,
+        "scanned_chars": 0, "visited_nodes": 0,
+    }
+
+
+def _serialized_size(value: Any) -> int:
+    return len(json.dumps(value, ensure_ascii=False, default=str))
+
+
+def _preview_fits(projected: Any, finding: dict[str, Any]) -> bool:
+    if isinstance(projected, dict):
+        candidate = dict(projected)
+        candidate.pop("_external_content_warning", None)
+        if finding.get("risk") != "none":
+            candidate["_external_content_warning"] = finding
+    elif finding.get("risk") != "none":
+        candidate = {"_type": "value", "value": projected,
+                     "_external_content_warning": finding}
+    else:
+        candidate = projected
+    return _serialized_size(candidate) <= _PREVIEW_TOTAL_CHAR_LIMIT
+
+
+def _with_external_content_warning(
+    source: Any, projected: Any, *, finding: dict[str, Any] | None = None,
+) -> Any:
+    """Attach only server-derived warning metadata to the prompt projection."""
+    finding = finding if finding is not None else inspect_external_content(source)
+    if isinstance(projected, dict):
+        result = dict(projected)
+        # Do not let a source field impersonate trusted server metadata.
+        result.pop("_external_content_warning", None)
+        if finding and finding.get("risk") != "none":
+            result["_external_content_warning"] = finding
+        return result
+    if finding and finding.get("risk") != "none":
+        return {"_type": "value", "value": projected,
+                "_external_content_warning": finding}
+    return projected
 
 
 def historical_cache_status(record: dict[str, Any], *, now: datetime | None = None) -> dict[str, Any]:
