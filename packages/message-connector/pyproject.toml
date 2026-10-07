@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lka-message-connector"
+version = "0.1.0"
+description = "Independent local message capture and read-only MCP service for LKA"
+requires-python = ">=3.12"
+dependencies = [
+  "httpx>=0.27,<1",
+  "mcp>=1.20,<2",
+  "pydantic>=2.8,<3",
+  "telethon>=1.42,<2",
+  "python-socks[asyncio]>=2.5,<3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<9", "ruff>=0.6"]
+
+[project.scripts]
+lka-message-connector = "lka_message_connector.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lka_message_connector"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
