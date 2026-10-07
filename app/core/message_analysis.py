@@ -12,6 +12,7 @@ import hashlib
 import inspect
 import json
 import logging
+import sqlite3
 import threading
 import time
 from collections.abc import Iterator
@@ -257,6 +258,7 @@ class MessageAnalysisCoordinator:
         self.controller = getattr(llm_client, "workloads", None) or LLMWorkloadController(
             service.db_path
         )
+        self.controller.reclassify_task_usage(self._historical_message_task_ids(), "background_message")
         if isinstance(llm_client, LLMService) and llm_client.workloads is None:
             llm_client.workloads = self.controller
         path = None
@@ -279,6 +281,40 @@ class MessageAnalysisCoordinator:
             poll_seconds=1,
             recover=service.schedule_pending,
         )
+
+    def _historical_message_task_ids(self) -> tuple[str, ...]:
+        """Return ledger task IDs attributable to durable message reading records."""
+        uri = f"{Path(self.service.db_path).resolve().as_uri()}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True)
+        conn.row_factory = sqlite3.Row
+        try:
+            tables = {row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            if "message_reading_families" not in tables:
+                return ()
+            families = [dict(row) for row in conn.execute(
+                "SELECT family_id,conversation_key,start_seq FROM message_reading_families")]
+            task_ids = {row["family_id"] for row in families}
+            family_by_scope_start = {(row["conversation_key"], row["start_seq"]) for row in families}
+            if "message_reading_manifests" in tables:
+                task_ids.update(row[0] for row in conn.execute(
+                    "SELECT job_id FROM message_reading_manifests"))
+            if "background_jobs" in tables:
+                for row in conn.execute(
+                    "SELECT job_id,scope_id,payload_json FROM background_jobs WHERE kind='message_analysis'"
+                ):
+                    try:
+                        payload = json.loads(row["payload_json"])
+                    except (TypeError, ValueError):
+                        continue
+                    if not isinstance(payload, dict):
+                        continue
+                    if (payload.get("work_family_id") in task_ids
+                            or (row["scope_id"], payload.get("start_seq")) in family_by_scope_start):
+                        task_ids.add(row["job_id"])
+            return tuple(sorted(task_ids))
+        finally:
+            conn.close()
 
     def start(self) -> None:
         # Raw history is the durable pending-input ledger: a crash between
@@ -492,6 +528,9 @@ class MessageAnalysisCoordinator:
             tuple(progress.get("legacy_task_ids", ())),
             ("message_reading", batch["conversation_key"], progress["family_id"]),
         )
+        self.controller.reclassify_task_usage(
+            tuple(progress.get("legacy_task_ids", ())), "background_message"
+        )
         checkpoint = progress.get("checkpoint") or {}
         if not checkpoint.get("reading_snapshot"):
             # Freeze precisely the granted, bounded candidates actually shown to
@@ -613,7 +652,7 @@ class MessageAnalysisCoordinator:
             ).encode()
         ).hexdigest()
         with workload_scope(
-            "background_memory",
+            "background_message",
             task_id=progress["family_id"],
             max_tokens=progress["work_token_limit"],
             quotas=self._quotas(progress, batch["conversation_key"]),
@@ -860,6 +899,7 @@ class MessageAnalysisCoordinator:
             raise BackgroundBudgetDeferred("message_analysis_not_live")
         self.controller.adopt_task_usage(tuple(progress.get("legacy_task_ids", ())),
                                         ("message_reading", batch["conversation_key"], progress["family_id"]))
+        self.controller.reclassify_task_usage(tuple(progress.get("legacy_task_ids", ())), "background_message")
         checkpoint = progress.get("checkpoint") or {}
         snapshot = checkpoint.get("reading_snapshot") or {
             key: batch.get(key, {}) for key in ("known_topics", "known_insights",
@@ -954,7 +994,7 @@ class MessageAnalysisCoordinator:
                 raise BackgroundBudgetDeferred("message_analysis_checkpoint_fenced")
             raise BackgroundJobYielded
 
-        with workload_scope("background_memory", task_id=progress["family_id"],
+        with workload_scope("background_message", task_id=progress["family_id"],
                 max_tokens=progress["work_token_limit"], quotas=self._quotas(progress, batch["conversation_key"]),
                 pricing=self._pricing(), before_dispatch=dispatch):
             response = self._call_once(client, kwargs, incoming)

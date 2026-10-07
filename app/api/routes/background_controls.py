@@ -5,20 +5,40 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.api.routes.memories import require_local_memory_control
 from app.api.routes.memory_settings import get_background_config
 
 router = APIRouter(dependencies=[Depends(require_local_memory_control)])
-_RETRYABLE_KINDS = {"memory_extract", "context_compact"}
+_RETRYABLE_KINDS = {"memory_extract", "context_compact", "memory_consolidate"}
 
 
 class JobControlRequest(BaseModel):
     expected_updated_at: str = Field(min_length=1, max_length=64)
+
+
+class BudgetResetRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_revisions: dict[str, Annotated[int, Field(strict=True, ge=0)]] = Field(min_length=1, max_length=3)
+    reason: str = Field(min_length=1, max_length=200)
+
+
+@router.post("/background/budgets/reset")
+def reset_background_budgets(payload: BudgetResetRequest, request: Request):
+    """Explicit local control only; no ledger deletion or work-cap reset."""
+    try:
+        return request.app.state.runtime.llm_workloads.reset_budgets(
+            payload.expected_revisions, reason=payload.reason,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 def _store(request: Request):

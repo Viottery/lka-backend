@@ -699,17 +699,20 @@ class BackgroundJobStore:
             conn.commit()
             return "cancelled", self._public(updated)
 
-    def defer(self, job_id: str, owner: str, epoch: int, *, delay_seconds: float = 60) -> bool:
+    def defer(self, job_id: str, owner: str, epoch: int, *, delay_seconds: float = 60,
+              error_class: str = "background_budget_deferred") -> bool:
         """Resource throttling waits without spending the provider retry allowance."""
+        if error_class not in {"background_budget_deferred", "background_circuit_open"}:
+            raise ValueError("invalid_resource_deferral")
         now = datetime.now(UTC)
         next_at = _stamp(now + timedelta(seconds=delay_seconds))
         with self._connect() as conn:
             cursor = conn.execute(
-                """UPDATE background_jobs SET status='retry_wait',error_class='background_budget_deferred',
+                """UPDATE background_jobs SET status='retry_wait',error_class=?,
                    available_at=?,attempts=MAX(0,attempts-1),updated_at=?,lease_owner=NULL,lease_expires_at=NULL
                    WHERE job_id=? AND status='running' AND lease_owner=? AND lease_epoch=?
                    AND lease_expires_at>? AND (deadline IS NULL OR deadline>?)""",
-                (next_at, _stamp(now), job_id, owner, epoch, _stamp(now), _stamp(now)),
+                (error_class, next_at, _stamp(now), job_id, owner, epoch, _stamp(now), _stamp(now)),
             )
             return cursor.rowcount == 1
 
@@ -840,8 +843,11 @@ class BackgroundJobWorker:
             # The handler's transaction already moved the same job to queued.
             # This is neither success nor a failed/retried provider attempt.
             pass
-        except BackgroundBudgetDeferred:
-            self.store.defer(job["job_id"], worker_owner, job["lease_epoch"])
+        except BackgroundBudgetDeferred as exc:
+            circuit_open = getattr(exc, "error_category", None) == "background_circuit_open"
+            self.store.defer(job["job_id"], worker_owner, job["lease_epoch"],
+                             delay_seconds=300 if circuit_open else 60,
+                             error_class="background_circuit_open" if circuit_open else "background_budget_deferred")
         except Exception as exc:  # noqa: BLE001 - worker boundary classifies failures.
             error_class, retryable = _classify_worker_error(exc)
             self.store.fail(job["job_id"], worker_owner, job["lease_epoch"], error_class, retryable)

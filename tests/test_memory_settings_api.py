@@ -122,6 +122,18 @@ def test_schema_exposes_limits_but_no_provider_credentials(tmp_path, monkeypatch
     assert call(app, "GET", "/background/config/schema", host="192.0.2.1").status_code == 403
 
 
+def test_unlimited_memory_config_retains_emergency_thresholds_after_restart(tmp_path, monkeypatch):
+    app = make_app(tmp_path, monkeypatch)
+    response = call(app, "PATCH", "/background/config", json={"expected_revision": 0,
+                    "memory": {"max_job_tokens": 0}, "background": {"memory_hourly_fuse_tokens": 3_000_000}})
+    assert response.status_code == 200
+    restarted = make_app(tmp_path, monkeypatch)
+    assert restarted.state.runtime.memory_background.max_job_tokens == 0
+    assert restarted.state.runtime.llm_workloads.memory_fuses["hourly_tokens"] == 3_000_000
+    assert call(restarted, "PATCH", "/background/config", json={"expected_revision": 1,
+                "background": {"memory_task_fuse_tokens": 0}}).status_code == 422
+
+
 def test_invalid_saved_values_do_not_prevent_config_recovery(tmp_path, monkeypatch):
     app = make_app(tmp_path, monkeypatch)
     app.state.runtime.memory_settings_store.save({"memory": {"generation_output_tokens": 0}}, expected_revision=0)

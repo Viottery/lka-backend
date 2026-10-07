@@ -8,6 +8,7 @@ from typing import Any
 
 from app.core.memory_extraction import extract_user_memories
 from app.core.memory_files import MemoryFileConflictError, MemoryFileError, MemoryFiles
+from app.core.memory_reconciliation import canonical_memory, reconciliation_candidates
 from app.core.sessions import SessionService
 from app.core.tools import ToolContext, ToolInvocation, ToolPackageSpec, ToolResult, ToolSpec
 from app.domains.memory import MemoryInput, MemoryService, MemorySourceInput
@@ -20,6 +21,7 @@ MEMORY_PACKAGE = ToolPackageSpec(
     routing_hints=[
         "Use when the user asks what the assistant remembers or needs earlier stable preferences or project decisions.",
         "Use for explicit requests to remember enduring preferences. Background learning handles ordinary conversation without blocking the answer.",
+        "Related old memories are reconciled before saving; background maintenance consolidates duplicates with versioned history, without editing AGENTS.md.",
     ],
     decision_hints=[
         "Memory is derived data, below the current user request and AGENTS.md in priority.",
@@ -98,12 +100,26 @@ class RememberMemoryTool:
             project and not self.service.learning_enabled(scope="project", project_id=project)
         ):
             return reject("Memory learning is disabled for this scope.")
+        related = reconciliation_candidates(self.service, [candidate.claim], scope=scope,
+                                            project_id=project, related_only=True)
+        exact = next((r for r in related if canonical_memory(r.content) == canonical_memory(candidate.claim)
+                      and r.memory_type == candidate.kind and r.expires_at == candidate.expires_at
+                      and r.sensitivity == candidate.sensitivity), None)
+        if (related and self.contextual_remember is not None
+            and exact is None):
+            records, file_status = self.contextual_remember(user, project_id=project, requested_memory=proposal)
+            if records:
+                return ToolResult(invocation_id=invocation.invocation_id, tool_name=self.spec.name,
+                    status="completed", output={"memory": records[0].model_dump(mode="json"),
+                        "memories": [record.model_dump(mode="json") for record in records],
+                        "memory_file_status": file_status})
         source = self.service.register_source(MemorySourceInput(
             source_type="user_message", source_ref=user.message_id,
             checksum=hashlib.sha256(user.content.encode()).hexdigest(), trusted_source=False,
         ))
         try:
-            record = self.service.create(MemoryInput(
+            record = self.service.add_source(exact.memory_id, source_id=source,
+                expected_version=exact.version, user_confirmed=candidate.explicit) if exact else self.service.create(MemoryInput(
                 content=candidate.claim, memory_type=candidate.kind, scope=scope,
                 project_id=project, source_id=source, confidence=candidate.confidence,
                 sensitivity=candidate.sensitivity, expires_at=candidate.expires_at,

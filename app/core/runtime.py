@@ -526,10 +526,14 @@ class LocalKnowledgeAgentRuntime:
             self.db_path, max_concurrency=resources.max_llm_concurrency,
             interactive_reserved=resources.interactive_reserved,
             memory_concurrency=resources.memory_concurrency, io_concurrency=resources.io_concurrency,
+            message_concurrency=resources.message_concurrency,
             hourly_tokens=resources.hourly_token_limit, daily_tokens=resources.daily_token_limit,
             daily_cost_limit=resources.daily_cost_limit,
             input_cost_per_million=resources.input_cost_per_million,
             output_cost_per_million=resources.output_cost_per_million,
+            memory_task_fuse_tokens=resources.memory_task_fuse_tokens,
+            memory_hourly_fuse_tokens=resources.memory_hourly_fuse_tokens,
+            memory_daily_fuse_tokens=resources.memory_daily_fuse_tokens,
         )
         if self.agent_llm_client is not None:
             self.agent_llm_client.workloads = self.llm_workloads
@@ -543,6 +547,13 @@ class LocalKnowledgeAgentRuntime:
             extraction_context_messages=memory_config.extraction_context_messages,
             extraction_context_chars=memory_config.extraction_context_chars,
             auto_publish_min_confidence=memory_config.auto_publish_min_confidence,
+            reconciliation_max_items=memory_config.reconciliation_max_items,
+            reconciliation_max_chars=memory_config.reconciliation_max_chars,
+            consolidation_enabled=memory_config.consolidation_enabled,
+            consolidation_debounce_seconds=memory_config.consolidation_debounce_seconds,
+            consolidation_interval_seconds=memory_config.consolidation_interval_seconds,
+            consolidation_batch_items=memory_config.consolidation_batch_items,
+            consolidation_min_confidence=memory_config.consolidation_min_confidence,
             memory_files=self.memory_files,
             max_job_tokens=memory_config.max_job_tokens,
             generation_output_tokens=memory_config.generation_output_tokens,

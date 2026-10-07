@@ -218,3 +218,29 @@ def test_configured_selected_budget_applies_to_extraction():
     assert extract_user_memories(source_id="s", content="我倾向在审阅合同时先看风险再看条款",
                                  llm_client=selected, allow_remote=True) == []
     assert client.calls[0]["max_output_tokens"] == 6000
+
+
+def test_unlimited_compaction_does_not_fall_back_after_crossing_old_allowance():
+    from app.core.memory_background import MemoryBackgroundCoordinator
+    from app.core.sessions import SessionRecentMessage, SessionService
+
+    client = SequenceClient([response('{"summary":"完整摘要","source_trace_ids":[]}') for _ in range(3)])
+    coordinator = MemoryBackgroundCoordinator(db_path=":memory:", memory=None, store=None,
+        session_service=SessionService(lambda: None), llm_client=client, max_job_tokens=0)
+    messages = [SessionRecentMessage(role="user", content="保留用户限定" * 320,
+                created_at="2026-10-07T00:00:00Z", trace_id=f"source-{i}") for i in range(3)]
+    coordinator._summarize("", messages, 16384)
+    assert len(client.calls) == 3
+    assert coordinator._compaction_state.used_local_fallback is False
+
+
+def test_zero_allowance_allows_bounded_incomplete_generation_recovery():
+    from app.core.llm_workloads import workload_scope
+
+    client = SequenceClient([response("partial", finish_reason="length"), response("complete")], thinking=True)
+    selected = SelectedBackgroundClient(client)
+    # A zero configured allowance must not be mistaken for zero remaining.
+    with workload_scope("background_memory", task_id="compact", max_tokens=0):
+        result = recover_generation(selected, system_prompt="s", user_prompt="u", prompt_summary="test")
+    assert result.content == "complete"
+    assert len(client.calls) == 2

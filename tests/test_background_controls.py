@@ -10,6 +10,7 @@ from starlette.requests import Request
 from app.api.routes import background_controls
 from app.api.routes.background_controls import _events, router
 from app.core.background_jobs import BackgroundJobStore
+from app.core.llm_workloads import BackgroundCircuitOpen, LLMWorkloadController, workload_scope
 from app.core.sessions import SessionService
 from app.storage.db import connect, init_db
 
@@ -25,9 +26,51 @@ def _api(tmp_path, monkeypatch):
     app.include_router(router)
     app.state.runtime = type("Runtime", (), {
         "background_job_store": store, "session_service": sessions,
+        "llm_workloads": LLMWorkloadController(path),
         "_conn": lambda self: connect(path),
     })()
     return app, store, sessions
+
+
+def test_budget_reset_is_local_cas_control_not_message_authority(tmp_path, monkeypatch):
+    monkeypatch.setenv("LKA_MESSAGES_CONTROL_TOKEN", "message-control-only")
+    app, _, _ = _api(tmp_path, monkeypatch)
+    headers = {"Authorization": "Bearer control-test-token"}
+    payload = {"expected_revisions": {"background_memory": 0, "background_message": 0}, "reason": "user reset"}
+
+    async def run():
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://localhost") as client:
+            assert (await client.post("/background/budgets/reset", json=payload)).status_code == 401
+            assert (await client.post("/background/budgets/reset", json=payload,
+                                     headers={"Authorization": "Bearer message-control-only"})).status_code == 401
+            for revisions in ({"interactive": 0}, {"background_memory": True}, {"background_memory": -1}):
+                assert (await client.post("/background/budgets/reset", json={**payload, "expected_revisions": revisions}, headers=headers)).status_code == 422
+            response = await client.post("/background/budgets/reset", json=payload, headers=headers)
+            assert response.status_code == 200
+            states = {row["pool"]: row for row in response.json()["budget_pools"]}
+            assert states["background_memory"]["revision"] == states["background_message"]["revision"] == 1
+            assert len(response.json()["budget_events"]) == 2
+            assert (await client.post("/background/budgets/reset", json=payload, headers=headers)).status_code == 409
+            with workload_scope("background_memory"):
+                async with app.state.runtime.llm_workloads.admit(input_tokens=1, output_tokens=1):
+                    assert (await client.post("/background/budgets/reset", json={**payload, "expected_revisions": {"background_memory": 1}}, headers=headers)).status_code == 409
+    asyncio.run(run())
+
+
+def test_emergency_stop_keeps_jobs_recoverable_without_spending_retries(tmp_path, monkeypatch):
+    from app.core.background_jobs import BackgroundJobWorker
+
+    _, store, _ = _api(tmp_path, monkeypatch)
+    job = _create(store)
+
+    def emergency(_job):
+        raise BackgroundCircuitOpen("hourly_tokens: 101 > 100")
+    worker = BackgroundJobWorker(store, {"memory_extract": emergency})
+    assert worker.run_one()
+    row = store.get(job["job_id"])
+    assert row["status"] == "retry_wait"
+    assert row["error_class"] == "background_circuit_open"
+    assert row["attempts"] == 0
 
 
 def _create(store, kind="memory_extract", payload=None):

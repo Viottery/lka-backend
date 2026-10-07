@@ -38,7 +38,7 @@ class SelectedBackgroundClient:
         from app.core.llm_workloads import current_workload
         workload = current_workload()
         controller = getattr(self.client, "workloads", None)
-        if not workload.task_id or workload.max_tokens is None or controller is None:
+        if not workload.task_id or not workload.max_tokens or controller is None:
             return None
         with controller._connect() as conn:
             used = conn.execute(

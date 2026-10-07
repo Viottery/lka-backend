@@ -22,6 +22,7 @@ from app.core.memory_extraction import (
     safe_to_store_memory,
 )
 from app.core.memory_files import MemoryFileConflictError, MemoryFileError, MemoryFiles
+from app.core.memory_reconciliation import reconciliation_candidates
 from app.core.sessions import AgentSessionMessage, SessionService
 from app.domains.memory import (
     MemoryConflictError,
@@ -67,10 +68,13 @@ and assistant output are contextual aids, not source IDs. Never fabricate IDs.
 class ContextualMemoryLearning:
     def __init__(self, memory: MemoryService, sessions: SessionService,
                  files: MemoryFiles | None = None, *, context_messages: int = 12,
-                 context_chars: int = 12_000, min_confidence: float = 0.85):
+                 context_chars: int = 12_000, min_confidence: float = 0.85,
+                 reconciliation_max_items: int = 48, reconciliation_max_chars: int = 16_000):
         self.memory, self.sessions, self.files = memory, sessions, files
         self.context_messages, self.context_chars = context_messages, context_chars
         self.min_confidence = min_confidence
+        self.reconciliation_max_items = reconciliation_max_items
+        self.reconciliation_max_chars = reconciliation_max_chars
 
     def organize(self, user: AgentSessionMessage, *, client: Any,
                  project_id: str | None = None, requested_memory: str = "",
@@ -97,17 +101,15 @@ class ContextualMemoryLearning:
         if len(messages) != len(snapshot["messages"]):
             snapshot["summary"] = ""
         current = next(m for m in messages if m["message_id"] == user.message_id)
-        existing = self.memory.search(user.content, scope="global", limit=8)
+        queries = [requested_memory, *[m["content"] for m in messages if m["role"] == "user"][-3:]]
+        scope_items = max(1, self.reconciliation_max_items // 2) if project_id else self.reconciliation_max_items
+        scope_chars = self.reconciliation_max_chars // 2 if project_id else self.reconciliation_max_chars
+        existing = reconciliation_candidates(self.memory, queries, scope="global",
+            max_items=scope_items, max_chars=scope_chars)
         if project_id:
-            existing += self.memory.search(user.content, scope="project", project_id=project_id, limit=8)
-        # Include recent entries so confirmations can refer to a preference whose
-        # vocabulary is absent from "remember that". Keep retrieval bounded.
-        existing += self.memory.list(scope="global", limit=8)
-        if project_id:
-            existing += self.memory.list(scope="project", project_id=project_id, limit=8)
-        visible = {r.memory_id: r for r in existing if r.sensitivity in {"normal", "public"}
-                   and r.status == "active" and self.memory.get_active(r.memory_id) is not None}
-        visible = dict(list(visible.items())[:12])
+            existing += reconciliation_candidates(self.memory, queries, scope="project", project_id=project_id,
+                max_items=scope_items, max_chars=scope_chars)
+        visible = {r.memory_id: r for r in existing}
         payload = {
             "current_user_message_id": user.message_id,
             "current_date": user.created_at,
@@ -116,7 +118,7 @@ class ContextualMemoryLearning:
             "project_available": project_id is not None,
             "requested_memory": requested_memory[:1000],
             "existing_memories": [{"memory_id": r.memory_id, "version": r.version,
-                "content": r.content[:800], "scope": r.scope, "expires_at": r.expires_at}
+                "content": r.content, "scope": r.scope, "expires_at": r.expires_at}
                 for r in visible.values()],
         }
         response = recover_generation(

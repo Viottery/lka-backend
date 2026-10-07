@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import math
 import sqlite3
 import threading
@@ -24,11 +25,20 @@ from uuid import uuid4
 
 from app.core.llm.errors import LLMClientError
 
+_BACKGROUND_POOLS = {"background_memory", "background_message", "background_io"}
+_logger = logging.getLogger(__name__)
+
 
 class BackgroundBudgetDeferred(LLMClientError):
     """A task should wait for budget or foreground load to clear."""
 
     category = error_category = "budget_deferred"
+
+
+class BackgroundCircuitOpen(BackgroundBudgetDeferred):
+    """Persistent emergency stop; only an explicit control reset reopens it."""
+
+    category = error_category = "background_circuit_open"
 
 
 class BackgroundTaskBudgetExceeded(LLMClientError):
@@ -115,7 +125,7 @@ def workload_scope(
     before_dispatch: Callable[[], None | Awaitable[None]] | None = None,
     pricing: BudgetPricing | None = None,
 ):
-    if pool not in {"interactive", "background_memory", "background_io"}:
+    if pool not in {"interactive", *_BACKGROUND_POOLS}:
         raise ValueError("unknown LLM workload pool")
     token = _workload.set(Workload(pool, task_id, max_tokens, quotas, before_dispatch, pricing))
     try:
@@ -140,16 +150,24 @@ class LLMWorkloadController:
     def __init__(
         self, db_path: str | Path, *, max_concurrency: int = 4,
         interactive_reserved: int = 2, memory_concurrency: int = 1,
-        io_concurrency: int = 1, hourly_tokens: int = 200_000,
+        io_concurrency: int = 1, message_concurrency: int = 1, hourly_tokens: int = 200_000,
         daily_tokens: int = 1_000_000, daily_cost_limit: float = 0,
         input_cost_per_million: float = 0, output_cost_per_million: float = 0,
+        memory_task_fuse_tokens: int = 262_144,
+        memory_hourly_fuse_tokens: int = 2_000_000,
+        memory_daily_fuse_tokens: int = 10_000_000,
     ) -> None:
         if not 1 <= interactive_reserved <= max_concurrency:
             raise ValueError("interactive reservation must fit total concurrency")
         self.db_path = str(db_path)
         self.max_concurrency = max_concurrency
         self.interactive_reserved = interactive_reserved
-        self.pool_limits = {"background_memory": memory_concurrency, "background_io": io_concurrency}
+        self.pool_limits = {"background_memory": memory_concurrency, "background_message": message_concurrency,
+                            "background_io": io_concurrency}
+        self.memory_fuses = {"task_tokens": memory_task_fuse_tokens, "hourly_tokens": memory_hourly_fuse_tokens,
+                             "daily_tokens": memory_daily_fuse_tokens}
+        if any(not isinstance(value, int) or isinstance(value, bool) or value <= 0 for value in self.memory_fuses.values()):
+            raise ValueError("memory emergency thresholds must be positive integers")
         self.hourly_tokens, self.daily_tokens = hourly_tokens, daily_tokens
         self.daily_cost_limit = daily_cost_limit
         self.input_price, self.output_price = input_cost_per_million, output_cost_per_million
@@ -157,6 +175,8 @@ class LLMWorkloadController:
         self._active: Counter[str] = Counter()
         self._interactive_waiters = 0
         self._cooldown_until = 0.0
+        self._inflight: dict[str, tuple[str, asyncio.AbstractEventLoop, asyncio.Task]] = {}
+        self._interrupted: set[str] = set()
         with self._connect() as conn:
             conn.execute("""CREATE TABLE IF NOT EXISTS llm_workload_usage(
                 call_id TEXT PRIMARY KEY, pool TEXT NOT NULL, task_id TEXT,
@@ -164,6 +184,15 @@ class LLMWorkloadController:
                 input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL,
                 cost REAL NOT NULL, duration_seconds REAL, count_method TEXT NOT NULL)""")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_llm_usage_time ON llm_workload_usage(created_at,pool)")
+            conn.execute("""CREATE TABLE IF NOT EXISTS llm_workload_pool_state(
+                pool TEXT PRIMARY KEY, revision INTEGER NOT NULL DEFAULT 0,
+                reset_at TEXT NOT NULL DEFAULT '', opened_at TEXT, reason TEXT)""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS llm_workload_budget_events(
+                event_id INTEGER PRIMARY KEY AUTOINCREMENT, pool TEXT NOT NULL,
+                created_at TEXT NOT NULL, kind TEXT NOT NULL, reason TEXT NOT NULL,
+                revision INTEGER NOT NULL)""")
+            for pool in sorted(_BACKGROUND_POOLS):
+                conn.execute("INSERT OR IGNORE INTO llm_workload_pool_state(pool) VALUES(?)", (pool,))
             columns = {row[1] for row in conn.execute("PRAGMA table_info(llm_workload_usage)")}
             for name, definition in (("cost_known", "INTEGER NOT NULL DEFAULT 1"),
                                      ("pricing_client", "TEXT"), ("pricing_model", "TEXT"), ("pricing_revision", "TEXT")):
@@ -203,7 +232,9 @@ class LLMWorkloadController:
         for name, interval in (("hourly", timedelta(hours=1)), ("daily", timedelta(days=1))):
             row = conn.execute("""SELECT COALESCE(SUM(u.input_tokens+u.output_tokens),0),COUNT(*)
                 FROM llm_workload_usage u JOIN llm_workload_quota_usage q ON q.call_id=u.call_id
-                WHERE q.scope_id=? AND u.created_at>=?""", (scope_id, (now - interval).isoformat())).fetchone()
+                LEFT JOIN llm_workload_pool_state s ON s.pool=u.pool
+                WHERE q.scope_id=? AND u.created_at>=? AND u.created_at>=COALESCE(s.reset_at,'')""",
+                (scope_id, (now - interval).isoformat())).fetchone()
             result[name + "_tokens"], result[name + "_calls"] = row
         return result
 
@@ -267,6 +298,88 @@ class LLMWorkloadController:
         return {"tokens": None if max_tokens is None else max(0, max_tokens - used["total_tokens"]),
                 "calls": None if max_calls is None else max(0, max_calls - used["total_calls"])}
 
+    def reclassify_task_usage(self, task_ids: tuple[str, ...], pool: str) -> None:
+        """Domain-owned migration of legacy attribution; no usage is removed."""
+        if pool not in _BACKGROUND_POOLS or not isinstance(task_ids, tuple) or any(not isinstance(t, str) or not t for t in task_ids):
+            raise ValueError("invalid workload attribution")
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for task_id in dict.fromkeys(task_ids):
+                conn.execute("UPDATE llm_workload_usage SET pool=? WHERE task_id=? AND pool!='interactive'", (pool, task_id))
+
+    def reset_budgets(self, expected_revisions: dict[str, int], *, reason: str) -> dict[str, Any]:
+        """Start new rolling accounting windows; retain history and work caps.
+
+        Reset is explicit, CAS-checked and only allowed without active/reserved
+        calls in the selected pools. It also acknowledges an emergency stop.
+        """
+        if not expected_revisions or set(expected_revisions) - _BACKGROUND_POOLS:
+            raise ValueError("select known background pools")
+        if not reason.strip() or len(reason) > 200:
+            raise ValueError("reset reason must contain 1..200 characters")
+        if any(type(revision) is not int or revision < 0 for revision in expected_revisions.values()):
+            raise ValueError("invalid budget revision")
+        now = datetime.now(UTC).isoformat()
+        with self._guard, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for pool, revision in expected_revisions.items():
+                state = conn.execute("SELECT revision FROM llm_workload_pool_state WHERE pool=?", (pool,)).fetchone()
+                reserved = conn.execute("SELECT 1 FROM llm_workload_usage WHERE pool=? AND status='reserved' AND expires_at>? LIMIT 1", (pool, now)).fetchone()
+                if self._active[pool] or reserved:
+                    raise RuntimeError("selected workload pool is active")
+                if state[0] != revision:
+                    raise RuntimeError("budget revision changed")
+            for pool, revision in expected_revisions.items():
+                conn.execute("UPDATE llm_workload_pool_state SET revision=revision+1,reset_at=?,opened_at=NULL,reason=NULL WHERE pool=?", (now, pool))
+                conn.execute("INSERT INTO llm_workload_budget_events(pool,created_at,kind,reason,revision) VALUES(?,?,'reset',?,?)",
+                             (pool, now, reason, revision + 1))
+        return self.health()
+
+    @staticmethod
+    def _pool_usage(conn: sqlite3.Connection, pool: str, since: str, *, task_id: str | None = None):
+        sql = """SELECT COALESCE(SUM(u.input_tokens+u.output_tokens),0) AS tokens,
+            COALESCE(SUM(u.cost),0) AS cost,COALESCE(SUM(u.cost_known=0),0) AS unknown_costs,COUNT(*) AS calls
+            FROM llm_workload_usage u JOIN llm_workload_pool_state s ON s.pool=u.pool
+            WHERE u.pool=? AND u.created_at>=? AND u.created_at>=s.reset_at"""
+        values: tuple = (pool, since)
+        if task_id is not None:
+            sql += " AND u.task_id=?"
+            values += (task_id,)
+        return conn.execute(sql, values).fetchone()
+
+    def _circuit_reason(self, conn: sqlite3.Connection, ticket: UsageTicket, now: datetime, extra: int) -> str | None:
+        if ticket.workload.pool != "background_memory":
+            return None
+        state = conn.execute("SELECT opened_at,reason FROM llm_workload_pool_state WHERE pool=?", (ticket.workload.pool,)).fetchone()
+        if state["opened_at"]:
+            return state["reason"]
+        checks = [("hourly_tokens", (now - timedelta(hours=1)).isoformat(), None),
+                  ("daily_tokens", (now - timedelta(days=1)).isoformat(), None)]
+        if ticket.workload.task_id:
+            checks.append(("task_tokens", "", ticket.workload.task_id))
+        for name, since, task_id in checks:
+            used = self._pool_usage(conn, ticket.workload.pool, since, task_id=task_id)["tokens"]
+            if used + extra > self.memory_fuses[name]:
+                reason = f"{name}: {used + extra} > {self.memory_fuses[name]}"
+                conn.execute("UPDATE llm_workload_pool_state SET opened_at=?,reason=?,revision=revision+1 WHERE pool=?", (now.isoformat(), reason, ticket.workload.pool))
+                revision = conn.execute("SELECT revision FROM llm_workload_pool_state WHERE pool=?", (ticket.workload.pool,)).fetchone()[0]
+                conn.execute("INSERT INTO llm_workload_budget_events(pool,created_at,kind,reason,revision) VALUES(?,?,'circuit_open',?,?)",
+                             (ticket.workload.pool, now.isoformat(), reason, revision))
+                _logger.error("Background token circuit opened: pool=%s %s", ticket.workload.pool, reason)
+                return reason
+        return None
+
+    def _interrupt_pool(self, pool: str, *, exclude: str) -> None:
+        with self._guard:
+            targets = [(call_id, loop, task) for call_id, (active_pool, loop, task) in self._inflight.items()
+                       if active_pool == pool and call_id != exclude and call_id not in self._interrupted and not task.done()]
+            self._interrupted.update(call_id for call_id, _, _ in targets)
+        for _, loop, task in targets:
+            try:
+                loop.call_soon_threadsafe(task.cancel)
+            except RuntimeError:
+                pass  # Closing worker loops are already stopping.
+
     @contextmanager
     def _connect(self):
         conn = sqlite3.connect(self.db_path, timeout=10)
@@ -312,6 +425,13 @@ class LLMWorkloadController:
             # dispatched calls stay charged conservatively, never free retries.
             conn.execute("UPDATE llm_workload_usage SET status='estimated' WHERE status='reserved' AND expires_at<=?", (now.isoformat(),))
             tokens = ticket.input_tokens + ticket.output_tokens
+            reason = self._circuit_reason(conn, ticket, now, tokens)
+            if reason:
+                # Persist the stop before raising; rolling budget deferrals
+                # ordinarily roll back their admission transaction.
+                conn.commit()
+                self._interrupt_pool(ticket.workload.pool, exclude=ticket.call_id)
+                raise BackgroundCircuitOpen(reason)
             quotas = self._quotas(ticket.workload)
             scoped_usage = {quota.scope_id: self._quota_usage(conn, quota.scope_id, now) for quota in quotas}
             # Exhausted lifetime allowances are permanent even when a rolling
@@ -321,23 +441,18 @@ class LLMWorkloadController:
                 if ((quota.max_tokens is not None and used["total_tokens"] + tokens > quota.max_tokens)
                         or (quota.max_calls is not None and used["total_calls"] + 1 > quota.max_calls)):
                     raise WorkBudgetExceeded("work budget exhausted")
-            if ticket.workload.pool != "interactive":
+            if ticket.workload.pool not in {"interactive", "background_memory"}:
                 if self.daily_cost_limit and (self._ticket_cost(ticket, 0, 0) is None
                         or (not ticket.workload.pricing and not (self.input_price or self.output_price))):
                     exc = BackgroundBudgetDeferred("background model pricing is unknown")
                     exc.category = exc.error_category = "pricing_unknown"
                     raise exc
                 for interval, limit in ((timedelta(hours=1), self.hourly_tokens), (timedelta(days=1), self.daily_tokens)):
-                    used = conn.execute(
-                        "SELECT COALESCE(SUM(input_tokens+output_tokens),0) FROM llm_workload_usage WHERE pool!='interactive' AND created_at>=?",
-                        ((now - interval).isoformat(),),
-                    ).fetchone()[0]
+                    used = self._pool_usage(conn, ticket.workload.pool, (now - interval).isoformat())["tokens"]
                     if limit and used + ticket.input_tokens + ticket.output_tokens > limit:
                         raise BackgroundBudgetDeferred("background token budget reached")
-                cost_used, unknown_costs = conn.execute(
-                    "SELECT COALESCE(SUM(cost),0),COALESCE(SUM(cost_known=0),0) FROM llm_workload_usage WHERE pool!='interactive' AND created_at>=?",
-                    ((now - timedelta(days=1)).isoformat(),),
-                ).fetchone()
+                cost_row = self._pool_usage(conn, ticket.workload.pool, (now - timedelta(days=1)).isoformat())
+                cost_used, unknown_costs = cost_row["cost"], cost_row["unknown_costs"]
                 if self.daily_cost_limit and unknown_costs:
                     exc = BackgroundBudgetDeferred("background usage pricing is unknown")
                     exc.category = exc.error_category = "pricing_unknown"
@@ -369,7 +484,7 @@ class LLMWorkloadController:
                     ON CONFLICT(scope_id) DO UPDATE SET total_tokens=total_tokens+excluded.total_tokens,
                     total_calls=total_calls+1""", (quota.scope_id, tokens))
 
-    def _finish(self, ticket: UsageTicket) -> None:
+    def _finish(self, ticket: UsageTicket) -> str | None:
         if not ticket.dispatched:
             with self._connect() as conn:
                 conn.execute("BEGIN IMMEDIATE")
@@ -400,10 +515,24 @@ class LLMWorkloadController:
                 cost or 0, int(cost is not None), time.perf_counter() - ticket.started,
                 "provider_usage" if known else "conservative_estimate", ticket.call_id,
             ))
+            reason = self._circuit_reason(conn, ticket, datetime.now(UTC), 0)
+        if reason:
+            self._interrupt_pool(ticket.workload.pool, exclude=ticket.call_id)
+        return reason
 
     def provider_limited(self, seconds: float = 30) -> None:
         with self._guard:
             self._cooldown_until = max(self._cooldown_until, time.monotonic() + seconds)
+
+    async def _settle(self, ticket: UsageTicket) -> str | None:
+        # Cancellation must not release a concurrency slot before persistent
+        # accounting has completed, nor let a reset race with its late write.
+        settlement = asyncio.create_task(asyncio.to_thread(self._finish, ticket))
+        try:
+            return await asyncio.shield(settlement)
+        except asyncio.CancelledError:
+            await settlement
+            raise
 
     @asynccontextmanager
     async def admit(self, *, input_tokens: int, output_tokens: int):
@@ -432,6 +561,9 @@ class LLMWorkloadController:
                             self._interactive_waiters -= 1
                             registered_waiter = False
                         acquired = True
+                        task = asyncio.current_task()
+                        if task is not None:
+                            self._inflight[ticket.call_id] = (workload.pool, asyncio.get_running_loop(), task)
                 if not acquired:
                     if not foreground and time.monotonic() - wait_started > 5:
                         raise BackgroundBudgetDeferred("foreground work or provider cooldown takes priority")
@@ -441,14 +573,27 @@ class LLMWorkloadController:
                 await asyncio.shield(reservation)
             except asyncio.CancelledError:
                 await reservation
-                await asyncio.to_thread(self._finish, ticket)
+                await self._settle(ticket)
                 raise
             try:
                 yield ticket
+            except BaseException:
+                ticket.failed = True
+                raise
             finally:
-                await asyncio.to_thread(self._finish, ticket)
+                reason = await self._settle(ticket)
+                if reason:
+                    raise BackgroundCircuitOpen(reason)
+        except asyncio.CancelledError:
+            with self._guard:
+                interrupted = ticket.call_id in self._interrupted
+            if interrupted:
+                raise BackgroundCircuitOpen("background token circuit interrupted the request") from None
+            raise
         finally:
             with self._guard:
+                self._inflight.pop(ticket.call_id, None)
+                self._interrupted.discard(ticket.call_id)
                 if registered_waiter:
                     self._interactive_waiters -= 1
                 if acquired:
@@ -458,10 +603,20 @@ class LLMWorkloadController:
         since = (datetime.now(UTC) - timedelta(days=1)).isoformat()
         with self._connect() as conn:
             rows = conn.execute("SELECT pool,status,SUM(input_tokens) AS input_tokens,SUM(output_tokens) AS output_tokens,CASE WHEN SUM(cost_known=0)>0 THEN NULL ELSE SUM(cost) END AS estimated_cost,COUNT(*) AS calls FROM llm_workload_usage WHERE created_at>=? GROUP BY pool,status", (since,)).fetchall()
+            states = [dict(row) for row in conn.execute("SELECT * FROM llm_workload_pool_state ORDER BY pool")]
+            now = datetime.now(UTC)
+            for state in states:
+                state["circuit_open"] = state["opened_at"] is not None
+                state["hourly"] = dict(self._pool_usage(conn, state["pool"], (now - timedelta(hours=1)).isoformat()))
+                state["daily"] = dict(self._pool_usage(conn, state["pool"], since))
+            events = [dict(row) for row in conn.execute("SELECT * FROM llm_workload_budget_events ORDER BY event_id DESC LIMIT 30")]
         with self._guard:
             active = dict(self._active)
             waiters = self._interactive_waiters
         return {"active_by_pool": active, "interactive_waiters": waiters,
                 "last_24h": [dict(row) for row in rows],
+                "budget_pools": states, "budget_events": events,
                 "cost_pricing_configured": bool(self.input_price or self.output_price),
-                "limits": {"hourly_background_tokens": self.hourly_tokens, "daily_background_tokens": self.daily_tokens, "daily_background_cost": self.daily_cost_limit}}
+                "limits": {"hourly_background_tokens": self.hourly_tokens, "daily_background_tokens": self.daily_tokens,
+                           "daily_background_cost": self.daily_cost_limit, "ordinary_limits_apply_to": ["background_message", "background_io"],
+                           "memory_emergency_thresholds": self.memory_fuses, "concurrency_by_pool": self.pool_limits}}

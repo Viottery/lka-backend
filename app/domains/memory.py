@@ -201,6 +201,12 @@ class MemoryService:
                     FOREIGN KEY(memory_id) REFERENCES memory_entries(memory_id),
                     UNIQUE(memory_id, version)
                 );
+                CREATE TABLE IF NOT EXISTS memory_merges(
+                    merge_id TEXT PRIMARY KEY, target_memory_id TEXT NOT NULL,
+                    members TEXT NOT NULL, before_state TEXT NOT NULL,
+                    after_versions TEXT NOT NULL, after_statuses TEXT NOT NULL,
+                    created_at TEXT NOT NULL, undone_at TEXT
+                );
                 CREATE INDEX IF NOT EXISTS idx_memory_entries_scope_status
                     ON memory_entries(scope, project_id, status, expires_at);
                 CREATE TABLE IF NOT EXISTS memory_learning_policies(
@@ -328,14 +334,20 @@ class MemoryService:
     def learning_enabled(self, *, scope: MemoryScope, project_id: str | None = None) -> bool:
         if scope == "project" and not project_id:
             return False
-        scope_id = project_id or "global"
         conn = self._connect()
         try:
-            row = conn.execute(
-                "SELECT enabled FROM memory_learning_policies WHERE scope=? AND scope_id=?",
-                (scope, scope_id),
+            master = conn.execute(
+                "SELECT enabled FROM memory_learning_policies WHERE scope='global' AND scope_id='global'"
             ).fetchone()
-            return row is None or bool(row["enabled"])
+            if master is not None and not master["enabled"]:
+                return False
+            if scope == "global":
+                return True
+            local = conn.execute(
+                "SELECT enabled FROM memory_learning_policies WHERE scope='project' AND scope_id=?",
+                (project_id,),
+            ).fetchone()
+            return local is None or bool(local["enabled"])
         finally:
             conn.close()
 
@@ -874,6 +886,306 @@ class MemoryService:
             conn.close()
         return self.get(memory_id)
 
+    def merge_records(
+        self, expected_versions: dict[str, int], *, target_memory_id: str,
+        content: str, publication_lease: tuple[str, str, int] | None = None,
+    ) -> MemoryRecord:
+        """Atomically consolidate active records while retaining full undo history."""
+        content = content.strip()
+        if not content or not isinstance(expected_versions, dict) or target_memory_id not in expected_versions:
+            raise ValueError("Merge requires content and expected versions for every member")
+        if len(expected_versions) < 2 or any(
+            not isinstance(key, str) or not key or isinstance(version, bool)
+            or not isinstance(version, int) or version < 1
+            for key, version in expected_versions.items()
+        ):
+            raise ValueError("Merge requires at least two valid memory versions")
+        merge_id = _stable_id("merge", _json([
+            sorted(expected_versions.items()), target_memory_id, content,
+        ]))
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            if publication_lease is not None:
+                self._validate_publication_lease(conn, publication_lease)
+            prior = conn.execute("SELECT * FROM memory_merges WHERE merge_id=?", (merge_id,)).fetchone()
+            if prior is not None:
+                prior_versions = json.loads(prior["after_versions"])
+                prior_statuses = json.loads(prior["after_statuses"])
+                current_rows = {row["memory_id"]: row for row in conn.execute(
+                    "SELECT * FROM memory_entries WHERE memory_id IN ("
+                    + ",".join("?" for _ in expected_versions) + ")", list(expected_versions),
+                )}
+                unchanged = (not prior["undone_at"] and set(current_rows) == set(expected_versions)
+                             and all(int(current_rows[mid]["version"]) == prior_versions[mid]
+                                     and current_rows[mid]["status"] == prior_statuses[mid]
+                                     for mid in expected_versions))
+                if unchanged:
+                    current = current_rows[target_memory_id]
+                    if (current["status"] != "active"
+                            or (current["expires_at"] is not None and current["expires_at"] <= _now())
+                            or not self.learning_enabled(scope=current["scope"], project_id=current["project_id"])
+                            or not self._has_live_source(conn, target_memory_id, _now())):
+                        raise MemoryPublicationSuppressed("Merged memory is no longer eligible")
+                if (unchanged and prior["target_memory_id"] == target_memory_id
+                        and current_rows[target_memory_id]["status"] == "active"
+                        and current_rows[target_memory_id]["content"] == content):
+                    if publication_lease is not None:
+                        self._validate_publication_lease(conn, publication_lease)
+                    conn.commit()
+                    return self.get(target_memory_id)
+                raise MemoryConflictError("An earlier merge has changed since publication")
+
+            members = sorted(expected_versions)
+            rows = {row["memory_id"]: row for row in conn.execute(
+                "SELECT * FROM memory_entries WHERE memory_id IN (" + ",".join("?" for _ in members) + ")",
+                members,
+            )}
+            if set(rows) != set(members):
+                raise KeyError("A merge member no longer exists")
+            now = _now()
+            for memory_id in members:
+                row = rows[memory_id]
+                if int(row["version"]) != expected_versions[memory_id]:
+                    raise MemoryConflictError(f"Expected version {expected_versions[memory_id]}, found {row['version']}")
+                if row["status"] != "active":
+                    raise MemoryPublicationSuppressed("Merge requires active memories")
+                metadata = json.loads(row["metadata"])
+                if metadata.get("needs_review"):
+                    raise MemoryPublicationSuppressed("Cannot merge a memory that needs review")
+                if row["expires_at"] is not None and row["expires_at"] <= now:
+                    raise MemoryPublicationSuppressed("Cannot merge an expired memory")
+                if not self.learning_enabled(scope=row["scope"], project_id=row["project_id"]):
+                    raise MemoryPublicationSuppressed("Memory learning is disabled for this scope")
+                if not self._has_live_source(conn, memory_id, now):
+                    raise MemoryPublicationSuppressed("A merge source is unavailable")
+            target = rows[target_memory_id]
+            for row in rows.values():
+                if any(row[key] != target[key] for key in ("scope", "project_id", "memory_type", "sensitivity", "expires_at")):
+                    raise MemoryPublicationSuppressed("Merge members differ in scope, type, sensitivity, or expiry")
+            hints = {memory_id: _valid_conflict_hints(json.loads(row["metadata"]).get("conflict_hints"))
+                     for memory_id, row in rows.items()}
+            for memory_id, row in rows.items():
+                blocked_peers = json.loads(row["metadata"]).get("consolidation_undo_peers", [])
+                blocked_ids = {peer for peer in blocked_peers if isinstance(peer, str)} if isinstance(blocked_peers, list) else set()
+                if blocked_ids & (set(members) - {memory_id}):
+                    raise MemoryPublicationSuppressed("These records were explicitly separated by merge undo")
+            if any(_opposite_hints(left, right) for left_id, left_list in hints.items()
+                   for right_id, right_list in hints.items() if left_id != right_id
+                   for left in left_list for right in right_list):
+                raise MemoryPublicationSuppressed("Cannot merge conflicting preference hints")
+
+            before_state: dict[str, Any] = {}
+            after_versions: dict[str, int] = {}
+            after_statuses: dict[str, str] = {}
+            merged_sources: set[str] = set()
+            merged_from = sorted(
+                (set(members) - {target_memory_id})
+                | {source_id for row in rows.values()
+                   for source_id in json.loads(row["metadata"]).get("merged_from", [])
+                   if isinstance(source_id, str)}
+            )
+            merged_hints = _valid_conflict_hints([
+                hint for member_hints in hints.values() for hint in member_hints
+            ])
+            for memory_id in members:
+                row = rows[memory_id]
+                source_ids = [r[0] for r in conn.execute(
+                    "SELECT source_id FROM memory_entry_sources WHERE memory_id=? ORDER BY source_id", (memory_id,)
+                )]
+                before_state[memory_id] = {"row": dict(row), "source_ids": source_ids}
+                merged_sources.update(source_ids)
+            for memory_id in members:
+                row = rows[memory_id]
+                self._snapshot(conn, row)
+                version = int(row["version"]) + 1
+                status = "active" if memory_id == target_memory_id else "superseded"
+                metadata = json.loads(row["metadata"])
+                if memory_id == target_memory_id:
+                    metadata["merged_from"] = merged_from
+                    metadata["last_merge_id"] = merge_id
+                    if merged_hints:
+                        existing_hints = _valid_conflict_hints(metadata.get("conflict_hints"))
+                        metadata["conflict_hints"] = _valid_conflict_hints(existing_hints + merged_hints)
+                conn.execute(
+                    "UPDATE memory_entries SET content=?,status=?,version=?,metadata=?,updated_at=? "
+                    "WHERE memory_id=? AND version=?",
+                    (content if memory_id == target_memory_id else row["content"], status, version,
+                     _json(metadata), now, memory_id, expected_versions[memory_id]),
+                )
+                if memory_id == target_memory_id:
+                    for source_id in sorted(merged_sources):
+                        conn.execute("INSERT OR IGNORE INTO memory_entry_sources VALUES(?,?)", (memory_id, source_id))
+                self._record_event(conn, memory_id, version,
+                                   "memory_merged" if memory_id == target_memory_id else "merged_into",
+                                   {"merge_id": merge_id, "target_memory_id": target_memory_id,
+                                    "member_ids": members})
+                after_versions[memory_id] = version
+                after_statuses[memory_id] = status
+            conn.execute(
+                "INSERT INTO memory_merges VALUES(?,?,?,?,?,?,?,NULL)",
+                (merge_id, target_memory_id, _json(members), _json(before_state),
+                 _json(after_versions), _json(after_statuses), now),
+            )
+            if publication_lease is not None:
+                self._validate_publication_lease(conn, publication_lease)
+            conn.commit()
+            return self.get(target_memory_id)
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def undo_merge(self, merge_id: str, *, expected_versions: dict[str, int]) -> list[MemoryRecord]:
+        """Restore a merge only while every member remains exactly at its post-merge version."""
+        if (not isinstance(expected_versions, dict) or any(
+            not isinstance(memory_id, str) or not memory_id
+            or isinstance(version, bool) or not isinstance(version, int) or version < 1
+            for memory_id, version in expected_versions.items()
+        )):
+            raise ValueError("Undo requires valid positive integer versions")
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            merge = conn.execute("SELECT * FROM memory_merges WHERE merge_id=?", (merge_id,)).fetchone()
+            if merge is None:
+                raise KeyError(f"Merge not found: {merge_id}")
+            if merge["undone_at"]:
+                raise MemoryConflictError("Merge was already undone")
+            members = json.loads(merge["members"])
+            after_versions = json.loads(merge["after_versions"])
+            after_statuses = json.loads(merge["after_statuses"])
+            if set(expected_versions) != set(members):
+                raise ValueError("Undo requires expected versions for every merge member")
+            rows = {row["memory_id"]: row for row in conn.execute(
+                "SELECT * FROM memory_entries WHERE memory_id IN (" + ",".join("?" for _ in members) + ")", members
+            )}
+            now = _now()
+            for memory_id in members:
+                row = rows.get(memory_id)
+                if row is None:
+                    raise KeyError(memory_id)
+                if (expected_versions[memory_id] != after_versions[memory_id]
+                        or int(row["version"]) != expected_versions[memory_id]
+                        or row["status"] != after_statuses[memory_id]):
+                    raise MemoryConflictError("A merge member changed after the merge")
+                old = json.loads(merge["before_state"])[memory_id]["row"]
+                if old["expires_at"] is not None and old["expires_at"] <= now:
+                    raise MemoryPublicationSuppressed("Cannot restore an expired memory")
+                if not self.learning_enabled(scope=old["scope"], project_id=old["project_id"]):
+                    raise MemoryPublicationSuppressed("Memory learning is disabled for this scope")
+                source_ids = json.loads(merge["before_state"])[memory_id]["source_ids"]
+                if not source_ids or not self._has_live_source_ids(conn, source_ids, now):
+                    raise MemoryPublicationSuppressed("Cannot restore memory without provenance")
+            before = json.loads(merge["before_state"])
+            for memory_id in members:
+                old = before[memory_id]["row"]
+                new_version = int(rows[memory_id]["version"]) + 1
+                self._snapshot(conn, rows[memory_id])
+                restored_metadata = json.loads(old["metadata"])
+                restored_metadata["consolidation_undo_peers"] = sorted(set(members) - {memory_id})
+                conn.execute(
+                    "UPDATE memory_entries SET memory_type=?,content=?,scope=?,project_id=?,status=?,confidence=?,"
+                    "sensitivity=?,expires_at=?,dedupe_key=?,version=?,supersedes_id=?,extraction_model=?,metadata=?,updated_at=? "
+                    "WHERE memory_id=? AND version=?",
+                    (old["memory_type"], old["content"], old["scope"], old["project_id"], old["status"],
+                     old["confidence"], old["sensitivity"], old["expires_at"], old["dedupe_key"], new_version,
+                     old["supersedes_id"], old["extraction_model"], _json(restored_metadata), now,
+                     memory_id, rows[memory_id]["version"]),
+                )
+                conn.execute("DELETE FROM memory_entry_sources WHERE memory_id=?", (memory_id,))
+                for source_id in before[memory_id]["source_ids"]:
+                    conn.execute("INSERT INTO memory_entry_sources VALUES(?,?)", (memory_id, source_id))
+                self._record_event(conn, memory_id, new_version, "merge_undone", {"merge_id": merge_id})
+            conn.execute("UPDATE memory_merges SET undone_at=? WHERE merge_id=?", (now, merge_id))
+            conn.commit()
+            return [self.get(memory_id) for memory_id in members]
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _merge_history_record(row: sqlite3.Row) -> dict[str, Any]:
+        return {"merge_id": row["merge_id"], "target_memory_id": row["target_memory_id"],
+                "member_ids": json.loads(row["members"]), "after_versions": json.loads(row["after_versions"]),
+                "after_statuses": json.loads(row["after_statuses"]), "created_at": row["created_at"],
+                "undone_at": row["undone_at"]}
+
+    def merges(
+        self, limit: int = 100, *, scope: MemoryScope | None = None,
+        project_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return payload-free merge history, optionally filtered before limiting."""
+        conn = self._connect()
+        try:
+            clauses: list[str] = []
+            params: list[Any] = []
+            if scope is not None:
+                clauses.append("e.scope=?")
+                params.append(scope)
+            if project_id is not None:
+                clauses.append("e.project_id=?")
+                params.append(project_id)
+            where = " WHERE " + " AND ".join(clauses) if clauses else ""
+            params.append(max(1, min(int(limit), 1000)))
+            rows = conn.execute(
+                "SELECT m.merge_id,m.target_memory_id,m.members,m.after_versions,m.after_statuses,m.created_at,m.undone_at "
+                "FROM memory_merges m JOIN memory_entries e ON e.memory_id=m.target_memory_id"
+                + where + " ORDER BY m.created_at DESC,m.merge_id LIMIT ?",
+                params,
+            ).fetchall()
+            return [self._merge_history_record(row) for row in rows]
+        finally:
+            conn.close()
+
+    def get_merge(
+        self, merge_id: str, *, scope: MemoryScope | None = None, project_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Return one payload-free merge row, enforcing target scope in the lookup."""
+        conn = self._connect()
+        try:
+            clauses = ["m.merge_id=?"]
+            params: list[Any] = [merge_id]
+            if scope is not None:
+                clauses.append("e.scope=?")
+                params.append(scope)
+            if project_id is not None:
+                clauses.append("e.project_id=?")
+                params.append(project_id)
+            row = conn.execute(
+                "SELECT m.merge_id,m.target_memory_id,m.members,m.after_versions,m.after_statuses,m.created_at,m.undone_at "
+                "FROM memory_merges m JOIN memory_entries e ON e.memory_id=m.target_memory_id WHERE "
+                + " AND ".join(clauses), params,
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Merge not found: {merge_id}")
+            return self._merge_history_record(row)
+        finally:
+            conn.close()
+
+    @classmethod
+    def _has_live_source(cls, conn: sqlite3.Connection, memory_id: str, now: str) -> bool:
+        rows = conn.execute(
+            "SELECT s.* FROM memory_sources s JOIN memory_entry_sources es USING(source_id) "
+            "WHERE es.memory_id=?", (memory_id,),
+        ).fetchall()
+        return cls._has_live_source_rows(rows, now)
+
+    @classmethod
+    def _has_live_source_ids(cls, conn: sqlite3.Connection, source_ids: list[str], now: str) -> bool:
+        rows = conn.execute(
+            "SELECT * FROM memory_sources WHERE source_id IN (" + ",".join("?" for _ in source_ids) + ")",
+            source_ids,
+        ).fetchall()
+        return cls._has_live_source_rows(rows, now)
+
+    @classmethod
+    def _has_live_source_rows(cls, rows: list[sqlite3.Row], now: str) -> bool:
+        return any(cls._source_valid(source, now) for source in rows)
+
     def correct(self, memory_id: str, *, content: str, expected_version: int,
                 source_id: str | None = None, user_confirmed: bool = True,
                 publication_lease: tuple[str, str, int] | None = None,
@@ -920,7 +1232,7 @@ class MemoryService:
             status = "active" if user_confirmed or source_row["trusted_source"] else "candidate"
             dedupe = hashlib.sha256(content.casefold().encode()).hexdigest()
             corrected_metadata = json.loads(old["metadata"])
-            for key in ("needs_review", "conflict_ids", "conflict_hints"):
+            for key in ("needs_review", "conflict_ids", "conflict_hints", "consolidation_undo_peers"):
                 corrected_metadata.pop(key, None)
             corrected_metadata.update(metadata or {})
             conn.execute("""INSERT INTO memory_entries VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",

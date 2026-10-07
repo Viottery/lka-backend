@@ -31,7 +31,7 @@ max_attempts = 2
 # tokenizer_json_path = "./data/tokenizers/model/tokenizer.json"
 
 [safety]
-# Tool calls with read_only != true must always enter the safety review step.
+# Every Agent tool call, including read-only calls, enters the safety review step.
 # Modes:
 # - skip: record the review and auto-approve it.
 # - llm: ask the configured LLM to approve/reject.
@@ -214,11 +214,18 @@ allow_remote_extraction = true
 extraction_context_messages = 12
 extraction_context_chars = 12000
 auto_publish_min_confidence = 0.85
+reconciliation_max_items = 48 # Related old memories, not only the most recent entries.
+reconciliation_max_chars = 16000 # Shared global/project candidate view; never cut a condition.
+consolidation_enabled = true
+consolidation_debounce_seconds = 60
+consolidation_interval_seconds = 21600 # Periodic safety-net check every six hours.
+consolidation_batch_items = 24
+consolidation_min_confidence = 0.9
 max_recalled_items = 8
 max_recalled_chars = 2400
 extraction_debounce_seconds = 5
 background_worker_count = 2
-max_job_tokens = 32768
+max_job_tokens = 0 # No ordinary memory/compaction allowance; emergency fuses below still apply.
 generation_output_tokens = 4096 # Includes reasoning and final output, not summary size.
 recovery_output_tokens = 8192 # One bounded recovery; thinking disabled when supported.
 # Optional separate low-cost route; must declare its context_window_tokens.
@@ -273,9 +280,13 @@ max_pending_jobs = 1024
 max_llm_concurrency = 4
 interactive_reserved = 2
 memory_concurrency = 1
+message_concurrency = 1
 io_concurrency = 1
-hourly_token_limit = 200000
+hourly_token_limit = 200000 # Per non-memory background pool, not shared with memory.
 daily_token_limit = 1000000
+memory_task_fuse_tokens = 262144 # Emergency stop, not a routine quota; must be positive.
+memory_hourly_fuse_tokens = 2000000
+memory_daily_fuse_tokens = 10000000
 # Monetary limits are opt-in, with configured prices; usage always records tokens.
 daily_cost_limit = 0
 input_cost_per_million = 0

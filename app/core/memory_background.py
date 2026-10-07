@@ -7,6 +7,7 @@ import json
 import re
 import sqlite3
 import threading
+import time
 from datetime import UTC, datetime
 from typing import Any
 
@@ -23,9 +24,11 @@ from app.core.llm_workloads import (
     BackgroundTaskBudgetExceeded,
     workload_scope,
 )
+from app.core.memory_consolidation import MemoryConsolidator
 from app.core.memory_extraction import direct_durable_preferences, extract_user_memories
 from app.core.memory_files import MemoryFileConflictError, MemoryFileError, MemoryFiles
 from app.core.memory_learning import ContextualMemoryLearning
+from app.core.memory_reconciliation import canonical_memory, reconciliation_candidates
 from app.core.sessions import SessionRecentMessage, SessionService
 from app.domains.memory import (
     MemoryInput,
@@ -106,12 +109,16 @@ class MemoryBackgroundCoordinator:
         session_service: SessionService, llm_client: Any = None,
         allow_remote_extraction: bool = True,
         memory_files: MemoryFiles | None = None,
-        max_job_tokens: int = 32_768, debounce_seconds: float = 0,
+        max_job_tokens: int = 0, debounce_seconds: float = 0,
         worker_count: int = 2,
         background_client_name: str | None = None, background_model: str | None = None,
         generation_output_tokens: int = 4096, recovery_output_tokens: int = 8192,
         extraction_context_messages: int = 12, extraction_context_chars: int = 12_000,
         auto_publish_min_confidence: float = 0.85,
+        reconciliation_max_items: int = 48, reconciliation_max_chars: int = 16_000,
+        consolidation_enabled: bool = True, consolidation_debounce_seconds: float = 60,
+        consolidation_interval_seconds: float = 21_600, consolidation_batch_items: int = 24,
+        consolidation_min_confidence: float = 0.9,
     ) -> None:
         self.db_path = db_path
         self.memory = memory
@@ -121,20 +128,37 @@ class MemoryBackgroundCoordinator:
         self.allow_remote_extraction = allow_remote_extraction
         self.memory_files = memory_files
         self.last_file_error: str | None = None
+        self.last_maintenance_error: str | None = None
         self.max_job_tokens, self.debounce_seconds = max_job_tokens, debounce_seconds
         self.background_client_name, self.background_model = background_client_name, background_model
         self.generation_output_tokens = generation_output_tokens
         self.recovery_output_tokens = recovery_output_tokens
         self._compaction_state = threading.local()
+        self.consolidation_enabled = consolidation_enabled
+        self.consolidation_debounce_seconds = consolidation_debounce_seconds
+        self.consolidation_interval_seconds = consolidation_interval_seconds
+        self.consolidator = MemoryConsolidator(memory, batch_items=consolidation_batch_items,
+            max_chars=reconciliation_max_chars, min_confidence=consolidation_min_confidence)
+        self._maintenance_stop = threading.Event()
+        self._maintenance_thread: threading.Thread | None = None
         self.learning = ContextualMemoryLearning(
             memory, session_service, memory_files, context_messages=extraction_context_messages,
             context_chars=extraction_context_chars, min_confidence=auto_publish_min_confidence,
+            reconciliation_max_items=reconciliation_max_items, reconciliation_max_chars=reconciliation_max_chars,
         )
         self.worker = BackgroundJobWorker(
-            store, {"memory_extract": self._bounded_extract, "context_compact": self._bounded_compact},
+            store, {"memory_extract": self._bounded_extract, "context_compact": self._bounded_compact,
+                    "memory_consolidate": self._bounded_consolidate},
             worker_count=worker_count,
             lease_seconds=600, poll_seconds=1,
         )
+        if memory is not None:
+            with sqlite3.connect(self.db_path, timeout=10) as conn:
+                conn.execute("""CREATE TABLE IF NOT EXISTS memory_maintenance_state(
+                    scope_id TEXT PRIMARY KEY, observed_signature TEXT NOT NULL,
+                    dirty_at TEXT NOT NULL, queued_key TEXT NOT NULL DEFAULT '',
+                    settled_signature TEXT NOT NULL DEFAULT '', last_completed_at TEXT,
+                    merged_count INTEGER NOT NULL DEFAULT 0, outcome TEXT)""")
 
     def enqueue_answer(self, conn: sqlite3.Connection, message: Any) -> None:
         """Called inside SessionService.append_message transaction."""
@@ -148,12 +172,90 @@ class MemoryBackgroundCoordinator:
                                    conn=conn, debounce_seconds=self.debounce_seconds)
 
     def _bounded_extract(self, job):
-        with workload_scope("background_memory", task_id=job["job_id"], max_tokens=self.max_job_tokens):
+        with workload_scope("background_memory", task_id=job["job_id"], max_tokens=self.max_job_tokens or None):
             self._extract(job)
 
     def _bounded_compact(self, job):
-        with workload_scope("background_memory", task_id=job["job_id"], max_tokens=self.max_job_tokens):
+        with workload_scope("background_memory", task_id=job["job_id"], max_tokens=self.max_job_tokens or None):
             self._compact(job)
+
+    def _bounded_consolidate(self, job):
+        if not self.consolidation_enabled:
+            raise BackgroundBudgetDeferred("memory_consolidation_disabled")
+        with workload_scope("background_memory", task_id=job["job_id"], max_tokens=self.max_job_tokens or None):
+            records, settled = self.consolidator.run(job, client=self._selected_client() if self.allow_remote_extraction else None,
+                                                      store=self.store)
+        if not self.store.heartbeat(job["job_id"], job["lease_owner"], job["lease_epoch"], 600):
+            raise MemoryPublicationSuppressed("Maintenance lease is stale")
+        file_status = self.learning.sync(records)
+        with sqlite3.connect(self.db_path, timeout=10) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("BEGIN IMMEDIATE")
+            self.memory._validate_publication_lease(
+                conn, (job["job_id"], job["lease_owner"], job["lease_epoch"]))
+            conn.execute("UPDATE memory_maintenance_state SET settled_signature=?,last_completed_at=?,merged_count=?,outcome=? WHERE scope_id=?",
+                (settled, datetime.now(UTC).isoformat(), len(records),
+                 "merged_file_conflict" if file_status == "conflict_or_unavailable" else "merged" if records else "no_safe_merge", job["scope_id"]))
+
+    def maintenance_status(self, *, scope: str = "global", project_id: str | None = None):
+        scope_id = "global" if scope == "global" else "project:" + (project_id or "")
+        with sqlite3.connect(self.db_path, timeout=10) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM memory_maintenance_state WHERE scope_id=?", (scope_id,)).fetchone()
+        jobs = self.store.list(scope_id=scope_id, kind="memory_consolidate", limit=5)
+        return {"enabled": self.consolidation_enabled, "state": dict(row) if row else None, "jobs": jobs,
+                "last_error": self.last_maintenance_error}
+
+    def enqueue_maintenance(self, *, scope: str = "global", project_id: str | None = None, force: bool = False):
+        if scope not in {"global", "project"} or (scope == "project") != bool(project_id):
+            raise ValueError("invalid maintenance scope")
+        if not self.consolidation_enabled or not self.memory.learning_enabled(scope="global") or not self.memory.learning_enabled(scope=scope, project_id=project_id):
+            return {"status": "disabled", "job_id": None}
+        if len(list(self.memory.list(scope=scope, project_id=project_id, limit=2))) < 2:
+            return {"status": "not_needed", "job_id": None}
+        scope_id = "global" if scope == "global" else "project:" + project_id
+        signature = self.consolidator.signature(scope, project_id)
+        now = datetime.now(UTC)
+        with sqlite3.connect(self.db_path, timeout=10) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("BEGIN IMMEDIATE")
+            state = conn.execute("SELECT * FROM memory_maintenance_state WHERE scope_id=?", (scope_id,)).fetchone()
+            if state is None:
+                conn.execute("INSERT INTO memory_maintenance_state(scope_id,observed_signature,dirty_at) VALUES(?,?,?)",
+                             (scope_id, signature, now.isoformat()))
+                state = conn.execute("SELECT * FROM memory_maintenance_state WHERE scope_id=?", (scope_id,)).fetchone()
+            elif state["observed_signature"] != signature:
+                conn.execute("UPDATE memory_maintenance_state SET observed_signature=?,dirty_at=? WHERE scope_id=?",
+                             (signature, now.isoformat(), scope_id))
+                state = conn.execute("SELECT * FROM memory_maintenance_state WHERE scope_id=?", (scope_id,)).fetchone()
+            dirty = signature != state["settled_signature"]
+            elapsed = (now - datetime.fromisoformat(state["last_completed_at"])).total_seconds() if state["last_completed_at"] else float("inf")
+            if not force and ((dirty and (now - datetime.fromisoformat(state["dirty_at"])).total_seconds() < self.consolidation_debounce_seconds)
+                              or (not dirty and elapsed < self.consolidation_interval_seconds)):
+                return {"status": "waiting", "job_id": None}
+            period = int(now.timestamp() // self.consolidation_interval_seconds)
+            key = f"{signature}:{period}" + (f":{time.time_ns()}" if force else "")
+            if state["queued_key"] == key:
+                return {"status": "already_scheduled", "job_id": None}
+            result = self.store.enqueue_latest_watermark("memory_consolidate", scope_id, key,
+                {"project_id": project_id} if project_id else {}, conn=conn, priority=-5,
+                max_attempts=3, watermark_order=time.time_ns())
+            conn.execute("UPDATE memory_maintenance_state SET queued_key=? WHERE scope_id=?", (key, scope_id))
+            return result
+
+    def schedule_maintenance(self):
+        with sqlite3.connect(self.db_path, timeout=10) as conn:
+            scopes = conn.execute("SELECT DISTINCT scope,project_id FROM memory_entries WHERE status='active'").fetchall()
+        for scope, project_id in scopes:
+            self.enqueue_maintenance(scope=scope, project_id=project_id)
+
+    def _maintenance_loop(self):
+        while not self._maintenance_stop.is_set():
+            try:
+                self.schedule_maintenance()
+            except Exception as exc:  # noqa: BLE001 - diagnostics contain no source text.
+                self.last_maintenance_error = type(exc).__name__
+            self._maintenance_stop.wait(30)
 
     def _selected_client(self):
         return SelectedBackgroundClient(
@@ -166,7 +268,7 @@ class MemoryBackgroundCoordinator:
         if not self.allow_remote_extraction:
             return [], "not_saved"
         with workload_scope("interactive", task_id=f"memory_save:{user.message_id}",
-                            max_tokens=self.max_job_tokens):
+                            max_tokens=self.max_job_tokens or None):
             return self.learning.organize(
                 user, client=self._selected_client(), project_id=project_id,
                 requested_memory=requested_memory,
@@ -318,7 +420,9 @@ class MemoryBackgroundCoordinator:
             used = 0
             for row in rows:
                 cost = len(row["content"].encode("utf-8")) + 128
-                if selected and used + cost > max(1024, self.max_job_tokens // 3):
+                # Prefix size bounds scheduling/latency, not a token allowance.
+                prefix_bytes = max(1024, self.max_job_tokens // 3) if self.max_job_tokens else 32_768
+                if selected and used + cost > prefix_bytes:
                     break
                 selected.append(row)
                 used += cost
@@ -379,7 +483,7 @@ class MemoryBackgroundCoordinator:
             chunks: list[list[SessionRecentMessage]] = []
             current: list[SessionRecentMessage] = []
             size = 0
-            remote_remaining = self.max_job_tokens
+            remote_remaining = self.max_job_tokens or None
             for message in messages:
                 byte_size = len(message.content.encode("utf-8")) + 128
                 if size + byte_size > 8000 and current:
@@ -419,7 +523,7 @@ class MemoryBackgroundCoordinator:
                     "about additional open questions the conversation did not raise."
                 )
                 estimated = _estimate_prompt_tokens({"system_prompt": system_prompt, "user_prompt": prompt}) + self.generation_output_tokens
-                if estimated > remote_remaining or len(prompt.encode("utf-8")) > 16000:
+                if (remote_remaining is not None and estimated > remote_remaining) or len(prompt.encode("utf-8")) > 16000:
                     # One unusually large message must not fail the whole job.
                     # Deterministic fallback preserves provenance and critical
                     # wording; immutable original text remains available.
@@ -451,7 +555,8 @@ class MemoryBackgroundCoordinator:
                     continue
                 metadata = getattr(response, "metadata", {})
                 charged = metadata.get("generation_tokens", estimated) if isinstance(metadata, dict) else estimated
-                remote_remaining = max(0, remote_remaining - charged)
+                if remote_remaining is not None:
+                    remote_remaining = max(0, remote_remaining - charged)
                 try:
                     require_complete_response(response)
                 except IncompleteGenerationError:
@@ -581,6 +686,22 @@ class MemoryBackgroundCoordinator:
                         publication_lease=(job["job_id"], job["lease_owner"], job["lease_epoch"]),
                     )
             return
+        # Deterministic extraction remains the fast path when no related old
+        # claim exists. Otherwise let the existing contextual organizer decide
+        # equivalent/update/new before publishing a second paraphrase.
+        if self.allow_remote_extraction and len(user["content"]) <= 20000:
+            related = reconciliation_candidates(self.memory, [c.claim for c in candidates], scope="global", related_only=True)
+            if project_id_for_policy:
+                related += reconciliation_candidates(self.memory, [c.claim for c in candidates], scope="project",
+                                                     project_id=project_id_for_policy, related_only=True)
+            exact_claims = {canonical_memory(r.content) for r in related}
+            if related and any(canonical_memory(c.claim) not in exact_claims for c in candidates):
+                persisted_user = self.session_service.get_turn_user_message(session_id=answer["session_id"], trace_id=trace_id)
+                if persisted_user is not None:
+                    records, _ = self.learning.organize(persisted_user, client=remote_client, project_id=project_id_for_policy,
+                        publication_lease=(job["job_id"], job["lease_owner"], job["lease_epoch"]))
+                    if records:
+                        return
         if not candidates:
             return
         source_id = self.memory.register_source(MemorySourceInput(
@@ -619,6 +740,16 @@ class MemoryBackgroundCoordinator:
                     self.last_file_error = type(exc).__name__
 
     def _publish_candidate(self, candidate, user, used_local, scope, project_id, source_id, job):
+        related = reconciliation_candidates(self.memory, [candidate.claim], scope=scope,
+            project_id=project_id, related_only=True,
+            max_items=self.learning.reconciliation_max_items, max_chars=self.learning.reconciliation_max_chars)
+        exact = next((r for r in related if canonical_memory(r.content) == canonical_memory(candidate.claim)
+                      and r.memory_type == candidate.kind and r.sensitivity == candidate.sensitivity
+                      and r.expires_at == candidate.expires_at), None)
+        if exact:
+            return self.memory.add_source(exact.memory_id, source_id=source_id, expected_version=exact.version,
+                user_confirmed=used_local and candidate.explicit,
+                publication_lease=(job["job_id"], job["lease_owner"], job["lease_epoch"]))
         return self.memory.create(MemoryInput(
             content=candidate.claim, memory_type=candidate.kind,
             scope=scope, project_id=project_id, source_id=source_id,
@@ -645,6 +776,10 @@ class MemoryBackgroundCoordinator:
     def start(self) -> None:
         self.recover_missing_jobs()
         self.worker.start()
+        if self.consolidation_enabled and (self._maintenance_thread is None or not self._maintenance_thread.is_alive()):
+            self._maintenance_stop.clear()
+            self._maintenance_thread = threading.Thread(target=self._maintenance_loop, daemon=True, name="lka-memory-maintenance")
+            self._maintenance_thread.start()
 
     def initialize_recovery(self) -> None:
         """Do not silently import all historical conversations on first enable."""
@@ -708,6 +843,9 @@ class MemoryBackgroundCoordinator:
         return queued
 
     def stop(self) -> None:
+        self._maintenance_stop.set()
+        if self._maintenance_thread is not None:
+            self._maintenance_thread.join(timeout=5)
         self.worker.stop()
 
 

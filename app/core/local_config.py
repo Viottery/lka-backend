@@ -391,10 +391,18 @@ class MemoryConfig(BaseModel):
     extraction_context_messages: int = Field(default=12, ge=2, le=40)
     extraction_context_chars: int = Field(default=12_000, ge=2000, le=24_000)
     auto_publish_min_confidence: float = Field(default=0.85, ge=0.5, le=1.0)
+    reconciliation_max_items: int = Field(default=48, ge=8, le=100)
+    reconciliation_max_chars: int = Field(default=16_000, ge=2000, le=64_000)
+    consolidation_enabled: bool = True
+    consolidation_debounce_seconds: float = Field(default=60, ge=0, le=3600)
+    consolidation_interval_seconds: float = Field(default=21_600, ge=60, le=604800)
+    consolidation_batch_items: int = Field(default=24, ge=2, le=48)
+    consolidation_min_confidence: float = Field(default=0.9, ge=0.85, le=1.0)
     max_recalled_items: int = Field(default=8, ge=0, le=30)
     max_recalled_chars: int = Field(default=2400, ge=0, le=12000)
     extraction_debounce_seconds: float = Field(default=5, ge=0, le=300)
-    max_job_tokens: int = Field(default=32_768, ge=1000, le=500_000)
+    # Zero removes the ordinary cumulative allowance; emergency fuses remain.
+    max_job_tokens: int = Field(default=0, ge=0, le=500_000)
     generation_output_tokens: int = Field(default=4096, ge=256, le=131_072)
     recovery_output_tokens: int = Field(default=8192, ge=256, le=131_072)
     background_client_name: str | None = None
@@ -463,12 +471,16 @@ class BackgroundConfig(BaseModel):
     max_llm_concurrency: int = Field(default=4, ge=1, le=32)
     interactive_reserved: int = Field(default=2, ge=1, le=32)
     memory_concurrency: int = Field(default=1, ge=1, le=8)
+    message_concurrency: int = Field(default=1, ge=1, le=8)
     io_concurrency: int = Field(default=1, ge=1, le=8)
     hourly_token_limit: int = Field(default=200_000, ge=0)
     daily_token_limit: int = Field(default=1_000_000, ge=0)
     daily_cost_limit: float = Field(default=0, ge=0)
     input_cost_per_million: float = Field(default=0, ge=0)
     output_cost_per_million: float = Field(default=0, ge=0)
+    memory_task_fuse_tokens: int = Field(default=262_144, ge=1)
+    memory_hourly_fuse_tokens: int = Field(default=2_000_000, ge=1)
+    memory_daily_fuse_tokens: int = Field(default=10_000_000, ge=1)
 
     @model_validator(mode="after")
     def reservation_fits(self):

@@ -6,13 +6,18 @@ import hashlib
 import ipaddress
 import os
 import secrets
-from typing import Literal
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.core.memory_files import MemoryFileConflictError, MemoryFileError
-from app.domains.memory import MemoryConflictError, MemoryInput, MemorySourceInput
+from app.domains.memory import (
+    MemoryConflictError,
+    MemoryInput,
+    MemoryPublicationSuppressed,
+    MemorySourceInput,
+)
 
 
 def require_local_memory_control(request: Request) -> None:
@@ -59,6 +64,69 @@ class LearningPolicyRequest(BaseModel):
 class RelocateProjectRequest(BaseModel):
     old_workspace_path: str = Field(min_length=1)
     new_workspace_path: str = Field(min_length=1)
+
+
+class MemoryMaintenanceRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    scope: Literal["global", "project"] = "global"
+    workspace_path: str | None = None
+
+
+class UndoMemoryMergeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_versions: dict[str, Annotated[int, Field(strict=True, ge=1)]] = Field(min_length=2, max_length=100)
+    workspace_path: str | None = None
+
+
+@router.post("/memories/maintenance")
+def request_memory_maintenance(payload: MemoryMaintenanceRequest, request: Request):
+    project_id = _project_id(request, payload.scope, payload.workspace_path, create=False)
+    if payload.scope == "project" and project_id is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    config = request.app.state.runtime.local_app_config.memory
+    if not config.enabled or not config.background_enabled:
+        return {"status": "disabled", "job_id": None}
+    return request.app.state.runtime.memory_background.enqueue_maintenance(
+        scope=payload.scope, project_id=project_id, force=True,
+    )
+
+
+@router.get("/memories/maintenance")
+def memory_maintenance_status(request: Request, scope: Literal["global", "project"] = "global",
+                              workspace_path: str | None = None):
+    project_id = _project_id(request, scope, workspace_path, create=False)
+    if scope == "project" and project_id is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    return request.app.state.runtime.memory_background.maintenance_status(scope=scope, project_id=project_id)
+
+
+@router.get("/memories/merges")
+def list_memory_merges(request: Request, scope: Literal["global", "project"] = "global",
+                      workspace_path: str | None = None, limit: int = Query(default=100, ge=1, le=500)):
+    project_id = _project_id(request, scope, workspace_path, create=False)
+    service = request.app.state.runtime.memory_service
+    if scope == "project" and project_id is None:
+        return {"merges": []}
+    return {"merges": service.merges(limit=limit, scope=scope, project_id=project_id)}
+
+
+@router.post("/memories/merges/{merge_id}/undo")
+def undo_memory_merge(merge_id: str, payload: UndoMemoryMergeRequest, request: Request):
+    service = request.app.state.runtime.memory_service
+    # Use current target for scope checks; superseded members keep their scope.
+    try:
+        row = service.get_merge(merge_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="merge not found") from exc
+    current = _authorized_record(request, row["target_memory_id"], payload.workspace_path)
+    try:
+        records = service.undo_merge(merge_id, expected_versions=payload.expected_versions)
+    except (MemoryConflictError, MemoryPublicationSuppressed) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"memories": [record.model_dump(mode="json") for record in records],
+            "memory_file_status": _refresh_file(request, current.scope, current.project_id)}
 
 
 @router.post("/memories/projects/{project_id}/relocate")
