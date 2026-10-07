@@ -106,8 +106,8 @@ PUT /sessions/{session_id}/workspace
 
 响应中的 `workspace` 会同时出现在该会话的 `GET /sessions/{session_id}` 结果中。它是
 `bash` 和 `filesystem` 的默认根目录：相对路径、`$workspace_root` 和命令环境变量均按此目录
-解析。`filesystem` 会拒绝目录之外的路径；`bash` 将其作为受校验的 `cwd`，但不是 OS 级
-sandbox，shell 命令本身仍须经过既有安全审查。
+解析。`filesystem` 对目录外目标申请本次调用的精确路径审批；`bash` 的目录外 `cwd` 同样
+需要审批。所有工具调用均走所选安全审查模式，shell 执行仍不是 OS 级文件 sandbox。
 
 路径协议：
 
@@ -542,10 +542,8 @@ audit record 和本地日志路径均不属于正常 HTTP 响应；它们只保�
   `observation.search` 默认 `scope=content`：生产者已声明证据角色时只搜索正文/搜索候选
   路径；不会把零匹配回执中的 `/output/query` 当正文。`scope=raw` 显式搜全部原始字段。
   未声明角色的MCP/工具仍支持结构搜索，但返回 `unknown_structure`／未知证据角色。
-- 所有非只读工具调用都会先进入 safety review。审查模式由本地配置选择：
-  `skip` 记录并自动通过、`llm` 调用 LLM 审查、`manual` 进入等待前端确认状态。
-- `bash.run` 会按具体命令动态判断只读性。白名单只读命令可直接执行；白名单之外、
-  写入、信号、stdin 交互等都按非只读处理并进入 safety review。
+- Agent 的每次工具调用都会进入配置的逐调用 safety review，包括只读工具；`skip` 仍创建审查记录并自动通过，`llm` 调用 LLM 审查，`manual` 等待用户决定。外部路径访问和非只读操作也必须通过 Tool Executor 的执行时校验。
+- `bash.run` 会按具体命令动态判断只读性。白名单之外、写入、信号、stdin 交互等按非只读处理。只读分类不代表命令的任意文件参数已被沙箱隔离。
 - Agent core 不硬编码具体 package 名、工具名、领域流程、路由关键词或工具调用示例。
   具体策略必须由 package metadata、tool description、input/output schema、routing hints、
   decision hints 和 cache policy 提供。
@@ -817,12 +815,13 @@ GET /agent/runs/{run_id}/safety-reviews
       "trace_id": "agent_turn_xxx",
       "invocation_id": "tool_invocation_xxx",
       "tool_name": "filesystem.edit_file",
-      "tool_input": {},
       "tool_risk": "medium",
       "side_effects": ["write_local_file"],
       "read_only": false,
       "mode": "manual",
       "reason": "Tool is explicitly non-read-only.",
+      "input_fields": ["path", "expected_sha256", "edits"],
+      "workspace_access": [],
       "status": "pending",
       "decided_by": null,
       "decision_reason": null
@@ -853,6 +852,18 @@ POST /agent/safety-reviews/{review_id}/decision
 
 `decision` 只能是 `approve` 或 `reject`。`approve` 会恢复对应 run 的执行；
 `reject` 会把工具调用作为 rejected observation 反馈给 Agent，Agent 可以生成解释性回答。
+
+公共审查响应和 SSE 摘要包含 `decision_reason` 与 `workspace_access`，不包含原始 `tool_input`、
+实际 `user_request` 或审查 LLM 输出；这些内容仅保存在本地审计记录。审查使用该 run 的实际用户
+请求作为上下文。批准只绑定当前调用；之后用户明确授权的操作仍会创建新的逐调用审查。
+
+`workspace_access` 列出本次调用申请访问的工作区外规范化路径。`filesystem.read_file`、
+`filesystem.edit_file` 的目标文件，以及 `bash.run` 的 `cwd` 超出当前允许根时，会请求对此
+精确路径的审查；工具执行前会重新解析路径，以便符号链接目标变化时失效。Child Agent 的
+ContextSnapshot 中收窄的路径范围仍是不可扩大的上限。Bash 的精确路径批准只控制工作目录；
+安全审查同时评估整条命令及其间接文件访问。命令在后端 OS 用户权限下执行，不是文件沙箱。
+前端应在运行状态和流程视图中展示 review reason 与 `decision_reason`；`manual` 等待用户决定时，
+应显示待批准的 `workspace_access` 路径。
 
 ---
 
@@ -925,7 +936,8 @@ safety-review decision 恢复；终态 run 和 legacy orchestrator run 返回 `4
 resume 请求会合并为同一个恢复任务。
 
 安全审查 API 与 SSE 的 `safety_review_*` 事件只返回公开摘要（review ID、工具、风险、状态、
-理由及时间）。原始 `tool_input` 和审查 LLM 输出属于本地审计材料，不会进入普通 HTTP/SSE 响应。
+理由、`decision_reason`、`workspace_access` 及时间）。原始 `tool_input`、run 的实际 `user_request`
+和审查 LLM 输出属于本地审计材料，不会进入普通 HTTP/SSE 响应。
 
 `POST /agent/turn/stream` 默认以 `llm.response_mode=stream` 运行。所有 Agent runtime
 中的 LLM stage 都可以发送 provider token delta，包括 route、decision、decision_repair、
@@ -1556,9 +1568,9 @@ tool_review_mode = "manual"
 ```
 
 Restart the backend after changing local configuration. `orchestrator = "langgraph"`
-is required when Multi-Agent planning is enabled. Use `tool_review_mode = "manual"`
-to queue non-read-only tool calls for user approval; `skip` and `llm` are alternative
-review policies, not substitutes for the execution-time Tool Executor checks.
+is required when Multi-Agent planning is enabled. Every Agent tool call, including read-only calls,
+follows `tool_review_mode`: `manual` queues each for user approval, `llm` uses model review, and `skip`
+records and automatically approves the review. Executor checks still run.
 
 ```http
 GET /agent/runs/{run_id}/snapshot
@@ -1640,6 +1652,19 @@ Agent 可展开 `web` 包，再调用只读 `web.search`（参数 `query`、`mod
 
 生产 runtime 的渐进式网页合同（不新增专用 HTTP 端点）：
 
+- `web.search/open/find` 声明受控 `external_read`，不是任意本地执行；它们仍按配置进行逐调用
+  safety review。工具范围、取消和 SSRF 检查仍生效。
+  若某来源策略显式禁止 `external_read`，网络请求仍拒绝；固定 search_id/snapshot_id
+  本地续读不联网，继续检查缓存所属会话、版本及当前访问范围。
+- 返回资料标为 `untrusted_data` 并保留原文与来源信息。上下文结果 gate 使用中英文启发式
+  警示检测常见指令式文本；受字符、节点和深度限制，扫描不完整时标记为 `unknown`。它不
+  封禁来源或工具，也不能保证发现所有恶意文本；缓存和折叠不使来源成为指令。
+- `search_lang` 支持 `zh-hans`/`zh-hant`，适配器将普通 `zh` 转为简体；country 为
+  TW/HK/MO 时转为繁体。常见 zh 地区别名及大小写归一化；显式脚本优先于 country。
+  转换发生在第一次请求前，不靠失败重试消耗搜索配额，返回参数记录实际 provider 语言。
+- 来源策略拒绝附 `source_constraint_denial`（constraint_id、reason、blocked_effect_domains、
+  retryable=false）；只有真实的专用审批操作才附 review_path。不可用能力不会一律指向
+  事项审批，普通工具确认也不能清除来源约束。确定性拒绝无需额外模型校验。
 - search 默认 `view=compact`，每项短摘要附 `snippet_truncated/snippet_total_chars`、候选
   `ref_id`；整体附 `queried_at/search_id/cache_hit`。`web.search(search_id=..., view=full)`
   只读本地标准化响应，不能同时传 query/filter；无新 provider 请求。
@@ -1696,6 +1721,18 @@ query string 传递 token；它们不暴露 LLM 密钥、原始 prompt、记忆�
   与消息导入协议的 schema_version 独立。
 - `GET /background/config/schema`：返回 memory/background/message_history 配置的 JSON Schema，
   前端可以获取类型、默认值和数值范围；模型目录沿用 `GET /agent/models`。
+- `GET /background/health` 的 `llm_workloads.budget_pools` 分别提供记忆、消息、I/O 池的
+  `revision`、`reset_at`、`circuit_open`、`opened_at`、`reason` 及小时／日 tokens、calls。
+  `last_24h` 保留历史统计，不因额度重置变成零；当前额度应查看 `budget_pools`。
+  `budget_events` 为最近30条无正文的重置／熔断记录，熔断也写入服务日志，SSE 同步该状态。
+  记忆与自动压缩默认无常规 token 配额；异常阈值见 `limits.memory_emergency_thresholds`。
+- `POST /background/budgets/reset`：请求
+  `{"expected_revisions":{"background_memory":0,"background_message":0},"reason":"用户确认重置"}`。
+  可选池为 background_memory/background_message/background_io；原子校验版本，冲突或
+  所选池有在途／未过期预约时409，非法类型／前台池422。只接受记忆管理凭据或未配置
+  凭据时的 loopback，不能使用消息配对凭据跨池操作。新计量窗口从操作时开始，并解除
+  所选池熔断；不删除历史、记忆、来源、检查点，不重置消息工作 family 的累计额度。
+  等待任务按原定时再次尝试；不是任意任务重放接口。结果返回更新后的 workload 健康状态。
 - `PATCH /background/config`：例如
   `{"expected_revision":0,"memory":{"generation_output_tokens":6000,"allow_remote_extraction":true},"background":{"request_timeout_seconds":45}}`。
   只合并提交字段，持久化到本地 SQLite；版本冲突 409，未知字段、非法数值及未知
@@ -1707,7 +1744,7 @@ query string 传递 token；它们不暴露 LLM 密钥、原始 prompt、记忆�
 - `POST /background/jobs/{job_id}/retry` 和 `/cancel`：请求
   `{"expected_updated_at":"任务列表中的 updated_at"}`，以任务状态 CAS 防止过期按钮
   重复操作。404 表示任务不存在，409 表示状态已变化或当前状态不能操作。
-  重试只支持 `memory_extract` / `context_compact` 的 failed/cancelled 任务；其他类型
+  重试只支持 `memory_extract` / `context_compact` / `memory_consolidate` 的 failed/cancelled 任务；其他类型
   返回 422，不能借此重放 Watch 或外部动作。过期 deadline、已清理 payload 不可重试。
   重试保留任务身份、累计用量和已完成输入 checkpoint，不重新发布已处理记忆。
   若自动重试次数已耗尽，用户明确重试会额外授予一次尝试，但不会清零次数或 token 用量。
@@ -1760,6 +1797,28 @@ Agent 读取使用只读 `memory.search` / `memory.read`；`memory.remember(cont
 必须分别展示。关闭学习或子 Agent 写入会被拒绝。
 
 `memory.allow_remote_extraction` 默认 true，旧 TOML/前端覆盖项显式 false 仍受尊重。
+
+#### 后台记忆维护与合并撤销
+
+- `GET /memories/maintenance?scope=global`：返回 enabled、无正文 state、最近5项整理作业和
+  last_error；state 包括已观察／已整理签名、last_completed_at、merged_count、outcome。
+  `no_safe_merge` 代表保守跳过，不表示模型质量已验证；`merged_file_conflict` 代表数据库
+  整理完成但派生文件有冲突。项目范围须提供允许的 workspace_path，未知项目404。
+- `POST /memories/maintenance`：正文 `{scope:"global",workspace_path:null}`，请求一次后台
+  整理，返回 job_id/status；仍受学习开关、全局后台开关、来源、租约与异常熔断约束。
+  合并只处理已有效的记忆，不直接读取知识库、邮箱或工作区，不同步调用模型等待完成。
+- `GET /memories/merges?scope=global&limit=100`：同范围 payload-free 合并元数据，含
+  merge_id、target_memory_id、member_ids、after_versions、after_statuses、created_at、undone_at。
+- `POST /memories/merges/{merge_id}/undo`：正文 `{expected_versions:{"mem_id":2,...},workspace_path:null}`。
+  必须提交所有成员的真实版本整数；非法类型422、后来修改／已撤销409、未知合并404。
+  来源失效或期限已过不得恢复。成功返回恢复后的 memories 与 memory_file_status；
+  版本递增、历史保留，不回滚其他修改，且阻止同一组合被自动重新合并。
+
+以上接口采用记忆管理认证，不接受消息配对凭据授权记忆修改。
+`memory_consolidate` 使用 background_memory 池，并支持既有 `/background/jobs/{id}/retry|cancel`。
+同 scope 维护串行，模型输出只能引用当前视图中的完整记录；scope、type、sensitivity、
+expires_at 必须相同，不将弱候选晋升或择一覆盖冲突。每个参与成员保留有效来源。
+源撤回、项目学习关闭、取消和版本变化在发布事务中复核；重新生成派生文件不改 AGENTS.md。
 `extraction_context_messages` 默认 12（2..40）、`extraction_context_chars` 默认 12000
 （2000..24000）、`auto_publish_min_confidence` 默认 0.85（0.5..1）；这些字段通过既有
 `/background/config` 和 schema 管理，保存后重启生效，不增加新接口。普通提取在后台；
@@ -1950,7 +2009,8 @@ QQ_MEDIA_IMAGE_MAX_BYTES / QQ_MEDIA_VIDEO_MAX_BYTES 配置。额度不足优先�
 关闭不影响本模块。N 条唯一消息触发固定 seq 范围；同会话串行，长文本完整分片后原子发布，
 异常保留旧摘要和原文。模型只输出摘要/信息候选，没有工具执行权限；输出必须通过 schema、
 证据 ID、capture_epoch/analysis_epoch/processing_revision 和任务 lease 校验。
-兼容旧任务经加法迁移保留；历史来源、许可和原文不自动删除。共享后台 token/费用预算照常生效。
+兼容旧任务经加法迁移保留；历史来源、许可和原文不自动删除。消息池的后台 token/费用预算照常生效，
+不会占用记忆／自动压缩的额度；历史消息调用按持久工作记录迁移到消息池，不删除用量。
 
 启动时记录实际服务商／模型／prompt 版本的 hash，不保存密钥、URL 或 prompt 正文。
 后续模型或处理版本变化取消旧分析；服务商配置身份变化额外关闭分析，须用户重新授权。
@@ -2040,10 +2100,9 @@ Agent 包为 `messages`，包含 `messages.list_conversations`、`recent`、`sea
 在同一 SQLite 事务提交；同一幂等键异内容或旧预览为409，无权限来源 opaque404。
 停用分析／候选会冻结未确认候选，record 撤销不能重新启用旧候选；pause 不阻止人工批准。
 已批准的有界副本是独立 matter，不因停用消息来源删除。消息来源 matter 的通用写路径
-必须有域层 receipt；Agent 消费消息后会持久化来源约束，随 session／父子 run 保留，
-省略 source_links 或 safety skip 也不能绕开。无法隔离控制凭据／数据库的 bash、文件及外部执行
-通道在该运行中拒绝，不向 Agent 暴露可复用 receipt。纯邮件及无该约束的流程保持原行为。
-这不是对同一 OS 所有者的防篡改保证；控制 token 私有文件与数据目录仍需部署侧 OS 权限隔离。
+必须有域层 receipt；消息来源事项继续使用专用人工决定流程，普通工具审查不能替代该 receipt。
+消息来源标签对旧记录兼容且仅作说明，不会形成 session 级工具禁用，也不会阻止之后经逐调用
+safety review 的文件、命令或其他工具操作。这不是对同一 OS 所有者的防篡改保证。
 
 Agent 新增 `messages.overview/topics/insights/read_insight/topic_sources`，全部只读，
 返回 source_policy、untrusted_data、coverage 与分页。聚合先应用 source/account 权限再计算。
@@ -2074,7 +2133,7 @@ Agent 新增 `messages.overview/topics/insights/read_insight/topic_sources`，�
   manual 优先于模型；切回 auto 不保留人为用途认证。GET 均只读，不推进后台游标。
 
 Agent 新增 `messages.participants/participant/participant_sources/focus`，全部 read_only，
-绑定消息来源约束；child 必须同时有对应 source/account scope，空 grant 不等于无限制。
+读取范围受消息来源及账户授权约束；child 必须同时有对应 source/account scope，空 grant 不等于无限制。
 人物信息不能转成执行授权、matter 批准或个人 memory。前端沿用原生 JS 与 Java 精确代理，
 控制凭据不进入页面或 Java。
 
@@ -2152,5 +2211,5 @@ IMPORT 上报必须绑定现有白名单和 capture_epoch，不能自授权。
 人物档案分页区分 claims／machine_notes，并从 SQLite 即时执行隐藏、删除和人工纠正控制；
 只有当前 capture 下仍存在、作者一致、逐字引用可核对的证据可返回。
 
-新增 Agent messages 工具全部只读。统一 search 获取消息前，同样从可信注册工具提交
-来源约束，不能通过通用知识来源绕过事项人工确认；没有 NapCat 原始客户端或 QQ 写操作。
+新增 Agent messages 工具全部只读，并按配置进行逐调用 safety review。消息来源标记不产生
+session 级工具禁用；事项候选仍须通过专用人工决定流程。没有 NapCat 原始客户端或 QQ 写操作。

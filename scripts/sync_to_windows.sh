@@ -13,6 +13,8 @@ Examples:
 
 Behavior:
   - Default mode is dry-run. It prints what would change.
+  - On the WSL-primary development workstation, use the destination only for Windows compatibility tests.
+  - This script does not start services or migrate the everyday backend/data to Windows.
   - Copies the application and lockfile; excludes tests, evaluations, local data and environments.
   - --apply writes files to the target path.
   - --delete mirrors removals into the target. Use it only when WSL is the source of truth.

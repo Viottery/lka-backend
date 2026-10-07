@@ -1,5 +1,56 @@
 # 更新、备份与故障检查
 
+## WSL 主环境与 Windows 功能验证
+
+采用 WSL 作为主环境的开发电脑，源码修改、评测和日常后端都在 Linux 中进行。
+Windows 保留独立后端副本用于平台兼容与功能验证，不同时维护另一套日常实例。
+这不影响其他电脑使用原生 Windows 安装。
+
+| 用途 | 环境与启动方式 | 数据与端口 |
+| --- | --- | --- |
+| 开发、评测、日常后端 | WSL/Linux；`uv run python scripts/start_backend.py personal` | Linux 原生虚拟环境、已确认的日常数据；默认 8765 |
+| Windows 功能验证 | Windows 原生 Python；`python scripts/start_backend.py test` | 默认临时数据、mock 模型；默认 8766 |
+| 桌面界面、桌宠、消息采集 | 可以继续运行在 Windows | 日常流量连接 WSL 后端，测试流量单独配置 |
+
+Linux 更新后在仓库根目录运行 `uv sync --locked`，依照下文先等待任务结束、备份、再重启。
+不要把原生 Windows 的虚拟环境复制到 WSL，也不把每次修改后的 Windows 同步作为日常部署。
+
+已配置用户级服务的 WSL 开发电脑，日常后端由 `lka-backend.service` 管理，
+不要再启动同端口的手动实例。检查与重启在 WSL 执行：
+
+```bash
+systemctl --user status lka-backend.service
+# 先确认任务空闲、完成必要备份，再执行：
+systemctl --user restart lka-backend.service
+journalctl --user -u lka-backend.service -n 50 --no-pager
+```
+
+服务使用 Linux checkout 中的原生 `.venv`；私有服务配置保留本地，不随 Git 同步。
+配套 Windows 前端可通过本地 `.runtime/lka-backend-mode.json` 选择 WSL 模式
+（`backend_mode: "wsl"`、`wsl_distro`、`wsl_user`），由启动器启动该用户服务并复用前端。
+没有该本机标记的其他 Windows 安装仍按原生方式运行。WSL 发行版必须已启用 systemd；
+此配置不会保证 Windows 关机、休眠或停止 WSL 后仍运行后台任务。
+
+Windows 测试入口：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\start_backend.py test --port 8766
+```
+
+省略 `--test-data-dir` 时，测试服务结束后清理本次临时目录；确实需要保留测试数据时，
+指定新的独立目录，不能指向已有日常数据。测试配置不加载私有模型 TOML，
+但这不是操作系统沙箱：不要给测试进程注入日常凭据或连接真实采集流。
+真实模型兼容测试须另行使用隔离配置与明确选取的数据。
+
+首次从 Windows 日常后端切换到 WSL 时，先确定数据来源并备份两边，不自动合并数据库。
+等待旧实例空闲后切换，逐项核对授权文件、模型/tokenizer 缓存、指导文件、工作区和媒体路径。
+Windows 路径不能原样作为 Linux 配置路径；控制凭据的 Windows DPAPI 解密仍由原生配对端完成，
+不能假定复制授权文件就能在 Linux 使用。
+
+Windows 端必须实测 `/health`、SSE 和消息导入目标；WSL 内健康检查通过不等于 Windows 前端已连通。
+日常前端启动器应使用外部后端连接方式，不能同时自动拉起原生 Windows 日常后端。
+服务仍以本机访问为默认，不通过随意扩大监听地址代替连通性核查。
+
 ## 使用 Git 更新源码安装
 
 这套步骤用于 Git 源码安装，不用于直接覆盖便携包。
@@ -24,6 +75,17 @@ Linux 在更新后运行 `uv sync --locked`，再使用原来的启动方式。
 
 Git 只更新已提交的文件。工作区内部的工程资料、真实配置和本地历史不会由 Git 同步。
 目前没有自动更新器；旧版本删除的文件应由 Git 按提交处理，而非手工覆盖后假设升级完成。
+
+## 后台额度与熔断
+
+记忆／压缩与消息分析分池计量，查看 `/background/health` 中的
+`llm_workloads.budget_pools`，不要将保留历史的 `last_24h` 当成重置后的额度。
+熔断的原因、时间与当前版本可以通过健康接口、后台 SSE 和服务日志查看。
+先排查异常来源、等待相关调用结束并备份，再由用户显式确认通过
+`POST /background/budgets/reset` 提交所选池的版本与原因。它会开启新的滚动计量窗口并
+解除所选池熔断，不删除账本、来源或检查点，不提高消息工作累计额度。
+409 时重新检查在途任务和版本，不直接改数据库或反复强制重置。
+重启不解除熔断；取消已发出的请求不保证退回服务商费用。
 
 ## 备份什么
 

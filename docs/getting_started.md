@@ -3,6 +3,10 @@
 LKA 后端支持 Windows 和 Linux 原生 Python，不需要 Docker。
 聊天界面、桌宠及 QQ 采集器在独立项目中维护，克隆后端不会同时安装它们。
 
+在以 WSL 为主环境的开发电脑上，按下方 Linux 步骤启动日常后端；
+Windows 后端副本仅做独立功能验证，流程见 [WSL 与 Windows 验证说明](maintenance.md)。
+Windows 前端和采集器可以继续使用，不必把界面迁入 Linux。
+
 ## 准备环境
 
 | 平台 | 需要准备 |

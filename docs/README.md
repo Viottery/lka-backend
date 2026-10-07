@@ -13,6 +13,7 @@
 | 更新版本、备份或排查运行问题 | [更新、备份与故障检查](maintenance.md) |
 | 了解各部分如何协作 | [系统说明](architecture.md) |
 | 接入自己的前端或采集器 | [API 接口说明](api_contract.md) |
+| 接入 Telegram 个人账号与独立消息 MCP | [消息连接器](../packages/message-connector/README.md) |
 
 ## 文档约定
 

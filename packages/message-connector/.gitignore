@@ -1,0 +1,6 @@
+data/
+*.session
+*.session-journal
+*.session-wal
+*.session-shm
+.env

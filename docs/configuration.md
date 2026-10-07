@@ -72,10 +72,14 @@ model = "your-model-id"
 ## 记忆、后台与可选专家
 
 - `[memory]`：学习开关、模型提取、近期整理上下文、记忆召回及压缩配置。
-- `[background]`：共享后台预算、并发、排队和请求时间等设置。
+- `[background]`：分池后台预算、共享并发、排队、请求时间和异常消耗熔断设置。
 - `[agent]`：多 Agent、邮件专家、外部代码专家及任务执行配置。
 - `[safety]`：工具审查模式；`manual` 等待人工决定，`llm` 使用模型审查，
-  `skip` 仍记录审查但自动放行。
+  `skip` 仍记录审查但自动放行。Agent 的每次工具调用（包括只读调用）都会经过所选模式；
+  单次请求可提高审查级别，不能降低本地配置要求。
+  安全审批不额外设置生成 token 上限，输出预留只用于上下文和并发预算计量；
+  模型自身容量、超时、取消与显式子任务额度仍生效。若模型输出仍被截断，
+  工具保持不执行，记录为审批未完成，而非模型明确拒绝。
 
 多 Agent 规划需要 `orchestrator = "langgraph"` 和
 `multi_agent_planning_enabled = true`。外部 Codex 专家需单独安装、认证并显式开启；
@@ -84,10 +88,34 @@ Windows 的 `codex_binary_path` 指向原生 `.exe`，不能使用 `.cmd` / `.ba
 基础 TOML 配置重启后加载。通过 `/background/config` 保存的配置具有 active / desired
 两种视图，管理端应展示是否待重启；暂停、恢复和取消是独立的即时控制操作。
 
+记忆提取和自动上下文压缩使用 `background_memory`，消息分析使用
+`background_message`，两者不共享 token／费用额度，但仍共享模型并发及前台优先级。
+`memory.max_job_tokens` 默认 `0`（不设常规任务累计额度）；旧配置显式正数仍生效。
+`background.hourly_token_limit`、`daily_token_limit` 和 `daily_cost_limit` 分别约束每个
+非记忆后台池，不约束记忆／压缩。消息模块原有服务、会话及工作累计限额继续生效。
+
+异常消耗保护不能关闭：`memory_task_fuse_tokens` 默认 262144，
+`memory_hourly_fuse_tokens` 默认 2000000，`memory_daily_fuse_tokens` 默认 10000000，
+均须为正数。它们是紧急停止阈值，不是达到后自动恢复的普通配额。
+预约和实际用量均检查；触发后持久化告警，取消同池在途调用，阻止新调用，重启不解除。
+健康接口与 SSE 提供状态，用户显式确认后通过预算重置接口恢复。未知实际用量保守计量，
+取消不能保证服务商不再收费。单次输出、模型容量、网络超时和有界恢复仍保留。
+
+入库前旧记忆匹配通过 `reconciliation_max_items`（默认48）及
+`reconciliation_max_chars`（默认16000）控制候选视图，全文分页查找旧条目，
+不只截取最近记录。全局和项目共同使用视图预算；完整条件不会被截断。
+`consolidation_enabled=true` 默认启用独立后台整理，变化后去抖60秒，另每6小时补查；
+分别由 `consolidation_debounce_seconds`／`consolidation_interval_seconds` 配置。
+`consolidation_batch_items=24` 限制每个模型视图，`consolidation_min_confidence=0.9`
+控制自动发布阈值。采用当前配置的记忆模型及记忆计量池，不另固定模型。
+关闭远程提取时仍可整理字面重复，语义整理不调用模型。
+
 ## 路径与数据保管
 
 Windows TOML 路径使用 `"D:/Work/project"` 或单引号的 `'D:\Work\project'`；
 Windows 后端应收到实际可访问的 Windows 路径，而不是 `/mnt/d/...`。
+WSL 后端的配置则使用 Linux 路径；读取 Windows 文件时使用实际挂载路径，
+工作区、模型/tokenizer 缓存、授权文件及媒体目录都要分别核对，不能照搬 Windows 配置。
 工作区根目录可通过 `LKA_WORKSPACE_ROOTS` 配置，多个目录以分号分隔。
 
 数据本地保存不代表模型请求完全离线。远程模型会收到所选对话及资料片段，
