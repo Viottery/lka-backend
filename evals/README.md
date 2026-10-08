@@ -63,6 +63,30 @@ is not hidden using xfail or relaxed assertions. A focus/regression plan may
 include it; use the case status to interpret failure rather than calling the
 whole quality inventory green. No production fix is claimed.
 
+## Message reading shadow comparison
+
+`scripts/compare_message_reading.py` compares the current selector, experimental
+multi-lane selector, and message input encodings on identical frozen windows.
+It defaults to offline measurement, opens source SQLite read-only, and requires
+an explicitly supplied ignored output directory. Identity/text bindings remain
+inline with `compact_records`; dictionary encoding `codec_v2` remains experimental.
+
+```bash
+.venv/bin/python scripts/compare_message_reading.py --source /path/to/messages.sqlite3 \
+  --output-dir docs/_engineering/reports/reading-comparison-new
+```
+
+Real calls require authorization for the source and configured provider, `--run`,
+and an explicit shared `--ledger` path. Retries reuse that ledger; defaults cap
+the whole experiment at 12 requests and 180,000 reserved input/output tokens.
+`--resume-from` verifies saved requests and reuses previous dispatches, including
+failures. `--arms` and `--window` support bounded additional probes. Returned
+schema failures remain failures; permission, transport and budget failures stop
+dispatch. Reports separate token counts, candidate retention, source attribution
+and provisional reference coverage. Agent-reviewed references are not human gold,
+and a structurally valid response is not semantic success. No result is published
+to production and no report automatically increases a gray rollout percentage.
+
 ## Offline Memory Release Regression Foundation
 
 Run the deterministic, local memory provenance/scope/retraction/injection

@@ -9,7 +9,12 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.domains.message_participant_profiles import ClaimKind
-from app.domains.message_reading_codec import CODEC_VERSION, SELECTOR_VERSION
+from app.domains.message_reading_codec import (
+    CODEC_VERSION,
+    SELECTOR_VERSION,
+    encode_messages,
+    encode_shared_defaults,
+)
 
 PROMPT_VERSION = "message-reading-production-v3.5-reference-constraints"
 PROJECTION_VERSION = "scoped-message-projection-v1"
@@ -61,6 +66,91 @@ The input contains explicit message records with id, sender, seq, sent_at, recei
 mentions, reply, capabilities, parts, timestamp_quality, thread and fragment metadata. A fragment is
 partial text; only text actually present can support a quotation.
 """
+
+
+MessageEncoding = Literal["records", "codec_v2", "compact_records"]
+OutputStyle = Literal["standard", "concise"]
+CONCISE_INSTRUCTIONS = """Use concise output: emit compact JSON without Markdown or explanation outside JSON.
+Prefer short paraphrases to repeating message text in topic summaries, findings and facts.
+Typical targets (characters, not hard truncation limits): topic summary <=160,
+finding text <=80, fact text <=80; use more when necessary to preserve meaning.
+Keep distinct key events, requests, decisions, corrections, disagreements and open questions.
+Retain actors, attribution, uncertainty, dates, numbers, conditions and all necessary source IDs.
+Avoid restating the same claim across highlights and importance_findings; choose its best category.
+Facts may also represent a highlighted event when needed for durable history: state atomic facts,
+explain sourced significance in findings, and summarize new outcomes/disagreements in topics.
+Do not reproduce conversational filler, message-by-message narration or unchanged prior results.
+Use minimal representative evidence IDs; member_message_ids must still cover ALL observed topic assignments.
+Omit unused optional fields; keep every required field and all required top-level arrays.
+Warnings describe actual problems in this fragment, without repeated boilerplate.
+Exact quotes required for participant_claim_candidates and focus_candidates remain verbatim,
+as short as sufficient for verification. Explicit participant text must still equal its quote;
+each evidence_quotes entry must remain an exact quote authored by its own source's sender.
+These are presentation targets, never permission to discard distinct important evidence,
+truncate strings, invent attribution or weaken source/schema validation.
+"""
+CODEC_PROMPT_VERSION = "message-reading-production-v3.6-codec-v2"
+CODEC_INSTRUCTIONS = """The messages input is a lossless codec v2 projection, not a summary.
+v=2; f lists row fields in order; m contains rows. Row slots and dictionary indices are zero-based.
+Row slots: 0 id, 1 sender, 2 seq, 3 sent_at offset, 4 received_at offset,
+5 text dictionary index, 6 kind, 7 mentions metadata index, 8 reply,
+9 capabilities metadata index, 10 parts metadata index, 11 optional metadata index.
+b is the timestamp base: sent_at is null or b+slot3; received_at is b+slot4.
+t is the text dictionary: message text is t[slot5], preserving every character.
+d is the metadata dictionary: dereference slots 7,9,10,11 through d before reading.
+Decoded parts are pairs [metadata,text_index]: copy metadata; when text_index is not
+null, the part's text is t[text_index]; null adds no text. Do not invent media contents.
+Decoded optional metadata supplies timestamp_quality, thread, fragment_index and
+fragment_count when present. fragment_index is one-based; fragment_count is the total
+fragments for that message. Preserve missing versus null values. A fragment is partial
+text; only text actually present can support a quotation. Repeated dictionary entries
+are shared values, not extra messages. Each m row is one CURRENT message or fragment; use its
+slot0 id for evidence, slot1 sender for attribution. authorized_aliases retain their
+existing meaning and confer no additional permissions. Decode all rows without omission.
+"""
+
+
+COMPACT_RECORDS_PROMPT_VERSION = "message-reading-production-v3.7-inline-source-defaults"
+COMPACT_RECORDS_INSTRUCTIONS = """messages contains explicit object rows. message_defaults holds shared metadata:
+inherit a field only when it is missing from a row AND present in message_defaults.
+An explicit row value, including null, always overrides that default. Missing fields
+without defaults remain missing. Each row's id, sender, seq and text are always inline:
+that row's exact text belongs only to its own id and sender. Never transfer text or
+source IDs between rows. Timestamp values are original integers, never offsets.
+Shared metadata does not add messages, evidence, permissions or attachment contents.
+"""
+
+
+def versions_for_encoding(encoding: MessageEncoding = "records",
+                          output_style: OutputStyle = "standard") -> dict:
+    if output_style not in ("standard", "concise"):
+        raise ValueError("unsupported_reading_output_style")
+    if encoding == "records":
+        versions = VERSIONS
+    elif encoding == "codec_v2":
+        versions = {**VERSIONS, "prompt": CODEC_PROMPT_VERSION,
+                    "projection": "scoped-message-projection-codec-v2"}
+    elif encoding == "compact_records":
+        versions = {**VERSIONS, "prompt": COMPACT_RECORDS_PROMPT_VERSION,
+                    "projection": "scoped-message-projection-shared-defaults-v1"}
+    else:
+        raise ValueError("unsupported_message_encoding")
+    if output_style == "concise":
+        return {**versions, "prompt": versions["prompt"] + "-concise-v1",
+                "output_style": output_style}
+    return versions
+
+
+def system_for_encoding(encoding: MessageEncoding = "records",
+                        output_style: OutputStyle = "standard") -> str:
+    versions_for_encoding(encoding, output_style)
+    if encoding == "records":
+        system = SYSTEM
+    elif encoding == "compact_records":
+        system = SYSTEM + COMPACT_RECORDS_INSTRUCTIONS
+    else:
+        system = SYSTEM[:SYSTEM.index("The input contains explicit message records")] + CODEC_INSTRUCTIONS
+    return system + CONCISE_INSTRUCTIONS if output_style == "concise" else system
 
 
 class ClaimCandidate(BaseModel):
@@ -133,15 +223,21 @@ class ScopedProjection:
         return value
 
 
-def prompt(context: dict, messages: list[dict], authorized_aliases: list[str]) -> str:
+def prompt(context: dict, messages: list[dict], authorized_aliases: list[str],
+           encoding: MessageEncoding = "records") -> str:
     references = {field: [row[key] for row in context.get(rows, [])]
                   for field, rows, key in (
                       ("existing_topic_id", "known_topics", "topic_id"),
                       ("existing_insight_id", "known_insights", "insight_id"),
                       ("supersedes_fact_ids", "prior_facts", "fact_id"))}
+    versions_for_encoding(encoding)
+    if encoding == "compact_records":
+        payload = encode_shared_defaults(messages)
+    else:
+        payload = {"messages": messages if encoding == "records" else encode_messages(messages)}
     return json.dumps({**context, "reference_constraints": references,
                        "authorized_aliases": authorized_aliases,
-                       "messages": messages}, ensure_ascii=False,
+                       **payload}, ensure_ascii=False,
                       sort_keys=True, separators=(",", ":"))
 
 

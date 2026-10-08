@@ -157,11 +157,11 @@ from app.tool_packages.knowledge import (
     SearchKnowledgeTool,
 )
 from app.tool_packages.mail import (
-    MAIL_PACKAGE,
     ListMailTool,
     LoadMailMessagesTool,
     SearchMailTool,
     SyncMailTool,
+    build_mail_package,
 )
 from app.tool_packages.mail_expert_tools import MailBatchLoadTool, MailSnapshotTool
 from app.tool_packages.matter import (
@@ -317,6 +317,8 @@ class LocalKnowledgeAgentRuntime:
                         "prompt_version": MessageAnalysisCoordinator.PROCESSING_VERSION,
                         "analysis_versions": MESSAGE_READING_VERSIONS
                         if reading_config.reading_algorithm != "legacy" else {},
+                        # Transport and selector rollout choices are pinned by
+                        # each checkpoint, rather than cancelling frozen work.
                         **{key: getattr(reading_config, key) for key in
                            ("input_chunk_bytes", "max_input_tokens", "generation_output_tokens", "recovery_output_tokens",
                             "reading_algorithm", "participant_pool_capacity", "participant_pinned_capacity",
@@ -387,7 +389,12 @@ class LocalKnowledgeAgentRuntime:
         self._mail_sync_thread: threading.Thread | None = None
         self.last_mail_sync_result: dict[str, Any] | None = None
         self.tool_registry = ToolRegistry()
-        self.tool_registry.register_package(MAIL_PACKAGE)
+        mail_config = self.local_app_config.mail.outlook
+        self.tool_registry.register_package(build_mail_package(
+            automatic_sync_enabled=(mail_config.enabled and mail_config.background_sync_enabled
+                                    and mail_config.sync_interval_seconds > 0),
+            sync_interval_seconds=mail_config.sync_interval_seconds,
+        ))
         self.tool_registry.register_package(MATTER_PACKAGE)
         self.tool_registry.register_package(KNOWLEDGE_PACKAGE)
         self.tool_registry.register_package(FILESYSTEM_PACKAGE)
@@ -618,6 +625,8 @@ class LocalKnowledgeAgentRuntime:
         )
         self.agent_turn_loop.multi_agent_max_retries = self.local_app_config.agent.multi_agent_max_retries
         self.agent_turn_runner: AgentTurnRunner = self.agent_turn_loop
+        self._resumable_runner_lock = threading.Lock()
+        self._resumable_runner: AgentGraphRunner | None = None
         if self.local_app_config.agent.orchestrator == "langgraph":
             checkpointer = None
             checkpoint_runtime = None
@@ -631,6 +640,7 @@ class LocalKnowledgeAgentRuntime:
                 checkpoint_runtime=checkpoint_runtime,
                 artifact_store=self.agent_run_store,
             )
+            self._resumable_runner = self.agent_turn_runner
         self.child_agent_executor = ChildAgentExecutor(
             runner=self.agent_turn_runner,
             run_manager=self.agent_run_manager,
@@ -863,6 +873,8 @@ class LocalKnowledgeAgentRuntime:
         close_runner = getattr(self.agent_turn_runner, "close", None)
         if callable(close_runner):
             close_runner()
+        if self._resumable_runner is not None and self._resumable_runner is not self.agent_turn_runner:
+            self._resumable_runner.close()
         self.agent_run_manager.close()
 
     def _run_startup_mail_sync(self) -> None:
@@ -1090,10 +1102,12 @@ class LocalKnowledgeAgentRuntime:
         llm_response_mode: LLMResponseMode = LLMResponseMode.TEXT,
         safety_review_mode: SafetyReviewMode | None = None,
         existing_run_id: str | None = None,
+        resumable: bool = False,
     ) -> AgentTurnResult:
         """Run the minimal general agent turn loop."""
 
-        return self.agent_turn_runner.run(
+        runner = self._runner_for_turn(existing_run_id=existing_run_id, resumable=resumable)
+        return runner.run(
             session_id=session_id,
             user_input=user_input,
             llm_client_name=llm_client_name,
@@ -1113,10 +1127,12 @@ class LocalKnowledgeAgentRuntime:
         llm_response_mode: LLMResponseMode = LLMResponseMode.TEXT,
         safety_review_mode: SafetyReviewMode | None = None,
         existing_run_id: str | None = None,
+        resumable: bool = False,
     ) -> AgentTurnResult:
         """Run one agent turn without blocking the event loop."""
 
-        return await self.agent_turn_runner.run_async(
+        runner = await asyncio.to_thread(self._runner_for_turn, existing_run_id=existing_run_id, resumable=resumable)
+        return await runner.run_async(
             session_id=session_id,
             user_input=user_input,
             llm_client_name=llm_client_name,
@@ -1512,10 +1528,11 @@ class LocalKnowledgeAgentRuntime:
                     raise KeyError(f"Agent run not found: {parent_run_id}")
             if waiting:
                 return await self.execute_multi_agent_plan_async(parent_run_id)
-            if isinstance(self.agent_turn_runner, AgentGraphRunner):
+            runner = self._runner_for_turn(existing_run_id=parent_run_id)
+            if isinstance(runner, AgentGraphRunner):
                 if parent.status == AgentRunStatus.WAITING_CONFIRMATION:
                     self.agent_run_manager.resume_running(parent_run_id)
-                result = await self.agent_turn_runner.resume_async(parent_run_id)
+                result = await runner.resume_async(parent_run_id)
                 updated_parent = self.agent_run_manager.get_run(parent_run_id)
                 if updated_parent is not None and updated_parent.parent_run_id is not None and updated_parent.status in {
                     AgentRunStatus.COMPLETED, AgentRunStatus.FAILED, AgentRunStatus.CANCELLED, AgentRunStatus.TIMED_OUT
@@ -1547,9 +1564,10 @@ class LocalKnowledgeAgentRuntime:
             raise ValueError("User continuation command does not match the active run.")
         if self.agent_run_manager.get_user_continuation(run_id, command_id) is None:
             raise ValueError("Trusted user continuation journal entry is missing.")
-        if not isinstance(self.agent_turn_runner, AgentGraphRunner):
+        runner = self._runner_for_turn(existing_run_id=run_id)
+        if not isinstance(runner, AgentGraphRunner):
             raise TypeError("User-question continuation requires the LangGraph orchestrator.")
-        result = await self.agent_turn_runner.resume_async(run_id)
+        result = await runner.resume_async(run_id)
         resumed = self.agent_run_manager.get_run(run_id)
         if resumed is None or resumed.status not in {
             AgentRunStatus.COMPLETED,
@@ -1630,23 +1648,87 @@ class LocalKnowledgeAgentRuntime:
         journal = self.codex_trace_journal or CodexTraceJournal(self.db_path)
         return journal.list(child_run_id, after_sequence=after_sequence, limit=limit)
 
+    def agent_run_orchestrator(self, run_id: str) -> str:
+        run = self.agent_run_manager.get_run(run_id)
+        if run is None:
+            raise KeyError(f"Agent run not found: {run_id}")
+        if run.metadata.get("orchestrator") == "langgraph":
+            return "langgraph"
+        return getattr(self.agent_turn_runner, "orchestrator_name", "legacy")
+
+    def _runner_for_turn(self, *, existing_run_id: str | None = None,
+                         resumable: bool = False) -> AgentTurnRunner:
+        if existing_run_id is not None:
+            bound = self.agent_run_orchestrator(existing_run_id)
+            if resumable and bound != "langgraph":
+                raise ValueError("An existing legacy run cannot gain a checkpoint retroactively.")
+            resumable = bound == "langgraph"
+        if not resumable or isinstance(self.agent_turn_runner, AgentGraphRunner):
+            return self.agent_turn_runner
+        # Opt-in per new turn; never change the default runner or inference policy.
+        with self._resumable_runner_lock:
+            if self._resumable_runner is None:
+                checkpoint_runtime = (create_sqlite_checkpoint_runtime(
+                    self.settings.data_dir / "agent_checkpoints.sqlite3"
+                ) if self.local_app_config.agent.checkpoint_backend == "sqlite" else None)
+                self._resumable_runner = AgentGraphRunner(
+                    self.agent_turn_loop, checkpoint_runtime=checkpoint_runtime, artifact_store=self.agent_run_store,
+                )
+            return self._resumable_runner
+
+    def interrupt_agent_run(self, run_id: str) -> AgentRunRecord:
+        runner = self._runner_for_turn(existing_run_id=run_id)
+        if not isinstance(runner, AgentGraphRunner):
+            raise ValueError("Resumable interruption requires the LangGraph orchestrator.")  # noqa: TRY004
+        return runner.interrupt(run_id)
+
+    def replace_agent_run(self, run_id: str, *, user_input: str, command_id: str,
+                          request_fingerprint: str) -> AgentRunRecord:
+        runner = self._runner_for_turn(existing_run_id=run_id)
+        if not isinstance(runner, AgentGraphRunner):
+            raise ValueError("Run replacement requires the LangGraph orchestrator.")  # noqa: TRY004
+        # Resume and replace compete for the same graph lease. A paused status
+        # alone must never permit replacement while its old worker can still run.
+        current = self.agent_run_manager.get_run(run_id)
+        if current is None:
+            raise KeyError(f"Agent run not found: {run_id}")
+        if current.status.value != "paused" and not current.metadata.get("replacement_command_id"):
+            raise ValueError("Wait for run_paused before replacing the run.")
+        lease = runner._execution_lease(run_id)
+        # The pause event can reach SSE just before the old worker releases its
+        # lease. Allow only that brief teardown, never a full model/tool wait.
+        if not lease.acquire(timeout=0.1):
+            raise ValueError("Agent run is still executing; retry after its pause is acknowledged.")
+        try:
+            return self.agent_run_manager.replace_paused(
+                run_id, user_input=user_input, command_id=command_id,
+                request_fingerprint=request_fingerprint,
+            )
+        finally:
+            lease.release()
+
+
     def resume_agent_run(self, run_id: str) -> AgentTurnResult:
         """Resume an incomplete LangGraph run from its latest checkpoint."""
 
-        if not isinstance(self.agent_turn_runner, AgentGraphRunner):
+        runner = self._runner_for_turn(existing_run_id=run_id)
+        if not isinstance(runner, AgentGraphRunner):
             raise RuntimeError(  # noqa: TRY004 - this is runtime mode, not an argument type.
                 "Agent run recovery requires the LangGraph orchestrator."
             )
-        return self.agent_turn_runner.resume(run_id)
+        return runner.resume(run_id)
 
     async def resume_agent_run_async(self, run_id: str) -> AgentTurnResult:
         """Asynchronously resume an incomplete LangGraph run."""
 
-        if not isinstance(self.agent_turn_runner, AgentGraphRunner):
+        # Select the in-process runner before the first suspension so the daemon
+        # graph worker starts even when a short-lived control loop then closes.
+        runner = self._runner_for_turn(existing_run_id=run_id)
+        if not isinstance(runner, AgentGraphRunner):
             raise RuntimeError(  # noqa: TRY004 - this is runtime mode, not an argument type.
                 "Agent run recovery requires the LangGraph orchestrator."
             )
-        return await self.agent_turn_runner.resume_async(run_id)
+        return await runner.resume_async(run_id)
 
     def create_agent_run(
         self,
@@ -1654,10 +1736,11 @@ class LocalKnowledgeAgentRuntime:
         session_id: str | None,
         user_input: str,
         parent_run_id: str | None = None,
+        resumable: bool = False,
     ) -> AgentRunRecord:
         """Create a queued run before an HTTP stream starts consuming events."""
 
-        return self.agent_turn_runner.create_run_for_turn(
+        return self._runner_for_turn(resumable=resumable).create_run_for_turn(
             session_id=session_id,
             user_input=user_input,
             parent_run_id=parent_run_id,

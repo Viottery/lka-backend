@@ -24,7 +24,7 @@ MAIL_PACKAGE = ToolPackageSpec(
         "Use mail.search for content discovery; its empty-query time order is a quick peek, not exhaustive enumeration. The 100-result cap and possible_more signal do not provide an exact total.",
         "mail.sync next_link/delta_link track remote provider sync progress, not mail.list pagination; use listing_id for local pages.",
         "Do not request complete message bodies in bulk. Use the returned evidence snippets unless exact source text is essential.",
-        "Synchronize mail first only when the user asks to sync, asks for the latest mailbox state, or local mail may be stale.",
+        "When automatic mail synchronization is enabled, normally read local mail without calling mail.sync first, including routine requests for recent mail. Call mail.sync only for an explicit sync/immediate-refresh request, or when automatic synchronization is unavailable and local mail may be stale.",
         "This package reads and syncs mail evidence; use another registered persistence package for tasks, events, or matters.",
     ],
     observation_cache={
@@ -32,6 +32,18 @@ MAIL_PACKAGE = ToolPackageSpec(
         "description": "Reuse loaded complete mail records from the same session when relevant.",
     },
 )
+
+
+def build_mail_package(*, automatic_sync_enabled: bool, sync_interval_seconds: int) -> ToolPackageSpec:
+    package = MAIL_PACKAGE.model_copy(deep=True)
+    if automatic_sync_enabled:
+        package.decision_hints.append(
+            f"Automatic mail synchronization is enabled; the backend polls every {sync_interval_seconds} seconds. "
+            "This is the configured schedule, not proof that the latest sync succeeded or that local mail is fully current."
+        )
+    else:
+        package.decision_hints.append("Automatic mail synchronization is disabled in the current backend configuration.")
+    return package
 
 
 class ListMailTool:

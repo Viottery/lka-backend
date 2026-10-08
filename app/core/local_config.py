@@ -424,6 +424,15 @@ class MessageHistoryConfig(BaseModel):
     schema_version: Literal[1] = 1
     # New analysis is opt-in; enabling a pipeline does not grant any source.
     reading_algorithm: Literal["legacy", "compact", "selected"] = "legacy"
+    # New work freezes transport/selector choices; an existing checkpoint keeps
+    # its choices when these rollout settings change.
+    message_encoding: Literal["records", "codec_v2", "compact_records"] = "records"
+    reading_output_style: Literal["standard", "concise"] = "standard"
+    # Concise v3 output has its own cap so enabling it cannot change the
+    # fingerprint or output reservation of a legacy frozen checkpoint.
+    concise_output_tokens: int = Field(default=8192, ge=256, le=32_768)
+    selector_algorithm: Literal["current", "multi_lane"] = "current"
+    selector_rollout_percent: int = Field(default=0, ge=0, le=100)
     participant_pool_capacity: int = Field(default=30, ge=1, le=100)
     participant_pinned_capacity: int = Field(default=10, ge=0, le=20)
     profile_cold_days: int = Field(default=14, ge=1, le=90)

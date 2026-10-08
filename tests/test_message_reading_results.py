@@ -129,6 +129,95 @@ def test_v2_combined_output_and_stable_topic_revision(tmp_path):
     assert len(store.list(status="succeeded")) == 2
 
 
+def test_cooled_topic_keeps_total_participants_separate_from_recent_heat(tmp_path):
+    service, _store, policy, _coordinator = pipeline(tmp_path, batch_size=2)
+    now = int(datetime.now(UTC).timestamp())
+    service.import_messages(
+        [
+            {
+                **IDENTITY,
+                "message_id": f"old-{index}",
+                "sender_id": f"member-{index}",
+                "text": "Discuss deployment",
+                "sent_at": _TIMESTAMP - 3 * 86400 - index,
+                "received_at": _TIMESTAMP - 3 * 86400 - index,
+            }
+            for index in range(2)
+        ]
+        + [
+            {
+                **IDENTITY,
+                "message_id": "current",
+                "sender_id": "current-member",
+                "text": "Discuss deployment",
+                "sent_at": now,
+                "received_at": now,
+            }
+        ]
+    )
+    topic_id = "message_topic_cooled"
+    with service._connection() as conn:
+        message_ids = [
+            row[0]
+            for row in conn.execute(
+                "SELECT internal_message_id FROM message_history_messages WHERE conversation_key=? ORDER BY seq",
+                (policy["conversation_key"],),
+            )
+        ]
+        conn.execute(
+            "INSERT INTO message_reading_topics VALUES(?,?,?,?,?,?,?,?,?)",
+            (
+                topic_id,
+                policy["conversation_key"],
+                1,
+                "Deploy",
+                "Deployment discussed.",
+                json.dumps({"conclusions": [], "disagreements": [], "open_questions": []}),
+                _TIMESTAMP - 3 * 86400 - 1,
+                _TIMESTAMP - 3 * 86400,
+                datetime.now(UTC).isoformat(),
+            ),
+        )
+        conn.executemany(
+            "INSERT INTO message_reading_sources VALUES(?,?,?,?,?,?,?)",
+            [
+                ("topic", topic_id, 1, message_id, policy["conversation_key"], None, "discussion")
+                for message_id in message_ids[:2]
+            ],
+        )
+        active_topic_id = "message_topic_active"
+        conn.execute(
+            "INSERT INTO message_reading_topics VALUES(?,?,?,?,?,?,?,?,?)",
+            (
+                active_topic_id,
+                policy["conversation_key"],
+                1,
+                "Deploy now",
+                "Deployment is active.",
+                json.dumps({"conclusions": [], "disagreements": [], "open_questions": []}),
+                now,
+                now,
+                datetime.now(UTC).isoformat(),
+            ),
+        )
+        conn.execute(
+            "INSERT INTO message_reading_sources VALUES(?,?,?,?,?,?,?)",
+            ("topic", active_topic_id, 1, message_ids[2], policy["conversation_key"], None, "discussion"),
+        )
+
+    topic = service.get_topic(topic_id)
+    assert topic["status"] == "cooled"
+    assert topic["heat"]["participant_count"] == 0
+    assert topic["heat"]["recent_participant_count"] == 0
+    assert topic["heat"]["total_participant_count"] == 2
+    assert topic["heat"]["score"] == 0
+    active_topic = service.get_topic(active_topic_id)
+    assert active_topic["heat"]["participant_count"] == 1
+    assert active_topic["heat"]["recent_participant_count"] == 1
+    assert active_topic["heat"]["total_participant_count"] == 1
+    assert active_topic["heat"]["score"] > topic["heat"]["score"]
+
+
 def test_local_native_mention_empty_body_exclusions_and_watermark(tmp_path):
     store = BackgroundJobStore(tmp_path / "local.sqlite")
     service = MessageHistoryService(store.db_path, store)

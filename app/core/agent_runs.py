@@ -42,6 +42,7 @@ class AgentRunCancelled(RuntimeError):
 class AgentRunStatus(str, Enum):
     QUEUED = "queued"
     RUNNING = "running"
+    PAUSED = "paused"
     WAITING_CONFIRMATION = "waiting_confirmation"
     WAITING_USER = "waiting_user"
     COMPLETED = "completed"
@@ -66,6 +67,7 @@ class AgentRunRecord(BaseModel):
     completed_at: str | None = None
     failed_at: str | None = None
     cancelled_at: str | None = None
+    paused_at: str | None = None
     waiting_since: str | None = None
     error_type: str | None = None
     error: str | None = None
@@ -155,6 +157,8 @@ class InMemoryAgentRunManager:
             parent = self.get_run(parent_run_id)
             if parent is None:
                 raise KeyError(f"Parent Agent run not found: {parent_run_id}")
+            if parent.status == AgentRunStatus.PAUSED or parent.metadata.get("pause_requested"):
+                raise ValueError("Cannot create a child while its parent is pausing or paused.")
             if parent.status in {
                 AgentRunStatus.WAITING_USER,
                 AgentRunStatus.WAITING_CONFIRMATION,
@@ -1332,6 +1336,107 @@ class InMemoryAgentRunManager:
                 event for event in self._events.get(run_id, []) if event.sequence > after_sequence
             ]
 
+    def request_pause(self, run_id: str) -> AgentRunRecord:
+        """Persist intent; only the checkpoint owner may acknowledge a safe pause."""
+        with self._lock:
+            current = self.get_run(run_id)
+            if current is None:
+                raise KeyError(f"Agent run not found: {run_id}")
+            if current.status == AgentRunStatus.PAUSED or current.metadata.get("pause_requested"):
+                return current
+            if any(child.status in {AgentRunStatus.QUEUED, AgentRunStatus.RUNNING, AgentRunStatus.PAUSED,
+                                    AgentRunStatus.WAITING_USER, AgentRunStatus.WAITING_CONFIRMATION}
+                   for child in self.child_tree(run_id)):
+                raise ValueError("Interrupt requires child tasks to finish or be cancelled first.")
+            if current.status not in {
+                AgentRunStatus.QUEUED, AgentRunStatus.RUNNING,
+                AgentRunStatus.WAITING_CONFIRMATION, AgentRunStatus.WAITING_USER,
+            } or current.metadata.get("completion_claimed") or current.metadata.get("cancel_requested"):
+                raise ValueError("Agent run can no longer be interrupted.")
+            updated = current.model_copy(update={"metadata": {
+                **current.metadata, "pause_requested": True, "pause_requested_at": _now_iso(),
+            }})
+            event = self._control_event(run_id, "run_pause_requested", "Pause requested; waiting for a checkpoint.",
+                                        stage="control", pending=[])
+            self._commit_control_updates([current], [updated], [event])
+            return updated
+
+    def acknowledge_pause(self, run_id: str) -> AgentRunRecord:
+        """Called with the graph lease held, after checkpoint persistence drained."""
+        with self._lock:
+            current = self.get_run(run_id)
+            if current is None:
+                raise KeyError(f"Agent run not found: {run_id}")
+            if current.status == AgentRunStatus.PAUSED:
+                return current
+            if (not current.metadata.get("pause_requested") or current.metadata.get("completion_claimed")
+                    or current.status not in {AgentRunStatus.QUEUED, AgentRunStatus.RUNNING,
+                                              AgentRunStatus.WAITING_CONFIRMATION, AgentRunStatus.WAITING_USER}):
+                return current
+            now = _now_iso()
+            updated = current.model_copy(update={"status": AgentRunStatus.PAUSED, "paused_at": now,
+                "metadata": {**current.metadata, "paused_from_status": current.status.value}})
+            event = self._control_event(run_id, "run_paused", "Agent run paused at a saved checkpoint.",
+                                        stage="control", pending=[])
+            self._commit_control_updates([current], [updated], [event])
+            return updated
+
+    def resume_paused(self, run_id: str) -> AgentRunRecord:
+        """Restore the exact pre-pause state, without bypassing questions/reviews."""
+        with self._lock:
+            current = self.get_run(run_id)
+            if current is None or current.status != AgentRunStatus.PAUSED:
+                raise ValueError("Agent run is not paused.")
+            status = AgentRunStatus(current.metadata["paused_from_status"])
+            updated = current.model_copy(update={"status": status, "paused_at": None,
+                "metadata": {**current.metadata, "pause_requested": False, "paused_from_status": None}})
+            event = self._control_event(run_id, "run_resumed", "Agent run resumed from its checkpoint.",
+                                        stage="control", pending=[])
+            self._commit_control_updates([current], [updated], [event])
+            return updated
+
+    def replace_paused(self, run_id: str, *, user_input: str, command_id: str,
+                       request_fingerprint: str) -> AgentRunRecord:
+        """Atomically abandon a paused root and queue its idempotent replacement."""
+        with self._lock:
+            current = self.get_run(run_id)
+            if current is None:
+                raise KeyError(f"Agent run not found: {run_id}")
+            prior = current.metadata.get("replacement_command_id")
+            if prior is not None:
+                if prior != command_id or current.metadata.get("replacement_fingerprint") != request_fingerprint:
+                    raise ValueError("Agent run was replaced by a different command.")
+                replacement = self.get_run(current.metadata["superseded_by_run_id"])
+                if replacement is None:
+                    raise RuntimeError("Replacement run is unavailable.")
+                return replacement
+            if current.status != AgentRunStatus.PAUSED or current.parent_run_id is not None:
+                raise ValueError("Only a checkpoint-paused root run can be replaced.")
+            if any(child.status in {AgentRunStatus.QUEUED, AgentRunStatus.RUNNING, AgentRunStatus.PAUSED,
+                                    AgentRunStatus.WAITING_USER, AgentRunStatus.WAITING_CONFIRMATION}
+                   for child in self.child_tree(run_id)):
+                raise ValueError("Active child tasks prevent replacing this run.")
+            now = _now_iso()
+            trace_id = _stable_id("agent_turn", current.session_id, command_id, now)
+            new_id = _stable_id("agent_run", trace_id, now)
+            replacement = AgentRunRecord(run_id=new_id, session_id=current.session_id, trace_id=trace_id,
+                status=AgentRunStatus.QUEUED, user_input=user_input, created_at=now,
+                metadata={"entrypoint": "agent.turn", "replaces_run_id": run_id,
+                          **({"orchestrator": "langgraph"} if current.metadata.get("orchestrator") == "langgraph" else {})})
+            updated = current.model_copy(update={"status": AgentRunStatus.CANCELLED, "cancelled_at": now,
+                "error_type": "cancelled", "error": "Replaced by a new user message.", "metadata": {
+                    **current.metadata, "cancel_requested": True, "cancel_requested_at": now,
+                    "cancel_reason": "superseded", "pause_requested": False,
+                    "replacement_command_id": command_id, "replacement_fingerprint": request_fingerprint,
+                    "superseded_by_run_id": new_id,
+                }})
+            events = [self._control_event(run_id, "run_cancelled", "Replaced by a new user message.",
+                stage="control", pending=[], payload={"superseded_by_run_id": new_id}),
+                self._control_event(new_id, "run_replacement_created", "Replacement run queued.",
+                stage="control", pending=[], payload={"replaces_run_id": run_id})]
+            self._commit_control_updates([current], [updated], events, created=[replacement])
+            return replacement
+
     def request_cancel(self, run_id: str, reason: str | None = None) -> None:
         with self._lock:
             if run_id not in self._runs:
@@ -1390,6 +1495,8 @@ class InMemoryAgentRunManager:
         previous: list[AgentRunRecord],
         updated: list[AgentRunRecord],
         events: list[AgentRunEvent],
+        *,
+        created: list[AgentRunRecord] | None = None,
     ) -> None:
         if not updated:
             return
@@ -1400,7 +1507,11 @@ class InMemoryAgentRunManager:
                 updated=[record.model_dump(mode="json") for record in updated],
                 events=[event.model_dump(mode="json") for event in events],
                 updated_at=_now_iso(),
+                created=[record.model_dump(mode="json") for record in created or []],
             )
+        for record in created or []:
+            self._runs[record.run_id] = record
+            self._events[record.run_id] = []
         for record in updated:
             self._runs[record.run_id] = record
             if record.metadata.get("cancel_requested") is True:

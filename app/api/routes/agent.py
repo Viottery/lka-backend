@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import time
 from collections.abc import AsyncIterator
@@ -18,12 +19,13 @@ from app.api.schemas import (
     ContinueAgentRunRequest,
     ContinueAgentRunResponse,
     PendingAgentQuestionResponse,
+    ReplaceAgentRunRequest,
     SafetyReviewDecisionRequest,
     SafetyReviewListResponse,
     SafetyReviewQueueResponse,
     SafetyReviewResponse,
 )
-from app.core.agent_graph import AgentTurnWaitingForConfirmation
+from app.core.agent_graph import AgentTurnPaused, AgentTurnWaitingForConfirmation
 from app.core.agent_runs import AgentRunEvent, AgentRunStatus
 from app.core.agent_turn import AgentTurnResult
 from app.core.llm import LLMResponseMode
@@ -47,6 +49,7 @@ async def run_agent_turn_endpoint(
             llm_model=llm_options.model if llm_options else None,
             llm_response_mode=llm_options.response_mode if llm_options else LLMResponseMode.TEXT,
             safety_review_mode=payload.safety_review_mode,
+            **({"resumable": True} if payload.resumable else {}),
         )
     except AgentTurnWaitingForConfirmation as exc:
         return JSONResponse(
@@ -57,6 +60,8 @@ async def run_agent_turn_endpoint(
                 "review_id": exc.review_id,
             },
         )
+    except AgentTurnPaused as exc:
+        return JSONResponse(status_code=202, content={"status": "paused", "run_id": exc.run_id})
     return AgentTurnResponse.from_result(result)
 
 
@@ -71,6 +76,7 @@ def run_agent_turn(payload: AgentTurnRequest, request: Request) -> AgentTurnResu
         llm_model=llm_options.model if llm_options else None,
         llm_response_mode=llm_options.response_mode if llm_options else LLMResponseMode.TEXT,
         safety_review_mode=payload.safety_review_mode,
+        **({"resumable": True} if payload.resumable else {}),
     )
     return result
 
@@ -83,6 +89,7 @@ async def stream_agent_turn(
     run = request.app.state.runtime.create_agent_run(
         session_id=payload.session_id,
         user_input=payload.user_input,
+        **({"resumable": True} if payload.resumable else {}),
     )
     return StreamingResponse(
         _agent_turn_event_stream(request=request, run_id=run.run_id, start_payload=payload),
@@ -311,6 +318,42 @@ async def cancel_agent_run(run_id: str, request: Request) -> AgentRunResponse:
     return AgentRunResponse.from_record(run_manager.get_run(run_id) or run)
 
 
+@router.post("/runs/{run_id}/interrupt", response_model=AgentRunResponse, status_code=202)
+async def interrupt_agent_run(run_id: str, request: Request) -> AgentRunResponse:
+    runtime = request.app.state.runtime
+    if runtime.agent_run_manager.get_run(run_id) is None:
+        raise HTTPException(404, "Agent run not found.")
+    try:
+        run = await asyncio.to_thread(runtime.interrupt_agent_run, run_id)
+    except KeyError as exc:
+        raise HTTPException(404, "Agent run not found.") from exc
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return AgentRunResponse.from_record(run)
+
+
+@router.post("/runs/{run_id}/replace", response_model=AgentRunResponse, status_code=202)
+async def replace_agent_run(run_id: str, payload: ReplaceAgentRunRequest, request: Request) -> AgentRunResponse:
+    runtime = request.app.state.runtime
+    previous = runtime.agent_run_manager.get_run(run_id)
+    if previous is None:
+        raise HTTPException(404, "Agent run not found.")
+    if previous.status != AgentRunStatus.PAUSED and not previous.metadata.get("replacement_command_id"):
+        raise HTTPException(409, "Wait for run_paused before replacing the run.")
+    if payload.session_id is not None and payload.session_id != previous.session_id:
+        raise HTTPException(409, "Replacement must remain in the original session.")
+    payload = payload.model_copy(update={"session_id": previous.session_id})
+    fingerprint = hashlib.sha256(json.dumps(payload.model_dump(mode="json"), sort_keys=True).encode()).hexdigest()
+    try:
+        run = await asyncio.to_thread(runtime.replace_agent_run, run_id, user_input=payload.user_input,
+                                      command_id=payload.command_id, request_fingerprint=fingerprint)
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    if run.status == AgentRunStatus.QUEUED:
+        _start_agent_turn_task(runtime=runtime, payload=payload, run_id=run.run_id)
+    return AgentRunResponse.from_record(run)
+
+
 @router.post("/runs/{run_id}/resume", response_model=AgentRunResponse)
 async def resume_agent_run(run_id: str, request: Request) -> AgentRunResponse:
     """Resume one incomplete LangGraph run after an explicit client request."""
@@ -337,9 +380,18 @@ async def resume_agent_run(run_id: str, request: Request) -> AgentRunResponse:
             status_code=409,
             detail="Waiting Agent runs must be continued with a user answer.",
         )
-    if run.status != AgentRunStatus.RUNNING:
+    if run.status not in {AgentRunStatus.RUNNING, AgentRunStatus.PAUSED}:
         raise HTTPException(status_code=409, detail="Agent run has no resumable checkpoint yet.")
-    if getattr(runtime.agent_turn_runner, "orchestrator_name", None) != "langgraph":
+    if run.status == AgentRunStatus.RUNNING and run.metadata.get("pause_requested"):
+        # A restart may retain pause intent without a live worker to acknowledge
+        # it. The checkpoint owner can safely acknowledge an idle lease here.
+        run = await asyncio.to_thread(runtime.interrupt_agent_run, run_id)
+        if run.status != AgentRunStatus.PAUSED:
+            raise HTTPException(status_code=409, detail="Wait for run_paused before resuming.")
+    selected_orchestrator = (runtime.agent_run_orchestrator(run_id)
+                            if callable(getattr(runtime, "agent_run_orchestrator", None))
+                            else getattr(runtime.agent_turn_runner, "orchestrator_name", None))
+    if selected_orchestrator != "langgraph":
         raise HTTPException(status_code=409, detail="Run recovery requires the LangGraph orchestrator.")
     # ChildAgentExecutor and the scheduler share this runtime runner instance.
     # Keep HTTP recovery on that same path so AgentGraphRunner's per-run lease
@@ -586,6 +638,7 @@ async def _agent_turn_event_stream(
             AgentRunStatus.FAILED,
             AgentRunStatus.CANCELLED,
             AgentRunStatus.TIMED_OUT,
+            AgentRunStatus.PAUSED,
         }:
             # Completion may publish its final events after the first read.
             # Once terminal status is visible, drain that durable tail before
@@ -619,6 +672,7 @@ def _start_agent_turn_task(*, runtime, payload: AgentTurnRequest, run_id: str) -
             llm_model=llm_options.model if llm_options else None,
             llm_response_mode=_stream_turn_llm_response_mode(payload),
             safety_review_mode=payload.safety_review_mode,
+            **({"resumable": True} if payload.resumable else {}),
             existing_run_id=run_id,
         )
     )
@@ -642,8 +696,11 @@ def _start_agent_resume_task(*, runtime, run_id: str) -> asyncio.Task:
         runtime._agent_turn_tasks = tasks
     existing = tasks.get(run_id)
     if existing is not None and not existing.done():
-        return existing
+        run = runtime.agent_run_manager.get_run(run_id)
+        if run is None or run.status != AgentRunStatus.PAUSED or getattr(existing, "_lka_resuming", False):
+            return existing
     task = asyncio.create_task(_resume_agent_and_parent(runtime=runtime, run_id=run_id))
+    task._lka_resuming = True
     tasks[run_id] = task
 
     def clear(completed: asyncio.Task) -> None:
@@ -847,6 +904,8 @@ async def _is_client_disconnected(request: Request) -> bool:
 
 
 def _consume_task_exception(task: asyncio.Task) -> None:
+    if task.cancelled():
+        return
     try:
         task.result()
     except Exception:  # noqa: BLE001 - task errors are persisted on the Agent run.

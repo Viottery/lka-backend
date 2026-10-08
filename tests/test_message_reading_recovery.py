@@ -158,6 +158,94 @@ def test_unknown_reference_feedback_explains_fragment_scope_without_ids():
     assert "Only evidence_requests" in feedback[0]["hint"]
 
 
+def test_incomplete_generation_feedback_is_safe_and_explicit():
+    from app.core.background_llm import IncompleteGenerationError
+    from app.core.message_analysis import _reading_validation_feedback
+
+    feedback = _reading_validation_feedback(IncompleteGenerationError("private provider output"))
+    assert feedback[0]["code"] == "incomplete_generation"
+    assert "possibly truncated" in feedback[0]["hint"]
+    assert "complete, concise JSON" in feedback[0]["hint"]
+    assert "preserves valid evidence references" in feedback[0]["hint"]
+    assert "private provider output" not in json.dumps(feedback)
+
+
+def test_legacy_generic_checkpoint_feedback_gets_safe_hint_at_prompt_time():
+    from app.core.message_analysis import _normalize_reading_validation_feedback
+
+    old_feedback = [{"code": "invalid_analysis_result"} for _ in range(8)]
+    old_feedback_snapshot = json.loads(json.dumps(old_feedback))
+    feedback = _normalize_reading_validation_feedback(old_feedback)
+    assert feedback[0]["code"] == "invalid_analysis_result"
+    assert "complete, concise JSON" in feedback[0]["hint"]
+    assert "keep valid evidence references" in feedback[0]["hint"]
+    assert "private" not in json.dumps(feedback)
+    assert old_feedback == old_feedback_snapshot
+    assert len(json.dumps(feedback, separators=(",", ":")).encode()) <= 480
+    assert _normalize_reading_validation_feedback([{"code": "private provider body"}])[0]["code"] == "invalid_analysis_result"
+
+
+@pytest.mark.parametrize(
+    "values,code,required_hint",
+    [
+        ({"text": " ", "existing_topic_id": "topic", "batch_local_key": "new"},
+         "invalid_finding", "text must be nonblank"),
+        ({"kind": "useful", "existing_insight_id": "insight"},
+         "correction_requires_explicit_evidence", "correction with certainty explicit"),
+        ({"due_at": "2026-10-08T12:00:00", "due_provenance": "explicit"},
+         "deadline_requires_grounded_timezone", "timezone-aware ISO value"),
+    ],
+)
+def test_reading_finding_validator_errors_have_safe_specific_feedback(values, code, required_hint):
+    from pydantic import ValidationError
+
+    from app.core.message_analysis import _reading_validation_feedback
+    from app.domains.message_reading_results import ReadingFinding
+
+    finding = {
+        "kind": "useful",
+        "text": "Deployment information",
+        "source_message_ids": ["message-alias"],
+        **values,
+    }
+    with pytest.raises(ValidationError) as error:
+        ReadingFinding.model_validate(finding)
+    feedback = _reading_validation_feedback(error.value)
+    assert feedback[0]["code"] == code
+    assert required_hint in feedback[0]["hint"]
+    assert "message-alias" not in json.dumps(feedback)
+
+
+def test_legacy_finding_schema_feedback_gets_bounded_safe_hint():
+    from app.core.message_analysis import _normalize_reading_validation_feedback
+
+    old_feedback = [
+        {"code": "schema_validation", "type": "value_error", "path": [field, index]}
+        for field, index in (("highlights", 0), ("importance_findings", 8))
+    ]
+    original = json.loads(json.dumps(old_feedback))
+    feedback = _normalize_reading_validation_feedback(old_feedback)
+    assert "existing_topic_id" in feedback[0]["hint"]
+    assert "explicit correction" in feedback[0]["hint"]
+    assert "timezone-aware" in feedback[0]["hint"]
+    assert old_feedback == original
+    assert len(json.dumps(feedback, separators=(",", ":")).encode()) <= 480
+
+
+def test_unknown_supersedes_alias_becomes_controlled_reference_feedback():
+    from app.core.message_analysis import (
+        _reading_validation_feedback,
+        _reverse_fact_aliases,
+    )
+
+    with pytest.raises(ValueError, match="reading_unknown_reference") as error:
+        _reverse_fact_aliases(["invented-alias"], {"known-alias": "fact-id"})
+    feedback = _reading_validation_feedback(error.value)
+    assert feedback[0]["code"] == "reading_unknown_reference"
+    assert "prior_facts.fact_id" in feedback[0]["hint"]
+    assert "invented-alias" not in json.dumps(feedback)
+
+
 def test_source_list_recovery_feedback_exposes_schema_limit_without_ids():
     from pydantic import ValidationError
 

@@ -189,10 +189,14 @@ class SqliteAgentRunStore:
         updated: list[dict[str, Any]],
         events: list[dict[str, Any]],
         updated_at: str,
+        created: list[dict[str, Any]] | None = None,
     ) -> None:
-        """Commit cancellation/timeout state and its events as one transaction."""
+        """Commit lifecycle controls, optional replacement runs and events atomically."""
 
         expected = {record["run_id"]: record for record in previous}
+        additions = {record["run_id"]: record for record in created or []}
+        if len(additions) != len(created or []) or set(additions) & set(expected):
+            raise ValueError("New control runs must have distinct identities.")
         if len(expected) != len(previous) or {record["run_id"] for record in updated} != set(expected):
             raise ValueError("Run control batch must update each expected run exactly once.")
         with connect(self.db_path) as conn:
@@ -205,9 +209,16 @@ class SqliteAgentRunStore:
                 if row is None or _json_load(row["record_payload"]) != expected[run_id]:
                     raise ValueError(f"Agent run changed during control transition: {run_id}")
             next_sequence: dict[str, int] = {}
+            for record in additions.values():
+                conn.execute(
+                    "INSERT INTO agent_runs(run_id, session_id, status, record_payload, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (record["run_id"], record["session_id"], record["status"], _json_dump(record),
+                     record["created_at"], updated_at),
+                )
             for event in events:
                 run_id = event["run_id"]
-                if run_id not in expected:
+                if run_id not in expected and run_id not in additions:
                     raise ValueError("Control event references a run outside the transition.")
                 if run_id not in next_sequence:
                     row = conn.execute(

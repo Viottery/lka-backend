@@ -88,6 +88,14 @@ class AgentTurnWaitingForUser(RuntimeError):
         self.question_id = question_id
 
 
+class AgentTurnPaused(RuntimeError):
+    """Execution stopped after persisting a resumable graph boundary."""
+
+    def __init__(self, run_id: str) -> None:
+        super().__init__(f"Agent run paused: {run_id}")
+        self.run_id = run_id
+
+
 class AgentGraphRunner:
     """LangGraph owns control flow, checkpoints and resume; project code owns semantics."""
 
@@ -181,7 +189,10 @@ class AgentGraphRunner:
             close()
 
     def create_run_for_turn(self, **kwargs: Any) -> AgentRunRecord:
-        return self.turn_loop.create_run_for_turn(**kwargs)
+        run = self.turn_loop.create_run_for_turn(**kwargs)
+        return self.turn_loop.run_manager._update_run(
+            run.run_id, status=run.status, metadata_patch={"orchestrator": "langgraph"},
+        )
 
     def run(self, **kwargs: Any) -> AgentTurnResult:
         run_id = self._resolve_run_id(**kwargs)
@@ -217,6 +228,12 @@ class AgentGraphRunner:
     def resume(self, run_id: str) -> AgentTurnResult:
         with self._execution_lease(run_id):
             current = self._run(run_id)
+            was_paused = current.status.value == "paused"
+            if was_paused:
+                snapshot = self.get_state(run_id)
+                if not snapshot.values or not snapshot.next:
+                    raise RuntimeError("Paused Agent run has no resumable checkpoint.")
+                current = self.turn_loop.run_manager.resume_paused(run_id)
             if current.status.value == "completed":
                 recovered = self._completed_result_from_checkpoint(run_id)
                 if recovered is not None:
@@ -237,9 +254,9 @@ class AgentGraphRunner:
                 raise RuntimeError(
                     f"Cannot resume terminal Agent run {run_id} ({current.status.value})."
                 )
-            if current.status.value != "running":
+            if current.status.value != "running" and not (was_paused and current.status.value == "queued"):
                 raise RuntimeError(f"Cannot resume Agent run {run_id} from {current.status.value}.")
-            self._resume_sync(run_id)
+            self._resume_sync(run_id, boundary_resume=was_paused)
             return self._take_result(run_id)
 
     def _execution_lease(self, run_id: str) -> threading.Lock:
@@ -254,6 +271,27 @@ class AgentGraphRunner:
 
     async def resume_async(self, run_id: str) -> AgentTurnResult:
         return await self._run_in_worker(self.resume, run_id)
+
+    def interrupt(self, run_id: str) -> AgentRunRecord:
+        """Request a cooperative pause, acknowledging idle checkpoint owners immediately."""
+        run = self._run(run_id)
+        if run.parent_run_id is not None:
+            raise ValueError("Interrupt the root run, not a scheduler-owned child.")
+        # Child/expert workers have their own leases. Do not advertise a stopped
+        # subtree while any child may still execute outside this graph's lease.
+        if any(child.status.value in {"queued", "running", "waiting_confirmation", "waiting_user", "paused"}
+               for child in self.turn_loop.run_manager.child_tree(run_id)):
+            raise ValueError("Interrupt requires child tasks to finish or be cancelled first.")
+        self.turn_loop.run_manager.request_pause(run_id)
+        lease = self._execution_lease(run_id)
+        if lease.acquire(blocking=False):
+            try:
+                snapshot = self.get_state(run_id)
+                if snapshot.values and snapshot.next:
+                    self.turn_loop.run_manager.acknowledge_pause(run_id)
+            finally:
+                lease.release()
+        return self._run(run_id)
 
     @staticmethod
     async def _run_in_worker(call: Any, *args: Any, **kwargs: Any) -> AgentTurnResult:
@@ -291,7 +329,7 @@ class AgentGraphRunner:
                 return value  # type: ignore[return-value]
             raise value
 
-    def _resume_sync(self, run_id: str) -> None:
+    def _resume_sync(self, run_id: str, *, boundary_resume: bool = False) -> None:
         graph = self.graph
         if self.checkpoint_runtime is not None:
             with self.checkpoint_runtime.sync_saver() as saver:
@@ -299,12 +337,20 @@ class AgentGraphRunner:
                 snapshot = graph.get_state(self._config(run_id))
                 self._requests[run_id] = dict(snapshot.values["request"])
                 self._restore(snapshot.values)
-                self._invoke_graph_sync(graph, Command(resume={"run_id": run_id}), run_id)
+                self._invoke_graph_sync(graph, self._resume_input(snapshot, run_id, boundary_resume), run_id)
                 return
         snapshot = graph.get_state(self._config(run_id))
         self._requests[run_id] = dict(snapshot.values["request"])
         self._restore(snapshot.values)
-        self._invoke_graph_sync(graph, Command(resume={"run_id": run_id}), run_id)
+        self._invoke_graph_sync(graph, self._resume_input(snapshot, run_id, boundary_resume), run_id)
+
+    @staticmethod
+    def _resume_input(snapshot: Any, run_id: str, boundary_resume: bool) -> Any:
+        # A cooperative boundary has no dynamic interrupt to consume. Existing
+        # safety/user interrupts continue using their original Command protocol.
+        if boundary_resume and not any(task.interrupts for task in snapshot.tasks):
+            return None
+        return Command(resume={"run_id": run_id})
 
     async def _invoke(
         self,
@@ -471,7 +517,16 @@ class AgentGraphRunner:
                 if counter is not None else nullcontext()
             )
             with scope:
-                graph.invoke(value, config=self._config(run_id))
+                stream = graph.stream(value, config=self._config(run_id), stream_mode="values")
+                try:
+                    for _state in stream:
+                        if self._run(run_id).metadata.get("pause_requested"):
+                            break
+                finally:
+                    # Closing drains LangGraph's pending checkpoint writes before
+                    # publishing paused. Never interrupt inside a side-effect node.
+                    stream.close()
+                self.turn_loop.run_manager.acknowledge_pause(run_id)
         except Exception as exc:  # noqa: BLE001 - graph boundary persists every failure.
             self._fail(run_id, exc)
         finally:
@@ -1738,6 +1793,8 @@ class AgentGraphRunner:
         if result:
             return result
         run = self._run(run_id)
+        if run.status.value == "paused":
+            raise AgentTurnPaused(run_id)
         if run.status.value == "completed":
             recovered = self._completed_result_from_checkpoint(run_id)
             if recovered is not None:
@@ -1793,6 +1850,8 @@ class AgentGraphRunner:
             return list(self._compile(saver).get_state_history(self._config(run_id)))
 
     def _restore(self, values: dict[str, Any]) -> None:
+        if "run_snapshot" not in values:
+            return  # A pause before initialize_run still has an input checkpoint.
         self.turn_loop.run_manager.restore_run(
             AgentRunRecord.model_validate(values["run_snapshot"])
         )

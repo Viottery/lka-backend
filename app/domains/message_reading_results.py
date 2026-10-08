@@ -781,8 +781,8 @@ class MessageReadingResultsMixin:
     def _topic(self, conn, row):
         now = int(datetime.fromisoformat(self._reading_now()).timestamp())
         stats = conn.execute(
-            "SELECT COUNT(*) raw,COUNT(DISTINCT m.sender_id) participants,COUNT(DISTINCT CASE WHEN COALESCE(json_array_length(json_extract(m.metadata_json,'$.mentions')),0)>0 OR m.text LIKE '%截止%' OR m.text LIKE '%更正%' OR lower(m.text) LIKE '%deadline%' OR lower(m.text) LIKE '%correction%' THEN m.internal_message_id ELSE m.text END) folded FROM message_history_messages m WHERE m.conversation_key=? AND COALESCE(m.sent_at,m.received_at)>=? AND EXISTS(SELECT 1 FROM message_reading_sources s WHERE s.object_kind='topic' AND s.object_id=? AND s.message_id=m.internal_message_id)",
-            (row["conversation_key"], now - 86400, row["topic_id"]),
+            "SELECT COUNT(DISTINCT CASE WHEN COALESCE(m.sent_at,m.received_at)>=? THEN m.internal_message_id END) raw,COUNT(DISTINCT CASE WHEN COALESCE(m.sent_at,m.received_at)>=? THEN m.sender_id END) participants,COUNT(DISTINCT m.sender_id) total_participants,COUNT(DISTINCT CASE WHEN COALESCE(m.sent_at,m.received_at)>=? THEN CASE WHEN COALESCE(json_array_length(json_extract(m.metadata_json,'$.mentions')),0)>0 OR m.text LIKE '%截止%' OR m.text LIKE '%更正%' OR lower(m.text) LIKE '%deadline%' OR lower(m.text) LIKE '%correction%' THEN m.internal_message_id ELSE m.text END END) folded FROM message_history_messages m WHERE m.conversation_key=? AND EXISTS(SELECT 1 FROM message_reading_sources s WHERE s.object_kind='topic' AND s.object_id=? AND s.message_id=m.internal_message_id)",
+            (now - 86400, now - 86400, now - 86400, row["conversation_key"], row["topic_id"]),
         ).fetchone()
         capped = (
             conn.execute(
@@ -833,6 +833,8 @@ class MessageReadingResultsMixin:
                 "raw_message_count": stats["raw"],
                 "unique_message_count": stats["folded"],
                 "participant_count": stats["participants"],
+                "recent_participant_count": stats["participants"],
+                "total_participant_count": stats["total_participants"],
                 "capped_message_count": capped,
                 "burst_comparable": comparable,
                 "burst_score": round(burst_score, 6) if comparable else None,

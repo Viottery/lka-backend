@@ -922,7 +922,9 @@ GET /agent/runs/{run_id}
 GET /agent/runs/{run_id}/events?after_sequence=42
 GET /agent/runs/{run_id}/stream?after_sequence=42
 POST /agent/runs/{run_id}/cancel
+POST /agent/runs/{run_id}/interrupt
 POST /agent/runs/{run_id}/resume
+POST /agent/runs/{run_id}/replace
 ```
 
 `cancel` 会立即把 run 标记为 `cancelled` 并记录 durable cancellation request；正在执行的
@@ -934,6 +936,56 @@ provider 调用无法保证被强制中止，但其后续 graph node、工具和
 `POST /agent/runs/{run_id}/resume` 显式恢复。`waiting_confirmation` run 必须继续通过对应的
 safety-review decision 恢复；终态 run 和 legacy orchestrator run 返回 `409`。同一进程内的重复
 resume 请求会合并为同一个恢复任务。
+
+### 可恢复打断与新消息替换
+
+创建新任务时，可在 `/agent/turn` 或 `/agent/turn/stream` 正文中增加 `"resumable": true`，
+让该次任务使用带检查点的 LangGraph。即使默认配置仍为 legacy，也无需修改全局配置；
+不会切换模型或修改阶段推理策略。默认不传时沿用原 orchestrator。运行方式绑定在服务端
+run 记录中，恢复、重启和替换沿用该绑定。已经开始的 legacy 运行不能补造此前的检查点。
+SQLite 检查点支持进程重启恢复；`checkpoint_backend="memory"` 只支持当前进程内继续。
+
+`POST /agent/runs/{run_id}/interrupt` 返回 `202`，请求在 LangGraph 节点之间暂停。
+运行中的模型请求或工具步骤不会被强杀；当前步骤结束、检查点写入完成后，状态变为
+`paused`，发布 `run_paused`。此前响应的 `pause_requested=true` 只代表请求已登记，
+不能当作已经停止。请求和暂停状态持久化；重复请求幂等。终态或不支持的运行返回 `409`，
+未知 run 返回 `404`。
+
+`AgentRunResponse` 增加 `paused_at`、`pause_requested`、`paused_from_status` 和
+`superseded_by_run_id`。SSE 发布 `run_pause_requested` / `run_paused` / `run_resumed`；
+看到 `paused` 后排空已记录事件并关闭连接。暂停不是取消；继续后用原 run ID 和最后的
+sequence 重新连接 `/stream`，不会从头回放已完成的工具操作。
+
+暂停后可选择：
+
+- **继续**：沿用 `POST /agent/runs/{run_id}/resume`，从原检查点继续原任务。若暂停前
+  正在等待审批或用户回答，则恢复到该等待状态，仍需走原有 decision / continue 接口；
+  普通 resume 不代替审批或用户回答。暂停尚未落稳时返回 `409`。重启留下的待暂停请求
+  可在空闲检查点处确认后继续；恢复失败保留错误，不宣称任务完成。
+- **用新消息替换**：`POST /agent/runs/{run_id}/replace`，正文沿用 `AgentTurnRequest`，
+  另加必填非空 `command_id`（最长 128 字符）。省略 `session_id` 时使用原会话，显式
+  指定则必须相同；模型与审查选项按新请求正常解析。
+  仅已暂停且执行租约空闲的根运行可替换；尚在执行时快速返回 `409`，不在 HTTP 请求里
+  等待模型结束（仅允许最多 100ms 的旧 worker 收尾等待）。旧 run 标记 `cancelled` 并指向新 run，新 run 在原会话排队执行，返回
+  `202 AgentRunResponse`。前端连接**新 run ID**的 `/stream` 观察新任务。
+
+替换的旧状态、新 run 与关联事件在一个 SQLite 事务提交。同一旧 run、同一 command ID、
+同一完整请求可重试，返回同一个新 run；变更 ID 或内容返回 `409`。重启后也保持这个关联，
+若新 run 尚未启动，重发相同替换请求可重新派发。不会删除原用户消息、工具记录或已发生的
+副作用，也不会把取消的旧任务再次恢复。已有写操作**不会回滚**。
+
+```json
+{
+  "command_id": "replace-unique-client-id",
+  "user_input": "停止原任务，改为整理已经找到的资料。",
+  "llm": {"response_mode": "stream"}
+}
+```
+
+目前可恢复打断仅支持 LangGraph 根运行，且没有活跃子 Agent / 外部专家。对活跃子任务
+返回 `409`，避免父图暂停而子任务继续执行；可先通过原有控制结束子任务，或使用原有
+`cancel` 永久终止整个任务树。未选择可恢复运行方式的 legacy 任务继续保留原有 cancel。
+执行租约为进程内互斥，不提供多个后端 worker 对同一图的并行执行保证。
 
 安全审查 API 与 SSE 的 `safety_review_*` 事件只返回公开摘要（review ID、工具、风险、状态、
 理由、`decision_reason`、`workspace_access` 及时间）。原始 `tool_input`、run 的实际 `user_request`
@@ -2078,6 +2130,8 @@ Agent 包为 `messages`，包含 `messages.list_conversations`、`recent`、`sea
 - `GET /messages/reading/topics[/{topic_id}]`、`GET /messages/reading/insights[/{insight_id}]`：
   结果与稳定 ID／revision、detector、certainty。列表支持 conversation_key、since/until（含时区 ISO）、
   limit（默认50、最大100）、cursor；insights 另支持 importance、unseen、kind=highlight/importance。
+  话题 `heat.participant_count`（兼容字段）与 `heat.recent_participant_count` 和热度分数按最近24小时计算；
+  `heat.total_participant_count` 表示该话题全部已关联证据消息的不同作者数，冷却话题仍保留历史总参与人数。
 - `GET /messages/reading/topics/{id}/sources`、`GET /messages/reading/insights/{id}/sources`：
   证据独立 keyset 分页（最大50）；每页重新检查 source/account，cursor 绑定筛选与版本。
 - `POST /messages/reading/insights/{id}/attention`：

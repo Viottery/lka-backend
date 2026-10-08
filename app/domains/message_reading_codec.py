@@ -117,6 +117,49 @@ def _validate(messages: list[dict[str, Any]]) -> None:
         raise ValueError("projection must be JSON-safe") from exc
 
 
+_INLINE_FIELDS = frozenset({"id", "sender", "seq", "text"})
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def encode_shared_defaults(messages: list[dict[str, Any]]) -> dict[str, Any]:
+    """Hoist repeated metadata; source identities and text always stay inline."""
+    _validate(messages)
+    rows = copy.deepcopy(messages)
+    defaults: dict[str, Any] = {}
+    for field in (*FIELDS, *OPTIONAL_FIELDS):
+        if field in _INLINE_FIELDS or not rows or any(field not in row for row in messages):
+            continue
+        values = [_canonical_json(row[field]) for row in messages]
+        common, count = Counter(values).most_common(1)[0]
+        if count < 2:
+            continue
+        defaults[field] = copy.deepcopy(messages[values.index(common)][field])
+        for row, value in zip(rows, values, strict=True):
+            if value == common:
+                del row[field]
+    return {"messages": rows, "message_defaults": defaults}
+
+
+def decode_shared_defaults(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Restore missing default fields, preserving explicit overrides and nulls."""
+    try:
+        rows, defaults = payload["messages"], payload["message_defaults"]
+        if not isinstance(rows, list) or not isinstance(defaults, dict):
+            raise TypeError("invalid shared-defaults payload")
+        if set(defaults) - (set(FIELDS) | set(OPTIONAL_FIELDS)) or set(defaults) & _INLINE_FIELDS:
+            raise ValueError("source identity and text must remain inline")
+        if any(not isinstance(row, dict) or not _INLINE_FIELDS <= row.keys() for row in rows):
+            raise ValueError("source identity and text must remain inline")
+        messages = [{**copy.deepcopy(defaults), **copy.deepcopy(row)} for row in rows]
+        _validate(messages)
+        return messages
+    except (KeyError, TypeError) as exc:
+        raise ValueError("malformed shared-defaults payload") from exc
+
+
 def encode_messages(messages: list[dict[str, Any]]) -> dict[str, Any]:
     """Encode all text without truncation; integer timestamps remain exact."""
     _validate(messages)

@@ -124,6 +124,18 @@ class AgentTurnRequest(BaseModel):
     user_input: str
     llm: AgentTurnLLMOptions | None = None
     safety_review_mode: SafetyReviewMode | None = None
+    resumable: bool = False
+
+
+class ReplaceAgentRunRequest(AgentTurnRequest):
+    command_id: str = Field(min_length=1, max_length=128)
+
+    @field_validator("command_id")
+    @classmethod
+    def nonblank_command_id(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("command_id must not be blank.")
+        return value.strip()
 
 
 class AgentTurnLLMEventSummary(BaseModel):
@@ -293,6 +305,10 @@ class AgentRunResponse(BaseModel):
     completed_at: str | None = None
     failed_at: str | None = None
     cancelled_at: str | None = None
+    paused_at: str | None = None
+    pause_requested: bool = False
+    paused_from_status: AgentRunStatus | None = None
+    superseded_by_run_id: str | None = None
     waiting_since: str | None = None
     error_type: str | None = None
     error: str | None = None
@@ -305,6 +321,12 @@ class AgentRunResponse(BaseModel):
         return cls(
             **payload,
             has_result=record.result_snapshot is not None,
+            pause_requested=(record.metadata.get("pause_requested") is True and record.status in {
+                AgentRunStatus.QUEUED, AgentRunStatus.RUNNING, AgentRunStatus.PAUSED,
+                AgentRunStatus.WAITING_CONFIRMATION, AgentRunStatus.WAITING_USER,
+            }),
+            paused_from_status=record.metadata.get("paused_from_status"),
+            superseded_by_run_id=record.metadata.get("superseded_by_run_id"),
             pending_user_question=(
                 PendingAgentQuestionResponse.from_metadata(record.metadata)
                 if record.status == AgentRunStatus.WAITING_USER

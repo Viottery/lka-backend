@@ -48,6 +48,13 @@ from app.core.prompt_tokens import PromptTokenCounter
 from app.domains.message_history import AnalysisResult, MessageHistoryService
 from app.domains.message_profile_documents import MessageProfileDocumentStore
 from app.domains.message_reading_codec import select_messages
+from app.domains.message_reading_rollout import choose_selector_algorithm
+from app.domains.message_reading_selection import (
+    SELECTOR_VERSION as CANDIDATE_SELECTOR_VERSION,
+)
+from app.domains.message_reading_selection import (
+    select_message_candidates,
+)
 from app.tool_packages import message_reading_analysis as reading_v3
 
 LOG = logging.getLogger(__name__)
@@ -109,12 +116,36 @@ def _reading_schema_node(schema, location):
     return unwrap(node)
 
 
+_READING_FEEDBACK_CODES = frozenset({
+    "invalid_reading_v3_envelope", "reading_v3_candidate_limit",
+    "reading_evidence_outside_range", "reading_reference_not_seen",
+    "reading_unknown_reference", "topic_requires_one_identity", "blank_topic",
+    "topic_representatives_must_be_members", "invalid_topic_statement",
+    "incomplete_generation", "invalid_analysis_result", "invalid_json", "schema_validation",
+    "invalid_finding", "correction_requires_explicit_evidence",
+    "deadline_requires_grounded_timezone",
+})
+_READING_FEEDBACK_HINTS = {
+    "invalid_finding": (
+        "Finding text must be nonblank. Set at most one of existing_topic_id and batch_local_key."
+    ),
+    "correction_requires_explicit_evidence": (
+        "Use existing_insight_id only for a correction with certainty explicit."
+    ),
+    "deadline_requires_grounded_timezone": (
+        "When due_at is present, use a timezone-aware ISO value and due_provenance explicit or relative_resolved."
+    ),
+    "finding_schema_validation": (
+        "For highlights/importance_findings, text must be nonblank; use at most one existing_topic_id or "
+        "batch_local_key; existing_insight_id requires an explicit correction; due_at needs a timezone-aware "
+        "ISO value and explicit or relative_resolved provenance."
+    ),
+}
+
+
 def _reading_validation_feedback(exc):
     """Bounded schema codes/field locations, excluding inputs and extra keys."""
-    codes = {"invalid_reading_v3_envelope", "reading_v3_candidate_limit",
-             "reading_evidence_outside_range", "reading_reference_not_seen",
-             "reading_unknown_reference", "topic_requires_one_identity", "blank_topic",
-             "topic_representatives_must_be_members", "invalid_topic_statement"}
+    codes = _READING_FEEDBACK_CODES
     if isinstance(exc, ValidationError):
         schema = AnalysisResult.model_json_schema()
         fields = set(schema.get("properties", {}))
@@ -126,6 +157,8 @@ def _reading_validation_feedback(exc):
             feedback = {"code": reason if reason in codes else "schema_validation", "type": row["type"][:60],
                 "path": [part if type(part) is int else part if part in fields else "unknown"
                          for part in row["loc"][:4]]}
+            if feedback["code"] in _READING_FEEDBACK_HINTS:
+                feedback["hint"] = _READING_FEEDBACK_HINTS[feedback["code"]]
             # Use our schema, never provider input or exception text, to explain
             # literal failures. A field path alone cannot show the allowed values.
             if row["type"] in {"literal_error", "too_long", "too_short", "string_too_long", "string_too_short"}:
@@ -140,29 +173,90 @@ def _reading_validation_feedback(exc):
                         feedback[label] = node[bound]
             errors.append(feedback)
     else:
-        code = exc.args[0] if exc.args and isinstance(exc.args[0], str) else None
-        errors = [{"code": code if code in codes else "invalid_json" if isinstance(exc, json.JSONDecodeError)
-                   else "invalid_analysis_result"}]
+        if isinstance(exc, IncompleteGenerationError):
+            code = "incomplete_generation"
+        else:
+            code = exc.args[0] if exc.args and isinstance(exc.args[0], str) else None
+        code = code if code in codes else "invalid_json" if isinstance(exc, json.JSONDecodeError) else "invalid_analysis_result"
+        errors = [{"code": code}]
+        hint = _READING_FEEDBACK_HINTS.get(code)
         if code == "reading_reference_not_seen":
-            errors[0]["hint"] = (
+            hint = (
                 "Result citations must use exact id values from CURRENT messages, including fragment suffixes. "
                 "Only evidence_requests may cite other authorized_aliases; omit unsupported result rows."
             )
         elif code == "invalid_reading_v3_envelope":
-            errors[0]["hint"] = (
+            hint = (
                 "schema_version must be integer 3. Return exactly schema_version, topic_updates, highlights, "
                 "importance_findings, facts, warnings, participant_claim_candidates, focus_candidates, "
                 "evidence_requests. Do not add summary, batch_summary or other keys."
             )
         elif code == "reading_unknown_reference":
-            errors[0]["hint"] = (
+            hint = (
                 "existing_topic_id must copy known_topics.topic_id; existing_insight_id must copy "
                 "known_insights.insight_id. For a new topic use batch_local_key and omit existing_topic_id. "
-                "Do not invent existing IDs or use message aliases as topic/insight IDs."
+                "supersedes_fact_ids must copy prior_facts.fact_id or be omitted. Do not invent IDs "
+                "or use message aliases as topic, insight, or fact IDs."
             )
+        elif code == "incomplete_generation":
+            hint = (
+                "The previous generation was incomplete (possibly truncated). Return complete, concise JSON "
+                "that follows the schema, preserves valid evidence references, prioritizes key evidence, and "
+                "reduces repeated content."
+            )
+        elif code == "invalid_analysis_result":
+            hint = (
+                "Return complete, concise JSON that follows the provided schema; keep valid evidence "
+                "references, omit unsupported rows and references, and reduce repeated content."
+            )
+        if hint:
+            errors[0]["hint"] = hint
     while len(_json(errors).encode()) > 480:
         errors.pop()
     return errors
+
+
+def _normalize_reading_validation_feedback(feedback):
+    """Add current safe hints to persisted feedback without rewriting checkpoints."""
+    if not isinstance(feedback, list):
+        return _reading_validation_feedback(ValueError("invalid_analysis_result"))
+    normalized = []
+    for row in feedback[:8]:
+        if not isinstance(row, dict):
+            continue
+        code = row.get("code")
+        if not isinstance(code, str) or code not in _READING_FEEDBACK_CODES:
+            code = "invalid_analysis_result"
+        value = {key: row[key] for key in (
+            "type", "path", "allowed_values", "max_items", "min_items", "max_length", "min_length"
+        ) if key in row}
+        value["code"] = code
+        hint = _READING_FEEDBACK_HINTS.get(code)
+        path = row.get("path")
+        if (code == "schema_validation" and row.get("type") == "value_error"
+                and isinstance(path, list) and path and isinstance(path[0], str)
+                and path[0] in {"highlights", "importance_findings"}):
+            hint = _READING_FEEDBACK_HINTS["finding_schema_validation"]
+        elif code in {"reading_reference_not_seen", "invalid_reading_v3_envelope",
+                      "reading_unknown_reference", "incomplete_generation", "invalid_analysis_result"}:
+            hint = _reading_validation_feedback(ValueError(code))[0].get("hint")
+        if hint:
+            value["hint"] = hint
+        normalized.append(value)
+    while len(_json(normalized).encode()) > 480:
+        normalized.pop()
+    return normalized or _reading_validation_feedback(ValueError("invalid_analysis_result"))
+
+
+def _reverse_reference_alias(alias, reverse):
+    try:
+        return reverse[alias]
+    except (KeyError, TypeError):
+        raise ValueError("reading_unknown_reference") from None
+
+
+def _reverse_fact_aliases(aliases, reverse):
+    return [_reverse_reference_alias(alias, reverse) for alias in aliases]
 
 
 def _split_text(text: str, budget: int) -> list[str]:
@@ -439,24 +533,28 @@ class MessageAnalysisCoordinator:
         return lower
 
     def _plan_v3_range(self, batch):
+        encoding = getattr(self.config, "message_encoding", "records")
+        output_style, output_limits = self._v3_output_policy()
+        system = reading_v3.system_for_encoding(encoding, output_style)
         # Evaluate actual complete prompts, including frozen profiles and schema.
         for count in range(len(batch["messages"]), 0, -1):
             projection = reading_v3.ScopedProjection(batch["conversation_key"], batch["messages"][:count])
             context = self._v3_context(batch, projection)
-            selected = self._v3_selection(projection, context, batch["family_id"])["messages"] \
+            selected = self._v3_selection(projection, context, batch["family_id"],
+                                          platform=batch["policy"].get("platform"))["messages"] \
                 if self.config.reading_algorithm == "selected" else projection.messages
             authorized = [row["id"] for row in projection.messages]
             try:
-                chunks = self._v3_fragments(selected, context, projection, authorized)
+                chunks = self._v3_fragments(selected, context, projection, authorized, encoding, output_style)
             except BackgroundTaskBudgetExceeded:
                 continue
             calls = len(chunks)
             reserve_calls = len(chunks) + 1 if self.config.fragment_recovery_enabled else 2
-            tokens = sum(self.counter.count_request(reading_v3.SYSTEM,
-                reading_v3.prompt(context, rows, authorized)).count + self.config.generation_output_tokens
+            tokens = sum(self.counter.count_request(system,
+                reading_v3.prompt(context, rows, authorized, encoding)).count + output_limits["generation"]
                 for rows in chunks)
             tokens += reserve_calls * (self.config.max_input_tokens + max(
-                self.config.generation_output_tokens, self.config.recovery_output_tokens))
+                output_limits["generation"], output_limits["recovery"]))
             if calls + reserve_calls <= batch["work_call_limit"] and tokens <= batch["work_token_limit"]:
                 return count
         return 0
@@ -847,8 +945,24 @@ class MessageAnalysisCoordinator:
         context["intelligence_snapshot"] = scrub(context["intelligence_snapshot"])
         return context
 
-    def _v3_fragments(self, messages, context, projection, authorized):
+    def _v3_output_policy(self, checkpoint=None):
+        if checkpoint:
+            # An absent marker is the historical contract, even after rollout.
+            style = checkpoint.get("versions", {}).get("output_style", "standard")
+        else:
+            style = self.config.reading_output_style
+        limits = checkpoint.get("output_token_limits") if checkpoint else None
+        if limits is None:
+            limits = {"generation": self.config.concise_output_tokens,
+                      "recovery": self.config.concise_output_tokens} if style == "concise" else {
+                "generation": self.config.generation_output_tokens,
+                "recovery": self.config.recovery_output_tokens}
+        return style, limits
+
+    def _v3_fragments(self, messages, context, projection, authorized, encoding=None, output_style="standard"):
         """Fit the complete actual request; recursively split text without omission."""
+        encoding = encoding if encoding is not None else getattr(self.config, "message_encoding", "records")
+        system = reading_v3.system_for_encoding(encoding, output_style)
         chunks = []
         for message in messages:
             parts = [message["text"]]
@@ -856,8 +970,8 @@ class MessageAnalysisCoordinator:
                 fragments = [projection.fragment(message, text, i, len(parts))
                              for i, text in enumerate(parts, 1)]
                 oversize = next((i for i, row in enumerate(fragments)
-                                if self.counter.count_request(reading_v3.SYSTEM,
-                                    reading_v3.prompt(context, [row], authorized)).count
+                                if self.counter.count_request(system,
+                                    reading_v3.prompt(context, [row], authorized, encoding)).count
                                 > self.config.max_input_tokens - 512), None)
                 if oversize is None:
                     break
@@ -868,15 +982,15 @@ class MessageAnalysisCoordinator:
                 parts[oversize:oversize + 1] = [text[:midpoint], text[midpoint:]]
             for fragment in fragments:
                 if (chunks and not any(r["id"] == fragment["id"] for r in chunks[-1])
-                        and self.counter.count_request(reading_v3.SYSTEM,
-                            reading_v3.prompt(context, [*chunks[-1], fragment], authorized)).count
+                        and self.counter.count_request(system,
+                            reading_v3.prompt(context, [*chunks[-1], fragment], authorized, encoding)).count
                         <= self.config.max_input_tokens - 512):
                     chunks[-1].append(fragment)
                 else:
                     chunks.append([fragment])
         return chunks
 
-    def _v3_selection(self, projection, context, seed):
+    def _v3_selection(self, projection, context, seed, selector_algorithm=None, *, platform=None):
         contacts, keywords = [], []
         for name in ("reading_profile", "conversation_profile"):
             contacts.extend(context[name].get("important_contacts", []))
@@ -886,10 +1000,16 @@ class MessageAnalysisCoordinator:
         for person in context.get("intelligence_snapshot", {}).get("participants", []):
             if person.get("pinned") or person.get("status") == "pinned" or person.get("state") == "pinned":
                 contacts.append(person.get("sender", person.get("sender_id")))
-        return select_messages(projection.messages, max_messages=self.config.selector_max_messages,
+        selector_algorithm = selector_algorithm or choose_selector_algorithm(self.config, seed)
+        selector = select_message_candidates if selector_algorithm == "multi_lane" else select_messages
+        extra = {}
+        if selector_algorithm == "multi_lane":
+            extra["self_ids"] = tuple(value for name in ("reading_profile", "conversation_profile")
+                                      for value in context[name].get("self_ids", {}).get(platform, []))
+        return selector(projection.messages, max_messages=self.config.selector_max_messages,
             exploration_fraction=self.config.selector_exploration_fraction, seed=seed,
             protected_senders=tuple(contacts), protected_keywords=tuple(keywords),
-            known_topics=tuple(row.get("title", "") for row in context.get("known_topics", [])))
+            known_topics=tuple(row.get("title", "") for row in context.get("known_topics", [])), **extra)
 
     def _analyze_v3(self, job):
         if not self.config.enabled or not self.config.background_enabled:
@@ -901,6 +1021,16 @@ class MessageAnalysisCoordinator:
                                         ("message_reading", batch["conversation_key"], progress["family_id"]))
         self.controller.reclassify_task_usage(tuple(progress.get("legacy_task_ids", ())), "background_message")
         checkpoint = progress.get("checkpoint") or {}
+        # Old frozen work must retain its original prompt, chunks and fingerprint.
+        encoding = checkpoint.get("message_encoding", "records") if checkpoint else getattr(
+            self.config, "message_encoding", "records")
+        output_style, output_limits = self._v3_output_policy(checkpoint)
+        versions = reading_v3.versions_for_encoding(encoding, output_style)
+        selector_algorithm = choose_selector_algorithm(self.config, progress["family_id"], checkpoint) \
+            if self.config.reading_algorithm == "selected" else "current"
+        if selector_algorithm == "multi_lane":
+            versions = {**versions, "selector": CANDIDATE_SELECTOR_VERSION}
+        system = reading_v3.system_for_encoding(encoding, output_style)
         snapshot = checkpoint.get("reading_snapshot") or {
             key: batch.get(key, {}) for key in ("known_topics", "known_insights",
                 "topic_candidates_limited", "reading_profile", "conversation_profile", "intelligence_snapshot",
@@ -914,23 +1044,29 @@ class MessageAnalysisCoordinator:
             row["reply_to_internal_message_id"], row["reply_resolution"] = reply_map[row["message_id"]]
         projection = reading_v3.ScopedProjection(batch["conversation_key"], batch["messages"])
         context = self._v3_context(batch, projection)
-        selected = self._v3_selection(projection, context, progress["family_id"]) if self.config.reading_algorithm == "selected" else {
+        selected = self._v3_selection(projection, context, progress["family_id"], selector_algorithm,
+                                      platform=batch["policy"].get("platform")) if self.config.reading_algorithm == "selected" else {
                 "messages": projection.messages, "coverage_mode": "full_text",
                 "decisions": [{"id": row["id"], "decision": "retained", "reasons": ["compact_full_text"]}
                               for row in projection.messages]}
         authorized = [row["id"] for row in projection.messages]
-        chunks = self._v3_fragments(selected["messages"], context, projection, authorized)
+        chunks = self._v3_fragments(selected["messages"], context, projection, authorized, encoding, output_style)
+        fingerprint_config = {k: getattr(self.config, k) for k in ("reading_algorithm", "max_input_tokens",
+            "selector_max_messages", "selector_exploration_fraction", "generation_output_tokens",
+            "recovery_output_tokens", "fragment_recovery_enabled", "participant_pool_capacity", "participant_pinned_capacity",
+            "profile_cold_days", "profile_retention_days")}
+        fingerprint_config.update(generation_output_tokens=output_limits["generation"],
+                                  recovery_output_tokens=output_limits["recovery"])
         fingerprint = hashlib.sha256(_json({"messages": projection.messages, "context": context,
-            "chunks": chunks, "versions": reading_v3.VERSIONS, "route": self._route(),
-            "config": {k: getattr(self.config, k) for k in ("reading_algorithm", "max_input_tokens",
-                "selector_max_messages", "selector_exploration_fraction", "generation_output_tokens",
-                "recovery_output_tokens", "fragment_recovery_enabled", "participant_pool_capacity", "participant_pinned_capacity",
-                "profile_cold_days", "profile_retention_days")}}).encode()).hexdigest()
+            "chunks": chunks, "versions": versions, "route": self._route(),
+            "config": fingerprint_config}).encode()).hexdigest()
         if checkpoint and checkpoint.get("input_snapshot_digest") != fingerprint:
             raise BackgroundJobFailure("checkpoint_input_changed")
         if not checkpoint:
             checkpoint = {"input_snapshot_digest": fingerprint, "reading_snapshot": snapshot,
-                          "reply_snapshot": reply_snapshot, "versions": reading_v3.VERSIONS}
+                          "reply_snapshot": reply_snapshot, "versions": versions,
+                          "message_encoding": encoding, "selector_algorithm": selector_algorithm,
+                          "output_token_limits": output_limits}
             if not self.service.freeze_reading_snapshot(job, fingerprint, checkpoint, progress["service_epoch"]):
                 raise BackgroundBudgetDeferred("message_analysis_checkpoint_fenced")
             progress["last_input_digest"] = fingerprint
@@ -950,9 +1086,9 @@ class MessageAnalysisCoordinator:
         prompt_context = dict(context)
         feedback = checkpoint.get("recovery_errors") if recovery else progress.get("restart_feedback")
         if feedback:
-            prompt_context["validation_feedback"] = feedback
-        prompt = reading_v3.prompt(prompt_context, fragments, authorized)
-        incoming = self.counter.count_request(reading_v3.SYSTEM, prompt).count
+            prompt_context["validation_feedback"] = _normalize_reading_validation_feedback(feedback)
+        prompt = reading_v3.prompt(prompt_context, fragments, authorized, encoding)
+        incoming = self.counter.count_request(system, prompt).count
         if incoming > self.config.max_input_tokens:
             raise BackgroundTaskBudgetExceeded("message_analysis_evidence_input_exceeded")
         digest = hashlib.sha256(_json([fingerprint, cursor, prompt, progress.get("last_input_digest")]).encode()).hexdigest()
@@ -970,10 +1106,10 @@ class MessageAnalysisCoordinator:
                 raise BackgroundJobFailure("model_recovery_exhausted")
 
         client = self._selected_client()
-        kwargs = {"system_prompt": reading_v3.SYSTEM, "user_prompt": prompt,
+        kwargs = {"system_prompt": system, "user_prompt": prompt,
                   "prompt_summary": "Analyze fixed scoped conversation evidence.", "require_json": True,
-                  "temperature": 0.0, "max_output_tokens": self.config.recovery_output_tokens
-                  if recovery else self.config.generation_output_tokens}
+                  "temperature": 0.0, "max_output_tokens": output_limits["recovery"]
+                  if recovery else output_limits["generation"]}
         if client.supports_thinking_control():
             kwargs["thinking_enabled"] = False
         accumulator = checkpoint.get("accumulator") or {
@@ -986,7 +1122,8 @@ class MessageAnalysisCoordinator:
             state = {"input_snapshot_digest": fingerprint, "reading_snapshot": snapshot,
                 "accumulator": accumulator, "previous_input_digest": progress.get("last_input_digest"),
                 "reply_snapshot": reply_snapshot,
-                "versions": reading_v3.VERSIONS,
+                "versions": versions, "message_encoding": encoding, "selector_algorithm": selector_algorithm,
+                "output_token_limits": output_limits,
                 "recovery_used": bool(checkpoint.get("recovery_used")),
                 "evidence_used": bool(checkpoint.get("evidence_used")),
                 "model_seen_spans": checkpoint.get("model_seen_spans", []), **extra}
@@ -1053,11 +1190,11 @@ class MessageAnalysisCoordinator:
                             row[sources] = list(dict.fromkeys(projection.reverse[s] for s in row[sources]))
                     for ref in ("existing_topic_id", "existing_insight_id"):
                         if row.get(ref):
-                            if row[ref] not in projection.reverse:
-                                raise ValueError("reading_unknown_reference")
-                            row[ref] = projection.reverse[row[ref]]
+                            row[ref] = _reverse_reference_alias(row[ref], projection.reverse)
                     if row.get("supersedes_fact_ids"):
-                        row["supersedes_fact_ids"] = [projection.reverse[s] for s in row["supersedes_fact_ids"]]
+                        row["supersedes_fact_ids"] = _reverse_fact_aliases(
+                            row["supersedes_fact_ids"], projection.reverse
+                        )
             result = AnalysisResult.model_validate(parsed)
         except (IncompleteGenerationError, ValueError, TypeError, KeyError, ValidationError) as exc:
             if recovery or evidence or checkpoint.get("recovery_used"):
@@ -1097,8 +1234,8 @@ class MessageAnalysisCoordinator:
         if requests and not evidence and not checkpoint.get("evidence_used"):
             evidence_rows = [projection.fragment(row, row["text"], 1, 1)
                              for row in projection.messages if row["id"] in requests[0].source_ids]
-            if self.counter.count_request(reading_v3.SYSTEM,
-                    reading_v3.prompt(context, evidence_rows, authorized)).count <= self.config.max_input_tokens:
+            if self.counter.count_request(system,
+                    reading_v3.prompt(context, evidence_rows, authorized, encoding)).count <= self.config.max_input_tokens:
                 save(cursor, evidence_pending=True, evidence_used=True,
                      evidence_ids=requests[0].source_ids, model_seen_spans=seen)
             accumulator["warnings"].append("evidence_request_exceeds_input_budget; unresolved evidence remains unknown")
@@ -1110,10 +1247,10 @@ class MessageAnalysisCoordinator:
         name, model = self._route()
         accumulator.update(reading_snapshot=snapshot, client_name=getattr(response, "client_name", None) or name,
             model=getattr(response, "model", None) or model, generation_calls=usage["total_calls"],
-            usage_tokens=usage["total_tokens"], prompt_version=reading_v3.PROMPT_VERSION,
+            usage_tokens=usage["total_tokens"], prompt_version=versions["prompt"],
             reading_manifest={"coverage_mode": selected["coverage_mode"], "screened_seq": job["payload"]["end_seq"],
                 "model_seen_spans": seen, "selection_manifest": [{**row, "id": projection.reverse[row["id"]]}
-                    for row in selected["decisions"]], "versions": reading_v3.VERSIONS})
+                    for row in selected["decisions"]], "versions": versions})
         if not self.service.publish_analysis(job, accumulator, service_epoch=progress["service_epoch"]):
             raise BackgroundBudgetDeferred("message_analysis_publication_fenced")
         self._export_profile_documents(job, batch, accumulator)

@@ -475,6 +475,8 @@ class ToolExecutor:
             return "Agent run is unavailable; tool invocation was stopped."
         if run.status.value in {"cancelled", "timed_out", "failed", "completed"} or manager.is_cancel_requested(run_id):
             return "Agent run is cancelled or terminal; tool invocation was stopped."
+        if run.status.value == "paused":
+            return "Agent run is paused; tool invocation was stopped."
         if tool_view and tool_view.expires_at and tool_view.expires_at <= datetime.now(UTC):
             if run.parent_run_id is not None:
                 manager.timeout_child_run(run_id, error="Child Agent exceeded its wall-time budget.")
