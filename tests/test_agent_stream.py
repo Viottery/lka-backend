@@ -241,6 +241,11 @@ def test_agent_turn_stream_emits_provider_token_delta_events(tmp_path, monkeypat
         for frame in delta_frames
         if frame["data"]["payload"]["content_role"] != "final_answer"
     )
+    control_deltas = [frame["data"] for frame in delta_frames
+                      if frame["data"]["stage"] not in {"answer", "context_answer"}]
+    assert control_deltas
+    assert all(frame["message"] == "" and "delta" not in frame["payload"]
+               and "content_snapshot" not in frame["payload"] for frame in control_deltas)
 
     final_answer = next(frame for frame in frames if frame["event"] == "final_answer")
     assert final_answer["data"]["stream_part"] == "final_answer"

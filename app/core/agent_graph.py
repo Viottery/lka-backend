@@ -822,8 +822,12 @@ class AgentGraphRunner:
     def _decide(self, s: AgentGraphState) -> AgentGraphState:
         self.turn_loop._raise_if_cancel_requested()
         ws, data = self._data(s)
-        if ws.step_index >= self.turn_loop.max_decision_steps:
-            ws.terminal_reason = "Step limit reached after loading evidence."
+        deadline_reached = self.turn_loop._decision_deadline_reached()
+        if ws.step_index >= self.turn_loop.max_decision_steps or deadline_reached:
+            ws.terminal_reason = "Execution deadline approaching." if deadline_reached else "Step limit reached after loading evidence."
+            progress = self._models(data["progress_events"], AgentTurnProgressEvent)
+            self.turn_loop._record_incomplete(progress, "execution_deadline" if deadline_reached else "decision_budget_exhausted")
+            data["progress_events"] = self._dump(progress)
             # A pending re-plan rejects final_answer by design. Sending one at
             # the decision limit would loop decide -> reject forever because
             # this branch cannot advance the step counter. Route unresolved
@@ -847,7 +851,14 @@ class AgentGraphRunner:
             observations=data["observations"],
             llm_events=llm,
             task_completion=ws.completion_state.context(),
+            task_working_state=ws.task_working_state.context(
+                remaining_steps=self.turn_loop.max_decision_steps - ws.step_index,
+                remaining_seconds=self.turn_loop._remaining_execution_seconds(),
+            ),
         )
+        progress = self._models(data["progress_events"], AgentTurnProgressEvent)
+        self.turn_loop._update_task_progress(ws.task_working_state, d or {}, data["observations"], progress)
+        data["progress_events"] = self._dump(progress)
         for observation in reversed(data["observations"]):
             if (
                 observation.get("action") == "fork_subtasks_schema_feedback"
@@ -902,6 +913,13 @@ class AgentGraphRunner:
         ws, data = self._data(s)
         x = ws.pending_decision
         action = str(x.get("action") or "")
+        if x.get("_progress_review_required"):
+            ws.pending_decision = {}
+            return self._save(s, ws, data, "operation_rejected")
+        if action in {"invalid_structured_decision", "invalid_plain_text_decision", "invalid_empty_decision", "malformed_tool_call", "invalid_final_answer"}:
+            progress = self._models(data["progress_events"], AgentTurnProgressEvent)
+            self.turn_loop._record_incomplete(progress, "decision_protocol_invalid")
+            data["progress_events"] = self._dump(progress)
         if action in {"fork_subtasks", "fork_subtasks_invalid"}:
             self.turn_loop._upgrade_fast_path_for_multi_agent(ws.run_id)
             if action == "fork_subtasks_invalid" and not data.get("fork_format_repair_used"):
@@ -1114,10 +1132,13 @@ class AgentGraphRunner:
             else False
         )
         if fp in data["successful"] and not repeat:
-            ws.terminal_reason = (
-                "Blocked an identical tool call after a successful result in this turn."
+            progress = self._models(data["progress_events"], AgentTurnProgressEvent)
+            self.turn_loop._duplicate_tool_feedback(
+                ws.task_working_state, name, tool_input, data["observations"], progress,
             )
-            return self._save(s, ws, data, "operation_answer")
+            data["progress_events"] = self._dump(progress)
+            ws.pending_decision = {}
+            return self._save(s, ws, data, "operation_rejected")
         ws.pending_invocation_id = _stable_id(
             "tool_invocation", ws.run_id, str(ws.step_index), name, fp
         )
@@ -1356,6 +1377,8 @@ class AgentGraphRunner:
                 run_id=ws.run_id,
             )
         )
+        ws.task_working_state.observe({"tool_name": name, "input": inp,
+                                       "result": result.model_dump(mode="json")}, x.get("purpose"))
         if result.status == "completed":
             if self.turn_loop._completed_tool_call_changes_state(
                 tool_name=name,
@@ -1384,6 +1407,7 @@ class AgentGraphRunner:
             "action": "final_answer",
             "reason": ws.terminal_reason or ws.pending_decision.get("reason"),
             "_task_completion": ws.completion_state.context(),
+            "_task_working_state": ws.task_working_state.context(),
         }
         if ws.pending_decision.get("action") == "final_answer":
             operation = ws.pending_decision.get("operation")
@@ -1447,7 +1471,7 @@ class AgentGraphRunner:
             progress,
             type="final_answer",
             stage="answer",
-            status="failed" if generation_failed else "partial" if missing or ws.completion_state.stop_reason else "completed",
+            status="failed" if generation_failed else "partial" if missing or ws.completion_state.stop_reason or self.turn_loop._task_outcome(progress)["task_outcome"] == "incomplete" else "completed",
             message=self.turn_loop._short_text(answer),
             persist=self._run(ws.run_id).metadata.get("defer_answer_publication") is not True,
             metadata={
@@ -1494,6 +1518,7 @@ class AgentGraphRunner:
             session_id=ws.session_id,
             trace_id=ws.trace_id,
             answer=answer,
+            **self.turn_loop._task_outcome(self._models(data["progress_events"], AgentTurnProgressEvent)),
             selected_package=ws.initial_package,
             initial_package=ws.initial_package,
             expanded_packages=ws.expanded_packages,
@@ -1518,6 +1543,8 @@ class AgentGraphRunner:
             "session_id": result.session_id,
             "trace_id": result.trace_id,
             "answer": result.answer,
+            "task_outcome": result.task_outcome,
+            "stop_reason": result.stop_reason,
             "selected_package": result.selected_package,
             "initial_package": result.initial_package,
             "expanded_packages": result.expanded_packages,
@@ -1527,6 +1554,7 @@ class AgentGraphRunner:
         }
         message_payload = {
             "run_id": ws.run_id, "trace_id": ws.trace_id,
+            "task_outcome": result.task_outcome, "stop_reason": result.stop_reason,
             "initial_package": ws.initial_package, "expanded_packages": ws.expanded_packages,
             "used_packages": ws.used_packages, "active_package": ws.active_package,
             "log_path": str(log), "tool_events": data.get("tool_events", []),

@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from evals.lka_evals import swe_sandbox as sandbox_module
-from evals.lka_evals.swe_sandbox import OUTPUT_LIMIT, Sandbox, SandboxError
+from evals.lka_evals.swe_sandbox import OUTPUT_LIMIT, SHELL_PIPELINE_POLICY, Sandbox, SandboxError
 
 
 @pytest.fixture
@@ -55,7 +55,19 @@ def test_command_confines_mounts_environment_and_shell(sandbox, monkeypatch):
     assert env["PATH"] == "/usr/bin:/bin"
     assert env["PYTHONPATH"] == f"{sandbox.workspace}/src:{sandbox.workspace}"
     assert "secret" not in str(argv)
-    assert argv[-6:] == ["--", "/bin/bash", "--noprofile", "--norc", "-c", "printf hello"]
+    assert argv[-6:] == [
+        "--",
+        "/bin/bash",
+        "--noprofile",
+        "--norc",
+        "-c",
+        SHELL_PIPELINE_POLICY + "printf hello",
+    ]
+    assert not any(source.startswith("/etc") for source, _ in options(argv, "--ro-bind", 2))
+    if Path("/usr/bin/awk").is_symlink() and os.readlink("/usr/bin/awk") == "/etc/alternatives/awk":
+        assert [str(Path("/usr/bin/awk").resolve()), "/etc/alternatives/awk"] in options(
+            argv, "--symlink", 2
+        )
     for name in ("/bin", "/lib", "/lib64"):
         if Path(name).is_symlink():
             assert [os.readlink(name), name] in options(argv, "--symlink", 2)
@@ -184,3 +196,29 @@ def test_available_sandbox_enforces_runtime_isolation(tmp_path):
     assert result == {"stdout": "ok", "stderr": "", "exit_code": 0, "timed_out": False}
     assert (repo / "result").read_text() == "ok"
     assert sandbox.run("exit 7")["exit_code"] == 7
+    assert sandbox.run("printf 'hello\\n' | awk '{print $1}'")["stdout"] == "hello\n"
+    assert sandbox.run("sh -c 'echo collection-error >&2; exit 4' | tail -5")["exit_code"] == 4
+
+
+@pytest.mark.parametrize(
+    "command, expected",
+    [
+        ("exit 7", 7),
+        ("true; exit 7", 7),
+        ("false | tail -5", 1),
+        ("sh -c 'exit 4' | tail -5", 4),
+        ("yes output | grep output | head -1", 0),
+        ("sh -c 'exit 1' | sh -c 'exit 141' | cat", 1),
+        ("printf ok | sh -c 'exit 141'", 141),
+        ("exit 141", 141),
+    ],
+)
+def test_pipeline_policy_preserves_test_failures_and_expected_early_close(command, expected):
+    result = subprocess.run(
+        ["/bin/bash", "--noprofile", "--norc", "-c", SHELL_PIPELINE_POLICY + command],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    assert result.returncode == expected

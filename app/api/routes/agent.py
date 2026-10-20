@@ -868,6 +868,21 @@ def _public_agent_event(event: AgentRunEvent) -> AgentRunEvent:
     payload.pop("log_path", None)
     if event.type in {"llm_started", "llm_completed", "llm_failed"}:
         payload.pop("audit_record", None)
+    elif event.type == "task_working_state_updated":
+        # Working notes can quote private facts; they are local audit state.
+        return event.model_copy(update={"payload": {}, "message": ""})
+    elif event.type == "llm_delta" and event.stage not in {"answer", "context_answer"}:
+        # Control JSON can contain working notes and source evidence. Keep only
+        # UI lifecycle metadata; partial JSON cannot be safely field-filtered.
+        payload = {
+            key: payload[key]
+            for key in (
+                "stream_part", "content_role", "display_target", "llm_call_id",
+                "client_name", "provider", "model", "provider_request_id",
+            )
+            if key in payload
+        }
+        return event.model_copy(update={"payload": payload, "message": ""})
     elif event.type in {
         "safety_review",
         "safety_review_required",
@@ -891,6 +906,8 @@ def _public_agent_event(event: AgentRunEvent) -> AgentRunEvent:
         "tool_feedback",
         "tool_recovered",
         "tool_execution_uncertain",
+        "tool_duplicate_blocked",
+        "task_progress_review_required",
     }:
         payload = {
             key: payload[key]

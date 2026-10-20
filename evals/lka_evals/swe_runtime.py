@@ -9,6 +9,7 @@ import threading
 import time
 import traceback
 from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from app.core.config import Settings
 from app.core.llm.models import LLMResponseMode
@@ -18,7 +19,13 @@ from app.core.safety import SafetyReviewMode
 from app.core.tools import ToolResult
 from evals.lka_evals.live_budget import MeteredClient, _protected_credential_values
 from evals.lka_evals.management_runtime import bounded_budget
-from evals.lka_evals.swe_bench import save
+from evals.lka_evals.swe_bench import (
+    NATIVE_PROFILE_VERSION,
+    environment_identity,
+    object_digest,
+    save,
+    verify_source,
+)
 from evals.lka_evals.swe_sandbox import Sandbox
 
 ALLOWED_TOOLS = frozenset(
@@ -33,6 +40,60 @@ ALLOWED_TOOLS = frozenset(
         "observation.group",
     }
 )
+
+
+def configuration_identity(config) -> str:
+    """Hash effective settings after removing credentials, including URL secrets."""
+    sensitive = {
+        "api_key",
+        "key",
+        "password",
+        "secret",
+        "token",
+        "access_token",
+        "refresh_token",
+        "authorization",
+    }
+
+    def sanitized(value):
+        if isinstance(value, dict):
+            return {
+                key: ("<redacted>" if key.lower() in sensitive else sanitized(item))
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [sanitized(item) for item in value]
+        if isinstance(value, str) and "://" in value:
+            parsed = urlsplit(value)
+            query = urlencode(
+                [
+                    (key, "<redacted>" if key.lower() in sensitive else item)
+                    for key, item in parse_qsl(parsed.query, keep_blank_values=True)
+                ]
+            )
+            return urlunsplit(
+                (parsed.scheme, parsed.netloc.rsplit("@", 1)[-1], parsed.path, query, "")
+            )
+        return value
+
+    return object_digest(sanitized(config.model_dump(mode="json")))
+
+
+def test_guidance(task: dict) -> str:
+    """Versioned public environment guidance; never inspect heldout identities."""
+    runner = (
+        "This historical SymPy checkout uses its native runner: "
+        "python bin/test -C --verbose --no-colors <relevant test file>. "
+        "Modern pytest may not collect these historical tests."
+        if task.get("repo") == "sympy/sympy"
+        else "Run relevant available tests with python -m pytest <test file or node>."
+    )
+    return (
+        f"Environment profile: {NATIVE_PROFILE_VERSION}. {runner} "
+        "Python and installed dependencies are preconfigured and network access is disabled. "
+        "Shell pipelines preserve non-SIGPIPE failures; use the actual test exit status, "
+        "not successful tail/head output, as validation evidence.\n\n"
+    )
 
 
 class EvalSettings(Settings):
@@ -70,7 +131,7 @@ class RecordedClient(MeteredClient):
                 log.write(json.dumps(event, ensure_ascii=False) + "\n")
 
 
-def configuration(job: dict):
+def configuration(job: dict, *, resolve_credentials: bool = True):
     """Import model settings only; never import personal domains or memory."""
     source = load_local_config(Path(job["local_config"]))
     clients = source.llm.client_configs()
@@ -84,11 +145,13 @@ def configuration(job: dict):
         or client.default_model != "deepseek-flash"
     ):
         raise ValueError("Current ledger supports only configured deepseek-flash pricing")
-    secret = client.resolved_api_key() or _dotenv_value(client.api_key_env, Path(job["env"]))
-    if not secret:
-        raise ValueError("Configured provider credential unavailable")
-    os.environ[client.api_key_env] = secret
-    protected = tuple({*_protected_credential_values(Path(job["env"])), secret})
+    protected = ()
+    if resolve_credentials:
+        secret = client.resolved_api_key() or _dotenv_value(client.api_key_env, Path(job["env"]))
+        if not secret:
+            raise ValueError("Configured provider credential unavailable")
+        os.environ[client.api_key_env] = secret
+        protected = tuple({*_protected_credential_values(Path(job["env"])), secret})
     config = LocalAppConfig()
     config.llm = source.llm.model_copy(deep=True)
     config.llm.clients = [client.model_copy(deep=True)]
@@ -112,7 +175,7 @@ def configuration(job: dict):
     return config, client, protected
 
 
-def confine(runtime, workspace: Path, sandbox: Sandbox) -> None:
+def confine(runtime, workspace: Path, sandbox: Sandbox, *, deadline: float | None = None) -> None:
     """Keep normal schema/safety handling; replace command execution at its OS boundary."""
     policy_provider = runtime._session_run_policy
 
@@ -180,7 +243,13 @@ def confine(runtime, workspace: Path, sandbox: Sandbox) -> None:
     def run_sync(
         *, command, cwd, read_only, policy, timeout_seconds, max_output_bytes, execution_env=None
     ):
-        outcome = sandbox.run(command, cwd=cwd, timeout=min(max(timeout_seconds, 1), 300))
+        timeout = min(max(timeout_seconds, 1), 300)
+        if deadline is not None:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise TimeoutError("Evaluation worker deadline reached before command dispatch")
+            timeout = min(timeout, remaining)
+        outcome = sandbox.run(command, cwd=cwd, timeout=timeout)
         size = min(max(max_output_bytes, 1), 131072)
         stdout, stderr = outcome["stdout"][:size], outcome["stderr"][:size]
         return {
@@ -204,6 +273,12 @@ def confine(runtime, workspace: Path, sandbox: Sandbox) -> None:
 
 def run(job: dict) -> int:
     output, workspace = Path(job["output"]), Path(job["workspace"]).resolve()
+    source_root = Path(job["source_root"]).resolve()
+    if Path(__file__).resolve().parents[2] != source_root:
+        raise ValueError("Worker must import the isolated evaluation source snapshot")
+    verify_source(source_root, job["source_identity"])
+    if environment_identity(Path(job["python"])) != job["benchmark_environment"]:
+        raise ValueError("Benchmark environment fingerprint changed")
     sandbox = Sandbox(workspace, Path(job["python"]))
     status = sandbox.check()
     if not status["available"]:
@@ -213,6 +288,21 @@ def run(job: dict) -> int:
         if key.startswith("LKA_"):
             os.environ.pop(key)
     config, _client, protected = configuration(job)
+    if configuration_identity(config) != job["effective_config_sha256"]:
+        raise ValueError("Effective configuration fingerprint changed")
+    save(
+        output / "worker_identity.json",
+        {
+            "source_sha256": job["source_identity"]["source_sha256"],
+            "worker_dependencies": job["source_identity"]["worker_dependencies"],
+            "effective_config_sha256": job["effective_config_sha256"],
+            "benchmark_environment": job["benchmark_environment"],
+            "deadline_unix_seconds": job["deadline_unix_seconds"],
+            "verified_at_unix_seconds": time.time(),
+        },
+    )
+    if time.time() >= job["deadline_unix_seconds"]:
+        raise TimeoutError("Evaluation deadline reached before runtime initialization")
     budget = bounded_budget(
         Path(job["ledger"]), usd_limit=job["usd_limit"], call_limit=job["call_limit"]
     )
@@ -239,7 +329,7 @@ def run(job: dict) -> int:
                 LKA_LOCAL_CONFIG=output / "missing.toml",
             )
         )
-        confine(runtime, workspace, sandbox)
+        confine(runtime, workspace, sandbox, deadline=job["deadline_unix_seconds"])
         for registered in runtime.agent_llm_client.registry.list_clients():
             runtime.agent_llm_client.registry.register_client(
                 RecordedClient(
@@ -258,8 +348,18 @@ def run(job: dict) -> int:
             "Resolve the following issue in this repository. Inspect the code, implement "
             "the fix, and run relevant available tests. Leave your changes in the workspace. "
             "Report what changed and the validation performed. The checkout is disposable; "
-            "commands run without network access. Python and pytest are available on PATH.\n\n"
+            "commands run without network access.\n\n"
+            + test_guidance(job["task"])
             + job["task"]["problem_statement"]
+        )
+        run_record = runtime.agent_turn_loop.create_run_for_turn(
+            session_id=session.session.session_id,
+            user_input=prompt,
+        )
+        runtime.agent_run_manager._update_run(
+            run_record.run_id,
+            status=run_record.status,
+            metadata_patch={"execution_deadline_unix_seconds": job["deadline_unix_seconds"]},
         )
         result = runtime.run_agent_turn(
             session_id=session.session.session_id,
@@ -268,6 +368,7 @@ def run(job: dict) -> int:
             llm_model=config.llm.model,
             llm_response_mode=LLMResponseMode.TEXT,
             safety_review_mode=SafetyReviewMode(config.safety.tool_review_mode),
+            existing_run_id=run_record.run_id,
         )
         save(output / "result.json", result.model_dump(mode="json"))
         manager = runtime.agent_run_manager
@@ -288,6 +389,8 @@ def run(job: dict) -> int:
         report.update(
             status=root.status.value if root else "unknown",
             run_id=result.run_id,
+            task_outcome=getattr(result, "task_outcome", "unknown"),
+            stop_reason=getattr(result, "stop_reason", None),
             root_tool_calls=len(result.tool_events),
             child_runs=max(len(runs) - 1, 0),
             tool_invocation_count=sum(len(item["tool_invocations"]) for item in trace),

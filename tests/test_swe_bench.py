@@ -3,6 +3,7 @@
 import asyncio
 import json
 import shutil
+import subprocess
 import sys
 from types import SimpleNamespace
 
@@ -319,3 +320,227 @@ def test_worker_meter_records_and_refuses_repeat_without_provider_dispatch(tmp_p
     event = json.loads((tmp_path / "calls.jsonl").read_text())
     assert event["status"] == "completed"
     assert "synthetic" not in json.dumps(event)
+
+
+def test_snapshot_preserves_worktree_and_rejects_later_mutation(tmp_path, monkeypatch):
+    root = tmp_path / "worktree"
+    (root / "app").mkdir(parents=True)
+    (root / "evals").mkdir()
+    source = root / "app/module.py"
+    source.write_text("dirty_and_untracked = True\n")
+    (root / "private.env").write_text("PRIVATE_TOKEN=secret")
+    output = tmp_path / "attempt"
+    output.mkdir()
+    monkeypatch.setattr(bench, "ROOT", root)
+    snapshot, identity = bench.freeze_source(output)
+    assert (snapshot / "app/module.py").read_text() == source.read_text()
+    assert not (snapshot / "private.env").exists()
+    source.write_text("changed_after_freeze = True\n")
+    bench.verify_source(snapshot, identity)
+    saved = snapshot / "app/module.py"
+    saved.chmod(0o644)
+    saved.write_text("tampered = True\n")
+    with pytest.raises(ValueError, match="source fingerprint"):
+        bench.verify_source(snapshot, identity)
+
+
+def test_snapshot_rejects_symlinked_code(tmp_path, monkeypatch):
+    (tmp_path / "app").mkdir()
+    (tmp_path / "outside.py").write_text("outside = True")
+    (tmp_path / "app/link.py").symlink_to(tmp_path / "outside.py")
+    monkeypatch.setattr(bench, "ROOT", tmp_path)
+    with pytest.raises(ValueError, match="symlinked"):
+        bench.source_files(tmp_path)
+
+
+def test_snapshot_imports_runtime_without_using_shared_application(tmp_path):
+    output = tmp_path / "attempt"
+    output.mkdir()
+    snapshot, identity = bench.freeze_source(output)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-B",
+            "-c",
+            (
+                "import app.core.runtime as a; "
+                "import evals.lka_evals.swe_runtime as e; print(a.__file__); print(e.__file__)"
+            ),
+        ],
+        cwd=snapshot,
+        env={"PATH": "/usr/bin:/bin", "PYTHONPATH": str(snapshot), "PYTHONDONTWRITEBYTECODE": "1"},
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=True,
+    )
+    assert result.stdout.splitlines() == [
+        str(snapshot / "app/core/runtime.py"),
+        str(snapshot / "evals/lka_evals/swe_runtime.py"),
+    ]
+    bench.verify_source(snapshot, identity)
+
+
+def test_historical_test_guidance_has_no_evaluator_only_data():
+    from evals.lka_evals.swe_runtime import test_guidance as guidance
+
+    task = {"repo": "sympy/sympy", "patch": "SECRET_GOLD", "FAIL_TO_PASS": ["SECRET_NODE"]}
+    text = guidance(task)
+    assert "python bin/test -C" in text and bench.NATIVE_PROFILE_VERSION in text
+    assert "SECRET" not in text
+    assert "python -m pytest" in guidance({"repo": "pallets/flask"})
+
+
+def test_effective_config_hash_redacts_credentials_but_tracks_settings():
+    from evals.lka_evals.swe_runtime import configuration_identity
+
+    class Config:
+        def __init__(self):
+            self.value = {
+                "agent": {"max_steps": 40},
+                "api_key": "one",
+                "base_url": "https://user:pass@example.test/v1?token=one",
+            }
+
+        def model_dump(self, mode):
+            return self.value
+
+    config = Config()
+    first = configuration_identity(config)
+    config.value["api_key"] = "two"
+    config.value["base_url"] = "https://other:secret@example.test/v1?token=two"
+    assert configuration_identity(config) == first
+    config.value["agent"]["max_steps"] = 10
+    assert configuration_identity(config) != first
+
+
+def test_worker_command_respects_deadline_before_dispatch(tmp_path, monkeypatch):
+    from evals.lka_evals import swe_runtime
+
+    runtime, _, bash = fake_runtime()
+    calls = []
+    sandbox = SimpleNamespace(
+        run=lambda command, cwd, timeout: (
+            calls.append(timeout)
+            or {
+                "stdout": "ok",
+                "stderr": "",
+                "exit_code": 0,
+                "timed_out": False,
+            }
+        )
+    )
+    monkeypatch.setattr(swe_runtime.time, "time", lambda: 100)
+    swe_runtime.confine(runtime, tmp_path, sandbox, deadline=103)
+    inputs = {
+        "command": "true",
+        "cwd": tmp_path,
+        "read_only": True,
+        "policy": None,
+        "timeout_seconds": 30,
+        "max_output_bytes": 100,
+    }
+    bash._run_sync(**inputs)
+    assert calls == [3]
+    monkeypatch.setattr(swe_runtime.time, "time", lambda: 104)
+    with pytest.raises(TimeoutError, match="deadline"):
+        bash._run_sync(**inputs)
+    assert calls == [3]
+
+
+def test_dispatch_uses_snapshot_and_binds_worker_identity_and_deadline(tmp_path, monkeypatch):
+    from evals.lka_evals import swe_runtime
+    from evals.lka_evals.swe_sandbox import Sandbox
+
+    root = tmp_path / "root"
+    (root / "app").mkdir(parents=True)
+    (root / "app/dirty.py").write_text("worktree_change = True\n")
+    (root / "evals").mkdir()
+    pristine = root / "data/prepared" / record()["instance_id"] / "pristine"
+    pristine.mkdir(parents=True)
+    (pristine / "module.py").write_text("before\n")
+    python = tmp_path / "venv/bin/python"
+    python.parent.mkdir(parents=True)
+    python.touch()
+    identity = {"native_profile_version": bench.NATIVE_PROFILE_VERSION}
+    monkeypatch.setattr(bench, "ROOT", root)
+    monkeypatch.setattr(
+        bench,
+        "selected_bundle",
+        lambda args: (
+            pristine.parent.parent,
+            {"selection": [record()["instance_id"]], "dataset_sha256": "dataset"},
+            {record()["instance_id"]: record()},
+        ),
+    )
+    monkeypatch.setattr(bench, "validate_calibration", lambda *args: identity)
+    monkeypatch.setattr(bench, "environment_identity", lambda *args: identity)
+    monkeypatch.setattr(Sandbox, "__init__", lambda self, *args: None)
+    monkeypatch.setattr(Sandbox, "check", lambda self: {"available": True})
+    monkeypatch.setattr(bench, "initialize_git", lambda path: None)
+    monkeypatch.setattr(bench, "capture_patch", lambda *args: "")
+    monkeypatch.setattr(swe_runtime, "configuration", lambda *args, **kwargs: (None, None, ()))
+    monkeypatch.setattr(swe_runtime, "configuration_identity", lambda config: "config-hash")
+    monkeypatch.setattr(bench.os, "killpg", lambda *args: None)
+    output = root / "data/attempt"
+    dispatched = []
+
+    class Process:
+        pid = 991234
+
+        def __init__(self, argv, **kwargs):
+            job = json.loads((output / record()["instance_id"] / "job.json").read_text())
+            dispatched.append(job)
+            assert kwargs["cwd"] == output / "source"
+            assert kwargs["env"]["PYTHONPATH"] == str(output / "source")
+            assert kwargs["env"]["PYTHONDONTWRITEBYTECODE"] == "1"
+            assert job["deadline_unix_seconds"] > bench.time.time()
+            assert job["deadline_unix_seconds"] <= bench.time.time() + 900
+            assert job["benchmark_environment"] == identity
+            assert job["effective_config_sha256"] == "config-hash"
+            assert "app/dirty.py" in job["source_identity"]["files"]
+
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr(bench.subprocess, "Popen", Process)
+    report = bench.run_cases(
+        SimpleNamespace(
+            output=output,
+            python=python,
+            calibration=tmp_path / "calibration.json",
+            ledger=None,
+            local_config=tmp_path / "config.toml",
+            env=tmp_path / "private.env",
+            usd_limit=1,
+            call_limit=10,
+            max_steps=40,
+            multi_agent=False,
+            safety_review=None,
+            timeout=900,
+        )
+    )
+    assert len(dispatched) == 1
+    assert report["source_sha256"] == dispatched[0]["source_identity"]["source_sha256"]
+
+
+def test_old_profile_or_changed_environment_cannot_reuse_calibration(tmp_path, monkeypatch):
+    manifest = {"dataset_sha256": "dataset", "selection": ["task"]}
+    (tmp_path / "manifest.json").write_text("prepared")
+    report = {
+        "dataset_sha256": "dataset",
+        "prepared_manifest_sha256": bench.digest(tmp_path / "manifest.json"),
+        "cases": [{"instance_id": "task", "environment_validated": True}],
+        "native_profile_version": "native-v1",
+    }
+    path = tmp_path / "calibration.json"
+    path.write_text(json.dumps(report))
+    monkeypatch.setattr(
+        bench,
+        "environment_identity",
+        lambda python: {
+            "native_profile_version": bench.NATIVE_PROFILE_VERSION,
+        },
+    )
+    with pytest.raises(ValueError, match="successful blank/gold"):
+        bench.validate_calibration(path, tmp_path, manifest, tmp_path / "python")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import math
 import queue
 import re
 import threading
@@ -17,7 +18,7 @@ from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from hashlib import sha1, sha256
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, Field, ValidationError
 
@@ -145,6 +146,11 @@ from app.core.sessions import (
     SessionService,
 )
 from app.core.task_completion import TaskCompletionState, assess_finish, completion_feedback
+from app.core.task_progress import (
+    PROGRESS_POLICY,
+    TaskProgressState,
+    native_progress_schema,
+)
 from app.core.tool_result_gate import (
     bounded_preview,
     cache_scope_compatible,
@@ -679,6 +685,8 @@ class AgentTurnResult(BaseModel):
     session_id: str
     trace_id: str
     answer: str
+    task_outcome: Literal["unknown", "incomplete"] = "unknown"
+    stop_reason: str | None = None
     selected_package: str | None = None
     initial_package: str | None = None
     expanded_packages: list[str] = Field(default_factory=list)
@@ -723,6 +731,7 @@ class AgentTurnWorkingSet(BaseModel):
     terminal_answer: str | None = None
     terminal_reason: str | None = None
     completion_state: TaskCompletionState = Field(default_factory=TaskCompletionState)
+    task_working_state: TaskProgressState = Field(default_factory=TaskProgressState)
 
 
 class AgentTurnLoop:
@@ -1248,7 +1257,7 @@ class AgentTurnLoop:
             progress_events,
             type="final_answer",
             stage="answer",
-            status="completed",
+            status="partial" if self._task_outcome(progress_events)["task_outcome"] == "incomplete" else "completed",
             message=self._short_text(answer),
             metadata={"answer": answer},
         )
@@ -1301,6 +1310,7 @@ class AgentTurnLoop:
             session_id=session.session_id,
             trace_id=trace_id,
             answer=answer,
+            **self._task_outcome(progress_events),
             selected_package=selected_package if isinstance(selected_package, str) else None,
             initial_package=selected_package if isinstance(selected_package, str) else None,
             expanded_packages=expanded_packages,
@@ -1329,6 +1339,7 @@ class AgentTurnLoop:
                 "expanded_packages": result.expanded_packages,
                 "used_packages": result.used_packages,
                 "active_package": result.active_package,
+                "task_outcome": result.task_outcome, "stop_reason": result.stop_reason,
                 "log_path": result.log_path,
                 "memory_project_id": (
                     context_window_payload.get("recalled_memories", {}).get("project_id")
@@ -1518,6 +1529,8 @@ class AgentTurnLoop:
             f"当前运行时没有获得 `{selected_package}` package 的有效结构化决策，"
             "已停止继续调用工具，避免把未完成的步骤误当作最终结果。请重试该请求。"
         )
+        if self._task_outcome(progress_events)["stop_reason"] == "execution_deadline":
+            answer = "本轮已到执行时限，已停止新增操作。任务尚未完成，现有结果和运行记录已保留。"
         self._record_decision(
             decision_events,
             source="local",
@@ -1545,6 +1558,7 @@ class AgentTurnLoop:
         successful_call_fingerprints: set[str] = set()
         fork_format_repair_used = False
         completion_state = TaskCompletionState()
+        working_state = TaskProgressState()
         observations.extend(self._cached_tool_observations_from_context_window(context_window))
         package_catalog = self._package_catalog(context.tool_view)
         expanded_package_names = {selected_package} if selected_package else set()
@@ -1552,6 +1566,9 @@ class AgentTurnLoop:
             str(tool.get("name")) for tool in expanded_tools if isinstance(tool.get("name"), str)
         }
         for step_index in range(1, self.max_decision_steps + 1):
+            if self._decision_deadline_reached():
+                self._record_incomplete(progress_events, "execution_deadline")
+                break
             decision = self._decide_next_action(
                 user_input=user_input,
                 route=route,
@@ -1562,9 +1579,15 @@ class AgentTurnLoop:
                 observations=observations,
                 llm_events=llm_events,
                 task_completion=completion_state.context(),
+                task_working_state=working_state.context(
+                    remaining_steps=self.max_decision_steps - step_index + 1,
+                    remaining_seconds=self._remaining_execution_seconds(),
+                ),
             )
             if decision is None:
+                self._record_incomplete(progress_events, "decision_unavailable")
                 return None
+            self._update_task_progress(working_state, decision, observations, progress_events)
             for observation in reversed(observations):
                 if (
                     observation.get("action") == "fork_subtasks_schema_feedback"
@@ -1618,6 +1641,9 @@ class AgentTurnLoop:
                     message=self._short_text(assistant_message),
                     metadata={"action": action, "step_index": step_index + 1},
                 )
+
+            if decision.get("_progress_review_required"):
+                continue
 
             if action in {"fork_subtasks", "fork_subtasks_invalid"}:
                 run_id = _turn_run_id.get()
@@ -1710,7 +1736,8 @@ class AgentTurnLoop:
                     progress_events=progress_events, can_continue=step_index < self.max_decision_steps,
                 ):
                     continue
-                decision = {**decision, "_task_completion": completion_state.context()}
+                decision = {**decision, "_task_completion": completion_state.context(),
+                            "_task_working_state": working_state.context()}
                 return self._answer_with_llm(
                     user_input=user_input,
                     route=route,
@@ -1721,6 +1748,7 @@ class AgentTurnLoop:
                 )
 
             if action == "malformed_tool_call":
+                self._record_incomplete(progress_events, "decision_protocol_invalid")
                 answer = (
                     "LLM 返回了疑似工具调用的损坏 JSON，系统已停止执行，避免把未执行的"
                     "工具操作误当作最终结果。请重试该请求。"
@@ -1728,6 +1756,7 @@ class AgentTurnLoop:
                 return answer
 
             if action in {"invalid_plain_text_decision", "invalid_empty_decision"}:
+                self._record_incomplete(progress_events, "decision_protocol_invalid")
                 if observations:
                     return self._answer_with_llm(
                         user_input=user_input,
@@ -1740,6 +1769,7 @@ class AgentTurnLoop:
                 return None
 
             if action == "invalid_final_answer":
+                self._record_incomplete(progress_events, "decision_protocol_invalid")
                 if observations:
                     return self._answer_with_llm(
                         user_input=user_input,
@@ -1825,6 +1855,7 @@ class AgentTurnLoop:
                 return self._control_stop_answer(decision)
 
             if action != "call_tool":
+                self._record_incomplete(progress_events, "decision_protocol_invalid")
                 return None
 
             tool_name = str(decision.get("tool_name") or "")
@@ -1864,35 +1895,10 @@ class AgentTurnLoop:
                 operation.get("repeat_successful_call") if isinstance(operation, dict) else False
             )
             if call_fingerprint in successful_call_fingerprints and not repeat_successful_call:
-                reason = (
-                    "Blocked an identical tool call after a successful result in this turn. "
-                    "Existing evidence is available for the answer stage."
+                self._duplicate_tool_feedback(
+                    working_state, tool_name, tool_input, observations, progress_events,
                 )
-                self._append_progress(
-                    progress_events,
-                    type="tool_duplicate_blocked",
-                    stage="decision",
-                    tool_name=tool_name,
-                    status="blocked",
-                    message=f"Skipped duplicate successful call to `{tool_name}`.",
-                    metadata={"tool_input": tool_input, "reason": reason},
-                )
-                self._record_decision(
-                    decision_events,
-                    source="local",
-                    action="final_answer",
-                    reason=reason,
-                    step_index=step_index + 1,
-                )
-                return self._answer_with_llm(
-                    user_input=user_input,
-                    route=route,
-                    context_window=context_window,
-                    observations=observations,
-                    final_decision={"action": "final_answer", "reason": reason,
-                                    "_task_completion": completion_state.context()},
-                    llm_events=llm_events,
-                )
+                continue
 
             tool_result = self._execute_tool(
                 tool_name=tool_name,
@@ -1930,6 +1936,8 @@ class AgentTurnLoop:
                     run_id=context.run_id,
                 )
             )
+            working_state.observe({"tool_name": tool_name, "input": tool_input,
+                                   "result": tool_result.model_dump(mode="json")}, decision.get("purpose"))
             if tool_result.status == "completed":
                 if self._completed_tool_call_changes_state(
                     tool_name=tool_name,
@@ -1944,6 +1952,8 @@ class AgentTurnLoop:
 
         if self._multi_agent_replan_pending():
             return self._unresolved_multi_agent_answer()
+        if not any(event.type == "task_incomplete" for event in progress_events):
+            self._record_incomplete(progress_events, "decision_budget_exhausted")
         if observations or completion_state.requirements:
             assess_finish(completion_state, operation={}, observations=observations, can_continue=False)
             return self._answer_with_llm(
@@ -1955,6 +1965,7 @@ class AgentTurnLoop:
                     "action": "final_answer",
                     "reason": "Step limit reached after loading evidence.",
                     "_task_completion": completion_state.context(),
+                    "_task_working_state": working_state.context(),
                 },
                 llm_events=llm_events,
             )
@@ -1990,10 +2001,113 @@ class AgentTurnLoop:
                 metadata={"missing_requirements": missing, "stop_reason": state.stop_reason,
                           "recovery_attempts": state.recovery_attempts},
             )
+            if ready and (missing or state.stop_reason):
+                self._record_incomplete(progress_events, state.stop_reason or "requirements_unfulfilled")
         if not ready:
             observations.append(completion_feedback(state))
         self._raise_if_cancel_requested()
         return ready
+
+    def _remaining_execution_seconds(self) -> float | None:
+        manager = _turn_run_manager.get() or getattr(self, "run_manager", None)
+        run_id = _turn_run_id.get()
+        run = manager.get_run(run_id) if manager is not None and run_id else None
+        value = run.metadata.get("execution_deadline_unix_seconds") if run is not None else None
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+            return max(0.0, value - time.time())
+        return None
+
+    def _decision_deadline_reached(self) -> bool:
+        remaining = self._remaining_execution_seconds()
+        return remaining is not None and remaining <= 15
+
+    def _check_execution_allowed(self) -> None:
+        self._raise_if_cancel_requested()
+        remaining = self._remaining_execution_seconds()
+        if remaining is not None and remaining <= 0:
+            raise LLMResourceError("Execution deadline exhausted before dispatch.", error_category="execution_deadline")
+
+    @staticmethod
+    def _task_outcome(progress_events: list[AgentTurnProgressEvent]) -> dict[str, Any]:
+        for event in reversed(progress_events):
+            if event.type == "task_incomplete":
+                return {"task_outcome": "incomplete", "stop_reason": event.metadata.get("stop_reason")}
+        return {"task_outcome": "unknown", "stop_reason": None}
+
+    def _record_incomplete(self, progress_events: list[AgentTurnProgressEvent], reason: str) -> None:
+        if any(event.type == "task_incomplete" and event.metadata.get("stop_reason") == reason
+               for event in progress_events):
+            return
+        self._append_progress(
+            progress_events, type="task_incomplete", stage="decision", status="partial",
+            message="Execution stopped with unfinished work.", metadata={"stop_reason": reason},
+        )
+
+    def _update_task_progress(
+        self, state: TaskProgressState, decision: dict[str, Any],
+        observations: list[dict[str, Any]], progress_events: list[AgentTurnProgressEvent],
+    ) -> None:
+        diagnostics = state.apply_decision(decision, observations)
+        if (state.review_required and decision.get("action") == "call_tool"
+                and state.defer_review_once()):
+            decision["_progress_review_required"] = True
+            feedback = {
+                "action": "task_progress_review_feedback", "status": "not_executed",
+                "required_fields": ["working_state.focus_gap", "purpose.gap", "purpose.question", "purpose.expected_observable"],
+                "instruction": (
+                    "Review was requested and this tool was not executed. In the next decision, "
+                    "preserve established findings and hypotheses ruled out, state the concrete "
+                    "remaining gap in working_state.focus_gap, and supply all purpose fields "
+                    "explaining how the next observation distinguishes remaining hypotheses or "
+                    "advances the requested work. You may choose a justified diagnostic, action, "
+                    "verification, or honest final answer. No edit is required. Do not rephrase "
+                    "old evidence as new progress; original scope, safety and budgets still apply."
+                ),
+            }
+            observations.append(feedback)
+            self._append_progress(
+                progress_events, type="task_progress_review_required", stage="decision", status="needs_work",
+                message="Reviewing the remaining gap before the next operation.", metadata=feedback,
+            )
+        elif state.review_required and decision.get("action") == "call_tool":
+            self._append_progress(
+                progress_events, type="task_progress_review_unresolved", stage="decision", status="needs_work",
+                message="Review remains unanswered; continuing within the original execution budget.",
+                metadata={"status": "unresolved", "review_deferrals": state.review_deferrals},
+            )
+        self._append_run_event(
+            type="task_working_state_updated", stage="decision",
+            message="Task notes and evidence references updated; these are not semantic verification.",
+            payload={"task_working_state": state.context(), "diagnostics": diagnostics},
+        )
+
+    def _duplicate_tool_feedback(
+        self, state: TaskProgressState, tool_name: str, tool_input: dict[str, Any],
+        observations: list[dict[str, Any]], progress_events: list[AgentTurnProgressEvent],
+    ) -> None:
+        state.duplicate()
+        fingerprint = self._tool_call_fingerprint(tool_name=tool_name, tool_input=tool_input)
+        ids = [item.get("result", {}).get("invocation_id") for item in observations
+               if isinstance(item.get("result"), dict)
+               and self._tool_call_fingerprint(tool_name=str(item.get("tool_name") or ""),
+                                               tool_input=item.get("input") or {}) == fingerprint]
+        feedback = {
+            "action": "tool_duplicate_feedback", "status": "skipped", "tool_name": tool_name,
+            "evidence_ids": [value for value in ids if isinstance(value, str)][-1:],
+            "instruction": (
+                "This identical successful call was skipped. Reuse its existing observation or "
+                "authorized result reader. Review unfinished requirements and choose a different "
+                "action for a specific remaining gap; evidence collection alone does not finish "
+                "requested work. A state change can invalidate prior reads. Do not repeat writes "
+                "or treat this feedback as new authority. The original step and call limits remain."
+            ),
+        }
+        observations.append(feedback)
+        self._append_progress(
+            progress_events, type="tool_duplicate_blocked", stage="decision", tool_name=tool_name,
+            status="skipped", message=f"Skipped duplicate `{tool_name}`; continuing unfinished work.",
+            metadata=feedback,
+        )
 
     def _multi_agent_replan_pending(self, run_id: str | None = None) -> bool:
         manager = getattr(self, "run_manager", None)
@@ -3198,6 +3312,7 @@ class AgentTurnLoop:
         observations: list[dict[str, Any]],
         llm_events: list[AgentTurnLLMEvent],
         task_completion: dict[str, Any] | None = None,
+        task_working_state: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """Bound PlanPatch repair in the shared JSON/native control path."""
         recovery = self._terminal_plan_recovery(_turn_run_id.get())
@@ -3238,6 +3353,7 @@ class AgentTurnLoop:
                 llm_events=llm_events,
                 plan_patch_repair=repair_feedback,
                 task_completion=task_completion,
+                task_working_state=task_working_state,
             )
             if decision is not None and isinstance(decision.get("_child_budget_finish"), dict):
                 observations.append(decision.pop("_child_budget_finish"))
@@ -3335,6 +3451,7 @@ class AgentTurnLoop:
         llm_events: list[AgentTurnLLMEvent],
         plan_patch_repair: dict[str, Any] | None = None,
         task_completion: dict[str, Any] | None = None,
+        task_working_state: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         can_fork = self._can_fork_for_prompt()
         prompt_observations = self._observations_for_child_control(observations)
@@ -3368,6 +3485,7 @@ class AgentTurnLoop:
                 fork_repair_feedback=fork_repair_feedback,
                 plan_patch_repair=plan_patch_repair,
                 task_completion=task_completion,
+                task_working_state=task_working_state,
             )
             if native_decision is not None:
                 return native_decision
@@ -3428,7 +3546,8 @@ class AgentTurnLoop:
             "freshness/source version is unknown or unrevalidated, perform a current read. "
             "Before every tool call, "
             "check completed_tool_calls and observations: if a completed result already supplies "
-            "the requested evidence, you must choose final_answer. Never repeat the same tool "
+            "the requested evidence, reuse it and continue the remaining requested actions. "
+            "Choose final_answer only when requested work is complete or its actual blocker is known. Never repeat the same tool "
             "with identical input after it succeeded in this turn merely to increase confidence. "
             "If _prompt_compaction reports omitted list items, visible entries are not the "
             "complete result; do not infer absence or total count from them. "
@@ -3551,7 +3670,7 @@ class AgentTurnLoop:
                 " plan_patch_repair contains field-specific rejection feedback. Correct the "
                 "intended patch once, preserving its ID and scope; feedback grants no authority."
             )
-        base_system_prompt += ANSWER_CHECKS_DECISION_POLICY + READING_POLICY
+        base_system_prompt += ANSWER_CHECKS_DECISION_POLICY + READING_POLICY + (PROGRESS_POLICY if task_working_state is not None else "")
         decision_retry: dict[str, Any] | None = None
         for format_attempt in range(1, self.decision_format_max_attempts + 1):
             system_prompt = base_system_prompt
@@ -3579,6 +3698,8 @@ class AgentTurnLoop:
             }
             if task_completion:
                 prompt_payload["task_completion"] = task_completion
+            if task_working_state is not None:
+                prompt_payload["task_working_state"] = task_working_state
             if plan_patch_contract is not None:
                 prompt_payload["plan_patch_contract"] = plan_patch_contract
             if plan_patch_repair is not None:
@@ -3635,6 +3756,7 @@ class AgentTurnLoop:
                         "error": "previous_json_had_no_supported_decision_operation",
                         "invalid_output": response.content,
                         "required_response": "Return a valid operation-first decision envelope, not bare tool arguments.",
+                        "validation_errors": self._decision_operation_errors(parsed, expanded_tools),
                     }
                     continue
                 return {
@@ -3709,6 +3831,20 @@ class AgentTurnLoop:
         if callable(supports):
             return bool(supports(client_name=_turn_llm_client_name.get()))
         return bool(supports)
+
+    @staticmethod
+    def _decision_operation_errors(parsed: dict[str, Any], expanded_tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        operation = parsed.get("operation")
+        if not isinstance(operation, dict):
+            return [{"path": "/operation", "error": "Expected one operation object."}]
+        received = operation.get("type")
+        error = {"path": "/operation/type", "received": received,
+                 "error": "Expected a supported operation type, not a tool name."}
+        if any(tool.get("name") == received for tool in expanded_tools):
+            error["correction"] = "Use type=tool_call; preserve tool_name and tool_input and follow the expanded tool schema."
+        else:
+            error["correction"] = "Choose one supported operation from the decision contract."
+        return [error]
 
     def _control_recovery_thinking_flag(self, client_name: str | None = None) -> bool | None:
         """Use only the selected client's explicit capability for one repair."""
@@ -3803,9 +3939,28 @@ class AgentTurnLoop:
             dispatch_identity=identity if isinstance(getattr(self, "llm_client", None), LLMService) else None,
         )
         if (response is None and state is not None and state["calls"] < 2
+                and getattr(self, "llm_max_attempts", 1) > 1
+                and len(llm_events) > events_before
+                and llm_events[-1].error_category == "network_failed"
+                and llm_events[-1].is_retriable is True
+                and not llm_events[-1].partial):
+            self._raise_if_cancel_requested()
+            self._append_run_event(
+                type="llm_retry_scheduled", stage=stage,
+                message="One bounded network recovery for this decision; tools are not replayed.",
+                payload={"error_category": "network_failed", "control_calls": state["calls"],
+                         "llm_call_id": llm_events[-1].llm_call_id},
+            )
+            return self._complete_control_generation(
+                stage=stage, system_prompt=system_prompt, user_prompt=user_prompt,
+                prompt_summary=prompt_summary, observations=observations,
+                llm_events=llm_events, tools=tools, tool_choice=tool_choice,
+            )
+        if (response is None and state is not None and state["calls"] < 2
                 and len(llm_events) > events_before
                 and llm_events[-1].error_category == "timeout"
-                and llm_events[-1].is_retriable is True):
+                and llm_events[-1].is_retriable is True
+                and not llm_events[-1].partial):
             # A classified request timeout is not proof of reasoning overflow.
             # This decision's only remaining recovery still passes the child
             # gate. Only its complete, unfiltered return can confirm a cooldown.
@@ -3992,6 +4147,19 @@ class AgentTurnLoop:
             )
         )
         actions["agent_finish_decision"] = {"action": "final_answer"}
+        # Optional notes travel with the same decision and never reach a domain
+        # tool. Keep actual tool arguments under their original executor schema.
+        for index, definition in enumerate(definitions):
+            parameters = dict(definition.parameters)
+            properties = dict(parameters.get("properties") or {})
+            if "_agent_progress" in properties:
+                continue
+            properties["_agent_progress"] = native_progress_schema(strict=definition.strict)
+            parameters["properties"] = properties
+            if definition.strict:
+                parameters["required"] = [*parameters.get("required", []), "_agent_progress"]
+            definitions[index] = definition.model_copy(update={"parameters": parameters})
+            actions[definition.name]["progress_metadata"] = True
         return definitions, actions
 
     def _decide_next_action_with_native_tools(
@@ -4012,6 +4180,7 @@ class AgentTurnLoop:
         plan_patch_repair: dict[str, Any] | None = None,
         delivery_observations: list[dict[str, Any]] | None = None,
         task_completion: dict[str, Any] | None = None,
+        task_working_state: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         require_function_call = self._supports_required_tool_choice()
         system_prompt = (
@@ -4034,7 +4203,7 @@ class AgentTurnLoop:
             "Follow function schemas exactly. expanded_tools.native_function identifies "
             "the matching provided function; input_schema_from_native_function means its "
             "parameters contain the complete input contract without a duplicate in the payload."
-            + USER_STATEMENT_POLICY + ANSWER_CHECKS_DECISION_POLICY + READING_POLICY
+            + USER_STATEMENT_POLICY + ANSWER_CHECKS_DECISION_POLICY + READING_POLICY + (PROGRESS_POLICY if task_working_state is not None else "")
         )
         if require_function_call:
             system_prompt += " Return exactly one function call; plain text is not a decision."
@@ -4082,6 +4251,7 @@ class AgentTurnLoop:
                 "observations": observations,
                 "completed_tool_calls": completed_tool_calls,
                 **({"task_completion": task_completion} if task_completion else {}),
+                **({"task_working_state": task_working_state} if task_working_state is not None else {}),
                 **({"plan_patch_contract": plan_patch_contract}
                    if plan_patch_contract is not None else {}),
                 **({"plan_patch_repair": plan_patch_repair}
@@ -4135,36 +4305,45 @@ class AgentTurnLoop:
                 "tool_input": call.arguments, "_native_functions": list(actions),
                 "_native_function_unknown": True, "_raw_output": response.content,
             }
+        progress_notes: dict[str, Any] = {}
+        arguments = dict(call.arguments)
+        if action.get("progress_metadata"):
+            notes = arguments.pop("_agent_progress", None)
+            if isinstance(notes, dict):
+                progress_notes = {key: notes[key] for key in ("working_state", "purpose")
+                                  if isinstance(notes.get(key), dict)}
         if action["action"] == "call_tool":
             return {
+                **progress_notes,
                 "action": "call_tool",
                 "tool_name": action["tool_name"],
-                "tool_input": call.arguments,
+                "tool_input": arguments,
                 "operation": {
                     "type": "tool_call",
                     "tool_name": action["tool_name"],
-                    "tool_input": call.arguments,
+                    "tool_input": arguments,
                 },
                 "reason": "Provider-native function call.",
                 "_raw_output": response.content,
             }
         if action["action"] == "fork_subtasks":
             return self._normalize_decision_output(
-                {"operation": {"type": "fork_subtasks", **call.arguments}},
+                {"operation": {"type": "fork_subtasks", **arguments}, **progress_notes},
                 raw_output=response.content,
             )
         if action["action"] == "plan_patch":
             return self._normalize_decision_output(
-                {"operation": {"type": "plan_patch", **call.arguments}},
+                {"operation": {"type": "plan_patch", **arguments}, **progress_notes},
                 raw_output=response.content,
             )
         if action["action"] == "final_answer":
             return self._normalize_decision_output(
-                {"operation": {"type": "final_answer", **call.arguments}},
+                {"operation": {"type": "final_answer", **arguments}, **progress_notes},
                 raw_output=response.content,
             )
-        package_name = call.arguments.get("package_name")
+        package_name = arguments.get("package_name")
         return {
+            **progress_notes,
             "action": "expand_package",
             "package_name": package_name,
             "operation": {"type": "expand_package", "package_name": package_name},
@@ -4271,7 +4450,14 @@ class AgentTurnLoop:
             )
         )
 
-    def _normalize_decision_output(
+    def _normalize_decision_output(self, parsed: dict[str, Any], *, raw_output: str) -> dict[str, Any]:
+        decision = self._normalize_decision_operation(parsed, raw_output=raw_output)
+        for key in ("working_state", "purpose"):
+            if isinstance(parsed.get(key), dict):
+                decision[key] = parsed[key]
+        return decision
+
+    def _normalize_decision_operation(
         self,
         parsed: dict[str, Any],
         *,
@@ -5831,7 +6017,7 @@ class AgentTurnLoop:
                 if progress_events is not None
                 else None
             ),
-            raise_if_cancel_requested=self._raise_if_cancel_requested,
+            raise_if_cancel_requested=self._check_execution_allowed,
             artifact_store=self.tool_invocation_store,
         )
         result = lifecycle_graph.run(
@@ -5988,7 +6174,7 @@ class AgentTurnLoop:
                 message=message,
                 metadata=metadata,
             ),
-            raise_if_cancel_requested=self._raise_if_cancel_requested,
+            raise_if_cancel_requested=self._check_execution_allowed,
             artifact_store=self.tool_invocation_store,
         )
         result = lifecycle_graph.run(
@@ -6623,6 +6809,14 @@ class AgentTurnLoop:
                 "stop is a partial result, not completion or a need to ask permission to retry "
                 "already-authorized reads. Do not print the internal ledger or recovery counters."
             )
+        working_context = final_decision.get("_task_working_state") if isinstance(final_decision, dict) else None
+        if working_context:
+            answer_payload["task_working_state"] = working_context
+            system_prompt += (
+                " task_working_state contains model-declared task notes, not verified facts. "
+                "Use original observations for claims; disclose remaining requested work honestly. "
+                "Do not print internal notes or counters."
+            )
         user_prompt = serialize_prompt_payload(answer_payload)
         response = self._complete_answer_with_recovery(
             stage="answer",
@@ -6890,6 +7084,7 @@ class AgentTurnLoop:
         display_target = self._llm_display_target_for_stage(stage)
 
         async def collect() -> tuple[str, dict[str, Any]]:
+            self._check_execution_allowed()
             client_name, model, reasoning_effort, selection_source, profile_id = (
                 self._inference_selection()
             )
@@ -6899,6 +7094,9 @@ class AgentTurnLoop:
                 "stage": stage,
                 "inference_selection_source": selection_source,
             }
+            remaining = self._remaining_execution_seconds()
+            if remaining is not None:
+                metadata["network_timeout_seconds"] = max(0.001, remaining)
             if profile_id is not None:
                 metadata["inference_profile_id"] = profile_id
             visual_content = self._input_content_for_stage(stage) if image_blocks is None else image_blocks
@@ -7454,6 +7652,9 @@ class AgentTurnLoop:
         timeout_retried = False
         for attempt in range(1, attempt_limit + 1):
             self._raise_if_cancel_requested()
+            remaining = self._remaining_execution_seconds()
+            if remaining is not None and remaining <= 0:
+                raise LLMResourceError("Execution deadline exhausted before model dispatch.", error_category="execution_deadline")
             child_output_cap = self._enforce_child_runtime_budget(
                 prompt_estimate=budgeted.input_tokens,
             )
@@ -7508,7 +7709,7 @@ class AgentTurnLoop:
                 },
             )
             try:
-                with self._admit_llm(provider):
+                with self._admit_llm(provider), self._provider_dispatch_guard():
                     if use_stream:
                         response = self._stream_text_once(
                             system_prompt=system_prompt,
@@ -7629,9 +7830,11 @@ class AgentTurnLoop:
                 if resource_refusal:
                     raise
                 if (
-                    isinstance(exc, LLMTimeoutError)
-                    and stage in {"answer", "context_answer"}
+                    (isinstance(exc, LLMNetworkError) or (
+                        isinstance(exc, LLMTimeoutError) and stage in {"answer", "context_answer"}
+                    ))
                     and not getattr(exc, "stream_output_emitted", False)
+                    and not getattr(exc, "partial_content", "")
                     and not timeout_retried
                     and attempt < attempt_limit
                 ):
@@ -7639,10 +7842,10 @@ class AgentTurnLoop:
                     self._raise_if_cancel_requested()
                     self._append_run_event(
                         type="llm_retry_scheduled",
-                        message="Retrying answer timeout before any stream output; tools are not replayed.",
+                        message="Retrying model transport failure before any stream output; tools are not replayed.",
                         stage=stage,
                         payload={"attempt": attempt, "next_attempt": attempt + 1,
-                                 "error_category": "timeout", "llm_call_id": llm_call_id},
+                                 "error_category": llm_event.error_category, "llm_call_id": llm_call_id},
                     )
                     continue
                 return None
@@ -7732,13 +7935,31 @@ class AgentTurnLoop:
         try:
             for semaphore in semaphores:
                 while not semaphore.acquire(timeout=0.1):
-                    self._raise_if_cancel_requested()
+                    self._check_execution_allowed()
                 acquired.append(semaphore)
-            self._raise_if_cancel_requested()
+            self._check_execution_allowed()
             yield
         finally:
             for semaphore in reversed(acquired):
                 semaphore.release()
+
+    @contextmanager
+    def _provider_dispatch_guard(self):
+        """Recheck after service admission without replacing workload fences."""
+        from app.core.llm_workloads import current_workload, workload_scope
+
+        inherited = current_workload()
+
+        async def before_dispatch():
+            self._check_execution_allowed()
+            await inherited.check_dispatch()
+            self._check_execution_allowed()
+
+        with workload_scope(
+            inherited.pool, task_id=inherited.task_id, max_tokens=inherited.max_tokens,
+            quotas=inherited.quotas, pricing=inherited.pricing, before_dispatch=before_dispatch,
+        ):
+            yield
 
     def _complete_text_once(
         self,
@@ -7757,6 +7978,7 @@ class AgentTurnLoop:
     ) -> LLMResponse:
         if self.llm_client is None:
             raise LLMClientError("No LLM client is configured.")
+        self._check_execution_allowed()
         client_name, model, reasoning_effort, selection_source, profile_id = (
             self._inference_selection()
         )
@@ -7766,6 +7988,9 @@ class AgentTurnLoop:
             "stage": stage,
             "inference_selection_source": selection_source,
         }
+        remaining = self._remaining_execution_seconds()
+        if remaining is not None:
+            request_metadata["network_timeout_seconds"] = max(0.001, remaining)
         output_schema = (
             _output_schema_from_contract(_current_output_contract()) if stage == "answer" else None
         )
@@ -7810,6 +8035,7 @@ class AgentTurnLoop:
                 or reasoning_effort is not None
                 or profile_id is not None
                 or (stage == "answer" and self._llm_stage_requires_json(stage))
+                or remaining is not None
             ):
                 message = (
                     "The configured LLM client cannot honor the structured output contract."
@@ -7903,7 +8129,10 @@ class AgentTurnLoop:
             headers = exc.headers
         else:
             category, retriable = classify_openai_sdk_exception(exc)
-            headers = {}
+            headers = getattr(exc, "headers", {})
+        partial_content = getattr(exc, "partial_content", "")
+        usage = getattr(exc, "usage", {})
+        input_tokens, output_tokens, total_tokens = usage_token_counts(usage)
         call_record = self._llm_call_record(
             llm_call_id=llm_call_id,
             stage=stage,
@@ -7919,6 +8148,7 @@ class AgentTurnLoop:
             user_prompt=user_prompt,
             prompt_summary=prompt_summary,
             http_status=status_code,
+            provider_request_id=getattr(exc, "provider_request_id", None),
             retry_after=retry_after,
             provider_error_type=provider_error_type,
             provider_error_code=provider_error_code,
@@ -7926,7 +8156,10 @@ class AgentTurnLoop:
             error_category=category,
             error_message=str(exc),
             is_retriable=retriable,
-            metadata={"headers": headers},
+            input_token_count=input_tokens, output_token_count=output_tokens, total_token_count=total_tokens,
+            content_length=len(partial_content), partial=bool(partial_content or getattr(exc, "stream_output_emitted", False)),
+            metadata={**getattr(exc, "metadata", {}), "headers": headers,
+                      "tool_calls": getattr(exc, "tool_calls", [])},
         )
         return AgentTurnLLMEvent(
             **self._event_fields_from_call_record(call_record),
@@ -7935,7 +8168,7 @@ class AgentTurnLoop:
             status=self._llm_error_status(exc),
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            output="",
+            output=partial_content,
             attempt=attempt,
             error_type=type(exc).__name__,
             status_code=status_code,
@@ -8224,12 +8457,14 @@ class AgentTurnLoop:
                 "tool_event_count": len(result.tool_events),
                 "llm_event_count": len(result.llm_events),
                 "log_path": result.log_path,
+                "task_outcome": result.task_outcome, "stop_reason": result.stop_reason,
             },
         )
         result_snapshot = {
             "session_id": result.session_id,
             "trace_id": result.trace_id,
             "answer": result.answer,
+            "task_outcome": result.task_outcome, "stop_reason": result.stop_reason,
             "selected_package": result.selected_package,
             "initial_package": result.initial_package,
             "expanded_packages": result.expanded_packages,

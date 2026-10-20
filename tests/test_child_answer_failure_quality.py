@@ -29,6 +29,8 @@ def test_actual_graph_failed_route_and_context_answer_vs_identical_generated_abs
     responses = [LLMClientError("Local dispatch cap refused routing.")]
     responses.append(response(PLACEHOLDER) if generated else response(" \n ")
                      if generation == "blank" else LLMClientError("Local cap refused answer."))
+    if generation == "blank":
+        responses.append(response(" \n "))  # Exhaust the existing single answer recovery.
     loop, provider, _ = make_loop(tmp_path, responses)
     db = tmp_path / "sessions.sqlite3"
     _initialize_session_database(db)
@@ -42,24 +44,30 @@ def test_actual_graph_failed_route_and_context_answer_vs_identical_generated_abs
 
     result = asyncio.run(executor.execute(**kwargs))
 
-    assert len(provider.requests) == 2
-    assert [request.prompt_summary.split()[0] for request in provider.requests] == [
+    expected_calls = 3 if generation == "blank" else 2
+    assert len(provider.requests) == expected_calls
+    assert [request.prompt_summary.split()[0] for request in provider.requests[:2]] == [
         "agent_turn_route", "agent_turn_context_answer",
     ]
-    assert manager.get_run(child.run_id).status == AgentRunStatus.COMPLETED
-    assert result.summary == PLACEHOLDER
-    assert result.status == (TaskResultStatus.COMPLETED if generated else TaskResultStatus.PARTIAL)
-    assert result.missing_requirements == (() if generated else ("answer_generation_failed",))
+    if generated:
+        assert manager.get_run(child.run_id).status == AgentRunStatus.COMPLETED
+        assert result.summary == PLACEHOLDER
+        assert result.status == TaskResultStatus.COMPLETED
+        assert result.missing_requirements == ()
+        final = next(e for e in manager.list_events(child.run_id) if e.type == "final_answer")
+        assert final.payload["status"] == "completed"
+    else:
+        # Current answer-generation contract raises on a refused or exhausted
+        # incomplete answer; no successful fallback delivery is manufactured.
+        assert manager.get_run(child.run_id).status == AgentRunStatus.FAILED
+        assert result.status == TaskResultStatus.FAILED
+        assert result.failure is not None
+        assert not any(e.type == "run_completed" for e in manager.list_events(child.run_id))
     assert result.verification is None
-    final = next(e for e in manager.list_events(child.run_id) if e.type == "final_answer")
-    assert final.payload["status"] == ("completed" if generated else "failed")
-    if not generated:
-        assert final.payload["metadata"]["missing_requirements"] == ["answer_generation_failed"]
-
     replay = asyncio.run(executor.execute(**kwargs))
     assert replay.status == result.status
     assert replay.missing_requirements == result.missing_requirements
-    assert len(provider.requests) == 2
+    assert len(provider.requests) == expected_calls
 
 
 def test_immutable_result_artifact_recovers_explicit_failure_without_wrapper_event():

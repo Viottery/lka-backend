@@ -14,6 +14,9 @@ def test_langgraph_fork_shape_gets_one_repair_before_persistent_rejection() -> N
             append_event=lambda *args, **kwargs: durable_events.append((args, kwargs))
         ),
         _raise_if_cancel_requested=lambda: None,
+        _decision_deadline_reached=lambda: False,
+        _remaining_execution_seconds=lambda: None,
+        _update_task_progress=lambda *args: None,
         _upgrade_fast_path_for_multi_agent=lambda _run_id: None,
         _append_progress=lambda progress, **values: progress.append(
             AgentTurnProgressEvent(
@@ -67,6 +70,9 @@ def test_langgraph_fork_repair_feedback_is_consumed_after_next_decision() -> Non
     loop = SimpleNamespace(
         max_decision_steps=4,
         _raise_if_cancel_requested=lambda: None,
+        _decision_deadline_reached=lambda: False,
+        _remaining_execution_seconds=lambda: None,
+        _update_task_progress=lambda *args: None,
         _decide_next_action=lambda **kwargs: (
             seen_observations.extend(kwargs["observations"])
             or {"action": "final_answer", "reason": "Evidence is sufficient."}
@@ -86,6 +92,7 @@ def test_langgraph_fork_repair_feedback_is_consumed_after_next_decision() -> Non
         "observations": [feedback],
         "llm_events": [],
         "decision_events": [],
+        "progress_events": [],
         "context_window": {},
         "package_catalog": [],
         "expanded_tools": [],

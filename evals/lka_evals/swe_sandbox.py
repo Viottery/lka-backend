@@ -12,6 +12,12 @@ from pathlib import Path
 
 OUTPUT_LIMIT = 128 * 1024
 
+# Keep non-SIGPIPE failures visible even when output is piped through tail/head.
+# A successful consumer may intentionally close early (e.g. grep | head).
+SHELL_PIPELINE_POLICY = r"""set -o pipefail
+trap '__lka_status=("$?" "${PIPESTATUS[@]}"); __lka_exit=${__lka_status[0]}; if (( __lka_exit == 141 && ${#__lka_status[@]} > 2 && __lka_status[-1] == 0 )); then __lka_exit=0; for __lka_code in "${__lka_status[@]:1}"; do if (( __lka_code != 0 && __lka_code != 141 )); then __lka_exit=$__lka_code; fi; done; fi; exit "$__lka_exit"' EXIT
+"""
+
 
 class SandboxError(RuntimeError):
     """The host cannot provide the required benchmark isolation."""
@@ -60,6 +66,20 @@ class Sandbox:
                 argv += ["--symlink", os.readlink(path), name]
             elif path.is_dir():
                 argv += ["--ro-bind", name, name]
+        # Debian's awk points through /etc/alternatives. Expose only this link,
+        # whose final program is already in read-only /usr, never the host /etc.
+        awk = Path("/usr/bin/awk")
+        if awk.is_symlink() and os.readlink(awk) == "/etc/alternatives/awk":
+            target = awk.resolve(strict=True)
+            if not target.is_relative_to(Path("/usr")) or not target.is_file():
+                raise SandboxError("awk alternative must resolve to a system program under /usr")
+            argv += [
+                "--dir",
+                "/etc/alternatives",
+                "--symlink",
+                str(target),
+                "/etc/alternatives/awk",
+            ]
         argv += ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--dir", "/tmp/home"]
         if self.python is not None:
             # uv environments link to a separate managed interpreter, including its stdlib.
@@ -102,7 +122,7 @@ class Sandbox:
             "--noprofile",
             "--norc",
             "-c",
-            command,
+            SHELL_PIPELINE_POLICY + command,
         ]
 
     def _execute(self, command: str, cwd: Path | None, timeout: float) -> dict:

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.metadata
 import json
 import math
 import os
@@ -33,6 +34,74 @@ from evals.lka_evals.swe_dataset import (
 ROOT = Path(__file__).resolve().parents[2]
 CATALOG = ROOT / "evals/fixtures/software_engineering.json"
 DEFAULT_DATASET = ROOT / "data/benchmarks/swe-verified" / DEFAULT_SOURCE["revision"]
+NATIVE_PROFILE_VERSION = "native-v2"
+
+
+def source_files(root: Path) -> dict[str, str]:
+    """Fingerprint current source, including dirty and untracked Python modules."""
+    for directory in (root / "app", root / "evals"):
+        if directory.is_symlink() or any(path.is_symlink() for path in directory.rglob("*")):
+            raise ValueError("Source snapshot cannot include symlinked modules or directories")
+    paths = [*sorted((root / "app").rglob("*.py")), *sorted((root / "evals").rglob("*.py"))]
+    paths.extend(root / name for name in ("pyproject.toml", "uv.lock") if (root / name).is_file())
+    files = {}
+    for path in paths:
+        if "__pycache__" in path.parts:
+            continue
+        if path.is_symlink() or not path.resolve().is_relative_to(root.resolve()):
+            raise ValueError("Source snapshot cannot include symlinked modules")
+        files[path.relative_to(root).as_posix()] = digest(path)
+    if not any(name.startswith("app/") for name in files):
+        raise ValueError("Application source missing from evaluation snapshot")
+    return files
+
+
+def object_digest(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def worker_dependency_identity() -> dict:
+    """Installed distributions and interpreter identity, without private paths."""
+    packages = sorted(
+        (dist.metadata["Name"], dist.version)
+        for dist in importlib.metadata.distributions()
+        if dist.metadata["Name"]
+    )
+    return {"python_version": sys.version, "packages_sha256": object_digest(packages)}
+
+
+def freeze_source(output: Path) -> tuple[Path, dict]:
+    """Copy the actual worktree rather than HEAD; reject changes during capture."""
+    before = source_files(ROOT)
+    destination = output / "source"
+    destination.mkdir()
+    for name in before:
+        target = destination / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ROOT / name, target)
+    if before != source_files(ROOT) or before != source_files(destination):
+        raise ValueError("Source changed while freezing; no paid calls dispatched")
+    identity = {
+        "profile_version": NATIVE_PROFILE_VERSION,
+        "files": before,
+        "source_sha256": object_digest(before),
+        "worker_dependencies": worker_dependency_identity(),
+    }
+    save(output / "source_manifest.json", identity)
+    # The evaluator never writes source after capture, including Python bytecode.
+    for path in sorted(destination.rglob("*"), reverse=True):
+        path.chmod(0o555 if path.is_dir() else 0o444)
+    destination.chmod(0o555)
+    return destination, identity
+
+
+def verify_source(root: Path, identity: dict) -> None:
+    if source_files(root) != identity["files"]:
+        raise ValueError("Frozen evaluation source fingerprint changed")
+    if worker_dependency_identity() != identity["worker_dependencies"]:
+        raise ValueError("Worker dependency fingerprint changed")
 
 
 def save(path: Path, value: object) -> None:
@@ -62,7 +131,28 @@ def environment_identity(python: Path) -> dict:
     manifest = python.parent.parent / "environment.json"
     if not manifest.is_file():
         raise ValueError("Use a dedicated environment prepared by the env subcommand")
-    return {"python": str(python), "environment_sha256": digest(manifest)}
+    installed = subprocess.run(
+        [
+            str(python),
+            "-I",
+            "-c",
+            (
+                "import importlib.metadata as m,json,sys; "
+                "print(json.dumps([sys.version,sorted((d.metadata['Name'],d.version) "
+                "for d in m.distributions() if d.metadata['Name'])]))"
+            ),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    return {
+        "python": str(python),
+        "environment_sha256": digest(manifest),
+        "installed_sha256": object_digest(json.loads(installed.stdout)),
+        "native_profile_version": NATIVE_PROFILE_VERSION,
+    }
 
 
 def catalog() -> dict:
@@ -343,18 +433,20 @@ def calibration(args) -> dict:
     return report
 
 
-def validate_calibration(path: Path, bundle: Path, manifest: dict, python: Path) -> None:
+def validate_calibration(path: Path, bundle: Path, manifest: dict, python: Path) -> dict:
     report = json.loads(path.read_text(encoding="utf-8"))
+    identity = environment_identity(python)
     valid = {c["instance_id"] for c in report["cases"] if c["environment_validated"]}
     if (
         report["dataset_sha256"] != manifest["dataset_sha256"]
         or report["prepared_manifest_sha256"] != digest(bundle / "manifest.json")
-        or any(report.get(k) != v for k, v in environment_identity(python).items())
+        or any(report.get(k) != v for k, v in identity.items())
         or not set(manifest["selection"]).issubset(valid)
     ):
         raise ValueError(
             "Every case needs successful blank/gold calibration with this bundle and environment"
         )
+    return identity
 
 
 def capture_patch(pristine: Path, workspace: Path, output: Path) -> str:
@@ -410,7 +502,7 @@ def capture_patch(pristine: Path, workspace: Path, output: Path) -> str:
 def run_cases(args) -> dict:
     bundle, manifest, rows = selected_bundle(args)
     output = separate_output(args.output, bundle, args.python)
-    validate_calibration(args.calibration, bundle, manifest, args.python)
+    benchmark_environment = validate_calibration(args.calibration, bundle, manifest, args.python)
     if not args.python.is_file():
         raise ValueError("Dedicated benchmark --python is missing")
     from evals.lka_evals.swe_sandbox import Sandbox
@@ -420,6 +512,19 @@ def run_cases(args) -> dict:
         if not status["available"]:
             raise RuntimeError(status["error"])
     output.mkdir(parents=True)
+    snapshot, source_identity = freeze_source(output)
+    # Import the private configuration adapter only after the explicit paid gate.
+    from evals.lka_evals.swe_runtime import configuration, configuration_identity
+
+    config_job = {
+        "local_config": str(args.local_config.resolve()),
+        "env": str(args.env.resolve()),
+        "max_steps": args.max_steps,
+        "multi_agent": args.multi_agent,
+        "safety_review_mode": args.safety_review,
+    }
+    effective, _, _ = configuration(config_job, resolve_credentials=False)
+    config_identity = configuration_identity(effective)
     ledger = ignored_output(args.ledger or output / "budget.sqlite3", fresh=False)
     report = {
         "protocol": "native_diagnostic_not_official",
@@ -430,6 +535,10 @@ def run_cases(args) -> dict:
         "dataset_sha256": manifest["dataset_sha256"],
         "ledger": str(args.ledger or output / "budget.sqlite3"),
         "cases": [],
+        "source_manifest": str(output / "source_manifest.json"),
+        "source_sha256": source_identity["source_sha256"],
+        "effective_config_sha256": config_identity,
+        "benchmark_environment": benchmark_environment,
         "limits": {
             "usd": args.usd_limit,
             "calls": args.call_limit,
@@ -459,13 +568,26 @@ def run_cases(args) -> dict:
             "max_steps": args.max_steps,
             "multi_agent": args.multi_agent,
             "safety_review_mode": args.safety_review,
+            "source_root": str(snapshot),
+            "source_identity": source_identity,
+            "effective_config_sha256": config_identity,
+            "benchmark_environment": benchmark_environment,
         }
-        save(directory / "job.json", job)
+        verify_source(snapshot, source_identity)
+        if environment_identity(args.python) != benchmark_environment:
+            raise ValueError("Benchmark environment changed before worker dispatch")
+        effective, _, _ = configuration(config_job, resolve_credentials=False)
+        if configuration_identity(effective) != config_identity:
+            raise ValueError("Effective configuration changed before worker dispatch")
         started = time.monotonic()
+        job["deadline_unix_seconds"] = time.time() + args.timeout
+        save(directory / "job.json", job)
+        worker_env = {**os.environ, "PYTHONPATH": str(snapshot), "PYTHONDONTWRITEBYTECODE": "1"}
         with (directory / "worker.log").open("wb") as log:
             process = subprocess.Popen(
                 [sys.executable, "-m", "evals.lka_evals.swe_runtime", str(directory / "job.json")],
-                cwd=ROOT,
+                cwd=snapshot,
+                env=worker_env,
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,

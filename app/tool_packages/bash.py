@@ -79,6 +79,9 @@ BASH_PACKAGE = ToolPackageSpec(
         "Commands receive workspace_root, WORKSPACE_ROOT, LKA_WORKSPACE_ROOT, and LKA_WORKSPACE_ROOTS environment variables.",
         ("Use relative paths from cwd or $env:WORKSPACE_ROOT; do not invent placeholder paths." if IS_WINDOWS else "Use relative paths from cwd or the injected $workspace_root variable; do not invent placeholder paths."),
         "Always inspect command status and output before claiming completion.",
+        "For issue repair, establish the reported failure before editing; if it does not reproduce, record that difference and investigate the relevant boundary. Use a focused regression that fails before the change and passes after it, then check related behavior. Existing-test passes alone do not prove the reported issue was fixed.",
+        "Tie further inspection to a concrete unresolved question and decide the next experiment or minimal change from its result. Stop broad reading once the missing information is known; preserve relevant evidence and hypotheses already ruled out.",
+        "Run validation commands directly when possible so their exit status remains visible. Piping tests through tail/head can hide failures; preserve the test process exit code and inspect collection errors before claiming tests passed.",
         "For complex computation or data processing, use bash.python_environment to inspect the managed Python interpreter and installed libraries. Write a reusable .py file with filesystem.create_file, execute with bash.run python_environment=default and the LKA_PYTHON interpreter, inspect exit status and generated files, and correct errors with filesystem.edit_file. Virtualenv isolates dependencies, not filesystem or network access; execution still requires safety review.",
     ],
 )

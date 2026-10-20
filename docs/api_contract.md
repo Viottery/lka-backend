@@ -591,6 +591,8 @@ response mode、耗时、usage、finish reason、provider request id、rate-limi
   "run_id": "agent_run_xxx",
   "trace_id": "agent_turn_xxx",
   "answer": "我已调用本地 mail tools...",
+  "task_outcome": "unknown",
+  "stop_reason": null,
   "selected_package": "mail",
   "initial_package": "mail",
   "expanded_packages": ["mail", "matter"],
@@ -684,11 +686,32 @@ audit record 和本地日志路径均不属于正常 HTTP 响应；它们只保�
 - 长工具结果会在进入后续 LLM prompt 的 `observations` 前做通用压缩，并用
   `_prompt_compacted=true` 标记。完整工具结果仍保留在内部 `tool_events`、session payload 和
   本地 markdown run log 中；正常 API 和 transport event 仅暴露摘要。
-- 每轮 decision prompt 还会包含 `completed_tool_calls`，以简洁形式列出当前 turn 已成功的
-  调用和其输入。模型在已有结果覆盖请求时必须进入 `final_answer`，不得仅为增加置信度而重放
-  相同工具和输入；如用户明确要求重复执行，模型必须在 operation 中显式设置
-  `repeat_successful_call=true`。无此标记的重复成功调用会被 harness 拦截，并直接以已有证据
-  进入 answer stage。
+- 每轮 decision prompt 包含 `completed_tool_calls` 和有界 `task_working_state`。
+  已有证据应复用，用户要求的修改、验证等剩余工作仍需完成。无显式
+  `repeat_successful_call=true` 的重复成功调用会跳过执行，反馈原结果引用并继续决策，
+  不直接结束任务；成功状态变更后允许相同参数回读。原步骤、调用和安全限制继续有效。
+- operation-first JSON 可在 envelope 中附 `working_state` 与 `purpose`；native function
+  的可选 `_agent_progress` 携带相同两项，服务端在 Tool Executor 校验前剥离，不能作为工具
+  参数或授权。严格 schema 用可为 null 的必填 `_agent_progress` 表示省略笔记，新增嵌套对象
+  保持属性全部必填。工作状态保存剩余要求、当前缺口、带本 run invocation 引用的结论和排除假设，
+  不保存长推理或复制工具正文；Graph checkpoint 会保留该状态。
+  连续三次工具调用未接受新的证据关联里程碑、重复调用、每八次工具调用会提示下一次正常
+  decision 复盘；未回应具体缺口与完整 purpose 的工具提议最多暂缓一次并收到字段反馈。
+  同一段无新证据关联里程碑的停滞不会反复暂缓；未回应状态继续保留和提示，后续工具仍经过
+  原校验和安全审查。回应文字本身不复位暂缓额度，状态随 checkpoint 保留。下一次正常决策
+  仍使用原步骤额度。不增加逐步模型审查，不按读取次数强制编辑或收尾。
+  换 invocation ID、命令包装或摘要不构成新证据；复盘回应不清零已消耗成本。
+  引用和新颖性检查是结构启发式，模型声明的进展不等于语义正确或任务完成。
+- 正常响应及持久结果增加 `task_outcome=unknown|incomplete` 和 `stop_reason`。
+  `unknown` 不认证任务成功；协议修复耗尽、步骤额度或执行时限收尾明确标记 `incomplete`，
+  `completed` 继续表示运行生命周期结束。子任务结果保留这些终止原因及 partial 状态。
+  无效操作会得到字段路径反馈，修复仍受原控制调用额度约束，不自动把工具名转换为操作类型。
+- 已知传输断开统一记录 `network_failed`，保留可用 request ID、partial、usage 和原因链。
+  无流输出时可在现有尝试额度内重试；控制生成与格式修复共用最多两次调用，单次尝试配置
+  不放宽网络重试。已有部分流输出时不透明重启，未知用量预留保留，工具不重放。
+  可信运行设置的执行 deadline 会限制后续模型和工具派发，并为正常收尾预留时间；
+  harness 与模型服务层排队后都会复验 deadline／取消状态，继承原工作负载的额度与派发栅栏；
+  普通会话内容或工具文本不能设置该运行控制字段。
 - `progress_events` 是由 harness 本地代码生成的自然语言运行过程流，不调用 LLM。它会记录
   package 选择、模型过程文本、package 展开、工具开始 / 完成、工具反馈、最终回答和校验
   warning，供前端展示“系统正在做什么”。
@@ -1058,7 +1081,7 @@ POST /agent/runs/{run_id}/replace
 
 `cancel` 会立即把 run 标记为 `cancelled` 并记录 durable cancellation request；正在执行的
 provider 调用无法保证被强制中止，但其后续 graph node、工具和 finalize 副作用会在下一个节点
-边界被阻止。重连的 `llm_delta` 保持 `content_snapshot` 字段兼容性，但 SQLite 只保存 delta 并在
+边界被阻止。重连的回答类 `llm_delta` 保持 `content_snapshot` 字段兼容性，但 SQLite 只保存 delta 并在
 回放时重建快照。完成前会先 flush token delta，之后才发布 `run_completed`。
 
 服务重启后，处于 `running` 状态且保留 LangGraph SQLite checkpoint 的 run 可由
@@ -1143,11 +1166,12 @@ sequence 重新连接 `/stream`，不会从头回放已完成的工具操作。
 和审查 LLM 输出属于本地审计材料，不会进入普通 HTTP/SSE 响应。
 
 `POST /agent/turn/stream` 默认以 `llm.response_mode=stream` 运行。所有 Agent runtime
-中的 LLM stage 都可以发送 provider token delta，包括 route、decision、decision_repair、
-异常工具检查的 tool_result_check、context_summarize、context_answer 和 answer。JSON 决策阶段只流式接收
-并审计 token；Agent 必须等完整内容累计完成后再解析 JSON 和执行下一步，避免半截 JSON
+中的 LLM stage 都可以流式接收并在本地审计 provider token delta。公开 HTTP/SSE 对
+`answer` / `context_answer` 以外的 delta 只保留 stage、role、调用标识等状态信息，清除
+`message`、`delta`、`content_snapshot` 及其他正文，避免控制 JSON 中的内部工作笔记或来源材料泄露。
+Agent 必须等完整内容累计完成后再解析 JSON 和执行下一步，避免半截 JSON
 驱动工具调用，也不能用 JSON stage 的 delta 解析或显示最终答案。最终自然语言回答必须来自
-`answer` / `context_answer` stage 的 `llm_delta`。`llm_delta.payload` 至少包含：
+`answer` / `context_answer` stage 的 `llm_delta`。回答类 `llm_delta.payload` 至少包含：
 
 ```json
 {

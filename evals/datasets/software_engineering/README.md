@@ -89,6 +89,17 @@ here includes serialized tool execution and is not production concurrency latenc
 Commands support synchronous execution only. This is a Linux evaluation profile,
 not a change to LKA's native Windows backend support.
 
+The `native-v2` profile exposes only the required system `awk` alternative link,
+without mounting the host `/etc`. Shell pipelines use `pipefail`: a failing
+test command remains a failure when piped through `tail`. An upstream SIGPIPE
+(141) is tolerated only when the last pipeline command succeeds and no other
+stage fails, allowing bounded inspection such as `grep | head`. Explicit command
+failures and a final-stage SIGPIPE remain failures. As with ordinary Bash,
+a later successful command can replace an earlier failure's exit status;
+inspect the actual test command output and status. Agent environment guidance
+names the historical SymPy `python bin/test -C --verbose --no-colors <file>`
+runner without revealing heldout test identities or reference solutions.
+
 ## Calibration, inference and grading
 
 Calibration uses fresh copies for two controls: the empty patch must fail every
@@ -128,6 +139,32 @@ The parent enforces a per-case process deadline; killing an incomplete worker
 preserves logs, ledger charges and its partial patch. Never count an interrupted
 run as completed. Changing the configured model requires extending pricing and
 validating the provider adapter explicitly.
+
+Before inference, the runner freezes the current worktree's `app/` and `evals/`
+Python sources, including uncommitted and untracked modules, into a separate
+read-only source tree under the attempt output. It also captures `pyproject.toml`
+and `uv.lock` when present; private configuration and `.env` are not copied.
+Source symlinks and changes during capture are rejected. Each worker imports
+from this snapshot with bytecode writes disabled. Before dispatch and again in
+the worker, source hashes, installed dependency versions, benchmark environment
+identity and a hash of sanitized effective settings are checked. The source
+manifest and each worker's identity record preserve those checks; credentials
+are not written into identity records. Package identities track installed
+versions, not byte-for-byte verification of site-packages. The source copy is
+protected against incidental edits, not a hostile same-user host process.
+
+Each job receives an absolute deadline in trusted run metadata; the Agent can
+bound calls and report incomplete work before the parent process's hard stop.
+Sandbox command timeouts also cannot exceed the remaining deadline. The parent
+still kills overdue workers and preserves unknown usage reservations. This does
+not increase the authorized time, call or dollar limits.
+
+`native-v2` requires fresh blank/reference calibration because the profile and
+installed benchmark dependencies are part of the calibration identity. Older
+diagnostic reports remain unchanged. Truncated or ambiguous pytest identities
+still fail calibration; passing required labels with a nonzero whole-file
+SymPy runner exit still does not pass. Changing those scoring rules would
+require a separately documented protocol rather than retrospective rescoring.
 
 Each attempt saves the actual working-tree patch independently of the final
 answer, `predictions.jsonl`, raw local runtime records, tool events, safety reviews,

@@ -199,7 +199,7 @@ def test_first_json_decision_prompt_shows_a_minimal_fork_shape() -> None:
     )
     loop.decision_format_max_attempts = 1
     loop.llm_generation_token_budget = 512
-    loop._observations_within_prompt_budget = lambda observations: observations
+    loop._observations_within_prompt_budget = lambda observations, **_kwargs: observations
     loop.llm_client = SimpleNamespace(supports_function_calling=False)
     loop.run_manager = None
     loop._route_context = lambda route: route
@@ -245,7 +245,7 @@ def test_answer_prompt_distinguishes_execution_from_verification() -> None:
     loop = AgentTurnLoop.__new__(AgentTurnLoop)
     loop.llm_client = object()
     loop._multi_agent_replan_pending = lambda: False
-    loop._observations_within_prompt_budget = lambda observations: observations
+    loop._observations_within_prompt_budget = lambda observations, **_kwargs: observations
     loop._route_context = lambda route: route
     loop._context_window_for_llm = lambda context_window: context_window
     prompts: list[str] = []
@@ -268,7 +268,7 @@ def test_answer_prompt_distinguishes_execution_from_verification() -> None:
     )
     assert "distinguish completed child execution" in prompts[0]
     assert "inconclusive verification check as passed" in prompts[0]
-    assert "Do not wrap the answer in JSON." in prompts[0]
+    assert "A user-requested data format is a deliverable" in prompts[0]
 
 
 def test_generic_output_schema_validation_rejects_missing_required_fields():

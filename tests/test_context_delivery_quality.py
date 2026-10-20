@@ -227,6 +227,9 @@ class _Count:
 
 
 class _CharCounter:
+    def count_text(self, text):
+        return _Count(len(text))
+
     def count_request(self, system_prompt, user_prompt, tools=None):
         return _Count(len(system_prompt) + len(user_prompt))
 

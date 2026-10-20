@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import http.client
 import json
 import queue
 import socket
@@ -138,7 +139,17 @@ class OpenAICompatibleLLMClient:
         yield self._stream_event("llm_started", request, snapshot, metadata=stream_metadata)
         try:
             while True:
-                line = await _run_blocking(response.readline)
+                try:
+                    line = await _run_blocking(response.readline)
+                except (TimeoutError, urllib.error.URLError, ConnectionError, http.client.IncompleteRead) as exc:
+                    raise self._transport_error(
+                        exc,
+                        metadata={
+                            **stream_metadata,
+                            "partial_content": snapshot,
+                            "tool_calls": self._tool_calls_from_parts(tool_call_parts),
+                        },
+                    ) from exc
                 if not line:
                     break
                 text = line.decode("utf-8", errors="replace").strip()
@@ -225,6 +236,7 @@ class OpenAICompatibleLLMClient:
         stream: bool,
     ) -> tuple[dict[str, Any], dict[str, str]]:
         http_request = self._build_request(request, stream=stream)
+        headers: dict[str, str] = {}
         try:
             with urllib.request.urlopen(
                 http_request,
@@ -234,10 +246,8 @@ class OpenAICompatibleLLMClient:
                 return json.loads(response.read().decode("utf-8")), headers
         except urllib.error.HTTPError as exc:
             self._raise_http_error(exc)
-        except (TimeoutError, socket.timeout) as exc:
-            raise LLMTimeoutError(f"LLM provider request timed out: {exc}") from exc
-        except urllib.error.URLError as exc:
-            raise LLMNetworkError(f"LLM provider network request failed: {exc}") from exc
+        except (TimeoutError, urllib.error.URLError, ConnectionError, http.client.IncompleteRead) as exc:
+            raise self._transport_error(exc, metadata={"headers": audit_headers(headers)}) from exc
         except json.JSONDecodeError as exc:
             raise LLMResponseParseError(f"LLM provider returned invalid JSON: {exc}") from exc
         raise LLMResponseParseError("LLM provider returned no response.")
@@ -254,11 +264,30 @@ class OpenAICompatibleLLMClient:
             return urllib.request.urlopen(http_request, timeout=self._request_timeout(request))
         except urllib.error.HTTPError as exc:
             self._raise_http_error(exc)
-        except (TimeoutError, socket.timeout) as exc:
-            raise LLMTimeoutError(f"LLM provider stream timed out: {exc}") from exc
-        except urllib.error.URLError as exc:
-            raise LLMNetworkError(f"LLM provider stream failed: {exc}") from exc
+        except (TimeoutError, urllib.error.URLError, ConnectionError, http.client.IncompleteRead) as exc:
+            raise self._transport_error(exc) from exc
         raise LLMResponseParseError("LLM provider stream returned no response.")
+
+    @staticmethod
+    def _transport_error(
+        exc: BaseException, *, metadata: dict[str, Any] | None = None,
+    ) -> LLMClientError:
+        # Keep transport recovery outside the provider so every new HTTP attempt
+        # goes through the caller's admission, metering and audit boundaries.
+        details = dict(metadata or {})
+        error = (
+            LLMTimeoutError(f"LLM provider request timed out: {exc}")
+            if isinstance(exc, (TimeoutError, socket.timeout))
+            else LLMNetworkError(f"LLM provider network request failed: {exc}")
+        )
+        error.headers = details.get("headers", {})
+        error.provider_request_id = provider_request_id_from_headers(error.headers)
+        error.partial_content = details.get("partial_content", "")
+        error.usage = details.get("usage", {})
+        error.tool_calls = details.get("tool_calls", [])
+        error.stream_output_emitted = bool(error.partial_content or error.tool_calls)
+        error.metadata = details
+        return error
 
     def _build_request(self, request: LLMRequest, *, stream: bool) -> urllib.request.Request:
         if any(message.has_audio for message in request.messages) and not self.supports_audio_input(self._model_for(request)):

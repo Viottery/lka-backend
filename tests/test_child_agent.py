@@ -344,27 +344,10 @@ def _session_connection(db_path):
 
 
 def _initialize_session_database(db_path):
-    conn = sqlite3.connect(db_path)
-    conn.executescript(
-        """
-        CREATE TABLE agent_sessions (
-            session_id TEXT PRIMARY KEY, title TEXT, status TEXT, metadata TEXT,
-            created_at TEXT, updated_at TEXT
-        );
-        CREATE TABLE agent_session_messages (
-            message_id TEXT PRIMARY KEY, session_id TEXT, role TEXT, content TEXT,
-            payload TEXT, created_at TEXT
-        );
-        CREATE TABLE agent_session_context_windows (
-            session_id TEXT PRIMARY KEY, token_budget INTEGER, summary TEXT,
-            recent_messages TEXT, token_estimate INTEGER, updated_at TEXT
-        );
-        CREATE TABLE agent_session_effects (
-            effect_id TEXT PRIMARY KEY, session_id TEXT, effect_type TEXT, created_at TEXT
-        );
-        """
-    )
-    conn.close()
+    # Exercise the current production schema, including session origins/kind.
+    from app.storage.db import init_db
+
+    init_db(db_path)
 
 
 def test_child_carries_only_completed_allowed_knowledge_refs() -> None:

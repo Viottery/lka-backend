@@ -9,7 +9,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from app.core.llm.errors import LLMTimeoutError
+from app.core.llm.errors import LLMNetworkError, LLMTimeoutError
 
 DEBUG_HEADER_NAMES = [
     "x-request-id",
@@ -165,6 +165,8 @@ def classify_openai_sdk_exception(exc: BaseException) -> tuple[str, bool]:
         return category, retriable if isinstance(retriable, bool) else False
     if isinstance(exc, LLMTimeoutError):
         return "timeout", True
+    if isinstance(exc, LLMNetworkError):
+        return "network_failed", True
     name = type(exc).__name__
     status_code = getattr(exc, "status_code", None)
     if isinstance(status_code, int):

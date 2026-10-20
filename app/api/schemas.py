@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -255,6 +255,8 @@ class AgentTurnResponse(BaseModel):
     session_id: str
     trace_id: str
     answer: str
+    task_outcome: Literal["unknown", "incomplete"] = "unknown"
+    stop_reason: str | None = None
     selected_package: str | None = None
     initial_package: str | None = None
     expanded_packages: list[str] = Field(default_factory=list)
@@ -272,6 +274,8 @@ class AgentTurnResponse(BaseModel):
             session_id=result.session_id,
             trace_id=result.trace_id,
             answer=result.answer,
+            task_outcome=result.task_outcome,
+            stop_reason=result.stop_reason,
             selected_package=result.selected_package,
             initial_package=result.initial_package,
             expanded_packages=result.expanded_packages,

@@ -16,7 +16,13 @@ from app.core.agent_graph import AgentGraphRunner
 from app.core.agent_runs import AgentRunCancelled
 from app.core.agent_turn import LLM_OBSERVATION_MAX_TOTAL_CHARS
 from app.core.config import get_settings
-from app.core.llm import LLMClientError, LLMRateLimitError, LLMResponse, LLMResponseMode, LLMStreamEvent
+from app.core.llm import (
+    LLMClientError,
+    LLMRateLimitError,
+    LLMResponse,
+    LLMResponseMode,
+    LLMStreamEvent,
+)
 from app.core.multi_agent_fast_path import FastPathEvent, project_fast_path_metrics
 from app.core.tools import ToolContext, ToolExecutor, ToolRegistry, ToolResult, ToolSpec
 from app.domains.mail import MailAccountInput, MailMessageInput
@@ -367,6 +373,8 @@ def test_langgraph_decision_event_step_matches_working_set_step(tmp_path, monkey
         "_decide_next_action",
         lambda **_kwargs: {"action": "final_answer", "reason": "test completion"},
     )
+
+    monkeypatch.setattr(loop, "_answer_with_llm", lambda **_kwargs: "Complete.")
 
     result = app.state.runtime.run_agent_turn(
         session_id="session_step_alignment", user_input="finish directly"
@@ -1555,8 +1563,8 @@ def test_agent_turn_blocks_repeated_successful_tool_call_and_answers(
         "call_tool",
         "final_answer",
     ]
-    assert response.decision_events[-1].source == "local"
-    assert "Blocked an identical tool call" in (response.decision_events[-1].reason or "")
+    assert response.decision_events[-1].source == "llm"
+    assert "Reuse the first search" in (response.decision_events[-1].reason or "")
     assert "tool_duplicate_blocked" in [event.type for event in response.progress_events]
     assert fake_llm.completed_tool_calls
     assert fake_llm.completed_tool_calls[-1]["tool_name"] == "mail.search"
@@ -2762,6 +2770,12 @@ class _RepeatedSuccessfulToolLLM:
             completed = payload.get("completed_tool_calls", [])
             if completed:
                 self.completed_tool_calls = completed
+            if any(item.get("action") == "tool_duplicate_feedback" for item in payload.get("observations", [])):
+                return LLMResponse(
+                    provider="fake_repeat_successful_tool_llm", status="completed",
+                    content=json.dumps({"operation": {"type": "final_answer", "reason": "Reuse the first search."}}),
+                    prompt_summary=prompt_summary,
+                )
             content = json.dumps(
                 {
                     "operation": {
