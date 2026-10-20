@@ -73,6 +73,8 @@ def _prepare_schema_migrations(conn: sqlite3.Connection) -> None:
         conn.execute(f"ALTER TABLE traces RENAME TO {legacy_name}")
 
     _migrate_agent_session_context_windows(conn)
+    if _table_exists(conn, "agent_sessions") and "kind" not in _table_columns(conn, "agent_sessions"):
+        conn.execute("ALTER TABLE agent_sessions ADD COLUMN kind TEXT NOT NULL DEFAULT 'ordinary'")
 
 
 def _migrate_agent_session_context_windows(conn: sqlite3.Connection) -> None:
@@ -171,6 +173,7 @@ def init_db(db_path: Path) -> None:
                 session_id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
                 status TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'ordinary',
                 metadata TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL

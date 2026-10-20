@@ -124,7 +124,7 @@ def test_non_child_and_unscoped_discovery_are_unchanged():
     loop = make_loop(Reader(scope_uses_sources=True, scope_uses_accounts=True,
                             scope_uses_workspace=True))
     assert loop._package_exists("records")
-    view = child_view().model_copy(update={"child_run_id": None})
+    view = child_view().model_copy(update={"child_run_id": None, "full_workspace_authority": True})
     assert loop._package_exists("records", tool_view=view)
 
 

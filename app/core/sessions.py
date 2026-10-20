@@ -34,6 +34,7 @@ class AgentSession(BaseModel):
     session_id: str
     title: str
     status: str
+    kind: Literal["ordinary", "manager"] = "ordinary"
     metadata: dict[str, Any] = Field(default_factory=dict)
     workspace: SessionWorkspace | None = None
     project_id: str | None = None
@@ -79,6 +80,18 @@ class AgentSessionList(BaseModel):
     sessions: list[AgentSession]
 
 
+class SessionRunPolicy(BaseModel):
+    """Server-owned defaults frozen into a run, never inferred from metadata."""
+
+    allow_default_workspace: bool = True
+    llm_client_name: str | None = None
+    llm_model: str | None = None
+    allowed_tools: list[str] | None = None
+    allowed_paths: list[str] | None = None
+    allow_fork: bool = True
+    require_high_risk_approval: bool = False
+
+
 class AgentSessionDetail(BaseModel):
     session: AgentSession
     messages: list[AgentSessionMessage]
@@ -97,6 +110,10 @@ class SessionService:
     ) -> None:
         self._conn_factory = conn_factory
         self._context_token_counter = context_token_counter
+        self.run_policy_provider: Callable[[str], SessionRunPolicy] | None = None
+        self.before_delete: Callable[..., None] | None = None
+        self.after_delete: Callable[..., None] | None = None
+        self.after_restore: Callable[..., None] | None = None
         self._turn_context_counter: ContextVar[PromptTokenCounter | None] = ContextVar(
             "session_context_counter", default=None
         )
@@ -112,6 +129,11 @@ class SessionService:
 
     def _active_context_token_counter(self) -> PromptTokenCounter | None:
         return self._turn_context_counter.get() or self._context_token_counter
+
+    def run_policy(self, session_id: str) -> SessionRunPolicy:
+        if self.run_policy_provider is not None:
+            return self.run_policy_provider(session_id)
+        return SessionRunPolicy()
 
     @property
     def context_token_count_method(self) -> str:
@@ -259,7 +281,7 @@ class SessionService:
         try:
             rows = conn.execute(
                 f"""
-                SELECT session_id, title, status, metadata, created_at, updated_at
+                SELECT session_id, title, status, kind, metadata, created_at, updated_at
                 FROM agent_sessions
                 WHERE {status_clause}
                 {search_clause}
@@ -366,6 +388,9 @@ class SessionService:
         now = _now_iso()
         conn = self._conn_factory()
         try:
+            conn.execute("BEGIN IMMEDIATE")
+            if self.before_delete is not None:
+                self.before_delete(conn, session_id)
             cursor = conn.execute(
                 """
                 UPDATE agent_sessions
@@ -374,6 +399,8 @@ class SessionService:
                 """,
                 (now, session_id),
             )
+            if cursor.rowcount and self.after_delete is not None:
+                self.after_delete(conn, session_id)
             conn.commit()
             return cursor.rowcount > 0
         finally:
@@ -385,6 +412,7 @@ class SessionService:
         now = _now_iso()
         conn = self._conn_factory()
         try:
+            conn.execute("BEGIN IMMEDIATE")
             cursor = conn.execute(
                 """
                 UPDATE agent_sessions
@@ -393,6 +421,8 @@ class SessionService:
                 """,
                 (now, session_id),
             )
+            if cursor.rowcount and self.after_restore is not None:
+                self.after_restore(conn, session_id)
             conn.commit()
             return cursor.rowcount > 0
         finally:
@@ -403,7 +433,7 @@ class SessionService:
         try:
             row = conn.execute(
                 """
-                SELECT session_id, title, status, metadata, created_at, updated_at
+                SELECT session_id, title, status, kind, metadata, created_at, updated_at
                 FROM agent_sessions
                 WHERE session_id = ? AND status != 'deleted'
                 """,
@@ -509,6 +539,42 @@ class SessionService:
             raise
         finally:
             conn.close()
+        return persisted
+
+    def append_message_in_transaction(
+        self, conn: sqlite3.Connection, *, session_id: str, role: SessionRole,
+        content: str, message_id: str, payload: dict[str, Any] | None = None,
+        persisted_message_callback: Callable[[sqlite3.Connection, AgentSessionMessage], None] | None = None,
+    ) -> AgentSessionMessage:
+        """Append once in a caller-owned transaction; never opens or commits one.
+
+        A stable ID replays the original message without updating timestamps or
+        invoking the callback twice. Callbacks must use the supplied connection.
+        """
+        if not conn.in_transaction:
+            raise ValueError("A message publication requires an existing transaction")
+        if not message_id:
+            raise ValueError("A stable message_id is required")
+        session = conn.execute("SELECT status FROM agent_sessions WHERE session_id=?", (session_id,)).fetchone()
+        if session is None or session["status"] == "deleted":
+            raise KeyError(f"Active session not found: {session_id}")
+        previous = conn.execute("SELECT * FROM agent_session_messages WHERE message_id=?", (message_id,)).fetchone()
+        payload = payload or {}
+        if previous is not None:
+            persisted = self._message_from_row(previous)
+            if (persisted.session_id, persisted.role, persisted.content, persisted.payload) != (session_id, role, content, payload):
+                raise ValueError("Message ID was already used with different content")
+            return persisted
+        now = _now_iso()
+        conn.execute(
+            "INSERT INTO agent_session_messages(message_id,session_id,role,content,payload,created_at) VALUES(?,?,?,?,?,?)",
+            (message_id, session_id, role, content, json.dumps(payload, ensure_ascii=False), now),
+        )
+        conn.execute("UPDATE agent_sessions SET updated_at=? WHERE session_id=?", (now, session_id))
+        persisted = AgentSessionMessage(message_id=message_id, session_id=session_id, role=role,
+                                        content=content, payload=payload, created_at=now)
+        if role == "agent" and persisted_message_callback is not None:
+            persisted_message_callback(conn, persisted)
         return persisted
 
     def memory_conversation(
@@ -720,6 +786,7 @@ class SessionService:
         user_input: str,
         agent_answer: str,
         trace_id: str,
+        input_role: SessionRole = "user",
         effect_id: str | None = None,
         token_budget: int | None = None,
         context_summarizer: Callable[
@@ -796,7 +863,7 @@ class SessionService:
                     )
                 next_seq = len(existing) + 1
             user_message = SessionRecentMessage(
-                role="user",
+                role=input_role,
                 content=user_input,
                 created_at=now,
                 trace_id=trace_id,
@@ -906,6 +973,89 @@ class SessionService:
             return self.get_context_window(session_id=session_id, token_budget=hard_budget)
         if background_mode and estimate > budget:
             return self.get_prompt_context_window(session_id=session_id, token_budget=budget)
+        return updated
+
+    def record_context_exchange_in_transaction(
+        self, conn: sqlite3.Connection, *, session_id: str, user_input: str,
+        agent_answer: str, trace_id: str, effect_id: str,
+        input_role: SessionRole = "user", token_budget: int | None = None,
+        background_enqueue: Callable[..., Any] | None = None,
+    ) -> AgentSessionContextWindow:
+        """Publish a raw exchange without model calls or synchronous compaction.
+
+        Preserve the published summary/watermark and complete raw tail, even on
+        overflow. Future prompt reads can project it within their own budget.
+        Only transactional background callbacks are accepted here.
+        """
+        if not conn.in_transaction or not effect_id:
+            raise ValueError("Context publication requires a transaction and stable effect_id")
+        if background_enqueue is not None and not self._callback_accepts_connection(background_enqueue):
+            raise ValueError("Context background enqueue must accept the transaction connection")
+        session = conn.execute("SELECT status FROM agent_sessions WHERE session_id=?", (session_id,)).fetchone()
+        if session is None or session["status"] == "deleted":
+            raise KeyError(f"Active session not found: {session_id}")
+        self._ensure_context_state_table(conn)
+        effect = conn.execute("SELECT session_id,effect_type FROM agent_session_effects WHERE effect_id=?", (effect_id,)).fetchone()
+        if effect is not None and (effect["session_id"] != session_id or effect["effect_type"] != "context_exchange"):
+            raise ValueError("Context effect ID belongs to another effect")
+        row = conn.execute("SELECT * FROM agent_session_context_windows WHERE session_id=?", (session_id,)).fetchone()
+        state = conn.execute("SELECT * FROM agent_session_context_state WHERE session_id=?", (session_id,)).fetchone()
+        budget = token_budget if token_budget is not None else row["token_budget"] if row else self.default_context_token_budget
+        summary = row["summary"] if row else ""
+        covered = state["covered_seq"] if state else 0
+        revision = state["revision"] if state else 0
+        next_seq = state["next_seq"] if state else 1
+        now = _now_iso()
+        if effect is None:
+            if state is None and row is not None:
+                existing = self._recent_messages_from_json(row["recent_messages"])
+                for seq, message in enumerate(existing, 1):
+                    conn.execute("INSERT OR IGNORE INTO agent_session_context_messages VALUES(?,?,?,?,?,?)",
+                                 (session_id, seq, message.role, message.content, message.created_at, message.trace_id))
+                next_seq = len(existing) + 1
+            incoming = SessionRecentMessage(role=input_role, content=user_input, created_at=now, trace_id=trace_id)
+            answer = SessionRecentMessage(role="agent", content=agent_answer, created_at=now, trace_id=trace_id)
+            for seq, message in ((next_seq, incoming), (next_seq + 1, answer)):
+                conn.execute("INSERT INTO agent_session_context_messages VALUES(?,?,?,?,?,?)",
+                             (session_id, seq, message.role, message.content, message.created_at, message.trace_id))
+            conn.execute(
+                "INSERT INTO agent_session_context_state(session_id,revision,next_seq,covered_seq) VALUES(?,?,?,?) "
+                "ON CONFLICT(session_id) DO UPDATE SET revision=excluded.revision,next_seq=excluded.next_seq",
+                (session_id, revision + 1, next_seq + 2, covered),
+            )
+        messages = self._context_messages_from_connection(conn, session_id=session_id, after_seq=covered)
+        estimate = self._context_token_estimate(summary, messages)
+        updated = AgentSessionContextWindow(
+            session_id=session_id, token_budget=budget, summary=summary,
+            summary_metadata=json.loads(state["summary_metadata"]) if state else {},
+            recent_messages=messages, token_estimate=estimate,
+            updated_at=row["updated_at"] if effect is not None and row else now,
+        )
+        if effect is not None:
+            return updated
+        conn.execute(
+            "INSERT INTO agent_session_context_windows(session_id,token_budget,summary,recent_messages,token_estimate,updated_at) VALUES(?,?,?,?,?,?) "
+            "ON CONFLICT(session_id) DO UPDATE SET token_budget=excluded.token_budget,summary=excluded.summary,"
+            "recent_messages=excluded.recent_messages,token_estimate=excluded.token_estimate,updated_at=excluded.updated_at",
+            (session_id, budget, summary, json.dumps([message.model_dump(mode="json") for message in messages], ensure_ascii=False), estimate, now),
+        )
+        conn.execute("INSERT INTO agent_session_effects(effect_id,session_id,effect_type,created_at) VALUES(?,?,'context_exchange',?)",
+                     (effect_id, session_id, now))
+        if background_enqueue is not None and estimate >= int(budget * .70):
+            self._invoke_enqueue(background_enqueue, session_id, revision + 1, next_seq + 1, conn)
+        atomic_context_enqueue = getattr(self, "atomic_context_enqueue", None)
+        atomic_context_store = getattr(self, "atomic_context_store", None)
+        if atomic_context_enqueue is not None:
+            if atomic_context_store is not None and next_seq > 1:
+                atomic_context_store.mark_pending(conn, session_id, next_seq - 1)
+            conn.execute("SAVEPOINT atomic_context_transaction_outbox")
+            try:
+                atomic_context_enqueue(session_id, next_seq + 1, conn=conn)
+            except Exception as exc:  # noqa: BLE001 - retain committed raw context if derived work is unavailable.
+                conn.execute("ROLLBACK TO atomic_context_transaction_outbox")
+                self.last_atomic_context_error = type(exc).__name__
+            finally:
+                conn.execute("RELEASE atomic_context_transaction_outbox")
         return updated
 
     def _ensure_context_state_table(self, conn: sqlite3.Connection) -> None:
@@ -1250,6 +1400,7 @@ class SessionService:
             session_id=row["session_id"],
             title=row["title"],
             status=row["status"],
+            kind=row["kind"],
             metadata=metadata,
             workspace=workspace,
             project_id=metadata.get("project_id"),

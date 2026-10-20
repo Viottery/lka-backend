@@ -199,7 +199,7 @@ def test_projected_usage_emergency_cancels_only_same_pool(tmp_path):
             pass
     asyncio.run(run())
     assert sum(controller.health()["active_by_pool"].values()) == 0
-    assert controller.health()["budget_pools"][2]["circuit_open"] is False  # message, alphabetically
+    assert next(row for row in controller.health()["budget_pools"] if row["pool"] == "background_message")["circuit_open"] is False  # Other pools remain unaffected.
     with sqlite3.connect(controller.db_path) as conn:
         assert conn.execute("SELECT status FROM llm_workload_usage WHERE task_id='slow'").fetchone()[0] == "failed"
 
@@ -218,7 +218,7 @@ def test_reset_reopens_circuit_preserves_history_work_caps_and_adoption(tmp_path
     asyncio.run(run())
     with pytest.raises(RuntimeError, match="revision"):
         controller.reset_budgets({"background_memory": 0, "background_message": 0}, reason="stale")
-    assert controller.health()["budget_pools"][2]["revision"] == 0  # atomic failure
+    assert next(row for row in controller.health()["budget_pools"] if row["pool"] == "background_message")["revision"] == 0  # atomic failure
     controller.reset_budgets({"background_memory": 1, "background_message": 0}, reason="user requested reset")
     assert controller.quota_usage("message-service")["hourly_tokens"] == 0
     assert controller.quota_usage("task:message")["total_tokens"] == 60
@@ -267,3 +267,49 @@ def test_legacy_attribution_migration_preserves_costs_and_quota_links(tmp_path):
     states = {row["pool"]: row for row in controller.health()["budget_pools"]}
     assert states["background_message"]["daily"]["tokens"] == 15
     assert states["background_memory"]["daily"]["tokens"] == 15
+
+
+def test_independent_agent_keeps_provider_deadline_instead_of_maintenance_timeout(tmp_path):
+    service = build_llm_service(LLMProviderConfig(default_client="mock", clients=[
+        LLMClientConfig(name="mock", provider="mock", default_model="m", context_window_tokens=5000)
+    ]))
+    service.workloads = LLMWorkloadController(tmp_path / "agent-usage.db")
+    received = []
+    provider = service.registry.get("mock")
+    original = provider.complete
+
+    async def capture(request):
+        received.append(request)
+        return await original(request)
+
+    provider.complete = capture
+
+    async def scenario():
+        with workload_scope("background_agent", task_id="independent"):
+            await service.complete_text(system_prompt="s", user_prompt="u", prompt_summary="agent", max_output_tokens=100)
+        with workload_scope("background_io", task_id="maintenance"):
+            await service.complete_text(system_prompt="s", user_prompt="u", prompt_summary="maintenance", max_output_tokens=100)
+
+    asyncio.run(scenario())
+    assert "network_timeout_seconds" not in received[0].metadata
+    assert received[1].metadata["network_timeout_seconds"] == 30
+
+
+def test_explicit_agent_work_is_not_a_maintenance_quota_but_frozen_allowance_remains(tmp_path):
+    from app.core.llm_workloads import WorkBudgetExceeded
+    controller = LLMWorkloadController(tmp_path / "explicit-agent.db", hourly_tokens=1, daily_tokens=1,
+                                       daily_cost_limit=0.01)
+    async def scenario():
+        with workload_scope("background_agent", task_id="user-line", quotas=(BudgetQuota("frozen", max_calls=1),)):
+            async with controller.admit(input_tokens=100, output_tokens=100) as ticket:
+                ticket.dispatched = True
+                ticket.usage = {"input_tokens": 100, "output_tokens": 100}
+            with pytest.raises(WorkBudgetExceeded):
+                async with controller.admit(input_tokens=1, output_tokens=1):
+                    raise AssertionError("Frozen allowance must survive")
+        with workload_scope("background_io", task_id="maintenance"), pytest.raises(BackgroundBudgetDeferred):
+            async with controller.admit(input_tokens=100, output_tokens=100):
+                raise AssertionError("Existing maintenance budget still applies")
+    asyncio.run(scenario())
+    assert controller.quota_usage("frozen")["total_calls"] == 1
+    assert controller.quota_usage("task:user-line")["total_tokens"] == 200

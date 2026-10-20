@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from app.api.routes.agent import router as agent_router
 from app.api.routes.background_controls import router as background_controls_router
@@ -9,6 +10,7 @@ from app.api.routes.capabilities import router as capabilities_router
 from app.api.routes.health import router as health_router
 from app.api.routes.knowledge import router as knowledge_router
 from app.api.routes.mail import router as mail_router
+from app.api.routes.managers import router as managers_router
 from app.api.routes.matters import router as matters_router
 from app.api.routes.memories import router as memories_router
 from app.api.routes.memory_settings import router as memory_settings_router
@@ -24,6 +26,7 @@ from app.api.routes.watches import router as watches_router
 from app.api.routes.workspaces import router as workspaces_router
 from app.core.config import get_settings
 from app.core.runtime import LocalKnowledgeAgentRuntime
+from app.core.session_admission import SessionBusyError
 
 
 def create_app() -> FastAPI:
@@ -41,6 +44,12 @@ def create_app() -> FastAPI:
 
     app = FastAPI(title=settings.app_name, version=settings.version, lifespan=lifespan)
     app.state.runtime = runtime
+
+    @app.exception_handler(SessionBusyError)
+    async def session_busy(request, exc):
+        return JSONResponse(status_code=409, content={
+            "detail": str(exc), "session_id": exc.session_id, "run_id": exc.run_id,
+        })
     cors_origins = settings.parsed_cors_origins()
     if cors_origins:
         app.add_middleware(
@@ -58,6 +67,7 @@ def create_app() -> FastAPI:
     app.include_router(agent_router)
     app.include_router(ui_preferences_router)
     app.include_router(sessions_router)
+    app.include_router(managers_router)
     app.include_router(session_files_router)
     app.include_router(knowledge_router)
     app.include_router(mail_router)

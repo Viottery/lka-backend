@@ -14,6 +14,43 @@
 
 ## 接入模型
 
+管理特殊会话的后端试用入口默认关闭。仅在需要时设置：
+
+```toml
+[management]
+enabled = true
+```
+
+这启用管理会话、长期目标 API、管理工具包和已接受独立任务的持久派发 worker。
+自动管理轮次另需 `autonomous_enabled=true`，且 controller 为 active；默认关闭。
+管理会话的 client/model 可通过 `/managers/{session_id}` 保存；显式请求覆盖优先，
+每次运行冻结自己的设置，恢复继续使用原设置。管理会话开放 management 工具包及 Matter 只读工具，
+管理会话不自动绑定默认工作区。普通任务不开放管理工具；独立事务线子 agent 具有受限管理能力，继承委托时冻结的模型、工具与工作区设置。
+controller 新建为 paused；设为 active 才能发出创建、介入或控制命令，读取仍可用。
+管理生命周期接口沿用现有本机／记忆管理 token 保护，工具写操作仍经统一安全审查。
+智能体创建的事务线及执行会话不会提升权限：高风险或显式 requires_confirmation 工具强制人工审批，skip/llm 不能代批；普通恢复也不能绕过原审批。
+管理派发要求 `agent.checkpoint_backend="sqlite"`（默认）；memory 模式拒绝新任务／指令／恢复派发，
+已接受的重复命令仍返回原回执。不要在有待运行任务时改为 memory；待派发任务会明确失败，避免静默降级。
+
+自动管理响应已关联任务终态、目标到期及显式配置的提醒／周期策略，不订阅自己的回答或每个 token。
+`poll_seconds` 默认 5 秒；普通自主轮的 `min_wake_interval_seconds` 默认 60 秒。
+`max_daily_rounds` 默认不设上限，可选配置按 UTC 日计算；`max_causal_rounds=6` 防止普通自动事件循环派生。
+显式派发的事务线和它的回报继续运行，不要求打开 autonomous_enabled，也不受普通自主轮间隔／轮数限制；
+父与子 controller 仍须 active。`failure_limit=3` 保留连续失败停止机制，需检查原因后显式介入。
+
+`internal_items_enabled=false` 默认禁止创建内部事项或把用户事项转为内部事项。
+所有客户端先兼容 visibility 与完整同步并重建缓存后，才启用该开关；它不是权限开关。
+任务根据持久租约独立派发，不设置管理专属固定 worker 数或就绪释放槽位。
+旧 `dispatch_workers` 输入仍可读取但不再影响运行。队列保留依赖和写资源互斥。
+模型调用使用通用 `background_agent` 分类，无管理专属模型并发上限，也不受 background.io_concurrency 的单通道限制；
+仍共享应用已有的总模型并发、前台预留和用量记录；用户显式委派的 agent 工作不消耗消息／IO 整理任务的滚动维护配额。
+静音／稍后、watch 订阅和队列暂停由管理工具保存到 SQLite，不修改私人 TOML；静音不停止捕获。
+
+管理层累计额度字段 `manager_max_calls`／`manager_max_tokens`、`goal_max_calls`／`goal_max_tokens`、
+`execution_max_calls`／`execution_max_tokens` 默认均不设限，可按需要显式配置。
+以前已经冻结的额度和累计用量会保留，重启、恢复、任务替换不会清账或扩大原额度。
+测试的真实模型调用另有独立评测预算，不改变产品配置。无安全检查点的中断仍需人工检查，不能重放未知副作用。
+
 后端内置 mock 和 OpenAI-compatible 两类 provider。下面是需要填写的最小片段，
 请修改现有 `[llm]`，不要重复添加同名 TOML 表：
 
@@ -24,6 +61,11 @@ base_url = "https://your-provider.example/v1"
 api_key_env = "LKA_MODEL_API_KEY"
 model = "your-model-id"
 ```
+
+`[llm].max_attempts` 控制普通 LLM 传输调用的尝试次数，包含首次调用；设置为 1 可关闭该层重试。
+它不是整轮调用上限：工具审查、后续决策、控制生成的一次有界恢复和不完整回答恢复仍是独立请求。
+本地预算或资源拒绝会保留明确错误类别并立即停止当前轮，不通过 repair／回答降级继续消耗调用；
+正常 provider 超时与格式恢复仍遵守原有边界。评测等需要整批调用限额时应使用持久账本。
 
 `base_url` 与 `model` 替换为服务商实际值。在本地 `.env` 中为 `LKA_MODEL_API_KEY`
 设置密钥；上述片段不含真实凭据。也可以配置多个命名客户端及精确模型的容量、

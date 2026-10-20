@@ -41,14 +41,16 @@ class _MessageReadTool:
 
     def invoke(self, *, invocation: ToolInvocation, context: ToolContext) -> ToolResult:
         view = context.tool_view
-        # A root run receives the service's enabled-policy boundary. Scoped runs
-        # must carry both grants; an omitted grant is deny-all.
-        if view is not None and (not view.allowed_source_ids or not view.allowed_account_ids):
+        # Full data authority retains the service's enabled-policy boundary.
+        # Explicit grants still narrow it; scoped views require both grants.
+        if view is not None and not view.full_data_authority and (
+            not view.allowed_source_ids or not view.allowed_account_ids
+        ):
             return ToolResult(invocation_id=invocation.invocation_id, tool_name=self.spec.name,
                               status="rejected", error="Message source and account scopes are required.")
         args = dict(invocation.input)
-        sources = sorted(set(view.allowed_source_ids)) if view is not None else None
-        accounts = sorted(set(view.allowed_account_ids)) if view is not None else None
+        sources = sorted(set(view.allowed_source_ids)) if view is not None and view.allowed_source_ids else None
+        accounts = sorted(set(view.allowed_account_ids)) if view is not None and view.allowed_account_ids else None
         key = args.pop("conversation_key", None)
         try:
             if self.method in {"reading_overview", "list_topics", "list_insights", "list_participants", "list_dossiers"}:

@@ -146,7 +146,9 @@ class LLMService:
     def _bounded_background_request(self, request: LLMRequest) -> LLMRequest:
         from app.core.llm_workloads import current_workload
 
-        if current_workload().pool == "interactive":
+        if current_workload().pool in {"interactive", "background_agent"}:
+            # Independent Agent tasks use the configured provider deadline;
+            # short maintenance jobs retain their separate background timeout.
             return request
         return request.model_copy(update={"metadata": {**request.metadata,
                                                        "network_timeout_seconds": self.background_timeout_seconds}})

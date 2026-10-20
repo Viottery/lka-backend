@@ -377,8 +377,7 @@ class BashRunTool:
 
     def invoke(self, *, invocation: ToolInvocation, context: ToolContext) -> ToolResult:
         if (
-            _child_run_id(context) is not None
-            and context.tool_view is not None
+            context.tool_view is not None
             and not context.tool_view.full_workspace_authority
         ):
             return ToolResult(
@@ -387,7 +386,7 @@ class BashRunTool:
                 status="rejected",
                 error=(
                     "bash.run is unavailable because arbitrary shell paths cannot be safely "
-                    "constrained to a narrowed child workspace scope."
+                    "constrained to a narrowed workspace scope."
                 ),
             )
         command = str(invocation.input.get("command") or "")
@@ -978,7 +977,15 @@ def _decode_limited(raw: bytes, max_bytes: int) -> str:
 
 def _child_run_id(context: ToolContext) -> str | None:
     view = context.tool_view
-    return view.child_run_id if view is not None else None
+    if view is None:
+        return None
+    if view.child_run_id is not None:
+        return view.child_run_id
+    if not view.full_workspace_authority:
+        # A scoped root must never pass None, which means unrestricted shell
+        # ownership. Runtime roots use their stable run identity.
+        return context.run_id or view.snapshot_id
+    return None
 
 
 def is_read_only_powershell_command(command: str) -> bool:

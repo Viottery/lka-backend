@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from hashlib import sha1
 from typing import Any
 
@@ -64,7 +64,7 @@ class LLMCallRecord(BaseModel):
 
 
 def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def stable_llm_call_id(*parts: str | None) -> str:
@@ -159,6 +159,10 @@ def classify_provider_error(
 
 
 def classify_openai_sdk_exception(exc: BaseException) -> tuple[str, bool]:
+    category = getattr(exc, "error_category", None)
+    if isinstance(category, str) and category:
+        retriable = getattr(exc, "is_retriable", None)
+        return category, retriable if isinstance(retriable, bool) else False
     if isinstance(exc, LLMTimeoutError):
         return "timeout", True
     name = type(exc).__name__

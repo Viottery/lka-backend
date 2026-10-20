@@ -7,6 +7,7 @@ import json
 import queue
 import threading
 from contextlib import nullcontext
+from contextvars import copy_context
 from datetime import UTC, datetime
 from hashlib import sha256
 from typing import Any, Literal, TypedDict
@@ -29,7 +30,6 @@ from app.core.agent_turn import (
     AgentTurnWorkingSet,
     _fork_subtasks_function_arguments_example,
     _fork_subtasks_shape_example,
-    _session_workspace_path,
     _stable_id,
     _turn_inference_snapshot,
     _turn_llm_client_name,
@@ -40,7 +40,6 @@ from app.core.agent_turn import (
     _turn_safety_review_mode,
 )
 from app.core.child_tool_audit import build_child_tool_audit
-from app.core.context_driver import ToolView
 from app.core.llm import LLMResponseMode
 from app.core.runtime_context import current_time_payload
 from app.core.safety import SafetyReviewMode, SafetyReviewRecord, SafetyReviewStatus
@@ -313,8 +312,9 @@ class AgentGraphRunner:
             except BaseException as exc:  # noqa: BLE001 - propagate graph boundary failures.
                 result_queue.put((False, exc))
 
+        context = copy_context()
         worker = threading.Thread(
-            target=target,
+            target=lambda: context.run(target),
             name="lka-agent-graph",
             daemon=True,
         )
@@ -577,17 +577,9 @@ class AgentGraphRunner:
             title=turn_user_input[:60] or "Agent Session",
             metadata={"entrypoint": "agent.turn"},
         )
-        user_message = self.turn_loop.session_service.append_message(
-            session_id=session.session_id,
-            role="user",
-            content=turn_user_input,
-            payload={"trace_id": run.trace_id, "entrypoint": "agent.turn"},
-            message_id=f"agent_graph_user_{run.run_id}",
-        )
-        self.turn_loop._apply_memory_pre_turn_gate(
-            session.workspace.backend_path if session.workspace is not None
-            else self.turn_loop.default_workspace_root,
-            turn_user_input, user_message.message_id,
+        turn_user_input, _input_message = self.turn_loop._persist_turn_input(
+            session_id=session.session_id, run_id=run.run_id, trace_id=run.trace_id,
+            user_input=turn_user_input, message_id=f"agent_graph_user_{run.run_id}",
         )
         window = self.turn_loop.session_service.get_prompt_context_window(
             session_id=session.session_id, token_budget=self.turn_loop.session_context_token_budget
@@ -597,16 +589,14 @@ class AgentGraphRunner:
             window["workspace"] = session.workspace.model_dump(mode="json")
         if self.turn_loop.instruction_files is not None:
             workspace_path = (
-                session.workspace.backend_path if session.workspace is not None
-                else self.turn_loop.default_workspace_root
+                self.turn_loop._workspace_for_run(session, run.run_id)
             )
             window["agent_instructions"] = self.turn_loop.instruction_files.for_workspace(
                 workspace_path
             )
         recalled = self.turn_loop._memory_context_for_turn(
                 session.session_id,
-                session.workspace.backend_path if session.workspace is not None
-                else self.turn_loop.default_workspace_root,
+                self.turn_loop._workspace_for_run(session, run.run_id),
                 turn_user_input,
         )
         if recalled is not None:
@@ -1408,6 +1398,7 @@ class AgentGraphRunner:
             stage="answer",
             status="failed" if generation_failed else "partial" if missing or ws.completion_state.stop_reason else "completed",
             message=self.turn_loop._short_text(answer),
+            persist=self._run(ws.run_id).metadata.get("defer_answer_publication") is not True,
             metadata={
                 "answer": answer,
                 **({"missing_requirements": missing, "completion_stop_reason": ws.completion_state.stop_reason}
@@ -1483,6 +1474,52 @@ class AgentGraphRunner:
             "active_package": result.active_package,
             "result_artifact_ref": ref,
         }
+        message_payload = {
+            "run_id": ws.run_id, "trace_id": ws.trace_id,
+            "initial_package": ws.initial_package, "expanded_packages": ws.expanded_packages,
+            "used_packages": ws.used_packages, "active_package": ws.active_package,
+            "log_path": str(log), "tool_events": data.get("tool_events", []),
+            "memory_project_id": (
+                data["context_window"].get("recalled_memories", {}).get("project_id")
+                if isinstance(data["context_window"].get("recalled_memories"), dict) else None
+            ),
+            "workspace_backend_path": (
+                data["context_window"].get("workspace", {}).get("backend_path")
+                if isinstance(data["context_window"].get("workspace"), dict)
+                else self.turn_loop._workspace_for_run(
+                    self.turn_loop.session_service.ensure_session(session_id=ws.session_id), ws.run_id
+                )
+            ),
+        }
+        self.turn_loop._raise_if_cancel_requested()
+        handler = getattr(self.turn_loop, "finalization_handler", None)
+        plan = self._run(ws.run_id).metadata.get("multi_agent_plan")
+        plan_failed = isinstance(plan, dict) and plan.get("status") == "failed"
+        if handler is not None and not plan_failed and not self.turn_loop._multi_agent_replan_pending(ws.run_id):
+            handled = handler(
+                ws.run_id, result, completed_snapshot,
+                user_input=ws.user_input, input_role=self.turn_loop._turn_input_role(ws.run_id),
+                message_payload=message_payload, message_id=f"agent_graph_agent_{ws.run_id}",
+                context_effect_id=f"agent_graph_context_exchange_{ws.run_id}",
+                token_budget=self.turn_loop.session_context_token_budget,
+                background_enqueue=self.turn_loop.background_compaction_callback,
+            )
+            if handled:
+                manager = self.turn_loop.run_manager
+                persisted = manager.durable_store.load_run(ws.run_id) if manager.durable_store is not None else None
+                if persisted is None or persisted.get("status") != "completed":
+                    raise RuntimeError("Finalization handler must commit the completed run before returning True")
+                manager.refresh_after_transaction(persisted)
+                with self._lock:
+                    self._results[ws.run_id] = result
+                return {
+                    "phase": "finalized", "status": "completed", "result_artifact_ref": ref,
+                    "result_summary": {"run_id": ws.run_id, "answer_chars": len(answer),
+                                       "tool_event_count": len(result.tool_events), "log_path": result.log_path},
+                    "run_snapshot": self._snapshot(self._run(ws.run_id)),
+                }
+        if self._run(ws.run_id).metadata.get("defer_answer_publication") is True:
+            raise RuntimeError("Deferred answer publication requires a finalization handler to commit the result")
         if not self.turn_loop.run_manager.claim_completion(ws.run_id):
             self.turn_loop._raise_if_cancel_requested()
             raise RuntimeError(f"Agent run cannot claim completion: {ws.run_id}")
@@ -1531,6 +1568,7 @@ class AgentGraphRunner:
         updated = self.turn_loop.session_service.record_context_exchange(
             session_id=ws.session_id,
             user_input=ws.user_input,
+            input_role=self.turn_loop._turn_input_role(ws.run_id),
             agent_answer=answer,
             trace_id=ws.trace_id,
             effect_id=f"agent_graph_context_exchange_{ws.run_id}",
@@ -1551,23 +1589,7 @@ class AgentGraphRunner:
             role="agent",
             content=answer,
             payload={
-                "run_id": ws.run_id,
-                "trace_id": ws.trace_id,
-                "initial_package": ws.initial_package,
-                "expanded_packages": ws.expanded_packages,
-                "used_packages": ws.used_packages,
-                "active_package": ws.active_package,
-                "log_path": str(log),
-                "tool_events": data.get("tool_events", []),
-                "memory_project_id": (
-                    data["context_window"].get("recalled_memories", {}).get("project_id")
-                    if isinstance(data["context_window"].get("recalled_memories"), dict) else None
-                ),
-                "workspace_backend_path": (
-                    data["context_window"].get("workspace", {}).get("backend_path")
-                    if isinstance(data["context_window"].get("workspace"), dict)
-                    else self.turn_loop.default_workspace_root
-                ),
+                **message_payload,
                 "context_window": {
                     "token_budget": updated.token_budget,
                     "token_estimate": updated.token_estimate,
@@ -1762,25 +1784,33 @@ class AgentGraphRunner:
         session = self.turn_loop.session_service.ensure_session(
             session_id=ws.session_id, title="Agent Session", metadata={"entrypoint": "agent.turn"}
         )
-        run = self._run(ws.run_id)
-        views = run.metadata.get("context_views", {})
-        tool_view_data = views.get("tool") if isinstance(views, dict) else None
         return ToolContext(
             session_id=ws.session_id,
             trace_id=ws.trace_id,
             context_id=ws.trace_id,
-            workspace_root=(
-                _session_workspace_path(session) or self.turn_loop.default_workspace_root
-            ),
-            tool_view=ToolView.model_validate(tool_view_data) if tool_view_data else None,
+            workspace_root=self.turn_loop._workspace_for_run(session, ws.run_id),
+            tool_view=self.turn_loop._tool_view_for_run(ws.run_id),
             run_id=ws.run_id,
         )
 
     def _fail(self, run_id: str, exc: Exception) -> None:
+        manager = self.turn_loop.run_manager
+        persisted = manager.durable_store.load_run(run_id) if manager.durable_store is not None else None
+        if persisted is not None and persisted.get("status") == "completed":
+            # Business publication may commit before the independent graph
+            # checkpoint. A checkpoint failure cannot undo that terminal result.
+            manager.refresh_after_transaction(persisted)
+            recovered = self._completed_result_from_checkpoint(run_id)
+            with self._lock:
+                if recovered is not None:
+                    self._results[run_id] = recovered
+                else:
+                    self._errors[run_id] = exc
+            return
         if isinstance(exc, AgentRunCancelled):
             self.turn_loop._mark_current_run_cancelled(str(exc))
         else:
-            self.turn_loop._mark_current_run_failed(type(exc).__name__, str(exc))
+            self.turn_loop._mark_current_run_failed(type(exc).__name__, str(exc), exc=exc)
         with self._lock:
             self._errors[run_id] = exc
 
@@ -1821,13 +1851,12 @@ class AgentGraphRunner:
     def _completed_result_from_checkpoint(self, run_id: str) -> AgentTurnResult | None:
         """Reload a terminal result after the process-local result cache was lost."""
 
-        state = self.get_state(run_id)
-        ref = state.values.get("result_artifact_ref")
+        run = self._run(run_id)
+        snapshot = run.result_snapshot or {}
+        ref = snapshot.get("result_artifact_ref")
         if not isinstance(ref, dict):
-            run = self._run(run_id)
-            snapshot = run.result_snapshot or {}
-            candidate = snapshot.get("result_artifact_ref")
-            ref = candidate if isinstance(candidate, dict) else None
+            state = self.get_state(run_id)
+            ref = state.values.get("result_artifact_ref")
         if not isinstance(ref, dict):
             return None
         if isinstance(ref.get("payload"), dict):

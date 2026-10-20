@@ -10,6 +10,27 @@
 # Microsoft Graph client IDs are not secrets, so Outlook can use client_id
 # directly or client_id_env for environment-variable based configuration.
 
+[management]
+# Management tools and durable task dispatch. Autonomous turns are separately opt-in.
+enabled = false
+autonomous_enabled = false
+# Enable only after all clients understand visibility and rebuild their Matter cache.
+internal_items_enabled = false
+# Accepted agent tasks dispatch independently; no fixed management worker pool.
+poll_seconds = 5
+min_wake_interval_seconds = 60
+max_causal_rounds = 6
+failure_limit = 3
+# Optional management-specific limits are unset by default. Existing frozen
+# allowances and usage ledgers survive restart/resume/replacement unchanged.
+# max_daily_rounds = 12
+# manager_max_calls = 300
+# manager_max_tokens = 2000000
+# goal_max_calls = 100
+# goal_max_tokens = 500000
+# execution_max_calls = 24
+# execution_max_tokens = 200000
+
 [llm]
 provider = "mock"
 base_url = "https://api.openai.com/v1"

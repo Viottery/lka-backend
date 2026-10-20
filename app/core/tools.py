@@ -99,20 +99,21 @@ def tool_scope_discovery_denial(spec: ToolSpec, tool_view: ToolView | None) -> s
     Visibility is not authorization: argument selection, paths, review and run
     lifetime still pass through ToolExecutor for every invocation.
     """
-    if tool_view is None or tool_view.child_run_id is None:
+    if tool_view is None:
         return None
+    child_scope = tool_view.child_run_id is not None
     source_ids = tool_view.allowed_source_ids
     account_ids = tool_view.allowed_account_ids
     uses_sources = spec.scope_uses_sources or bool(spec.scope_source_fields)
     uses_accounts = spec.scope_uses_accounts or bool(spec.scope_account_fields)
     uses_workspace = spec.scope_uses_workspace or bool(spec.scope_path_fields)
-    if uses_sources and not source_ids and not tool_view.full_data_authority:
+    if child_scope and uses_sources and not source_ids and not tool_view.full_data_authority:
         return "Child run has no authorized source scope for this tool."
-    if uses_accounts and not account_ids and not tool_view.full_data_authority:
+    if child_scope and uses_accounts and not account_ids and not tool_view.full_data_authority:
         return "Child run has no authorized account scope for this tool."
-    if uses_sources and source_ids and not spec.scope_source_fields and not spec.scope_filtering_required:
+    if child_scope and uses_sources and source_ids and not spec.scope_source_fields and not spec.scope_filtering_required:
         return "Tool does not enforce this child run's source scope."
-    if uses_accounts and account_ids and not spec.scope_account_fields and not spec.scope_filtering_required:
+    if child_scope and uses_accounts and account_ids and not spec.scope_account_fields and not spec.scope_filtering_required:
         return "Tool does not enforce this child run's account scope."
     if uses_workspace and not tool_view.allowed_paths and not tool_view.full_workspace_authority:
         return "Child run has no authorized workspace scope for this tool."
@@ -293,6 +294,8 @@ class ToolExecutor:
     ) -> ToolResult:
         if tool_view is None:
             tool_view = context.tool_view
+        elif tool_view is not context.tool_view:
+            context = context.model_copy(update={"tool_view": tool_view})
         tool = self.registry.get_tool_or_none(tool_name)
         if tool is None:
             return ToolResult(
@@ -496,20 +499,23 @@ class ToolExecutor:
         tool_view: ToolView | None,
     ) -> str | None:
         """Apply tool-declared argument scope and fail closed on unfiltered data tools."""
-        if tool_view is None or tool_view.child_run_id is None:
+        if tool_view is None:
+            return None
+        child_scope = tool_view.child_run_id is not None
+        if not child_scope and tool_view.full_workspace_authority:
             return None
         if denial := tool_scope_discovery_denial(spec, tool_view):
             return denial
         source_ids = tuple(getattr(tool_view, "allowed_source_ids", ()))
         account_ids = tuple(getattr(tool_view, "allowed_account_ids", ()))
         paths = tuple(getattr(tool_view, "allowed_paths", ()))
-        for field in spec.scope_source_fields:
+        for field in spec.scope_source_fields if child_scope else ():
             requested = _scope_values(tool_input.get(field))
             if source_ids and not requested and not spec.scope_filtering_required:
                 return f"Tool argument {field!r} must explicitly select sources in the child scope."
             if requested and not set(requested).issubset(source_ids):
                 return f"Tool argument {field!r} requests a source outside the child scope."
-        for field in spec.scope_account_fields:
+        for field in spec.scope_account_fields if child_scope else ():
             requested = _scope_values(tool_input.get(field))
             if account_ids and not requested and not spec.scope_filtering_required:
                 return f"Tool argument {field!r} must explicitly select accounts in the child scope."

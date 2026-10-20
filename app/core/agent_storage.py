@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
+from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
+from app.core.session_admission import TERMINAL_RUN_STATUSES, SessionAdmissionStore
 from app.storage.db import connect, init_db
 
 
@@ -66,6 +69,7 @@ class SqliteAgentRunStore:
         self.db_path = db_path
         init_db(db_path)
         with connect(self.db_path) as conn:
+            SessionAdmissionStore.ensure_schema(conn)
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS agent_user_continuations (
@@ -87,27 +91,119 @@ class SqliteAgentRunStore:
 
     def save_run(self, record: dict[str, Any], *, updated_at: str) -> None:
         with connect(self.db_path) as conn:
-            conn.execute(
-                """
-                INSERT INTO agent_runs(
-                    run_id, session_id, status, record_payload, created_at, updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(run_id) DO UPDATE SET
-                    session_id = excluded.session_id,
-                    status = excluded.status,
-                    record_payload = excluded.record_payload,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    record["run_id"],
-                    record["session_id"],
-                    record["status"],
-                    _json_dump(record),
-                    record["created_at"],
-                    updated_at,
-                ),
+            conn.execute("BEGIN IMMEDIATE")
+            self.save_run_in_transaction(conn, record, updated_at=updated_at)
+
+    def save_run_in_transaction(self, conn, record: dict[str, Any], *, updated_at: str) -> None:
+        """Persist a run and its logical slot in the caller's write transaction.
+
+        Does not begin, commit or close the connection. This lets a caller bind
+        a newly created session, command, run and dispatch record atomically.
+        """
+        existing = conn.execute("SELECT 1 FROM agent_runs WHERE run_id=?", (record["run_id"],)).fetchone()
+        if existing is None:
+            SessionAdmissionStore._existing_session(conn, record["session_id"])
+        if record.get("parent_run_id") is None and record["status"] not in TERMINAL_RUN_STATUSES:
+            SessionAdmissionStore.reserve(conn, record["session_id"], record["run_id"])
+        conn.execute(
+            """
+            INSERT INTO agent_runs(
+                run_id, session_id, status, record_payload, created_at, updated_at
             )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(run_id) DO UPDATE SET
+                session_id = excluded.session_id,
+                status = excluded.status,
+                record_payload = excluded.record_payload,
+                updated_at = excluded.updated_at
+            """,
+            (
+                record["run_id"],
+                record["session_id"],
+                record["status"],
+                _json_dump(record),
+                record["created_at"],
+                updated_at,
+            ),
+        )
+        SessionAdmissionStore.release_if_terminal(conn, record)
+
+    def complete_run_in_transaction(
+        self, conn, run_id: str, *, result_snapshot: dict[str, Any],
+        log_path: str | None = None, event_payload: dict[str, Any] | None = None,
+        final_answer_event: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Commit a root terminal record/event/slot in the caller's transaction.
+
+        Pending token events must be flushed before opening that transaction.
+        This method has no run-manager/cache dependencies or implicit commit.
+        """
+        if not conn.in_transaction:
+            raise ValueError("Atomic completion requires an existing transaction")
+        row = conn.execute("SELECT record_payload FROM agent_runs WHERE run_id=?", (run_id,)).fetchone()
+        if row is None:
+            raise KeyError(run_id)
+        record = _json_load(row[0])
+        if record.get("status") == "completed":
+            return record
+        metadata = record.get("metadata") or {}
+        if metadata.get("defer_answer_publication") is True and final_answer_event is None:
+            raise ValueError("Deferred completion requires its final_answer event")
+        if final_answer_event is not None:
+            answer_metadata = final_answer_event.get("metadata")
+            if (final_answer_event.get("type") != "final_answer"
+                    or not isinstance(final_answer_event.get("message"), str)
+                    or not isinstance(answer_metadata, dict)
+                    or answer_metadata.get("answer") != result_snapshot.get("answer")):
+                raise ValueError("Final answer progress must match the completed result")
+        if record.get("status") != "running" or metadata.get("cancel_requested") or metadata.get("pause_requested"):
+            raise ValueError("Only a running, non-cancelled and non-pausing run can publish")
+        if record.get("parent_run_id") is not None:
+            raise ValueError("Atomic publication currently requires a root run")
+        active = conn.execute(
+            "WITH RECURSIVE descendants(run_id,status) AS ("
+            "SELECT run_id,status FROM agent_runs WHERE json_extract(record_payload,'$.parent_run_id')=? UNION ALL "
+            "SELECT child.run_id,child.status FROM agent_runs child JOIN descendants parent "
+            "ON json_extract(child.record_payload,'$.parent_run_id')=parent.run_id) "
+            "SELECT 1 FROM descendants WHERE status NOT IN ('completed','failed','cancelled','timed_out') LIMIT 1",
+            (run_id,),
+        ).fetchone()
+        if active is not None:
+            raise ValueError("Cannot complete a root with unfinished descendants")
+        session = conn.execute("SELECT status FROM agent_sessions WHERE session_id=?", (record["session_id"],)).fetchone()
+        if session is None or session[0] == "deleted":
+            raise ValueError("Cannot publish into a deleted or absent session")
+        now = datetime.now(UTC).isoformat()
+        record = {**record, "status": "completed", "completed_at": now,
+                  "result_snapshot": result_snapshot, "log_path": log_path or record.get("log_path"),
+                  "metadata": {**metadata, "completion_claimed": True,
+                               "completion_claimed_at": metadata.get("completion_claimed_at") or now}}
+        self.save_run_in_transaction(conn, record, updated_at=now)
+        if final_answer_event is not None and conn.execute(
+            "SELECT 1 FROM agent_run_events WHERE run_id=? AND json_extract(event_payload,'$.type')='final_answer'", (run_id,),
+        ).fetchone() is None:
+            sequence = conn.execute("SELECT COALESCE(MAX(sequence),0)+1 FROM agent_run_events WHERE run_id=?", (run_id,)).fetchone()[0]
+            answer_event = {
+                "event_id": f"{run_id}_final_answer", "run_id": run_id, "sequence": sequence,
+                "type": "final_answer", "stage": final_answer_event.get("stage"),
+                "message": final_answer_event["message"], "created_at": final_answer_event.get("created_at") or now,
+                "payload": {key: final_answer_event.get(key) for key in ("tool_name", "package_name", "status", "metadata")},
+            }
+            conn.execute("INSERT INTO agent_run_events(run_id,sequence,event_payload,created_at) VALUES(?,?,?,?)",
+                         (run_id, sequence, _json_dump(answer_event), answer_event["created_at"]))
+        previous_event = conn.execute(
+            "SELECT 1 FROM agent_run_events WHERE run_id=? AND json_extract(event_payload,'$.type')='run_completed'",
+            (run_id,),
+        ).fetchone()
+        if previous_event is None:
+            sequence = conn.execute("SELECT COALESCE(MAX(sequence),0)+1 FROM agent_run_events WHERE run_id=?", (run_id,)).fetchone()[0]
+            event = {"event_id": f"{run_id}_completed", "run_id": run_id, "sequence": sequence,
+                     "type": "run_completed", "stage": "run", "message": "Agent run completed.",
+                     "payload": event_payload or {"answer_length": len(str(result_snapshot.get("answer", ""))), "log_path": log_path},
+                     "created_at": now}
+            conn.execute("INSERT INTO agent_run_events(run_id,sequence,event_payload,created_at) VALUES(?,?,?,?)",
+                         (run_id, sequence, _json_dump(event), now))
+        return record
 
     def save_child_creation(
         self,
@@ -190,6 +286,7 @@ class SqliteAgentRunStore:
         events: list[dict[str, Any]],
         updated_at: str,
         created: list[dict[str, Any]] | None = None,
+        on_created: Callable[[Any, dict[str, Any]], None] | None = None,
     ) -> None:
         """Commit lifecycle controls, optional replacement runs and events atomically."""
 
@@ -210,12 +307,8 @@ class SqliteAgentRunStore:
                     raise ValueError(f"Agent run changed during control transition: {run_id}")
             next_sequence: dict[str, int] = {}
             for record in additions.values():
-                conn.execute(
-                    "INSERT INTO agent_runs(run_id, session_id, status, record_payload, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (record["run_id"], record["session_id"], record["status"], _json_dump(record),
-                     record["created_at"], updated_at),
-                )
+                if conn.execute("SELECT 1 FROM agent_runs WHERE run_id=?", (record["run_id"],)).fetchone():
+                    raise ValueError("New control run already exists.")
             for event in events:
                 run_id = event["run_id"]
                 if run_id not in expected and run_id not in additions:
@@ -229,16 +322,12 @@ class SqliteAgentRunStore:
                 if event["sequence"] != next_sequence[run_id]:
                     raise ValueError("Agent event sequence changed during control transition.")
                 next_sequence[run_id] += 1
-            conn.executemany(
-                """
-                UPDATE agent_runs SET status = ?, record_payload = ?, updated_at = ?
-                WHERE run_id = ?
-                """,
-                [
-                    (record["status"], _json_dump(record), updated_at, record["run_id"])
-                    for record in updated
-                ],
-            )
+            # Retire old roots first, then reserve replacements in this same
+            # transaction. A later event error rolls both slot and run back.
+            for record in sorted(updated, key=lambda item: item["status"] not in TERMINAL_RUN_STATUSES):
+                self.save_run_in_transaction(conn, record, updated_at=updated_at)
+            for record in additions.values():
+                self.save_run_in_transaction(conn, record, updated_at=updated_at)
             conn.executemany(
                 """
                 INSERT INTO agent_run_events(run_id, sequence, event_payload, created_at)
@@ -249,6 +338,9 @@ class SqliteAgentRunStore:
                     for event in events
                 ],
             )
+            if on_created is not None:
+                for record in additions.values():
+                    on_created(conn, record)
 
     def load_run(self, run_id: str) -> dict[str, Any] | None:
         with connect(self.db_path) as conn:

@@ -68,6 +68,8 @@ from app.core.llm.audit import (
 from app.core.llm.audit import (
     now_iso as llm_audit_now_iso,
 )
+from app.core.llm.errors import LLMResourceError
+from app.core.llm_workloads import BackgroundBudgetDeferred, BackgroundTaskBudgetExceeded
 from app.core.multi_agent import (
     ContextSnapshot,
     ForkCallerKind,
@@ -128,7 +130,14 @@ from app.core.safety import (
     SafetyReviewStatus,
     stable_safety_review_id,
 )
-from app.core.sessions import AgentSession, SessionRecentMessage, SessionService
+from app.core.sessions import (
+    AgentSession,
+    AgentSessionMessage,
+    SessionRecentMessage,
+    SessionRole,
+    SessionRunPolicy,
+    SessionService,
+)
 from app.core.task_completion import TaskCompletionState, assess_finish, completion_feedback
 from app.core.tool_result_gate import (
     bounded_preview,
@@ -143,6 +152,7 @@ from app.core.tools import (
     effective_tool_read_only,
     tool_scope_discovery_denial,
 )
+from app.core.turn_input import TurnInputEnvelope
 
 DEFAULT_MAX_DECISION_STEPS = 10
 ROOT_COORDINATOR_STEP_ID = "root_coordinator"
@@ -708,6 +718,7 @@ class AgentTurnLoop:
         llm_client: TextLLMClient | LLMService | None,
         log_dir: Path,
         max_decision_steps: int = DEFAULT_MAX_DECISION_STEPS,
+        llm_max_attempts: int = 2,
         run_manager: InMemoryAgentRunManager | None = None,
         safety_review_mode: SafetyReviewMode | str = SafetyReviewMode.SKIP,
         safety_manual_wait_poll_seconds: float = 0.5,
@@ -731,9 +742,13 @@ class AgentTurnLoop:
         self.unified_entry_enabled = unified_entry_enabled
         self.tool_executor = tool_executor
         self.llm_client = llm_client
+        # Optional publication owner; ordinary turns retain their existing path.
+        self.finalization_handler: Callable[..., bool] | None = None
         self.log_dir = log_dir
         self.run_manager = run_manager
-        self.llm_max_attempts = 2
+        if type(llm_max_attempts) is not int or llm_max_attempts < 1:
+            raise ValueError("llm_max_attempts must be a positive integer")
+        self.llm_max_attempts = llm_max_attempts
         self.default_rate_limit_wait_seconds = 1.0
         self.max_decision_steps = max(1, int(max_decision_steps))
         self.decision_format_max_attempts = 2
@@ -746,6 +761,7 @@ class AgentTurnLoop:
         self._prompt_counters: dict[str | None, PromptTokenCounter] = {}
         self.safety_review_mode = self._normalize_safety_review_mode(safety_review_mode)
         self.safety_manual_wait_poll_seconds = safety_manual_wait_poll_seconds
+        self.execution_guard: Callable[[str], None] | None = None
         self.tool_invocation_store = tool_invocation_store
         self.fork_policy = fork_policy
         self.agent_catalog_provider = agent_catalog_provider
@@ -787,8 +803,12 @@ class AgentTurnLoop:
         except ValueError:
             return SafetyReviewMode.SKIP
 
-    def _effective_safety_review_mode(self) -> SafetyReviewMode:
-        """A request may increase review strictness, never weaken local policy."""
+    def _effective_safety_review_mode(self, tool_name: str | None = None) -> SafetyReviewMode:
+        """Requests and frozen run policy may increase review strictness."""
+        if tool_name is not None and self._session_run_policy().require_high_risk_approval:
+            tool = self.tool_executor.registry.get_tool_or_none(tool_name)
+            if tool is not None and (tool.spec.requires_confirmation or tool.spec.risk == "high"):
+                return SafetyReviewMode.MANUAL
         requested = _turn_safety_review_mode.get()
         priority = {
             SafetyReviewMode.SKIP: 0,
@@ -874,7 +894,7 @@ class AgentTurnLoop:
             self._mark_current_run_cancelled(str(exc) or "Run cancelled.")
             raise
         except Exception as exc:
-            self._mark_current_run_failed(type(exc).__name__, str(exc))
+            self._mark_current_run_failed(type(exc).__name__, str(exc), exc=exc)
             raise
         finally:
             if run_id_token is not None:
@@ -953,7 +973,11 @@ class AgentTurnLoop:
             user_input=user_input,
             trace_id=trace_id,
             parent_run_id=parent_run_id,
-            metadata={"entrypoint": "agent.turn"},
+            metadata={
+                "entrypoint": "agent.turn",
+                **({"session_policy": self.session_service.run_policy(session.session_id).model_dump(mode="json")}
+                   if parent_run_id is None else {}),
+            },
         )
 
     def _get_existing_run(self, run_id: str) -> AgentRunRecord:
@@ -989,7 +1013,7 @@ class AgentTurnLoop:
     def _inference_selection(
         self,
     ) -> tuple[str | None, str | None, LLMReasoningEffort | None, str, str | None]:
-        """Apply explicit request > frozen child profile > configured client default."""
+        """Apply request > frozen child > frozen session > configuration defaults."""
         request_client = _turn_llm_client_name.get()
         request_model = _turn_llm_model.get()
         if request_client is not None or request_model is not None:
@@ -1018,6 +1042,9 @@ class AgentTurnLoop:
                 snapshot.inference_selection_source,
                 snapshot.inference_profile_id,
             )
+        policy = self._session_run_policy()
+        if policy.llm_client_name is not None or policy.llm_model is not None:
+            return policy.llm_client_name, policy.llm_model, None, "session", None
         return None, None, None, "default", None
 
     def _inference_call_metadata(self) -> dict[str, str]:
@@ -1058,19 +1085,12 @@ class AgentTurnLoop:
             session_id=session.session_id,
             trace_id=trace_id,
             context_id=trace_id,
-            workspace_root=_session_workspace_path(session) or self.default_workspace_root,
+            workspace_root=self._workspace_for_run(session, run_id),
             tool_view=self._tool_view_for_run(run_id),
             run_id=run_id,
         )
-        user_message = self.session_service.append_message(
-            session_id=session.session_id,
-            role="user",
-            content=user_input,
-            payload={"trace_id": trace_id, "entrypoint": "agent.turn"},
-        )
-        self._apply_memory_pre_turn_gate(
-            _session_workspace_path(session) or self.default_workspace_root,
-            user_input, user_message.message_id,
+        user_input, _input_message = self._persist_turn_input(
+            session_id=session.session_id, run_id=run_id, trace_id=trace_id, user_input=user_input,
         )
         context_window = self.session_service.get_prompt_context_window(
             session_id=session.session_id,
@@ -1082,11 +1102,11 @@ class AgentTurnLoop:
             context_window_payload["workspace"] = session.workspace.model_dump(mode="json")
         if self.instruction_files is not None:
             context_window_payload["agent_instructions"] = self.instruction_files.for_workspace(
-                _session_workspace_path(session) or self.default_workspace_root
+                self._workspace_for_run(session, run_id)
             )
         recalled = self._memory_context_for_turn(
             session.session_id,
-            _session_workspace_path(session) or self.default_workspace_root,
+            self._workspace_for_run(session, run_id),
             user_input,
         )
         if recalled is not None:
@@ -1189,6 +1209,7 @@ class AgentTurnLoop:
                     reason="No supported package was selected.",
                 )
 
+        self._raise_if_cancel_requested()
         self._append_progress(
             progress_events,
             type="final_answer",
@@ -1219,9 +1240,11 @@ class AgentTurnLoop:
 
         self._finalize_multi_agent_plan(run_id)
 
+        self._raise_if_cancel_requested()
         updated_context_window = self.session_service.record_context_exchange(
             session_id=session.session_id,
             user_input=user_input,
+            input_role=self._turn_input_role(run_id),
             agent_answer=answer,
             trace_id=trace_id,
             token_budget=self.session_context_token_budget,
@@ -1278,8 +1301,7 @@ class AgentTurnLoop:
                     if isinstance(context_window_payload.get("recalled_memories"), dict)
                     else None
                 ),
-                "workspace_backend_path": _session_workspace_path(session)
-                or self.default_workspace_root,
+                "workspace_backend_path": self._workspace_for_run(session, run_id),
                 "context_window": {
                     "token_budget": updated_context_window.token_budget,
                     "token_estimate": updated_context_window.token_estimate,
@@ -2356,6 +2378,8 @@ class AgentTurnLoop:
         run = self.run_manager.get_run(run_id)
         if run is None:
             return {"status": "rejected", "message": "Agent run no longer exists."}
+        if run.parent_run_id is None and not self._session_run_policy(run_id).allow_fork:
+            parse_error = "Delegation is disabled by the frozen session policy."
         if self.fork_policy is None:
             parse_error = (
                 parse_error or "Structured multi-agent planning is disabled by server policy."
@@ -2921,6 +2945,10 @@ class AgentTurnLoop:
         operation_id: str,
         step_ids: list[str] | None = None,
     ) -> dict[str, Any]:
+        run = self.run_manager.get_run(run_id) if self.run_manager is not None else None
+        if run is not None and run.parent_run_id is None and not self._session_run_policy(run_id).allow_fork:
+            return {"status": "rejected", "operation_id": operation_id,
+                    "message": "Delegation is disabled by the frozen session policy."}
         recovery = self._terminal_plan_recovery(run_id)
         if recovery is not None:
             return {
@@ -3800,6 +3828,8 @@ class AgentTurnLoop:
         manager = getattr(self, "run_manager", None)
         run_id = _turn_run_id.get()
         run = manager.get_run(run_id) if manager is not None and run_id else None
+        if run is not None and run.parent_run_id is None and not self._session_run_policy(run_id).allow_fork:
+            return False
         if run is None or run.parent_run_id is None:
             return True
         if (
@@ -4448,13 +4478,67 @@ class AgentTurnLoop:
         )
         return normalized
 
+    def _input_envelope_for_run(self, run_id: str) -> TurnInputEnvelope | None:
+        run = self.run_manager.get_run(run_id) if self.run_manager is not None else None
+        raw = run.metadata.get("input_envelope") if run is not None else None
+        return TurnInputEnvelope.model_validate(raw) if raw is not None else None
+
+    def _turn_input_role(self, run_id: str) -> SessionRole:
+        envelope = self._input_envelope_for_run(run_id)
+        return "tool" if envelope is not None and envelope.origin != "user" else "user"
+
+    def _persist_turn_input(self, *, session_id: str, run_id: str, trace_id: str,
+                            user_input: str, message_id: str | None = None) -> tuple[str, AgentSessionMessage]:
+        envelope = self._input_envelope_for_run(run_id)
+        payload = {"trace_id": trace_id, "entrypoint": "agent.turn"}
+        if envelope is not None:
+            user_input = envelope.render()
+            message_id = envelope.message_id(session_id)
+            payload.update(input_origin=envelope.origin, input_id=envelope.input_id,
+                           input_envelope=envelope.model_dump(mode="json"))
+        message = self.session_service.append_message(
+            session_id=session_id, role=self._turn_input_role(run_id), content=user_input,
+            payload=payload, message_id=message_id,
+        )
+        if self._turn_input_role(run_id) == "user":
+            session = self.session_service.ensure_session(session_id=session_id)
+            self._apply_memory_pre_turn_gate(self._workspace_for_run(session, run_id), user_input, message.message_id)
+        return user_input, message
+
+    def _session_run_policy(self, run_id: str | None = None) -> SessionRunPolicy:
+        run_id = run_id or _turn_run_id.get()
+        run = self.run_manager.get_run(run_id) if self.run_manager and run_id else None
+        return SessionRunPolicy.model_validate(run.metadata.get("session_policy", {})) if run else SessionRunPolicy()
+
+    def _workspace_for_run(self, session: AgentSession, run_id: str | None = None) -> str | None:
+        path = _session_workspace_path(session)
+        if path is not None:
+            return path
+        return self.default_workspace_root if self._session_run_policy(run_id).allow_default_workspace else None
+
     def _tool_view_for_run(self, run_id: str) -> ToolView | None:
         if self.run_manager is None:
             return None
         run = self.run_manager.get_run(run_id)
         views = run.metadata.get("context_views", {}) if run is not None else {}
         tool_view_data = views.get("tool") if isinstance(views, dict) else None
-        return ToolView.model_validate(tool_view_data) if tool_view_data else None
+        if tool_view_data:
+            return ToolView.model_validate(tool_view_data)
+        policy = self._session_run_policy(run_id)
+        if policy.allowed_tools is None and policy.allowed_paths is None:
+            return None
+        tools = policy.allowed_tools
+        if tools is None:
+            tools = [spec.name for spec in self.tool_executor.registry.list_tools()]
+        return ToolView(
+            snapshot_id=f"session_policy:{run_id}",
+            allowed_tools=tuple(tools),
+            allowed_packages=(),
+            allowed_paths=tuple(policy.allowed_paths or ()),
+            full_workspace_authority=policy.allowed_paths is None,
+            full_data_authority=True,
+            side_effect_level=SideEffectLevel.EXTERNAL,
+        )
 
     def _configured_fast_path_request(
         self, *, run_id: str, session_id: str, user_input: str
@@ -5555,11 +5639,9 @@ class AgentTurnLoop:
         sanitized.pop("cached_tool_observations", None)
         if self.instruction_files is not None:
             workspace = sanitized.get("workspace")
-            workspace_path = (
-                workspace.get("backend_path") or self.default_workspace_root
-                if isinstance(workspace, dict)
-                else self.default_workspace_root
-            )
+            default_root = self.default_workspace_root if self._session_run_policy().allow_default_workspace else None
+            workspace_path = workspace.get("backend_path") if isinstance(workspace, dict) else None
+            workspace_path = workspace_path or default_root
             sanitized["agent_instructions"] = self.instruction_files.for_workspace(workspace_path)
         return sanitized
 
@@ -5671,7 +5753,7 @@ class AgentTurnLoop:
         if tool is None:
             return None, None
         read_only = effective_tool_read_only(tool, tool_input)
-        review_mode = self._effective_safety_review_mode()
+        review_mode = self._effective_safety_review_mode(tool_name)
         run_manager = _turn_run_manager.get()
         run_id = _turn_run_id.get()
         if run_manager is None or run_id is None:
@@ -5720,6 +5802,10 @@ class AgentTurnLoop:
                 stage="safety_review",
                 payload={"review": review.model_dump(mode="json")},
             )
+        # A pending human decision retains its original authority requirement
+        # across process/configuration changes and graph checkpoint recovery.
+        if review.mode == SafetyReviewMode.MANUAL:
+            review_mode = SafetyReviewMode.MANUAL
         if review.status == SafetyReviewStatus.PENDING:
             if review_mode == SafetyReviewMode.SKIP:
                 review = run_manager.decide_safety_review(
@@ -5818,7 +5904,7 @@ class AgentTurnLoop:
         if tool is None:
             return None, None
         read_only = effective_tool_read_only(tool, tool_input)
-        review_mode = self._effective_safety_review_mode()
+        review_mode = self._effective_safety_review_mode(tool_name)
         run_manager = _turn_run_manager.get()
         run_id = _turn_run_id.get()
         if run_manager is None or run_id is None:
@@ -5871,6 +5957,8 @@ class AgentTurnLoop:
             stage="safety_review",
             payload={"review": review.model_dump(mode="json")},
         )
+        if review.mode == SafetyReviewMode.MANUAL:
+            review_mode = SafetyReviewMode.MANUAL
         if review_mode == SafetyReviewMode.SKIP:
             decided = run_manager.decide_safety_review(
                 review_id=review.review_id,
@@ -6015,14 +6103,25 @@ class AgentTurnLoop:
             "or complete tool parameters."
         )
         user_prompt = serialize_prompt_payload({"review": review.model_dump(mode="json")})
-        response = self._complete_text_with_retry(
-            stage="safety_review",
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            prompt_summary=f"safety_review tool={review.tool_name}",
-            max_output_tokens=None,
-            llm_events=llm_events if llm_events is not None else [],
-        )
+        try:
+            response = self._complete_text_with_retry(
+                stage="safety_review",
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                prompt_summary=f"safety_review tool={review.tool_name}",
+                max_output_tokens=None,
+                llm_events=llm_events if llm_events is not None else [],
+            )
+        except (LLMResourceError, BackgroundBudgetDeferred, BackgroundTaskBudgetExceeded) as exc:
+            run_manager.decide_safety_review(
+                review_id=review.review_id,
+                decision=SafetyReviewDecision.REJECT,
+                decided_by="system.llm_resource_unavailable",
+                reason=("Safety review could not complete because model resources were refused "
+                        f"({getattr(exc, 'error_category', 'resource_unavailable')}). "
+                        "The tool was not executed; this is not an explicit model rejection."),
+            )
+            raise
         finish_reason = (getattr(response, "finish_reason", None)
                          or (getattr(response, "metadata", None) or {}).get("finish_reason"))
         incomplete = bool(response is not None and (getattr(response, "partial", False)
@@ -6057,6 +6156,7 @@ class AgentTurnLoop:
         package_name: str | None = None,
         status: str | None = None,
         metadata: dict[str, Any] | None = None,
+        persist: bool = True,
     ) -> None:
         progress_events.append(
             AgentTurnProgressEvent(
@@ -6071,6 +6171,8 @@ class AgentTurnLoop:
                 metadata=metadata or {},
             )
         )
+        if not persist:
+            return
         self._append_run_event(
             type=type,
             message=message,
@@ -7105,7 +7207,7 @@ class AgentTurnLoop:
                 stage=stage,
                 payload={"needed": exc.needed, "limit": exc.limit, "reason": exc.reason},
             )
-            raise LLMClientError(str(exc)) from exc
+            raise LLMResourceError(str(exc), error_category="prompt_budget_exceeded") from exc
         user_prompt = budgeted.user_prompt
         if max_output_tokens is None and isinstance(self.llm_client, LLMService) and stage != "safety_review":
             # Normal stages enforce the output reserve. Safety review deliberately
@@ -7264,6 +7366,14 @@ class AgentTurnLoop:
                 time.sleep(self._retry_after_seconds(exc.retry_after))
                 continue
             except LLMClientError as exc:
+                resource_refusal = isinstance(exc, (LLMResourceError, BackgroundBudgetDeferred, BackgroundTaskBudgetExceeded))
+                if resource_refusal:
+                    exc.is_retriable = False
+                    if not getattr(exc, "error_category", None):
+                        exc.error_category = (
+                            "background_task_budget_exceeded" if isinstance(exc, BackgroundTaskBudgetExceeded)
+                            else "budget_deferred"
+                        )
                 duration_ms = self._duration_ms(perf_start)
                 llm_event = self._llm_error_event(
                     stage=stage,
@@ -7301,6 +7411,8 @@ class AgentTurnLoop:
                     },
                 )
                 llm_events.append(llm_event)
+                if resource_refusal:
+                    raise
                 return None
 
             duration_ms = self._duration_ms(perf_start)
@@ -7895,23 +8007,27 @@ class AgentTurnLoop:
                 log_path=result.log_path,
             )
 
-    def _mark_current_run_failed(self, error_type: str, error: str) -> None:
+    def _mark_current_run_failed(self, error_type: str, error: str, *, exc: Exception | None = None) -> None:
         run_manager = _turn_run_manager.get()
         run_id = _turn_run_id.get()
         if run_manager is None or run_id is None:
             return
+        category = getattr(exc, "error_category", None)
+        resource_failure = isinstance(exc, (LLMResourceError, BackgroundBudgetDeferred, BackgroundTaskBudgetExceeded))
+        failure_type = category if resource_failure and isinstance(category, str) and category else error_type
         run_manager.append_event(
             run_id,
             "run_failed",
             error or "Agent run failed.",
             stage="run",
-            payload={"error_type": error_type},
+            payload={"error_type": error_type, **({"error_category": category, "is_retriable": False}
+                                                 if resource_failure and category else {})},
         )
         current_run = run_manager.get_run(run_id)
         if current_run is not None and current_run.parent_run_id is not None:
-            run_manager.fail_child_run(run_id, error_type=error_type, error=error)
+            run_manager.fail_child_run(run_id, error_type=failure_type, error=error)
         else:
-            run_manager.fail_run(run_id, error_type=error_type, error=error)
+            run_manager.fail_run(run_id, error_type=failure_type, error=error)
 
     def _mark_current_run_cancelled(self, reason: str) -> None:
         run_manager = _turn_run_manager.get()
@@ -7925,6 +8041,9 @@ class AgentTurnLoop:
         run_id = _turn_run_id.get()
         if run_manager is None or run_id is None:
             return
+        guard = getattr(self, "execution_guard", None)
+        if guard is not None:
+            guard(run_id)
         if run_manager.is_cancel_requested(run_id):
             reason = run_manager.cancel_reason(run_id) or "Run cancelled."
             raise AgentRunCancelled(reason)

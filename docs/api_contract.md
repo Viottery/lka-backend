@@ -1302,6 +1302,168 @@ limit 1..200，offset 0..1,000,000，q 最长 500 字符，按字面子串搜索
 会话恢复后重新计入。旧数据库的 workspace-only 会话在启动时按受允许目录补齐身份关联，
 不改会话时间或顺序、不删除消息、不改项目记忆 ID；无目录的会话继续独立存在。
 
+### 10.9 管理特殊会话
+
+会话列表、详情和回收站的 session 增加 `kind: ordinary|manager`，历史记录默认为 ordinary。
+普通创建接口或 metadata 中的类型标记不会把会话转换为 manager。
+
+以下接口需启用 `[management].enabled=true`，否则返回 409 `management_disabled`；
+沿用现有 loopback／`LKA_MEMORY_API_TOKEN` 校验。未引入账号或设备身份体系。
+
+| 接口 | 行为 |
+| --- | --- |
+| `POST /managers/default` | 并发幂等获取或首次创建主控会话，返回 200；已删除默认会话返回 409，不自动重建 |
+| `POST /managers` | 创建另一管理会话，返回 201；可传 title、make_default、llm_client_name、llm_model |
+| `GET /managers?limit=50&offset=0` | 返回未删除管理会话数组，limit 为 1..200 |
+| `GET /managers/{session_id}` | 返回一个管理会话与 controller，不是管理会话则 404 |
+| `PATCH /managers/{session_id}` | 修改 status 或模型默认值，必须携带 expected_revision；冲突 409 |
+
+单项响应为 `{session: {...}, controller: {...}}`。controller 包含 session_id、
+status(active/paused)、revision、llm_client_name、llm_model、created_at、updated_at。
+新建时 paused；模型字段省略保持原值，显式 null 清除。未知 client 返回 422。
+make_default=true 表示显式切换默认入口，主控会话无需固定 ID。
+
+对话仍通过通用 `/agent/turn` 或 `/agent/turn/stream`。请求模型覆盖优先于会话默认；
+运行冻结其实际会话策略，恢复沿用原设置，替换的新轮读取当前会话设置。
+主管会话开放 `management` 与 `matter` 的只读工具，不提供默认目录回退；事务线子 agent 的能力和路径按委托冻结。
+Matter 写入统一经过 `management.organize_work`，不开放即时 `matter.update` 等写工具。
+controller active 才能发出管理写命令；paused 可对话和读取结果。普通任务和 child 不开放管理包。
+
+工具包括 `list_sessions`、`read_session`、`list_runs`、`inspect_run`、`start_task`、
+`send_instruction`、`control_run`、`list_goals`、`read_goal`、`read_events` 和 `set_goal`。工具调用继续走包展开、schema 校验和统一安全审查。
+写命令必带稳定 `command_id`（1..128 字符），相同参数重试返回同一持久回执，参数改变则冲突。
+`start_task` 接收 purpose、可选 title/workspace_path，原子创建 ordinary 会话、独立 LangGraph root、
+会话关联和派发记录；回执包含 command_id、session_id、run_id、status=accepted、action。
+新回执另含 `snapshot_kind=command_commit`、`snapshot_at` 与 `run_snapshot`；
+替换还含 `replaced_run_snapshot`，分别描述新 run 已排队和旧 run 已取消，不能沿用介入前的 paused。
+`accepted` 是命令受理状态，不能当作运行完成；暂停请求中的 `pause_requested=true` 不等于已暂停。
+回执快照随命令固定，幂等重放保持原值；需查询当前状态时使用新的只读查询。
+workspace_path 为本后端平台绝对路径，仍验证工作区根；省略不继承管理会话目录。
+`send_instruction` 必带 session_id、purpose、expected_run_id；最后一轮已终态或无历史可启动下一轮，
+paused 时原子替换原轮。运行中先 pause 并等暂停确认，等待确认或答复不可替换；目标已变化则拒绝。
+`control_run` 接收显式 run_id 和 pause/resume/cancel；resume 只用于 paused，
+waiting_confirmation/waiting_user 使用原有确认／答复接口。管理暂停不连带取消独立任务。
+已关联独立任务进入等待用户／审批时会捕获去重提醒，唤醒空闲主管；旧问题已答复或取消后不再交付。
+兼容存储的 kind=timer、payload.task_waiting=true 表示该提醒，而非目标定时到期。
+waiting_user 快照可含有界 pending_user_question 与原 run 的 user_control.continue_path；
+waiting_confirmation 仅提示 requires_original_approval，不转交审批权限。主管处理提醒后可以接收其他委托，原工作线仍等待原用户入口。
+管理输入的发送方、目的、原话引用和有界调试信息冻结于本地运行记录，非用户输入保存为 tool，
+不会作为用户偏好提取；普通运行列表不返回完整提示。
+
+`GET /sessions/{session_id}/runs?limit=30&offset=0` 返回
+`{session_id,runs:[{run_id,session_id,trace_id,parent_run_id,status,created_at,started_at,completed_at,paused_at,waiting_since,error_type}],next_offset}`，
+只列主运行，按 created_at/run_id 倒序，limit 为 1..100；未启用管理也可查询，删除或不存在会话为 404。
+同一真实会话的 queued/running/paused/waiting 主运行占位，竞争的 turn/stream 返回 409，
+响应携带 detail、session_id 和占位 run_id；不同会话独立。替换在同事务转移位置，终态释放。
+管理工具的会话消息读取使用 limit/offset；长消息返回 next_char，按 message_id/start_char 续读。
+`management.list_sessions` 的每项和 `management.read_session` 的结果均包含 `latest_run` 安全摘要
+（无 root 时为 null），以及查询的 `observed_at`；消息页和 latest_run 在同一 SQLite 读事务取得。
+摘要包含运行 ID、状态、时间及暂停／取消请求标志，不暴露 metadata、完整提示或内部结果。
+摘要已满足状态查询时无需再调用 list_runs／inspect_run；历史运行和指定运行仍可分别查询。
+`completed` 仅表示运行状态，不能证明当前消息页已包含全部结果；分页／续读合同不变。
+派发 worker 在 API 生命周期运行，按检查点恢复原运行；无安全检查点则失败并保留记录。
+管理派发要求 SQLite checkpoint；memory 配置拒绝新增派发，幂等命令仍可查原回执。
+结果可由后续管理轮按需读取；启用 `autonomous_enabled` 后，任务终态和目标到期还可唤醒自动轮。
+外部主动结果通知尚未实现。
+
+长期目标与后台记录接口同样沿用本地授权：
+
+| 接口 | 行为 |
+| --- | --- |
+| `POST /managers/{session_id}/goals` | 创建目标，201；objective 必填（1..16000 字符），status 默认 active，可传 next_wake_at、wait_run_id |
+| `GET /managers/{session_id}/goals?limit=50&offset=0` | 返回 goals、next_offset；limit 1..100 |
+| `GET /managers/{session_id}/goals/{goal_id}` | 读取完整目标 |
+| `PATCH /managers/{session_id}/goals/{goal_id}` | 必须传 expected_revision；冲突 409；省略保持原值，next_wake_at／wait_run_id 显式 null 清除 |
+| `GET /managers/{session_id}/events?after=0&limit=50` | 返回 events、next_after，按递增 event_id；保留原事件及 consumed_execution_id |
+| `GET /managers/{session_id}/executions?after=0&limit=50` | 返回 executions、next_after；包含稳定 execution_id／run_id、冻结事件和目标版本 |
+| `GET /managers/{session_id}/deliveries?after=0&limit=50` | 返回 deliveries、next_after；引用已发布 session／run／message，不包含推送确认 |
+
+目标状态为 active、waiting、paused、completed、cancelled；时间必须含时区，保存为 UTC。
+wait_run_id 必须是现存 ordinary root。目标修改增加 revision 与 timer_generation；
+到期捕获清除 next_wake_at，但不增加 revision。已编辑或取消目标的迟到事件不能重新激活它。
+事件与后台记录的 after 均为非负整数游标；next_after 为 null 表示本次已读完，
+持续轮询时客户端仍应保存已收到的最大 event_id 或 cursor。接口不返回原始 LLM prompt。
+
+`management.set_goal` 必带 command_id；创建时 objective 必填，更新时必须带 goal_id 和
+expected_revision。人工发起管理轮返回 status=applied；自主轮返回 status=proposed，
+先校验并保存提案，最终提交同时发布目标和回答。同一自主轮每个目标只能有一份提案。
+回执是历史快照，重复命令不重新应用。旧提案所属轮失败或被替换后，新轮重用该 command_id 会冲突；
+应先读取当前目标，再用新 command_id 提交重新考虑后的提案。`list_goals` 只预览 objective 前 500 字符，
+`read_goal(goal_id,start_char)` 可继续读取，每页 4000 字符。
+
+Matter 增加一等 `visibility: user|internal`，旧记录为 user。list/search 默认 user，
+可显式查询 internal/all；get 已知 ID 仍验证来源权限。sync 保持全量授权变更，
+客户端统一投影 user 列表／日历／计数；同 ID visibility 切换以 revision 更新，不能过滤掉删除投影所需的变化。
+规划进度只计算 user 子任务，visibility 不改变 ACL，也不以是否有日期推断。
+
+`management.overview` 提供有界工作预览，`inspect_work` 读取事项、可选管理扩展及关系；
+`organize_work(command_id,operations)` 在同一事务内执行 1..20 个 create/update/link/bind_goal。
+create 默认 internal（须启用开关），update 必带 expected_revision，link 支持 supports/depends_on 并拒绝循环。
+管理扩展分别保存 purpose、responsible_party、next_action、wait_condition、management_state，
+事项允许没有 due_at；不往普通 metadata 存储管理状态或完整提示。
+绑定 goal 后，业务标题、摘要和完成状态以 Matter 为准，goal 只保留调度状态；
+get/list_goal 返回 matter_id/matter_revision/matter_status，拒绝直接改绑定 goal 的 objective/status。
+未绑定历史目标保持原有行为。自主 organize 提案与正式回答一同提交；失败／版本冲突不部分写回。
+
+额外的管理工具（沿用包展开和审查，不增加专用 Agent 执行 HTTP 端点）：
+
+- `readiness(matter_id)`：读取 depends_on 的业务完成与核验条件；supports 不阻塞。
+- `start_work(command_id,matter_id,expected_revision,purpose,title?,workspace_path?)`：同事务验证工作与依赖、创建独立任务和绑定；稳定重试返回原受理任务，依赖未就绪不产生任务。独立任务一经受理不因主管轮失败而取消。
+- `assign_existing(command_id,matter_id,expected_revision,run_id,expected_run_status?)`：关联本主管已创建的独立任务；提交时拒绝未就绪依赖，不会门控已开始的未绑定运行。
+- `result_view(matter_id)`：读取绑定运行及核验状态，实际正文使用 read_session。
+- `review(...)`：仅核验已绑定且 completed 的运行，accepted 必须引用同 run 的真实 agent 消息 ID；保存核验并返回 completion_update，不直接完成 Matter。自主核验先发布，再在后续轮使用 organize_work 更新完成状态。任何后续业务编辑会保守使旧完成核验失效。
+- `read_policies(limit?,offset?)`：读取近期提醒与周期配置。
+- `configure_attention(expected_revision,enabled,timezone?,horizon_days?)`：初次 expected_revision=0，horizon 1..90；默认不启用，只扫描 user 活跃事项。
+- `configure_schedule(command_id,goal_id,timezone,kind,...)`：kind 为 one_shot/daily/weekly；一次性用带时区 run_at，日／周用 local_time=HH:MM，周另传 weekday（周一=0）。更新需 schedule_id、expected_revision，并提交完整配置；可传 expires_at、enabled。
+
+排队与关注工具：
+
+- `delegate_work(command_id,objective,title?,workspace_path?,allowed_tools?)`：创建独立持久事务线子 agent，返回 delegate_id、session_id、state、revision。当前主管轮可结束，子 agent 独立推进；默认只授予已注册的非管理只读工具，显式工具清单不能包含管理工具。workspace_path 冻结路径范围；省略不获得默认目录权限。子 agent 仅可管理自己创建的普通执行会话，不能递归创建下级主管。
+- `list_delegates(limit?,offset?)`／`read_delegate(delegate_id,start_char?)`：读取本主管名下（或子 agent 自身）归属、最新运行和分页目标／报告／证据。来源原文不进入普通返回字段。
+- `report_delegate(command_id,kind,summary,evidence?)`：子 agent 报告 progress/completed/needs_decision/blocked；evidence 引用自己名下 session_id、run_id、message_id，服务端复验归属。回执 proposed，只在当前轮最终发布事务成功后提交报告、主管事件与本轮终态；失败不发送。completed 要求没有未终结执行任务。
+- `instruct_delegate(command_id,delegate_id,expected_revision,instruction)`：父主管向空闲子 agent 补充指令并唤醒新轮，支持继续已完成事务线。冻结工具／路径保持不变；忙碌时冲突，不能取代原用户确认或答复。重复命令返回原回执。
+- `control_delegate(command_id,delegate_id,expected_revision,action)`：父主管 pause/cancel 事务线，先持久收回后续执行权限，再取消该线与其执行会话中的未终态运行；重复命令重发原取消信号。pause 是停止推进而非保留运行检查点的暂停；原运行终结后可 instruct_delegate 继续，cancel 不可复活。
+- 智能体创建的事务线及执行会话强制冻结高风险人工审批策略；已注册工具声明 high 风险或 requires_confirmation 时，不能因 skip/llm 模式自动批准。等待确认保留原 review/run 身份，由原用户审批入口决定，主管与子 agent 都不能代批；重启、恢复、替换不能降低此策略。
+- 显式事务线和回报不依赖 autonomous_enabled；父子 controller 均需 active。回报唤醒主管的新 run，经既有消息／SSE 与 delivery 索引交付；失败／等待用户也持久捕获，重复扫描不重复交付。
+- `queue_work(command_id,purpose,matter_id?,expected_revision?,priority?,deadline?,read_only_work?,workspace_path?,write_resources?)`：立即持久受理独立 root，等待验证过的依赖及写资源后才派发。Matter 与 expected_revision 必须同时提供或都省略；无 Matter 的临时任务也可排队。priority 为 low/normal/high/urgent，默认 normal；deadline 必须带时区，只参与排序，不是超时取消。回执仍为 accepted，另含 queue_id、queue_state=pending、queue_revision，不能当作已执行。
+- `list_queue(limit?,offset?)`：返回 items、next_offset，可见 pending/paused/blocked/released/finished 及 issue、当前 revision。
+- `control_queue(command_id,queue_id,expected_revision,action)`：action=pause/resume，仅控制未派发 pending/paused 项；已运行任务继续用 control_run。取消也使用原 run 控制入口，后台回收该队列项。
+- `list_available_watches(q?,limit?,offset?)`：发现既有 watch ID 和有界用途预览，不返回原始来源配置。
+- `list_watch_subscriptions(limit?,offset?)`：读取当前管理会话显式订阅。
+- `configure_watch(command_id,watch_id,expected_revision?,enabled?,condition?,goal_id?)`：初次 revision=0，绑定既有 watch 的当前授权版本；condition=published 接收之后每份已发布简报，changes 仅接收 changes 非空的简报。配置／重绑从当前发布基线开始，不补配置前历史。
+- `read_notification(event_id?|briefing_id?,start_char?,max_chars?)`：二选一引用本会话有效 inbox，返回 JSON 正文 content、next_char、total_chars；默认／上限 4000 字符。不重新抓取来源，不转交原始来源授权。
+- `read_delivery_policy()`、`configure_delivery(expected_revision,muted?,snooze_until?,allow_decisions?)`：初次 revision=0；muted 或未来的带时区 snooze_until 抑制普通自动唤醒／交付，捕获水位继续推进。allow_decisions 默认 true，保留工作线提问／审批提醒；false 则一起静音。静音事件不被当作已消费，解除后重验有效性再处理。
+
+队列在接纳时冻结原始来源封装、模型及累计额度，释放时不创建新运行或新预算。
+仅就绪项按跨主管持久轮转、主管内优先级／等待老化／软期限排序；未核验依赖不抢占执行槽。
+read_only_work 默认 true，实际冻结只读工具白名单并关闭 fork；写工作需显式 workspace_path。
+写工作保留已验证工作区及可选精确资源键；父子目录互斥，等待／暂停期间保留逻辑预留，终态才释放。
+预留只协调此队列内的工作，不提供操作系统文件隔离，也不覆盖既有直接任务。
+排队工作不支持原地替换指令；应取消原 run 后用新 command_id 重新入队，原运行恢复保持冻结权限。
+队列不再用 dispatch_workers 限制就绪释放；独立任务动态派发，写预留和业务依赖继续约束释放。手动恢复仍走原用户路径和共享模型资源控制。
+事项版本／来源或写工作区变化会阻止旧工作执行，blocked 项须重新核对，不自动重绑定。
+
+未来捕获策略仅允许用户前台委托轮修改，自主轮不能即时改写策略绕过最终提交。
+周期按 IANA 时区计算；DST 不存在时刻跳过该日／周，重复时刻固定 fold=0。
+每次只捕获最近一次到期 occurrence，事件与触发水位一起提交；暂停、过期标 skipped，恢复不无限补跑。
+近期提醒按事项 ID、日期事实、提醒阶段和目的地去重，标题／排序修改不重复提醒；
+每次持久推进一页候选，末页回到开头。并发重排可在下一轮补齐，不提供单次扫描快照。
+策略取消／修订及业务版本变化都会在绑定和最终发布时重验；未交付的失效事件可在新策略代重建，已交付事实不重播。
+这些交付均为本地管理会话消息；未接入外部推送或任意来源的通用变化流。
+既有 watch 简报引用通过 watch_subscription_revision 与 scope_version 在捕获、读取、绑定和最终发布时重验；
+watch scope 变化后必须显式重新订阅，不能自动把新范围视为已授权。
+静音／稍后策略版本同样在最终事务重验；不停止来源捕获，不重置模型额度。
+
+自动管理轮绑定持久事件集合、controller revision、目标 revisions 和绑定 Matter revisions；同会话已有未终态 root
+时不创建第二个 root。成功最终事务同时发布消息、上下文、目标与 Matter 提案、final_answer／run_completed
+事件、消费水位及 delivery。失败不消费事件。业务已提交但 checkpoint 未完成时，从原 run 的
+result artifact 返回已提交结果。等待确认／用户答复和显式暂停保留原 run，仍需原控制入口；
+用户输入自动抢占、持久输入排队和外部通知不在此阶段。
+
+重命名、删除和恢复继续使用 `/sessions`。自动空会话清理禁止删除 manager；
+手动删除需 controller paused、没有未终态运行或活跃／等待目标，否则 409。
+恢复保留 kind 和历史并维持 controller paused，默认指针保留以便恢复原入口。
+
 ## 11. Mail Import
 
 ```http

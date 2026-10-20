@@ -15,17 +15,23 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from uuid import uuid4
 
-from app.core.llm.errors import LLMClientError
+from app.core.llm.errors import LLMResourceError
 from app.core.llm.models import LLMRequest, LLMStreamEvent
 from app.core.prompt_tokens import PromptTokenCounter
 
 
-class LiveBudgetExceeded(LLMClientError):
+class LiveBudgetExceeded(LLMResourceError):
     """No external dispatch is allowed after a reservation is refused."""
 
+    def __init__(self, message: str):
+        super().__init__(message, error_category="live_budget_exceeded")
 
-class ProtectedEvaluationContent(LLMClientError):
+
+class ProtectedEvaluationContent(LLMResourceError):
     """Credential content is never authorized as model-visible test input."""
+
+    def __init__(self, message: str):
+        super().__init__(message, error_category="protected_evaluation_content")
 
 
 def _protected_credential_values(env_file: Path = Path(".env")) -> tuple[str, ...]:

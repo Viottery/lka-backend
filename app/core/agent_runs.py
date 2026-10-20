@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import queue
 import threading
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 from enum import Enum
 from hashlib import sha1
@@ -139,9 +139,9 @@ class InMemoryAgentRunManager:
             metadata=metadata or {},
         )
         with self._lock:
+            self._persist_run(record)
             self._runs[run_id] = record
             self._events[run_id] = []
-            self._persist_run(record)
         return record
 
     def create_child_run(
@@ -325,8 +325,8 @@ class InMemoryAgentRunManager:
                 "multi_agent_aggregate_fingerprint": fingerprint,
             })
             updated = current.model_copy(update={"metadata": metadata})
-            self._runs[run_id] = updated
             self._persist_run(updated)
+            self._runs[run_id] = updated
         return self.append_event(
             run_id,
             "multi_agent_aggregated",
@@ -447,11 +447,39 @@ class InMemoryAgentRunManager:
             existing = self._runs.get(record.run_id)
             if existing is not None:
                 return existing
+            self._persist_run(record)
             self._runs[record.run_id] = record
             self._events[record.run_id] = self._load_events(record.run_id)
             self._restore_reviews(record.run_id)
             self._restore_cancel_request(record)
-            self._persist_run(record)
+        return record
+
+    def complete_run_in_transaction(
+        self, conn, run_id: str, *, result_snapshot: dict[str, Any],
+        log_path: str | None = None, event_payload: dict[str, Any] | None = None,
+        final_answer_event: dict[str, Any] | None = None,
+    ) -> AgentRunRecord:
+        """No cache writes or manager locks; refresh only after caller commit."""
+        if self.durable_store is None:
+            raise ValueError("Atomic completion requires a durable run store")
+        return AgentRunRecord.model_validate(self.durable_store.complete_run_in_transaction(
+            conn, run_id, result_snapshot=result_snapshot, log_path=log_path, event_payload=event_payload,
+            final_answer_event=final_answer_event,
+        ))
+
+    def refresh_after_transaction(self, record: AgentRunRecord | dict[str, Any]) -> AgentRunRecord:
+        """Load a committed record/events without writing a stale cache to SQLite."""
+        record = AgentRunRecord.model_validate(record)
+        if self.durable_store is None:
+            raise ValueError("Transaction refresh requires a durable run store")
+        persisted = self.durable_store.load_run(record.run_id)
+        if persisted is None or persisted != record.model_dump(mode="json"):
+            raise ValueError("Run transaction has not committed or record has changed")
+        events = self._load_events(record.run_id)
+        with self._lock:
+            self._runs[record.run_id] = record
+            self._events[record.run_id] = events
+            self._restore_cancel_request(record)
         return record
 
     def mark_running(self, run_id: str) -> AgentRunRecord:
@@ -1396,7 +1424,9 @@ class InMemoryAgentRunManager:
             return updated
 
     def replace_paused(self, run_id: str, *, user_input: str, command_id: str,
-                       request_fingerprint: str) -> AgentRunRecord:
+                       request_fingerprint: str, session_policy: dict[str, Any] | None = None,
+                       metadata_updates: dict[str, Any] | None = None,
+                       on_created: Callable[[Any, AgentRunRecord], None] | None = None) -> AgentRunRecord:
         """Atomically abandon a paused root and queue its idempotent replacement."""
         with self._lock:
             current = self.get_run(run_id)
@@ -1419,9 +1449,12 @@ class InMemoryAgentRunManager:
             now = _now_iso()
             trace_id = _stable_id("agent_turn", current.session_id, command_id, now)
             new_id = _stable_id("agent_run", trace_id, now)
+            frozen_policy = session_policy if session_policy is not None else current.metadata.get("session_policy")
             replacement = AgentRunRecord(run_id=new_id, session_id=current.session_id, trace_id=trace_id,
                 status=AgentRunStatus.QUEUED, user_input=user_input, created_at=now,
-                metadata={"entrypoint": "agent.turn", "replaces_run_id": run_id,
+                metadata={**json.loads(json.dumps(metadata_updates or {})),
+                          "entrypoint": "agent.turn", "replaces_run_id": run_id,
+                          **({"session_policy": json.loads(json.dumps(frozen_policy))} if frozen_policy is not None else {}),
                           **({"orchestrator": "langgraph"} if current.metadata.get("orchestrator") == "langgraph" else {})})
             updated = current.model_copy(update={"status": AgentRunStatus.CANCELLED, "cancelled_at": now,
                 "error_type": "cancelled", "error": "Replaced by a new user message.", "metadata": {
@@ -1434,7 +1467,7 @@ class InMemoryAgentRunManager:
                 stage="control", pending=[], payload={"superseded_by_run_id": new_id}),
                 self._control_event(new_id, "run_replacement_created", "Replacement run queued.",
                 stage="control", pending=[], payload={"replaces_run_id": run_id})]
-            self._commit_control_updates([current], [updated], events, created=[replacement])
+            self._commit_control_updates([current], [updated], events, created=[replacement], on_created=on_created)
             return replacement
 
     def request_cancel(self, run_id: str, reason: str | None = None) -> None:
@@ -1497,9 +1530,12 @@ class InMemoryAgentRunManager:
         events: list[AgentRunEvent],
         *,
         created: list[AgentRunRecord] | None = None,
+        on_created: Callable[[Any, AgentRunRecord], None] | None = None,
     ) -> None:
         if not updated:
             return
+        if on_created is not None and self.durable_store is None:
+            raise ValueError("Atomic replacement callbacks require a durable run store.")
         if self.durable_store is not None:
             self.flush_events()
             self.durable_store.save_run_control_batch(
@@ -1508,6 +1544,8 @@ class InMemoryAgentRunManager:
                 events=[event.model_dump(mode="json") for event in events],
                 updated_at=_now_iso(),
                 created=[record.model_dump(mode="json") for record in created or []],
+                on_created=(lambda conn, payload: on_created(conn, AgentRunRecord.model_validate(payload)))
+                if on_created is not None else None,
             )
         for record in created or []:
             self._runs[record.run_id] = record
@@ -1552,8 +1590,8 @@ class InMemoryAgentRunManager:
                 metadata.update(metadata_patch)
                 payload["metadata"] = metadata
             updated = current.model_copy(update={"status": status, **payload})
-            self._runs[run_id] = updated
             self._persist_run(updated)
+            self._runs[run_id] = updated
             return updated
 
     def _persist_run(self, record: AgentRunRecord) -> None:

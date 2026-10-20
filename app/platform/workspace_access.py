@@ -16,10 +16,10 @@ def approved_path(path: Path, context: Any) -> bool:
 
 
 def require_child_path_scope(path: Path, context: Any) -> None:
-    """Recheck a child snapshot's immutable path ceiling."""
+    """Recheck a snapshot or session policy's immutable path ceiling."""
 
     view = getattr(context, "tool_view", None)
-    if view is None or getattr(view, "child_run_id", None) is None:
+    if view is None:
         return
     if getattr(view, "full_workspace_authority", False):
         return

@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from hashlib import sha1, sha256
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.domains.mail_knowledge import MailKnowledgeMirror
 
@@ -24,6 +25,60 @@ def _stable_id(prefix: str, *parts: str | None) -> str:
     text = "|".join(part or "" for part in parts)
     digest = sha1(text.encode("utf-8")).hexdigest()[:12]
     return f"{prefix}_{digest}"
+
+
+def validate_matter_date(value: str | None) -> str | None:
+    """Accept an ISO calendar date or an instant with an explicit timezone."""
+    if value is None:
+        return None
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        date.fromisoformat(value)
+        return value
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?(?:Z|[+-]\d{2}:\d{2})", value):
+        raise ValueError("Expected an ISO date or timezone-aware datetime")
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("Datetime must include a timezone")
+    return value
+
+
+def validate_scheduled_on(value: str | None) -> str | None:
+    if value is not None:
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+            raise ValueError("scheduled_on must be an ISO calendar date")
+        date.fromisoformat(value)
+    return value
+
+
+def validate_scheduled_time(value: str | None) -> str | None:
+    validate_matter_date(value)
+    if value is not None and len(value) == 10:
+        raise ValueError("Time blocks require timezone-aware datetimes")
+    return value
+
+
+def validate_sections(value: list[str]) -> list[str]:
+    if len(value) > 100:
+        raise ValueError("At most 100 plan sections are supported")
+    normalized = [item.strip() for item in value]
+    if any(not item or len(item) > 120 for item in normalized):
+        raise ValueError("Section names must be 1..120 characters")
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("Section names must be unique")
+    return normalized
+
+
+def validate_planning_state(*, kind: str, scheduled_start: str | None, scheduled_end: str | None, sections: list[str]) -> None:
+    if (scheduled_start is None) != (scheduled_end is None):
+        raise ValueError("scheduled_start and scheduled_end must both be supplied or both cleared")
+    if scheduled_start is not None and datetime.fromisoformat(scheduled_start) >= datetime.fromisoformat(scheduled_end):
+        raise ValueError("scheduled_start must be earlier than scheduled_end")
+    if kind != "plan" and sections:
+        raise ValueError("Only plans may define sections")
+
+
+class MatterConflictError(ValueError):
+    """A matter changed after the caller read its revision."""
 
 
 class MatterSourceLinkInput(BaseModel):
@@ -40,6 +95,17 @@ class MatterSourceLink(BaseModel):
 
 
 class MatterCreateInput(BaseModel):
+    visibility: Literal["user", "internal"] = "user"
+    scheduled_on: str | None = None
+    scheduled_start: str | None = None
+    scheduled_end: str | None = None
+    inbox: bool = Field(default=False, strict=True)
+    section: str = Field(default="", max_length=120)
+    sort_order: float = Field(default=0, allow_inf_nan=False)
+    sections: list[str] = Field(default_factory=list)
+    kind: Literal["task", "plan"] = "task"
+    parent_matter_id: str | None = None
+    project_id: str | None = None
     title: str
     summary: str = ""
     status: str = "open"
@@ -49,8 +115,24 @@ class MatterCreateInput(BaseModel):
     source_links: list[MatterSourceLinkInput] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
+    _validate_due_at = field_validator("due_at")(validate_matter_date)
+    _validate_scheduled_on = field_validator("scheduled_on")(validate_scheduled_on)
+    _validate_scheduled_times = field_validator("scheduled_start", "scheduled_end")(validate_scheduled_time)
+    _validate_sections = field_validator("sections")(validate_sections)
+
 
 class MatterUpdateInput(BaseModel):
+    visibility: Literal["user", "internal"] = "user"
+    scheduled_on: str | None = None
+    scheduled_start: str | None = None
+    scheduled_end: str | None = None
+    inbox: bool = Field(default=False, strict=True)
+    section: str = Field(default="", max_length=120)
+    sort_order: float = Field(default=0, allow_inf_nan=False)
+    sections: list[str] = Field(default_factory=list)
+    parent_matter_id: str | None = None
+    project_id: str | None = None
+    expected_revision: int | None = Field(default=None, ge=1)
     title: str | None = None
     summary: str | None = None
     status: str | None = None
@@ -59,8 +141,25 @@ class MatterUpdateInput(BaseModel):
     tags: list[str] | None = None
     metadata: dict[str, Any] | None = None
 
+    _validate_due_at = field_validator("due_at")(validate_matter_date)
+    _validate_scheduled_on = field_validator("scheduled_on")(validate_scheduled_on)
+    _validate_scheduled_times = field_validator("scheduled_start", "scheduled_end")(validate_scheduled_time)
+    _validate_sections = field_validator("sections")(validate_sections)
+
 
 class MatterRecord(BaseModel):
+    visibility: Literal["user", "internal"] = "user"
+    scheduled_on: str | None = None
+    scheduled_start: str | None = None
+    scheduled_end: str | None = None
+    inbox: bool = Field(default=False, strict=True)
+    section: str = Field(default="", max_length=120)
+    sort_order: float = Field(default=0, allow_inf_nan=False)
+    sections: list[str] = Field(default_factory=list)
+    kind: Literal["task", "plan"] = "task"
+    parent_matter_id: str | None = None
+    project_id: str | None = None
+    progress: dict[str, int] = Field(default_factory=lambda: {"total": 0, "done": 0, "cancelled": 0})
     matter_id: str
     title: str
     summary: str
@@ -77,9 +176,33 @@ class MatterRecord(BaseModel):
 
 class MatterList(BaseModel):
     matters: list[MatterRecord]
+    next_offset: int | None = None
+    total_count: int = 0
+
+
+class MatterSyncChange(BaseModel):
+    sequence: int
+    matter: MatterRecord
+
+
+class MatterSyncPage(BaseModel):
+    changes: list[MatterSyncChange]
+    cursor: int
+    has_more: bool
 
 
 class MatterSearchResultItem(BaseModel):
+    visibility: Literal["user", "internal"] = "user"
+    scheduled_on: str | None = None
+    scheduled_start: str | None = None
+    scheduled_end: str | None = None
+    inbox: bool = Field(default=False, strict=True)
+    section: str = Field(default="", max_length=120)
+    sort_order: float = Field(default=0, allow_inf_nan=False)
+    sections: list[str] = Field(default_factory=list)
+    kind: Literal["task", "plan"] = "task"
+    parent_matter_id: str | None = None
+    project_id: str | None = None
     matter_id: str
     title: str
     summary: str
@@ -111,13 +234,56 @@ class MatterService:
     VALID_STATUSES = {"open", "in_progress", "waiting", "done", "cancelled"}
     VALID_PRIORITIES = {"low", "normal", "high", "urgent"}
 
-    def __init__(self, conn_factory: Callable[[], sqlite3.Connection]) -> None:
+    def __init__(self, conn_factory: Callable[[], sqlite3.Connection], *,
+                 internal_items_enabled: Callable[[], bool] | None = None) -> None:
         self._conn_factory = conn_factory
+        self.internal_items_enabled = internal_items_enabled or (lambda: False)
         self.__receipt_token = object()
         with self._write_connection() as conn:
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(matters)")}
             if "revision" not in columns:
                 conn.execute("ALTER TABLE matters ADD COLUMN revision INTEGER NOT NULL DEFAULT 1")
+            for column, declaration in (
+                ("visibility", "TEXT NOT NULL DEFAULT 'user' CHECK(visibility IN ('user','internal'))"),
+                ("kind", "TEXT NOT NULL DEFAULT 'task'"),
+                ("parent_matter_id", "TEXT"),
+                ("project_id", "TEXT"),
+                ("scheduled_on", "TEXT"),
+                ("scheduled_start", "TEXT"),
+                ("scheduled_end", "TEXT"),
+                ("inbox", "INTEGER NOT NULL DEFAULT 0"),
+                ("section", "TEXT NOT NULL DEFAULT ''"),
+                ("sort_order", "REAL NOT NULL DEFAULT 0"),
+                ("sections", "TEXT NOT NULL DEFAULT '[]'"),
+            ):
+                if column not in columns:
+                    conn.execute(f"ALTER TABLE matters ADD COLUMN {column} {declaration}")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_matters_parent ON matters(parent_matter_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_matters_project ON matters(project_id, kind)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_matters_schedule ON matters(scheduled_on)")
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS matter_changes("
+                "sequence INTEGER PRIMARY KEY AUTOINCREMENT, matter_id TEXT NOT NULL)"
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_matter_changes_id ON matter_changes(matter_id)")
+            for trigger, table, event, identity in (
+                ("matter_change_insert", "matters", "INSERT", "NEW.matter_id"),
+                ("matter_change_update", "matters", "UPDATE", "NEW.matter_id"),
+                ("matter_link_change_insert", "matter_source_links", "INSERT", "NEW.matter_id"),
+                ("matter_link_change_update", "matter_source_links", "UPDATE", "NEW.matter_id"),
+                ("matter_link_change_delete", "matter_source_links", "DELETE", "OLD.matter_id"),
+            ):
+                conn.execute(
+                    f"CREATE TRIGGER IF NOT EXISTS {trigger} AFTER {event} ON {table} "
+                    f"BEGIN INSERT INTO matter_changes(matter_id) VALUES({identity}); END"
+                )
+            # Seed unchanged legacy rows once; triggers and seed share this transaction.
+            conn.execute(
+                "INSERT INTO matter_changes(matter_id) SELECT m.matter_id FROM matters m "
+                "WHERE NOT EXISTS(SELECT 1 FROM matter_changes c WHERE c.matter_id=m.matter_id) "
+                "ORDER BY m.created_at,m.matter_id"
+            )
+
 
     @contextmanager
     def _write_connection(self, conn: sqlite3.Connection | None = None):
@@ -190,6 +356,39 @@ class MatterService:
         ):
             raise PermissionError("message_matter_proposal_receipt_required")
 
+    def _validate_plan_links(
+        self, conn, *, kind, parent_matter_id, project_id, project_explicit,
+        source_ids, account_ids, allow_unattributed,
+    ):
+        if parent_matter_id is not None:
+            if kind != "task":
+                raise ValueError("Only tasks can belong to a plan")
+            parent = self.get_matter(
+                matter_id=parent_matter_id, conn=conn, source_ids=source_ids,
+                account_ids=account_ids, allow_unattributed=allow_unattributed,
+            )
+            if parent.kind != "plan":
+                raise ValueError("Task parent must be a plan")
+            if project_explicit and project_id != parent.project_id:
+                raise ValueError("Task project must match its plan project")
+            project_id = parent.project_id
+        if project_id is not None and not conn.execute(
+            "SELECT 1 FROM project_profiles WHERE project_id=?", (project_id,),
+        ).fetchone():
+            raise ValueError("Unknown directory project")
+        return project_id
+
+    def _plan_progress(self, conn, matter_id, *, source_ids=None, account_ids=None, allow_unattributed=True):
+        rows = conn.execute(
+            "SELECT matter_id, status FROM matters WHERE parent_matter_id=? AND kind='task' AND visibility='user'", (matter_id,),
+        ).fetchall()
+        rows = [row for row in rows if self._matter_in_scope(
+            conn, matter_id=row["matter_id"], source_ids=source_ids,
+            account_ids=account_ids, allow_unattributed=allow_unattributed,
+        )]
+        return {"total": len(rows), "done": sum(row["status"] == "done" for row in rows),
+                "cancelled": sum(row["status"] == "cancelled" for row in rows)}
+
     def create_matter(
         self,
         payload: MatterCreateInput,
@@ -198,6 +397,7 @@ class MatterService:
         account_ids: tuple[str, ...] | None = None,
         allow_unattributed: bool = True,
         conn: sqlite3.Connection | None = None,
+        matter_id: str | None = None,
         _receipt: Any = None,
     ) -> MatterRecord:
         if (
@@ -206,13 +406,17 @@ class MatterService:
             and not allow_unattributed
         ):
             raise PermissionError("Unlinked matters are outside the child source/account scope.")
+        if payload.visibility == "internal" and not self.internal_items_enabled():
+            raise PermissionError("Internal matter creation is disabled")
+        if matter_id is not None and (not isinstance(matter_id, str) or not matter_id.strip()):
+            raise ValueError("matter_id must be a non-empty server-assigned ID")
         now = _now_iso()
         title = payload.title.strip() or "Untitled matter"
         summary = payload.summary.strip() or title
         status = self._normalized_status(payload.status)
         priority = self._normalized_priority(payload.priority)
         tags = self._normalized_tags(payload.tags)
-        matter_id = _stable_id(
+        matter_id = matter_id or _stable_id(
             "matter",
             title,
             summary,
@@ -237,13 +441,23 @@ class MatterService:
                     allow_unattributed=allow_unattributed,
                     conn=transaction,
                 )
+            validate_planning_state(
+                kind=payload.kind, scheduled_start=payload.scheduled_start,
+                scheduled_end=payload.scheduled_end, sections=payload.sections,
+            )
+            project_id = self._validate_plan_links(
+                transaction, kind=payload.kind, parent_matter_id=payload.parent_matter_id,
+                project_id=payload.project_id, project_explicit="project_id" in payload.model_fields_set,
+                source_ids=source_ids, account_ids=account_ids, allow_unattributed=allow_unattributed,
+            )
             transaction.execute(
                 """
                 INSERT INTO matters(
                     matter_id, title, summary, status, priority, due_at,
-                    tags, metadata, created_at, updated_at
+                    tags, metadata, created_at, updated_at, kind, parent_matter_id, project_id,
+                    scheduled_on, scheduled_start, scheduled_end, inbox, section, sort_order, sections, visibility
                 )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     matter_id,
@@ -256,6 +470,17 @@ class MatterService:
                     self._json_dumps(payload.metadata),
                     now,
                     now,
+                    payload.kind,
+                    payload.parent_matter_id,
+                    project_id,
+                    payload.scheduled_on,
+                    payload.scheduled_start,
+                    payload.scheduled_end,
+                    int(payload.inbox),
+                    payload.section,
+                    payload.sort_order,
+                    self._json_dumps(payload.sections),
+                    payload.visibility,
                 ),
             )
             self._upsert_fts(transaction, matter_id, title, summary, tags)
@@ -267,14 +492,21 @@ class MatterService:
             )
             return self.get_matter(matter_id=matter_id, conn=transaction)
 
-    def get_matter(self, *, matter_id: str, conn: sqlite3.Connection | None = None) -> MatterRecord:
+    def get_matter(
+        self, *, matter_id: str, conn: sqlite3.Connection | None = None,
+        source_ids: tuple[str, ...] | None = None,
+        account_ids: tuple[str, ...] | None = None,
+        allow_unattributed: bool = True,
+    ) -> MatterRecord:
         owns = conn is None
         conn = conn or self._conn_factory()
         try:
+            if owns:
+                conn.execute("BEGIN")
             row = conn.execute(
                 """
                 SELECT matter_id, title, summary, status, priority, due_at,
-                       tags, metadata, created_at, updated_at, revision
+                       tags, metadata, created_at, updated_at, revision, kind, parent_matter_id, project_id, scheduled_on, scheduled_start, scheduled_end, inbox, section, sort_order, sections, visibility
                 FROM matters
                 WHERE matter_id = ?
                 """,
@@ -282,11 +514,55 @@ class MatterService:
             ).fetchone()
             if row is None:
                 raise KeyError(f"Matter not found: {matter_id}")
+            if not self._matter_in_scope(
+                conn, matter_id=matter_id, source_ids=source_ids,
+                account_ids=account_ids, allow_unattributed=allow_unattributed,
+            ):
+                raise PermissionError("Matter is outside the child source/account scope.")
             source_links = self._load_source_links(conn, matter_id=matter_id)
+            record = self._record_from_row(row, source_links=source_links)
+            if record.kind == "plan":
+                record.progress = self._plan_progress(
+                    conn, matter_id, source_ids=source_ids, account_ids=account_ids,
+                    allow_unattributed=allow_unattributed,
+                )
         finally:
             if owns:
                 conn.close()
-        return self._record_from_row(row, source_links=source_links)
+        return record
+
+    def sync_matters(self, *, after: int = 0, limit: int = 200) -> MatterSyncPage:
+        """Read a bounded change page, hydrating current records in one snapshot.
+
+        Sequence entries may repeat a matter. This feed has no deletion contract;
+        cancellation is an ordinary update. Clients derive parent progress from
+        their full task cache because child changes do not journal parent records.
+        """
+        if after < 0 or not 1 <= limit <= 500:
+            raise ValueError("Sync requires after >= 0 and limit in 1..500")
+        conn = self._conn_factory()
+        try:
+            conn.execute("BEGIN")
+            rows = conn.execute(
+                "SELECT sequence,matter_id FROM matter_changes WHERE sequence>? ORDER BY sequence LIMIT ?",
+                (after, limit + 1),
+            ).fetchall()
+            has_more = len(rows) > limit
+            page = rows[:limit]
+            records: dict[str, MatterRecord] = {}
+            changes = []
+            for row in page:
+                matter_id = row["matter_id"]
+                if matter_id not in records:
+                    records[matter_id] = self.get_matter(matter_id=matter_id, conn=conn)
+                changes.append(MatterSyncChange(sequence=row["sequence"], matter=records[matter_id]))
+            return MatterSyncPage(
+                changes=changes,
+                cursor=page[-1]["sequence"] if page else after,
+                has_more=has_more,
+            )
+        finally:
+            conn.close()
 
     def _matter_in_scope(
         self,
@@ -414,85 +690,143 @@ class MatterService:
         self,
         *,
         limit: int = 50,
+        offset: int = 0,
         status: str | None = None,
+        q: str | None = None,
+        kind: Literal["task", "plan"] | None = None,
+        parent_matter_id: str | None = None,
+        project_id: str | None = None,
+        due_before: str | None = None,
+        due_after: str | None = None,
+        unscheduled: bool = False,
+        scheduled_on: str | None = None,
+        scheduled_before: str | None = None,
+        scheduled_after: str | None = None,
+        inbox: bool | None = None,
+        section: str | None = None,
         source_ids: tuple[str, ...] | None = None,
         account_ids: tuple[str, ...] | None = None,
         allow_unattributed: bool = True,
+        visibility: Literal["user", "internal", "all"] = "user",
+        conn: sqlite3.Connection | None = None,
     ) -> MatterList:
-        conn = self._conn_factory()
+        if visibility not in {"user", "internal", "all"}:
+            raise ValueError("visibility must be user, internal or all")
+        page_size = max(1, min(int(limit), 200))
+        start = max(0, int(offset))
+        conditions: list[str] = []
+        params: list[Any] = []
+        if visibility != "all":
+            conditions.append("visibility = ?")
+            params.append(visibility)
+        if status == "active":
+            conditions.append("status IN ('open', 'in_progress', 'waiting')")
+        elif status:
+            conditions.append("status = ?")
+            params.append(self._normalized_status(status))
+        for column, value in (("kind", kind), ("parent_matter_id", parent_matter_id), ("project_id", project_id)):
+            if value is not None:
+                conditions.append(f"{column} = ?")
+                params.append(value)
+        if q and q.strip():
+            conditions.append("(instr(lower(title), lower(?)) > 0 OR instr(lower(summary), lower(?)) > 0)")
+            params.extend((q.strip(), q.strip()))
+        if unscheduled:
+            conditions.append("due_at IS NULL")
+        for column, value in (("inbox", inbox), ("section", section)):
+            if value is not None:
+                conditions.append(f"{column} = ?")
+                params.append(value)
+        for bound, operator in ((scheduled_on, "="), (scheduled_before, "<"), (scheduled_after, ">=")):
+            if bound is not None:
+                validate_scheduled_on(bound)
+                conditions.append(f"scheduled_on {operator} ?")
+                params.append(bound)
+
+        for bound, operator in ((due_before, "<"), (due_after, ">=")):
+            if bound is not None:
+                validate_matter_date(bound)
+                # Calendar deadlines follow the caller's local day; timed deadlines
+                # remain absolute instants, including when offsets differ.
+                calendar_bound = datetime.fromisoformat(bound).date().isoformat()
+                conditions.append(
+                    f"((length(due_at) = 10 AND julianday(due_at) {operator} julianday(?)) "
+                    f"OR (length(due_at) != 10 AND julianday(due_at) {operator} julianday(?)))"
+                )
+                params.extend((calendar_bound, bound))
+        where = " WHERE " + " AND ".join(conditions) if conditions else ""
+        scoped = source_ids is not None or account_ids is not None
+        owns = conn is None
+        conn = conn if conn is not None else self._conn_factory()
         try:
-            if source_ids is not None or account_ids is not None:
+            # Count and page share a snapshot; child authority is filtered before pagination.
+            if owns:
                 conn.execute("BEGIN")
-            limit_sql = "LIMIT ?" if source_ids is None and account_ids is None else ""
-            if status:
-                rows = conn.execute(
-                    f"""
-                    SELECT matter_id, title, summary, status, priority, due_at,
-                           tags, metadata, created_at, updated_at, revision
-                    FROM matters
-                    WHERE status = ?
-                    ORDER BY
-                        due_at IS NULL,
-                        due_at ASC,
-                        updated_at DESC
-                    {limit_sql}
-                    """,
-                    (self._normalized_status(status), limit)
-                    if limit_sql
-                    else (self._normalized_status(status),),
-                ).fetchall()
+            rows = conn.execute(
+                "SELECT matter_id, title, summary, status, priority, due_at, "
+                "tags, metadata, created_at, updated_at, revision, kind, parent_matter_id, project_id, scheduled_on, scheduled_start, scheduled_end, inbox, section, sort_order, sections, visibility FROM matters" + where +
+                " ORDER BY sort_order ASC, julianday(due_at) IS NULL, julianday(due_at) ASC, updated_at DESC, matter_id ASC" +
+                ("" if scoped else " LIMIT ? OFFSET ?"),
+                params if scoped else [*params, page_size, start],
+            ).fetchall()
+            if scoped:
+                rows = [row for row in rows if self._matter_in_scope(
+                    conn, matter_id=row["matter_id"], source_ids=source_ids,
+                    account_ids=account_ids, allow_unattributed=allow_unattributed,
+                )]
+                total_count = len(rows)
+                rows = rows[start:start + page_size]
             else:
-                rows = conn.execute(
-                    f"""
-                    SELECT matter_id, title, summary, status, priority, due_at,
-                           tags, metadata, created_at, updated_at, revision
-                    FROM matters
-                    ORDER BY
-                        due_at IS NULL,
-                        due_at ASC,
-                        updated_at DESC
-                    {limit_sql}
-                    """,
-                    (limit,) if limit_sql else (),
-                ).fetchall()
-            rows = [
-                row
-                for row in rows
-                if self._matter_in_scope(
-                    conn,
-                    matter_id=row["matter_id"],
-                    source_ids=source_ids,
-                    account_ids=account_ids,
-                    allow_unattributed=allow_unattributed,
-                )
-            ][:limit]
+                total_count = conn.execute("SELECT COUNT(*) FROM matters" + where, params).fetchone()[0]
             links_by_matter = self._load_source_links_for_rows(conn, rows)
+            records = [self._record_from_row(row, source_links=links_by_matter.get(row["matter_id"], [])) for row in rows]
+            for record in records:
+                if record.kind == "plan":
+                    record.progress = self._plan_progress(
+                        conn, record.matter_id, source_ids=source_ids, account_ids=account_ids,
+                        allow_unattributed=allow_unattributed,
+                    )
+            return MatterList(
+                matters=records,
+                total_count=total_count,
+                next_offset=start + page_size if start + page_size < total_count else None,
+            )
         finally:
-            conn.close()
-        return MatterList(
-            matters=[
-                self._record_from_row(
-                    row,
-                    source_links=links_by_matter.get(row["matter_id"], []),
-                )
-                for row in rows
-            ]
-        )
+            if owns:
+                conn.close()
 
     def search_matters(
         self,
         *,
         query: str,
         limit: int = 10,
+        kind: Literal["task", "plan"] | None = None,
+        parent_matter_id: str | None = None,
+        project_id: str | None = None,
         source_ids: tuple[str, ...] | None = None,
         account_ids: tuple[str, ...] | None = None,
         allow_unattributed: bool = True,
+        visibility: Literal["user", "internal", "all"] = "user",
+        conn: sqlite3.Connection | None = None,
     ) -> MatterSearchResult:
+        if visibility not in {"user", "internal", "all"}:
+            raise ValueError("visibility must be user, internal or all")
         normalized_query = query.strip()
-        conn = self._conn_factory()
+        owns = conn is None
+        conn = conn if conn is not None else self._conn_factory()
         try:
-            if source_ids is not None or account_ids is not None:
+            if owns:
                 conn.execute("BEGIN")
+            filters: list[str] = []
+            filter_params: list[Any] = []
+            if visibility != "all":
+                filters.append("visibility = ?")
+                filter_params.append(visibility)
+            for column, value in (("kind", kind), ("parent_matter_id", parent_matter_id), ("project_id", project_id)):
+                if value is not None:
+                    filters.append(f"{column} = ?")
+                    filter_params.append(value)
+            filter_sql = " AND " + " AND ".join(filters) if filters else ""
             limit_sql = "LIMIT ?" if source_ids is None and account_ids is None else ""
             if normalized_query:
                 rows = conn.execute(
@@ -505,31 +839,32 @@ class MatterService:
                         m.priority,
                         m.due_at,
                         m.tags,
-                        m.revision,
+                        m.revision, m.kind, m.parent_matter_id, m.project_id, m.scheduled_on, m.scheduled_start, m.scheduled_end, m.inbox, m.section, m.sort_order, m.sections, m.visibility,
                         snippet(matters_fts, 2, '[', ']', '...', 12) AS snippet
                     FROM matters_fts
                     JOIN matters m ON m.matter_id = matters_fts.matter_id
-                    WHERE matters_fts MATCH ?
+                    WHERE matters_fts MATCH ? {filter_sql}
                     ORDER BY rank
                     {limit_sql}
                     """,
-                    (self._fts_query(normalized_query), limit)
+                    [self._fts_query(normalized_query), *filter_params, limit]
                     if limit_sql
-                    else (self._fts_query(normalized_query),),
+                    else [self._fts_query(normalized_query), *filter_params],
                 ).fetchall()
             else:
                 rows = conn.execute(
                     f"""
-                    SELECT matter_id, title, summary, status, priority, due_at, tags, revision,
+                    SELECT matter_id, title, summary, status, priority, due_at, tags, revision, kind, parent_matter_id, project_id, scheduled_on, scheduled_start, scheduled_end, inbox, section, sort_order, sections, visibility,
                            summary AS snippet
                     FROM matters
+                    WHERE 1=1 {filter_sql}
                     ORDER BY
                         due_at IS NULL,
                         due_at ASC,
                         updated_at DESC
                     {limit_sql}
                     """,
-                    (limit,) if limit_sql else (),
+                    [*filter_params, limit] if limit_sql else filter_params,
                 ).fetchall()
             rows = [
                 row
@@ -543,12 +878,17 @@ class MatterService:
                 )
             ][:limit]
         finally:
-            conn.close()
+            if owns:
+                conn.close()
 
         return MatterSearchResult(
             query=query,
             matters=[
                 MatterSearchResultItem(
+                    visibility=row["visibility"],
+                    scheduled_on=row["scheduled_on"], scheduled_start=row["scheduled_start"], scheduled_end=row["scheduled_end"],
+                    inbox=bool(row["inbox"]), section=row["section"], sort_order=row["sort_order"], sections=self._json_list(row["sections"]),
+                    kind=row["kind"], parent_matter_id=row["parent_matter_id"], project_id=row["project_id"],
                     matter_id=row["matter_id"],
                     title=row["title"],
                     summary=row["summary"],
@@ -603,7 +943,7 @@ class MatterService:
             if payload.priority is not None
             else current.priority
         )
-        due_at = payload.due_at if payload.due_at is not None else current.due_at
+        due_at = payload.due_at if "due_at" in payload.model_fields_set else current.due_at
         tags = self._normalized_tags(payload.tags) if payload.tags is not None else current.tags
         metadata = payload.metadata if payload.metadata is not None else current.metadata
         now = _now_iso()
@@ -615,11 +955,36 @@ class MatterService:
             allow_unattributed=allow_unattributed,
         ):
             raise PermissionError("Matter is outside the child source/account scope.")
+        if payload.expected_revision is not None and payload.expected_revision != current.revision:
+            raise MatterConflictError(f"Matter revision conflict: {matter_id}")
+        visibility = payload.visibility if "visibility" in payload.model_fields_set else current.visibility
+        if current.visibility == "user" and visibility == "internal" and not self.internal_items_enabled():
+            raise PermissionError("Internal matter creation is disabled")
+        parent_matter_id = payload.parent_matter_id if "parent_matter_id" in payload.model_fields_set else current.parent_matter_id
+        project_id = payload.project_id if "project_id" in payload.model_fields_set else current.project_id
+        project_id = self._validate_plan_links(
+            conn, kind=current.kind, parent_matter_id=parent_matter_id, project_id=project_id,
+            project_explicit="project_id" in payload.model_fields_set,
+            source_ids=source_ids, account_ids=account_ids, allow_unattributed=allow_unattributed,
+        )
+        if current.kind == "plan" and current.project_id != project_id and conn.execute(
+            "SELECT 1 FROM matters WHERE parent_matter_id=? LIMIT 1", (matter_id,),
+        ).fetchone():
+            raise ValueError("Detach all tasks before changing the plan project")
+        planning = {
+            field: getattr(payload, field) if field in payload.model_fields_set else getattr(current, field)
+            for field in ("scheduled_on", "scheduled_start", "scheduled_end", "inbox", "section", "sort_order", "sections")
+        }
+        validate_planning_state(
+            kind=current.kind, scheduled_start=planning["scheduled_start"],
+            scheduled_end=planning["scheduled_end"], sections=planning["sections"],
+        )
         conn.execute(
             """
                 UPDATE matters
                 SET title = ?, summary = ?, status = ?, priority = ?, due_at = ?,
-                    tags = ?, metadata = ?, updated_at = ?, revision = revision + 1
+                    tags = ?, metadata = ?, updated_at = ?, parent_matter_id = ?, project_id = ?,
+                    scheduled_on = ?, scheduled_start = ?, scheduled_end = ?, inbox = ?, section = ?, sort_order = ?, sections = ?, visibility = ?, revision = revision + 1
                 WHERE matter_id = ?
                 """,
             (
@@ -631,11 +996,21 @@ class MatterService:
                 self._json_dumps(tags),
                 self._json_dumps(metadata),
                 now,
+                parent_matter_id,
+                project_id,
+                planning["scheduled_on"],
+                planning["scheduled_start"],
+                planning["scheduled_end"],
+                int(planning["inbox"]),
+                planning["section"],
+                planning["sort_order"],
+                self._json_dumps(planning["sections"]),
+                visibility,
                 matter_id,
             ),
         )
         self._upsert_fts(conn, matter_id, title, summary, tags)
-        return self.get_matter(matter_id=matter_id, conn=conn)
+        return self.get_matter(matter_id=matter_id, conn=conn, source_ids=source_ids, account_ids=account_ids, allow_unattributed=allow_unattributed)
 
     def link_source(
         self,
@@ -696,7 +1071,7 @@ class MatterService:
                 "UPDATE matters SET revision=revision+1, updated_at=? WHERE matter_id=?",
                 (now, matter_id),
             )
-            return self.get_matter(matter_id=matter_id, conn=transaction)
+            return self.get_matter(matter_id=matter_id, conn=transaction, source_ids=source_ids, account_ids=account_ids, allow_unattributed=allow_unattributed)
 
     def _upsert_fts(
         self,
@@ -789,6 +1164,10 @@ class MatterService:
         source_links: list[MatterSourceLink],
     ) -> MatterRecord:
         return MatterRecord(
+            visibility=row["visibility"],
+            scheduled_on=row["scheduled_on"], scheduled_start=row["scheduled_start"], scheduled_end=row["scheduled_end"],
+            inbox=bool(row["inbox"]), section=row["section"], sort_order=row["sort_order"], sections=self._json_list(row["sections"]),
+            kind=row["kind"], parent_matter_id=row["parent_matter_id"], project_id=row["project_id"],
             matter_id=row["matter_id"],
             title=row["title"],
             summary=row["summary"],

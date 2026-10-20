@@ -97,6 +97,17 @@ def get_session(session_id: str, request: Request) -> SessionDetailResponse:
     return SessionDetailResponse(**result.model_dump())
 
 
+@router.get("/{session_id}/runs")
+def list_session_runs(session_id: str, request: Request,
+                      limit: int = Query(default=30, ge=1, le=100),
+                      offset: int = Query(default=0, ge=0)) -> dict:
+    """Server-side run discovery, independent of a device's SSE cursor."""
+    try:
+        return request.app.state.runtime.managed_tasks.list_runs(session_id, limit=limit, offset=offset)
+    except KeyError as exc:
+        raise HTTPException(404, detail="Session not found") from exc
+
+
 @router.patch("/{session_id}", response_model=SessionDetailResponse)
 def rename_session(
     session_id: str,

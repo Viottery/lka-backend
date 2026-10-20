@@ -25,7 +25,7 @@ from uuid import uuid4
 
 from app.core.llm.errors import LLMClientError
 
-_BACKGROUND_POOLS = {"background_memory", "background_message", "background_io"}
+_BACKGROUND_POOLS = {"background_memory", "background_message", "background_io", "background_agent"}
 _logger = logging.getLogger(__name__)
 
 
@@ -441,7 +441,7 @@ class LLMWorkloadController:
                 if ((quota.max_tokens is not None and used["total_tokens"] + tokens > quota.max_tokens)
                         or (quota.max_calls is not None and used["total_calls"] + 1 > quota.max_calls)):
                     raise WorkBudgetExceeded("work budget exhausted")
-            if ticket.workload.pool not in {"interactive", "background_memory"}:
+            if ticket.workload.pool not in {"interactive", "background_memory", "background_agent"}:
                 if self.daily_cost_limit and (self._ticket_cost(ticket, 0, 0) is None
                         or (not ticket.workload.pricing and not (self.input_price or self.output_price))):
                     exc = BackgroundBudgetDeferred("background model pricing is unknown")
@@ -554,7 +554,7 @@ class LLMWorkloadController:
                     if not foreground:
                         permitted = permitted and not self._interactive_waiters and time.monotonic() >= self._cooldown_until
                         permitted = permitted and background < self.max_concurrency - self.interactive_reserved
-                        permitted = permitted and self._active[workload.pool] < self.pool_limits[workload.pool]
+                        permitted = permitted and self._active[workload.pool] < self.pool_limits.get(workload.pool, self.max_concurrency)
                     if permitted:
                         self._active[workload.pool] += 1
                         if foreground:

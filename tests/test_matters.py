@@ -124,6 +124,7 @@ def test_matter_tools_are_registered(tmp_path, monkeypatch):
         "matter.create_many",
         "matter.search",
         "matter.list",
+        "matter.get",
         "matter.update",
         "matter.link_source",
     }

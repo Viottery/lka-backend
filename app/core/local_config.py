@@ -500,6 +500,27 @@ class BackgroundConfig(BaseModel):
         return self
 
 
+class ManagementConfig(BaseModel):
+    """Opt-in management tools and separately enabled bounded autonomous work."""
+
+    enabled: bool = False
+    autonomous_enabled: bool = False
+    internal_items_enabled: bool = False
+    # Legacy input accepted for old configuration files; dispatch is dynamic.
+    dispatch_workers: int = Field(default=1, ge=1, le=8, exclude=True)
+    poll_seconds: float = Field(default=5, ge=0.1, le=3600)
+    min_wake_interval_seconds: float = Field(default=60, ge=0, le=86400)
+    max_daily_rounds: int | None = Field(default=None, ge=1, le=1000)
+    max_causal_rounds: int = Field(default=6, ge=1, le=100)
+    failure_limit: int = Field(default=3, ge=1, le=20)
+    manager_max_calls: int | None = Field(default=None, ge=1)
+    manager_max_tokens: int | None = Field(default=None, ge=1)
+    goal_max_calls: int | None = Field(default=None, ge=1)
+    goal_max_tokens: int | None = Field(default=None, ge=1)
+    execution_max_calls: int | None = Field(default=None, ge=1)
+    execution_max_tokens: int | None = Field(default=None, ge=1)
+
+
 class LocalAppConfig(BaseModel):
     llm: LLMProviderConfig = Field(default_factory=LLMProviderConfig)
     safety: SafetyReviewConfig = Field(default_factory=SafetyReviewConfig)
@@ -512,6 +533,7 @@ class LocalAppConfig(BaseModel):
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     message_history: MessageHistoryConfig = Field(default_factory=MessageHistoryConfig)
     background: BackgroundConfig = Field(default_factory=BackgroundConfig)
+    management: ManagementConfig = Field(default_factory=ManagementConfig)
 
     @model_validator(mode="after")
     def inference_profiles_match_llm_clients(self) -> LocalAppConfig:

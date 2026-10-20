@@ -516,3 +516,52 @@ No benchmark case should depend on or mutate the user's real mailbox.
 - `file_ops/real_llm_file_bash_tasks`: real LLM Agent-turn file/bash tasks
   without `tool_plan` or `scripted_answer`; run with `--llm-mode real` and a
   real `--local-config`.
+
+## Persistent management delegate evaluations
+
+`evals.lka_evals.management_cases` is a dedicated driver for persistent manager
+sessions and event-driven follow-up turns. It does not use the generic one-turn
+runner to approximate this lifecycle. The public synthetic catalog is
+`fixtures/management_delegates.json`; no private report or runtime database is
+needed. Listing and default dry runs do not load private configuration, create a
+runtime, or call providers:
+
+```bash
+.venv/bin/python -m evals.lka_evals.management_cases --list --json
+.venv/bin/python -m evals.lka_evals.management_cases --case date_handoff
+.venv/bin/python -m evals.lka_evals.management_cases --run \
+  --case ownership --case restart_dedup --case lease --case manual_high_risk \
+  --output /tmp/management-contracts-new
+```
+
+Offline selections invoke bounded pytest node IDs against actual ownership,
+lease, restart/deduplication and registered-tool manual approval contracts. These
+passes do not establish real-model semantic quality. Model scenarios require an
+explicit selection, both dispatch gates, a fresh output directory and an
+explicitly authorized budget, for example:
+
+```bash
+.venv/bin/python -m evals.lka_evals.management_cases --run --llm-mode real \
+  --case date_handoff --output /tmp/management-date-new \
+  --ledger /path/to/shared-evaluation-budget.sqlite3 \
+  --call-limit 24 --usd-limit 0.30 --local-config config/local.toml
+```
+
+The driver reads the configured default model only after those gates. Current
+ledger pricing supports only configured `deepseek-flash`; an unpriced model is
+refused. All registered clients, including review calls, are metered at the async
+provider boundary. Search is disabled. Reservations and failures remain charged;
+reuse `--ledger` across retries, never clear it to obtain a successful result.
+Stored management ledger ceilings cannot be raised. Every run uses fresh data and
+synthetic workspace files, disables unrelated background features and never
+starts/restarts a service or connects to the daily database.
+
+`parallel_lines` requires two delegates and four independent execution sessions,
+then checks source content, ownership, completed-run readbacks, report references,
+parent report reads, dates, compatibility, capacity and arithmetic. `date_handoff`
+generates a new source identifier at execution and requires `needs_decision` for
+the date mismatch. `approval_conflict` tests a missing current approval against an
+obsolete approval; its earlier budget-limited attempt remains **unvalidated**, not
+a pass. Missing trace evidence, partial runs, unknown results and budget failures
+never count as passes. Structured gates still require independent semantic review;
+inspect local report and trace artifacts before a production release decision.

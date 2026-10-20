@@ -9,6 +9,16 @@ class LLMClientError(RuntimeError):
     """Raised when a configured LLM provider cannot complete a request."""
 
 
+class LLMResourceError(LLMClientError):
+    """A local resource refusal ends this run without another model dispatch."""
+
+    is_retriable = False
+
+    def __init__(self, message: str, *, error_category: str):
+        super().__init__(message)
+        self.error_category = error_category
+
+
 class LLMContextCapacityError(LLMClientError):
     def __init__(self, message: str, *, error_category: str):
         super().__init__(message)

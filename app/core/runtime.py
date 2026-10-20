@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 import threading
+from contextlib import closing
 from datetime import UTC, datetime
 from hashlib import sha1, sha256
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -67,6 +69,7 @@ from app.core.sessions import (
     AgentSessionList,
     AgentSessionMessage,
     SessionRole,
+    SessionRunPolicy,
     SessionService,
     SessionWorkspace,
 )
@@ -91,6 +94,8 @@ from app.domains.mail import (
     MailService,
 )
 from app.domains.mail_knowledge import MailKnowledgeMirror, MailKnowledgeMirrorResult
+from app.domains.managed_tasks import ManagedTaskService
+from app.domains.management import ManagementService
 from app.domains.matters import (
     MatterCreateInput,
     MatterList,
@@ -164,10 +169,12 @@ from app.tool_packages.mail import (
     build_mail_package,
 )
 from app.tool_packages.mail_expert_tools import MailBatchLoadTool, MailSnapshotTool
+from app.tool_packages.management import MANAGEMENT_PACKAGE, management_tools
 from app.tool_packages.matter import (
     MATTER_PACKAGE,
     CreateManyMattersTool,
     CreateMatterTool,
+    GetMatterTool,
     LinkMatterSourceTool,
     ListMattersTool,
     SearchMattersTool,
@@ -291,6 +298,12 @@ class LocalKnowledgeAgentRuntime:
         self.session_service = SessionService(
             self._conn, context_token_counter=context_counter
         )
+        self.management_service = ManagementService(self._conn, self.session_service)
+        self.management_service.ensure_schema()
+        self.session_service.before_delete = self.management_service.guard_delete
+        self.session_service.after_delete = self.management_service.after_delete
+        self.session_service.after_restore = self.management_service.after_restore
+        self.session_service.run_policy_provider = self._session_run_policy
         self.memory_service = MemoryService(self.db_path)
         self.memory_service.ensure_schema()
         self.project_service = ProjectService(self._conn, self.memory_service)
@@ -424,6 +437,7 @@ class LocalKnowledgeAgentRuntime:
         self.tool_registry.register_tool(CreateMatterTool(self.matter_service))
         self.tool_registry.register_tool(CreateManyMattersTool(self.matter_service))
         self.tool_registry.register_tool(SearchMattersTool(self.matter_service))
+        self.tool_registry.register_tool(GetMatterTool(self.matter_service))
         self.tool_registry.register_tool(ListMattersTool(self.matter_service))
         self.tool_registry.register_tool(UpdateMatterTool(self.matter_service))
         self.tool_registry.register_tool(LinkMatterSourceTool(self.matter_service))
@@ -583,6 +597,7 @@ class LocalKnowledgeAgentRuntime:
             llm_client=self.agent_llm_client,
             log_dir=self.settings.data_dir / "agent_logs",
             max_decision_steps=self.local_app_config.agent.max_decision_steps,
+            llm_max_attempts=self.local_app_config.llm.max_attempts,
             run_manager=self.agent_run_manager,
             safety_review_mode=self.local_app_config.safety.tool_review_mode,
             safety_manual_wait_poll_seconds=(
@@ -778,9 +793,206 @@ class LocalKnowledgeAgentRuntime:
             tool_executor=MockToolExecutor(),
             trace_recorder=TraceRecorder(self._conn),
         )
+        # Dispatch is generic; management owns only command/link persistence.
+        from app.core.agent_dispatch import AgentDispatcher
+
+        self.agent_dispatch = AgentDispatcher(
+            self.background_job_store, self.agent_run_manager,
+            execute=self._execute_dispatched_agent_run,
+            resume=lambda run, guard: self._execute_dispatched_agent_run(run, guard, resume=True),
+            has_checkpoint=lambda run_id: bool(self._runner_for_turn(existing_run_id=run_id).get_state(run_id).values),
+            request_pause=lambda run: self.interrupt_agent_run(run.run_id),
+        )
+        self.agent_turn_loop.execution_guard = self.agent_dispatch.check_run
+        self.managed_tasks = ManagedTaskService(
+            self._conn, sessions=self.session_service, management=self.management_service,
+            run_store=self.agent_run_store, run_manager=self.agent_run_manager,
+            policy=self._session_run_policy,
+            workspace=lambda path: self._resolve_session_workspace(
+                path=path, platform=self.platform.name,
+            ).model_dump(mode="json"),
+            enqueue=lambda run, **kwargs: self.agent_dispatch.enqueue(run.run_id, **kwargs),
+            replace=self.replace_agent_run, interrupt=self.interrupt_agent_run,
+            enabled=lambda: self.local_app_config.management.enabled,
+            guard=self.agent_dispatch.check_run,
+            durable_execution=lambda: self.local_app_config.agent.checkpoint_backend == "sqlite",
+        )
+        self.managed_tasks.ensure_schema()
+        from app.domains.management_goals import ManagementGoalService
+        from app.experts.management import ManagementCoordinator
+
+        self.management_goals = ManagementGoalService(self._conn, self.management_service)
+        self.management_goals.ensure_schema()
+        self.management_service.goal_service = self.management_goals
+        from app.domains.management_work import ManagementWorkService
+
+        self.matter_service.internal_items_enabled = lambda: self.local_app_config.management.internal_items_enabled
+        self.management_work = ManagementWorkService(
+            self._conn, matters=self.matter_service, tasks=self.managed_tasks,
+            management=self.management_service, goals=self.management_goals,
+            run_store=self.agent_run_store, run_manager=self.agent_run_manager,
+        )
+        self.management_work.ensure_schema()
+        self.management_goals.work_service = self.management_work
+        self.managed_tasks.work_service = self.management_work
+        from app.domains.management_assignments import ManagementAssignmentService
+
+        self.management_assignments = ManagementAssignmentService(
+            self._conn, tasks=self.managed_tasks, matters=self.matter_service,
+            work=self.management_work, goals=self.management_goals,
+        )
+        self.management_assignments.ensure_schema()
+        from app.domains.management_attention import ManagementAttentionService
+        from app.domains.management_schedules import ManagementScheduleService
+
+        self.management_attention = ManagementAttentionService(
+            self._conn, matters=self.matter_service, goals=self.management_goals, management=self.management_service,
+        )
+        self.management_attention.ensure_schema()
+        self.management_schedules = ManagementScheduleService(
+            self._conn, goals=self.management_goals, management=self.management_service,
+        )
+        self.management_schedules.ensure_schema()
+        from app.domains.management_delivery import ManagementDeliveryService
+        from app.domains.management_queue import ManagementQueueService
+        from app.domains.management_watches import ManagementWatchService
+
+        self.management_delivery = ManagementDeliveryService(self._conn)
+        self.management_delivery.ensure_schema()
+        self.management_watch_subscriptions = ManagementWatchService(
+            self._conn, watches=self.watch_service, goals=self.management_goals, tasks=self.managed_tasks,
+        )
+        self.management_watch_subscriptions.ensure_schema()
+        self.management_queue = ManagementQueueService(
+            self._conn, tasks=self.managed_tasks, assignments=self.management_assignments,
+            dispatcher=self.agent_dispatch, config=self.local_app_config.management,
+            read_only_tools=lambda: [tool.name for tool in self.tool_registry.list_tools()
+                                     if tool.read_only is True and tool.package != "management"],
+        )
+        self.management_queue.ensure_schema()
+        self.management_coordinator = ManagementCoordinator(
+            self._conn, goals=self.management_goals, management=self.management_service,
+            tasks=self.managed_tasks, sessions=self.session_service,
+            run_store=self.agent_run_store, run_manager=self.agent_run_manager,
+            dispatcher=self.agent_dispatch, config=self.local_app_config.management,
+            workloads=self.llm_workloads,
+        )
+        from app.domains.management_delegates import ManagementDelegateService
+
+        self.management_delegates = ManagementDelegateService(
+            self._conn, tasks=self.managed_tasks, management=self.management_service,
+            goals=self.management_goals, registry=self.tool_registry,
+        )
+        self.management_delegates.ensure_schema()
+        self.managed_tasks.delegates = self.management_delegates
+        self.management_service.delegates = self.management_delegates
+        self.management_coordinator.delegates = self.management_delegates
+        self.management_coordinator.ensure_schema()
+        self.management_coordinator.work_service = self.management_work
+        self.management_coordinator.attention = self.management_attention
+        self.management_coordinator.schedules = self.management_schedules
+        self.management_coordinator.assignments = self.management_assignments
+        self.management_coordinator.delivery = self.management_delivery
+        self.management_coordinator.watch_subscriptions = self.management_watch_subscriptions
+        self.management_coordinator.work_queue = self.management_queue
+        self.agent_turn_loop.execution_guard = self.management_coordinator.check_run
+        self.agent_turn_loop.finalization_handler = self.management_coordinator.finalize
+        self.managed_tasks.guard = self.management_coordinator.check_run
+        self.managed_tasks.goals = self.management_goals
+        if self.local_app_config.management.enabled:
+            self.tool_registry.register_package(MANAGEMENT_PACKAGE.model_copy(deep=True))
+            from app.tool_packages.management_delegates import management_delegate_tools
+
+            for tool in management_delegate_tools(self.management_delegates):
+                self.tool_registry.register_tool(tool)
+            for tool in management_tools(self.managed_tasks):
+                self.tool_registry.register_tool(tool)
+            from app.tool_packages.management import management_work_tools
+
+            for tool in management_work_tools(self.management_work):
+                self.tool_registry.register_tool(tool)
+            from app.tool_packages.management import management_assignment_tools
+
+            for tool in management_assignment_tools(self.management_assignments):
+                self.tool_registry.register_tool(tool)
+            from app.tool_packages.management_policies import management_policy_tools
+
+            for tool in management_policy_tools(self.managed_tasks, self.management_attention, self.management_schedules):
+                self.tool_registry.register_tool(tool)
+            from app.tool_packages.management_background import management_background_tools
+
+            for tool in management_background_tools(
+                self.managed_tasks, self.management_queue, self.management_watch_subscriptions, self.management_delivery,
+            ):
+                self.tool_registry.register_tool(tool)
 
     def _conn(self) -> sqlite3.Connection:
         return connect(self.db_path)
+
+    def _execute_dispatched_agent_run(self, run, guard, *, resume=False):
+        guard.check()
+        if self.local_app_config.agent.checkpoint_backend != "sqlite":
+            # Configuration changes must not silently downgrade accepted durable
+            # work to an in-memory run after restart.
+            self.agent_run_manager.fail_run(
+                run.run_id, error_type="checkpoint_configuration_required",
+                error="Durable dispatch requires agent.checkpoint_backend=sqlite.",
+            )
+            return None
+        from app.core.agent_runs import AgentRunCancelled
+        from app.core.llm_workloads import workload_scope
+
+        scope = (self.management_coordinator.workload(run) if run.metadata.get("work_budget_scopes")
+                 else workload_scope("background_agent", task_id=run.run_id,
+                                          before_dispatch=lambda: self.management_coordinator.check_run(run.run_id)))
+        try:
+            with scope:
+                # A queued autonomous run has not yet entered running status.
+                # The harness guard checks its frozen control fence on entry.
+                if resume:
+                    return self.resume_agent_run(run.run_id)
+                return self.run_agent_turn(
+                    session_id=run.session_id, user_input=run.user_input,
+                    existing_run_id=run.run_id, resumable=True,
+                )
+        except AgentRunCancelled as exc:
+            latest = self.agent_run_manager.get_run(run.run_id)
+            if latest and latest.status.value not in {"completed", "failed", "cancelled", "timed_out"}:
+                self.agent_run_manager.mark_cancelled(run.run_id, reason=str(exc))
+            raise
+
+    def _session_run_policy(self, session_id: str) -> SessionRunPolicy:
+        session = self.session_service.get_session_or_none(session_id=session_id)
+        if session is None or session.kind != "manager":
+            delegates = getattr(self, "management_delegates", None)
+            if delegates is not None:
+                with closing(self._conn()) as conn:
+                    row = conn.execute("SELECT r.record_payload FROM agent_runs r "
+                                       "JOIN managed_session_links l ON l.task_session_id=r.session_id "
+                                       "WHERE r.session_id=? ORDER BY r.created_at DESC,r.run_id DESC LIMIT 1",
+                                       (session_id,)).fetchone()
+                    if row:
+                        frozen = json.loads(row[0])["metadata"]["session_policy"]
+                        return SessionRunPolicy.model_validate({**frozen, "require_high_risk_approval": True})
+            return SessionRunPolicy(allowed_tools=[
+                tool.name for tool in self.tool_registry.list_tools() if tool.package != "management"
+            ]) if self.local_app_config.management.enabled else SessionRunPolicy()
+        controller = self.management_service.get(session_id)["controller"]
+        delegates = getattr(self, "management_delegates", None)
+        if delegates is not None:
+            with closing(self._conn()) as conn:
+                delegate = delegates.get_for_session(conn, session_id)
+            if delegate is not None:
+                with closing(self._conn()) as conn:
+                    policy = delegates.policy_for_session(conn, session_id)
+                return SessionRunPolicy.model_validate(policy)
+        return SessionRunPolicy(
+            allow_default_workspace=False, allowed_tools=[
+                tool.name for tool in self.tool_registry.list_tools()
+                if tool.package == "management" or (tool.package == "matter" and tool.read_only is True)
+            ], allow_fork=False,
+            llm_client_name=controller["llm_client_name"], llm_model=controller["llm_model"],
+        )
 
     def _backfill_session_projects(self) -> None:
         """Associate legacy folder sessions without changing their order or history."""
@@ -857,10 +1069,15 @@ class LocalKnowledgeAgentRuntime:
             self.memory_background.start()
         if self.local_app_config.message_history.enabled and self.local_app_config.message_history.background_enabled:
             self.message_analysis.start()
+        if self.local_app_config.management.enabled:
+            self.agent_dispatch.start()
+            self.management_coordinator.start()
 
     def stop(self) -> None:
         """Stop runtime background services."""
 
+        self.management_coordinator.stop()
+        self.agent_dispatch.stop()
         self.watch_scheduler.stop()
         self.memory_background.stop()
         self.message_analysis.stop()
@@ -1092,6 +1309,16 @@ class LocalKnowledgeAgentRuntime:
             user_input=user_input,
         )
 
+    def _management_workload_for_run(self, run_id):
+        from contextlib import nullcontext
+
+        run = self.agent_run_manager.get_run(run_id) if run_id else None
+        while run and run.parent_run_id and not run.metadata.get("work_budget_scopes"):
+            run = self.agent_run_manager.get_run(run.parent_run_id)
+        if run and run.metadata.get("work_budget_scopes"):
+            return self.management_coordinator.workload(run)
+        return nullcontext()
+
     def run_agent_turn(
         self,
         *,
@@ -1107,15 +1334,16 @@ class LocalKnowledgeAgentRuntime:
         """Run the minimal general agent turn loop."""
 
         runner = self._runner_for_turn(existing_run_id=existing_run_id, resumable=resumable)
-        return runner.run(
-            session_id=session_id,
-            user_input=user_input,
-            llm_client_name=llm_client_name,
-            llm_model=llm_model,
-            llm_response_mode=llm_response_mode,
-            safety_review_mode=safety_review_mode,
-            existing_run_id=existing_run_id,
-        )
+        with self._management_workload_for_run(existing_run_id):
+            return runner.run(
+                session_id=session_id,
+                user_input=user_input,
+                llm_client_name=llm_client_name,
+                llm_model=llm_model,
+                llm_response_mode=llm_response_mode,
+                safety_review_mode=safety_review_mode,
+                existing_run_id=existing_run_id,
+            )
 
     async def run_agent_turn_async(
         self,
@@ -1132,15 +1360,16 @@ class LocalKnowledgeAgentRuntime:
         """Run one agent turn without blocking the event loop."""
 
         runner = await asyncio.to_thread(self._runner_for_turn, existing_run_id=existing_run_id, resumable=resumable)
-        return await runner.run_async(
-            session_id=session_id,
-            user_input=user_input,
-            llm_client_name=llm_client_name,
-            llm_model=llm_model,
-            llm_response_mode=llm_response_mode,
-            safety_review_mode=safety_review_mode,
-            existing_run_id=existing_run_id,
-        )
+        with self._management_workload_for_run(existing_run_id):
+            return await runner.run_async(
+                session_id=session_id,
+                user_input=user_input,
+                llm_client_name=llm_client_name,
+                llm_model=llm_model,
+                llm_response_mode=llm_response_mode,
+                safety_review_mode=safety_review_mode,
+                existing_run_id=existing_run_id,
+            )
 
     async def run_child_agent_async(
         self,
@@ -1168,7 +1397,7 @@ class LocalKnowledgeAgentRuntime:
         run = self.agent_run_manager.get_run(run_id)
         if run is None:
             return ScopeGrant(), ScopeGrant(), ScopeGrant()
-        tools = self.tool_registry.list_tools()
+        tools = [tool for tool in self.tool_registry.list_tools() if tool.package != "management"]
         packages = tuple(sorted({tool.package for tool in tools if tool.package}))
         tool_names = tuple(sorted(tool.name for tool in tools))
         session = self.session_service.get_session_or_none(session_id=run.session_id)
@@ -1683,7 +1912,8 @@ class LocalKnowledgeAgentRuntime:
         return runner.interrupt(run_id)
 
     def replace_agent_run(self, run_id: str, *, user_input: str, command_id: str,
-                          request_fingerprint: str) -> AgentRunRecord:
+                          request_fingerprint: str, on_created=None,
+                          metadata_updates: dict[str, Any] | None = None) -> AgentRunRecord:
         runner = self._runner_for_turn(existing_run_id=run_id)
         if not isinstance(runner, AgentGraphRunner):
             raise ValueError("Run replacement requires the LangGraph orchestrator.")  # noqa: TRY004
@@ -1692,6 +1922,12 @@ class LocalKnowledgeAgentRuntime:
         current = self.agent_run_manager.get_run(run_id)
         if current is None:
             raise KeyError(f"Agent run not found: {run_id}")
+        queue = getattr(self, "management_queue", None)
+        if queue is not None:
+            queue.guard_replacement(run_id)
+        metadata_updates = {**(metadata_updates or {}), **self.managed_tasks.budget_metadata(
+            current.metadata, metadata_updates or {},
+        )}
         if current.status.value != "paused" and not current.metadata.get("replacement_command_id"):
             raise ValueError("Wait for run_paused before replacing the run.")
         lease = runner._execution_lease(run_id)
@@ -1700,9 +1936,14 @@ class LocalKnowledgeAgentRuntime:
         if not lease.acquire(timeout=0.1):
             raise ValueError("Agent run is still executing; retry after its pause is acknowledged.")
         try:
+            replacement_policy = self.session_service.run_policy(current.session_id).model_dump(mode="json")
+            if current.metadata.get("session_policy", {}).get("require_high_risk_approval"):
+                replacement_policy["require_high_risk_approval"] = True
             return self.agent_run_manager.replace_paused(
                 run_id, user_input=user_input, command_id=command_id,
                 request_fingerprint=request_fingerprint,
+                session_policy=replacement_policy,
+                on_created=on_created, metadata_updates=metadata_updates,
             )
         finally:
             lease.release()
@@ -1716,7 +1957,8 @@ class LocalKnowledgeAgentRuntime:
             raise RuntimeError(  # noqa: TRY004 - this is runtime mode, not an argument type.
                 "Agent run recovery requires the LangGraph orchestrator."
             )
-        return runner.resume(run_id)
+        with self._management_workload_for_run(run_id):
+            return runner.resume(run_id)
 
     async def resume_agent_run_async(self, run_id: str) -> AgentTurnResult:
         """Asynchronously resume an incomplete LangGraph run."""
@@ -1728,7 +1970,8 @@ class LocalKnowledgeAgentRuntime:
             raise RuntimeError(  # noqa: TRY004 - this is runtime mode, not an argument type.
                 "Agent run recovery requires the LangGraph orchestrator."
             )
-        return await runner.resume_async(run_id)
+        with self._management_workload_for_run(run_id):
+            return await runner.resume_async(run_id)
 
     def create_agent_run(
         self,
@@ -1938,6 +2181,7 @@ class LocalKnowledgeAgentRuntime:
             if current is None or current["status"] == "deleted":
                 conn.rollback()
                 return False
+            self.management_service.guard_delete(conn, session_id, only_if_empty=only_if_empty)
             if only_if_empty:
                 # The frontend's earlier empty preview is not authoritative:
                 # another window may have started a turn since it was read.
@@ -1971,6 +2215,7 @@ class LocalKnowledgeAgentRuntime:
                 "UPDATE agent_sessions SET status='deleted',updated_at=? WHERE session_id=?",
                 (datetime.now(UTC).isoformat(), session_id),
             )
+            self.management_service.after_delete(conn, session_id)
             conn.commit()
             return True
         except Exception:
@@ -2063,20 +2308,47 @@ class LocalKnowledgeAgentRuntime:
 
         return self.matter_service.create_matter(payload)
 
-    def search_matters(self, *, query: str, limit: int = 10) -> MatterSearchResult:
+    def search_matters(
+        self, *, query: str, limit: int = 10, kind: str | None = None,
+        parent_matter_id: str | None = None, project_id: str | None = None,
+        visibility: str = "user",
+    ) -> MatterSearchResult:
         """Search independent local matters."""
 
-        return self.matter_service.search_matters(query=query, limit=limit)
+        return self.matter_service.search_matters(
+            query=query, limit=limit, kind=kind,
+            parent_matter_id=parent_matter_id, project_id=project_id, visibility=visibility,
+        )
 
     def list_matters(
         self,
         *,
         limit: int = 50,
         status: str | None = None,
+        offset: int = 0,
+        q: str | None = None,
+        kind: str | None = None,
+        parent_matter_id: str | None = None,
+        project_id: str | None = None,
+        due_before: str | None = None,
+        due_after: str | None = None,
+        unscheduled: bool = False,
+        scheduled_on: str | None = None,
+        scheduled_before: str | None = None,
+        scheduled_after: str | None = None,
+        inbox: bool | None = None,
+        section: str | None = None,
+        visibility: str = "user",
     ) -> MatterList:
         """List independent local matters."""
 
-        return self.matter_service.list_matters(limit=limit, status=status)
+        return self.matter_service.list_matters(
+            limit=limit, status=status, offset=offset, q=q, kind=kind,
+            parent_matter_id=parent_matter_id, project_id=project_id,
+            due_before=due_before, due_after=due_after, unscheduled=unscheduled,
+            scheduled_on=scheduled_on, scheduled_before=scheduled_before,
+            scheduled_after=scheduled_after, inbox=inbox, section=section, visibility=visibility,
+        )
 
     def update_matter(
         self,
