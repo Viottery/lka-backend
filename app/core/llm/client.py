@@ -34,6 +34,8 @@ class AsyncLLMClient(Protocol):
     available_models: list[str]
     supports_stream: bool
     supports_json_mode: bool
+    supports_vision: bool
+    supports_audio: bool
     supports_function_calling: bool
 
     async def complete(self, request: LLMRequest) -> LLMResponse:

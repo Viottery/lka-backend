@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from enum import Enum
 from hashlib import sha1
 from typing import Any
+from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
@@ -96,6 +97,7 @@ class InMemoryAgentRunManager:
     """Thread-safe hot cache with optional durable SQLite backing for Agent runs."""
 
     def __init__(self, *, durable_store: SqliteAgentRunStore | None = None) -> None:
+        self._execution_owner_id = uuid4().hex
         self._lock = threading.RLock()
         self._runs: dict[str, AgentRunRecord] = {}
         self._events: dict[str, list[AgentRunEvent]] = {}
@@ -188,6 +190,8 @@ class InMemoryAgentRunManager:
                     "agent_id": agent_id,
                     "agent_version": agent_version,
                     "executor_kind": executor_kind,
+                    **({"orchestrator": "langgraph"}
+                       if executor_kind == "react" and parent.metadata.get("orchestrator") == "langgraph" else {}),
                 },
             )
             parent = parent.model_copy(
@@ -221,6 +225,10 @@ class InMemoryAgentRunManager:
 
     def attach_child_context(self, run_id: str, *, snapshot: dict[str, Any], views: dict[str, Any]) -> AgentRunRecord:
         """Bind the immutable snapshot and derived views before child execution."""
+        with self._lock:
+            return self._attach_child_context_locked(run_id, snapshot=snapshot, views=views)
+
+    def _attach_child_context_locked(self, run_id: str, *, snapshot: dict[str, Any], views: dict[str, Any]) -> AgentRunRecord:
         child = self._require_child(run_id)
         if child.status != AgentRunStatus.QUEUED:
             raise ValueError("Child context can only be attached before execution.")
@@ -366,12 +374,39 @@ class InMemoryAgentRunManager:
         return result
 
     def mark_child_running(self, run_id: str) -> AgentRunRecord:
+        with self._lock:
+            return self._mark_child_running_locked(run_id)
+
+    def _mark_child_running_locked(self, run_id: str) -> AgentRunRecord:
         child = self._require_child(run_id)
         if child.status != AgentRunStatus.QUEUED:
             return child
         updated = self.mark_running(run_id)
         self.append_event(run_id, "subtask_started", "Subtask started.", stage="subtask", **self._child_event_refs(child))
         return updated
+
+    def admit_child_execution(self, run_id: str) -> bool:
+        """Fence queued non-graph executors against tree-pause acknowledgement."""
+        with self._lock:
+            child = self._require_child(run_id)
+            if child.status not in {AgentRunStatus.QUEUED, AgentRunStatus.RUNNING}:
+                return False
+            ancestor = child
+            while ancestor is not None:
+                if ancestor.metadata.get("pause_requested") or ancestor.status in {
+                    AgentRunStatus.PAUSED, AgentRunStatus.CANCELLED, AgentRunStatus.FAILED, AgentRunStatus.TIMED_OUT,
+                } or ancestor.metadata.get("cancel_requested"):
+                    return False
+                ancestor = self.get_run(ancestor.parent_run_id) if ancestor.parent_run_id else None
+            self._update_run(run_id, status=child.status, metadata_patch={
+                "executor_active": True, "executor_owner_id": self._execution_owner_id,
+            })
+            return True
+
+    def is_child_execution_active(self, run_id: str) -> bool:
+        child = self.get_run(run_id)
+        return bool(child and child.metadata.get("executor_active")
+                    and child.metadata.get("executor_owner_id") == self._execution_owner_id)
 
     def complete_child_run(self, run_id: str, *, result_snapshot: dict[str, Any] | None = None, log_path: str | None = None) -> AgentRunRecord:
         child = self._require_child(run_id)
@@ -1372,10 +1407,6 @@ class InMemoryAgentRunManager:
                 raise KeyError(f"Agent run not found: {run_id}")
             if current.status == AgentRunStatus.PAUSED or current.metadata.get("pause_requested"):
                 return current
-            if any(child.status in {AgentRunStatus.QUEUED, AgentRunStatus.RUNNING, AgentRunStatus.PAUSED,
-                                    AgentRunStatus.WAITING_USER, AgentRunStatus.WAITING_CONFIRMATION}
-                   for child in self.child_tree(run_id)):
-                raise ValueError("Interrupt requires child tasks to finish or be cancelled first.")
             if current.status not in {
                 AgentRunStatus.QUEUED, AgentRunStatus.RUNNING,
                 AgentRunStatus.WAITING_CONFIRMATION, AgentRunStatus.WAITING_USER,
@@ -1386,7 +1417,19 @@ class InMemoryAgentRunManager:
             }})
             event = self._control_event(run_id, "run_pause_requested", "Pause requested; waiting for a checkpoint.",
                                         stage="control", pending=[])
-            self._commit_control_updates([current], [updated], [event])
+            previous, updates, events = [current], [updated], [event]
+            for child in self.child_tree(run_id):
+                if child.status in {AgentRunStatus.QUEUED, AgentRunStatus.RUNNING,
+                                    AgentRunStatus.WAITING_USER, AgentRunStatus.WAITING_CONFIRMATION}:
+                    previous.append(child)
+                    updates.append(child.model_copy(update={"metadata": {
+                        **child.metadata, "pause_requested": True,
+                        "pause_requested_at": updated.metadata["pause_requested_at"],
+                        "pause_root_run_id": run_id,
+                    }}))
+                    events.append(self._control_event(child.run_id, "run_pause_requested",
+                        "Task tree pause requested.", stage="control", pending=[]))
+            self._commit_control_updates(previous, updates, events)
             return updated
 
     def acknowledge_pause(self, run_id: str) -> AgentRunRecord:
@@ -1401,13 +1444,31 @@ class InMemoryAgentRunManager:
                     or current.status not in {AgentRunStatus.QUEUED, AgentRunStatus.RUNNING,
                                               AgentRunStatus.WAITING_CONFIRMATION, AgentRunStatus.WAITING_USER}):
                 return current
+            if any(child.status in {AgentRunStatus.QUEUED, AgentRunStatus.RUNNING,
+                                   AgentRunStatus.WAITING_USER, AgentRunStatus.WAITING_CONFIRMATION}
+                   for child in self.child_tree(run_id)):
+                if not current.metadata.get("pause_checkpoint_ready"):
+                    current = self._update_run(run_id, status=current.status,
+                                              metadata_patch={"pause_checkpoint_ready": True})
+                return current
             now = _now_iso()
             updated = current.model_copy(update={"status": AgentRunStatus.PAUSED, "paused_at": now,
                 "metadata": {**current.metadata, "paused_from_status": current.status.value}})
             event = self._control_event(run_id, "run_paused", "Agent run paused at a saved checkpoint.",
                                         stage="control", pending=[])
             self._commit_control_updates([current], [updated], [event])
+            self._acknowledge_ready_ancestors(updated)
             return updated
+
+    def _acknowledge_ready_ancestors(self, run: AgentRunRecord) -> None:
+        ancestor_id = run.parent_run_id
+        while ancestor_id is not None:
+            ancestor = self.get_run(ancestor_id)
+            if ancestor is None:
+                break
+            if ancestor.metadata.get("pause_requested") and ancestor.metadata.get("pause_checkpoint_ready"):
+                self.acknowledge_pause(ancestor_id)
+            ancestor_id = ancestor.parent_run_id
 
     def resume_paused(self, run_id: str) -> AgentRunRecord:
         """Restore the exact pre-pause state, without bypassing questions/reviews."""
@@ -1417,10 +1478,25 @@ class InMemoryAgentRunManager:
                 raise ValueError("Agent run is not paused.")
             status = AgentRunStatus(current.metadata["paused_from_status"])
             updated = current.model_copy(update={"status": status, "paused_at": None,
-                "metadata": {**current.metadata, "pause_requested": False, "paused_from_status": None}})
+                "metadata": {**current.metadata, "pause_requested": False, "paused_from_status": None,
+                             "pause_checkpoint_ready": False}})
             event = self._control_event(run_id, "run_resumed", "Agent run resumed from its checkpoint.",
                                         stage="control", pending=[])
-            self._commit_control_updates([current], [updated], [event])
+            previous, updates, events = [current], [updated], [event]
+            if current.parent_run_id is None:
+                for child in self.child_tree(run_id):
+                    if child.status != AgentRunStatus.PAUSED:
+                        continue
+                    previous.append(child)
+                    updates.append(child.model_copy(update={
+                        "status": AgentRunStatus(child.metadata["paused_from_status"]), "paused_at": None,
+                        "metadata": {**child.metadata, "pause_requested": False, "paused_from_status": None,
+                                     "pause_checkpoint_ready": False,
+                                     "checkpoint_boundary_resume": child.metadata["paused_from_status"] == "running"},
+                    }))
+                    events.append(self._control_event(child.run_id, "run_resumed",
+                        "Task tree resumed.", stage="control", pending=[]))
+            self._commit_control_updates(previous, updates, events)
             return updated
 
     def replace_paused(self, run_id: str, *, user_input: str, command_id: str,
@@ -1442,7 +1518,7 @@ class InMemoryAgentRunManager:
                 return replacement
             if current.status != AgentRunStatus.PAUSED or current.parent_run_id is not None:
                 raise ValueError("Only a checkpoint-paused root run can be replaced.")
-            if any(child.status in {AgentRunStatus.QUEUED, AgentRunStatus.RUNNING, AgentRunStatus.PAUSED,
+            if any(child.status in {AgentRunStatus.QUEUED, AgentRunStatus.RUNNING,
                                     AgentRunStatus.WAITING_USER, AgentRunStatus.WAITING_CONFIRMATION}
                    for child in self.child_tree(run_id)):
                 raise ValueError("Active child tasks prevent replacing this run.")
@@ -1467,7 +1543,28 @@ class InMemoryAgentRunManager:
                 stage="control", pending=[], payload={"superseded_by_run_id": new_id}),
                 self._control_event(new_id, "run_replacement_created", "Replacement run queued.",
                 stage="control", pending=[], payload={"replaces_run_id": run_id})]
-            self._commit_control_updates([current], [updated], events, created=[replacement], on_created=on_created)
+            previous, updates = [current], [updated]
+            for child in self.child_tree(run_id):
+                if child.status != AgentRunStatus.PAUSED:
+                    continue
+                previous.append(child)
+                updates.append(child.model_copy(update={"status": AgentRunStatus.CANCELLED,
+                    "cancelled_at": now, "error_type": "cancelled", "error": "Parent task replaced.",
+                    "metadata": {**child.metadata, "cancel_requested": True, "cancel_reason": "superseded",
+                                 "pause_requested": False, "superseded_by_run_id": new_id}}))
+                events.append(self._control_event(child.run_id, "run_cancelled", "Parent task replaced.",
+                    stage="control", pending=[], payload={"superseded_by_run_id": new_id}))
+            # Retain the historical DAG, but remove every unfinished node's dispatch eligibility.
+            for index, item in enumerate(updates):
+                plan = item.metadata.get("multi_agent_plan")
+                if isinstance(plan, dict):
+                    plan = {**plan, "status": "cancelled", "steps": [
+                        {**step, "status": "cancelled"}
+                        if step.get("status") not in {"completed", "skipped", "failed", "cancelled"}
+                        else step for step in plan.get("steps", [])]}
+                    updates[index] = item.model_copy(update={"metadata": {**item.metadata,
+                        "multi_agent_plan": plan, "dag_retired": True}})
+            self._commit_control_updates(previous, updates, events, created=[replacement], on_created=on_created)
             return replacement
 
     def request_cancel(self, run_id: str, reason: str | None = None) -> None:
@@ -1592,6 +1689,9 @@ class InMemoryAgentRunManager:
             updated = current.model_copy(update={"status": status, **payload})
             self._persist_run(updated)
             self._runs[run_id] = updated
+            if status in {AgentRunStatus.COMPLETED, AgentRunStatus.FAILED,
+                          AgentRunStatus.CANCELLED, AgentRunStatus.TIMED_OUT}:
+                self._acknowledge_ready_ancestors(updated)
             return updated
 
     def _persist_run(self, record: AgentRunRecord) -> None:

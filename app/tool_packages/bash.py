@@ -14,6 +14,7 @@ from typing import Any
 
 from app.core.tools import ToolContext, ToolInvocation, ToolPackageSpec, ToolResult, ToolSpec
 from app.platform.commands import IS_WINDOWS, SHELL_NAME, run_sync, start_terminal
+from app.platform.python_environment import ManagedPythonEnvironment
 from app.platform.workspace_access import approved_path, require_child_path_scope
 
 DEFAULT_SYNC_TIMEOUT_SECONDS = 30
@@ -78,6 +79,7 @@ BASH_PACKAGE = ToolPackageSpec(
         "Commands receive workspace_root, WORKSPACE_ROOT, LKA_WORKSPACE_ROOT, and LKA_WORKSPACE_ROOTS environment variables.",
         ("Use relative paths from cwd or $env:WORKSPACE_ROOT; do not invent placeholder paths." if IS_WINDOWS else "Use relative paths from cwd or the injected $workspace_root variable; do not invent placeholder paths."),
         "Always inspect command status and output before claiming completion.",
+        "For complex computation or data processing, use bash.python_environment to inspect the managed Python interpreter and installed libraries. Write a reusable .py file with filesystem.create_file, execute with bash.run python_environment=default and the LKA_PYTHON interpreter, inspect exit status and generated files, and correct errors with filesystem.edit_file. Virtualenv isolates dependencies, not filesystem or network access; execution still requires safety review.",
     ],
 )
 
@@ -189,8 +191,9 @@ class BashSessionManager:
         read_only: bool,
         env: dict[str, str],
         owner_run_id: str | None = None,
+        load_profile: bool = True,
     ) -> BashSession:
-        process = start_terminal(command, cwd=cwd, env=env)
+        process = start_terminal(command, cwd=cwd, env=env, load_profile=load_profile)
         with self._lock:
             session_id = f"bash_session_{self._next_id:06d}"
             self._next_id += 1
@@ -313,9 +316,11 @@ class BashSessionManager:
 
 
 class BashRunTool:
-    def __init__(self, *, policy: BashAccessPolicy, session_manager: BashSessionManager) -> None:
+    def __init__(self, *, policy: BashAccessPolicy, session_manager: BashSessionManager,
+                 python_environment: ManagedPythonEnvironment | None = None) -> None:
         self.policy = policy
         self.session_manager = session_manager
+        self.python_environment = python_environment
 
     spec = ToolSpec(
         name="bash.run",
@@ -326,6 +331,9 @@ class BashRunTool:
             f"Run a native {SHELL_NAME} command in sync or background mode. The command is classified "
             "per invocation as read_only only for whitelisted commands with safe arguments; "
             "otherwise it is non-read-only. Every invocation requires the configured safety review."
+            " Optional python_environment=default uses the separate managed Python environment, "
+            "filters inherited service credentials, and exposes LKA_PYTHON. Use the explicit interpreter "
+            "($LKA_PYTHON on bash, & $env:LKA_PYTHON on PowerShell) to run saved .py scripts."
         ),
         risk="high",
         requires_confirmation=False,
@@ -342,6 +350,7 @@ class BashRunTool:
                 "mode": {"type": "string", "allowed_values": ["sync", "background"]},
                 "timeout_seconds": {"type": "integer", "minimum": 1},
                 "max_output_bytes": {"type": "integer", "minimum": 1},
+                "python_environment": {"type": "string", "allowed_values": ["default"]},
             },
         },
         output_schema={
@@ -363,6 +372,8 @@ class BashRunTool:
     )
 
     def is_read_only_invocation(self, tool_input: dict[str, Any]) -> bool:
+        if tool_input.get("python_environment") is not None:
+            return False
         return is_read_only_command(str(tool_input.get("command") or ""))
 
     def workspace_access_request(self, tool_input: dict[str, Any], context: ToolContext) -> list[str]:
@@ -395,6 +406,9 @@ class BashRunTool:
         try:
             if not command.strip():
                 raise ValueError("command is required.")
+            selection = invocation.input.get("python_environment")
+            if selection is not None and selection != "default":
+                raise ValueError("Only the default managed Python environment is available")
             policy = self.policy.for_session_workspace(context.workspace_root)
             cwd = policy.resolve_cwd(invocation.input.get("cwd"), allow_outside=True)
             require_child_path_scope(cwd, context)
@@ -402,6 +416,12 @@ class BashRunTool:
                 canonical = cwd.expanduser().resolve(strict=False)
                 if canonical != cwd or not approved_path(canonical, context):
                     raise PermissionError("cwd is outside allowed workspace roots and was not approved for this invocation")
+            execution_env = None
+            if selection is not None:
+                if self.python_environment is None:
+                    raise RuntimeError("Managed Python environment is not configured")
+                execution_env = self.python_environment.environment(cwd)
+                execution_env.update(policy.env())
             if mode == "background":
                 payload = self._run_background(
                     command=command,
@@ -409,6 +429,7 @@ class BashRunTool:
                     read_only=read_only,
                     policy=policy,
                     owner_run_id=_child_run_id(context),
+                    execution_env=execution_env,
                 )
             else:
                 payload = self._run_sync(
@@ -424,6 +445,7 @@ class BashRunTool:
                         invocation.input.get("max_output_bytes")
                         or DEFAULT_OUTPUT_BYTES
                     ),
+                    execution_env=execution_env,
                 )
         except (OSError, RuntimeError, ValueError, PermissionError) as exc:
             return ToolResult(
@@ -448,11 +470,13 @@ class BashRunTool:
         policy: BashAccessPolicy,
         timeout_seconds: int,
         max_output_bytes: int,
+        execution_env: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         timeout = min(max(1, timeout_seconds), MAX_SYNC_TIMEOUT_SECONDS)
         byte_limit = min(max(1, max_output_bytes), MAX_OUTPUT_BYTES)
         stdout_raw, stderr_raw, exit_code, timed_out = run_sync(
-            command, cwd=cwd, env=self._env(policy, read_only=read_only), timeout=timeout
+            command, cwd=cwd, env=execution_env if execution_env is not None else self._env(policy, read_only=read_only),
+            timeout=timeout, load_profile=execution_env is None,
         )
         stdout = _decode_limited(stdout_raw, byte_limit)
         stderr = _decode_limited(stderr_raw, byte_limit)
@@ -481,14 +505,16 @@ class BashRunTool:
         read_only: bool,
         policy: BashAccessPolicy,
         owner_run_id: str | None = None,
+        execution_env: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         session = self.session_manager.start(
             command=command,
             cwd=cwd,
             workspace_root=policy.default_root,
             read_only=read_only,
-            env=self._env(policy, read_only=read_only),
+            env=execution_env if execution_env is not None else self._env(policy, read_only=read_only),
             owner_run_id=owner_run_id,
+            load_profile=execution_env is None,
         )
         return {
             "mode": "background",
@@ -520,6 +546,36 @@ class BashRunTool:
                    and not key.startswith("BASH_FUNC_")}
         env.update(policy.env())
         return env
+
+
+class BashPythonEnvironmentTool:
+    def __init__(self, environment: ManagedPythonEnvironment, policy: BashAccessPolicy) -> None:
+        self.environment = environment
+        self.policy = policy
+
+    spec = ToolSpec(
+        name="bash.python_environment", package="bash", type="local_tool",
+        description="Inspect the explicitly provisioned default Python environment: exact interpreter, "
+        "actual installed version/libraries, script/output locations, and workflow guidance. Does not install anything.",
+        risk="low", requires_confirmation=False, read_only=True,
+        side_effects=["read_local_files"], scope_uses_workspace=True,
+        input_schema={"type": "object", "properties": {}},
+        output_schema={"name": "string", "available": "boolean", "environment_root": "string",
+                       "interpreter": "string", "python_version": ["string", "null"],
+                       "packages": "object", "scripts_directory": "string", "output_directory": "string",
+                       "is_os_sandbox": "boolean", "guidance": "string"},
+    )
+
+    def invoke(self, *, invocation: ToolInvocation, context: ToolContext) -> ToolResult:
+        try:
+            policy = self.policy.for_session_workspace(context.workspace_root)
+            require_child_path_scope(policy.default_root, context)
+            output = self.environment.status(policy.default_root)
+        except (OSError, ValueError, PermissionError) as exc:
+            return ToolResult(invocation_id=invocation.invocation_id, tool_name=self.spec.name,
+                              status="failed", error=str(exc))
+        return ToolResult(invocation_id=invocation.invocation_id, tool_name=self.spec.name,
+                          status="completed", output=output)
 
 
 class BashListSessionsTool:

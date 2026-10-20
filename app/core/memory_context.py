@@ -13,6 +13,7 @@ from app.domains.memory import (
     MemoryService,
     memory_target_matches,
 )
+from app.domains.memory_feedback import MemoryFeedbackInput
 
 
 class MemoryContextProvider:
@@ -222,7 +223,8 @@ class MemoryPreTurnGate:
             if record.scope == "project" and record.project_id != project_id:
                 continue
             try:
-                self.service.retract(memory_id, expected_version=record.version)
+                self.service.retract(memory_id, expected_version=record.version,
+                                     user_feedback=MemoryFeedbackInput(origin="user_message"))
             except MemoryConflictError:
                 continue
             retracted.append(memory_id)

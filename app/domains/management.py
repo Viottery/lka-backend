@@ -1,6 +1,7 @@
 """Deterministic lifecycle of management sessions; no model or worker execution."""
 from __future__ import annotations
 
+import json
 from contextlib import closing
 from datetime import UTC, datetime
 from uuid import uuid4
@@ -15,10 +16,22 @@ _TERMINAL_RUNS = ("completed", "failed", "cancelled", "timed_out")
 
 
 class ManagementService:
-    def __init__(self, conn_factory, session_service, *, goal_service=None):
+    def __init__(self, conn_factory, session_service, *, goal_service=None, workspace_resolver=None):
         self._conn = conn_factory
         self.session_service = session_service
         self.goal_service = goal_service
+        self.workspace_resolver = workspace_resolver
+
+    @staticmethod
+    def allowed_tool_names(tools, *, manager):
+        """Keep supervisor capabilities out of ordinary sessions across packages."""
+        def management_tool(tool):
+            return tool.package == "management" or tool.name.startswith("management.")
+
+        return [tool.name for tool in tools if (
+            (management_tool(tool) and tool.name != "management.report_delegate")
+            or tool.read_only is True or tool.supports_read_only_invocations
+        )] if manager else [tool.name for tool in tools if not management_tool(tool)]
 
     def ensure_schema(self):
         with closing(self._conn()) as conn, conn:
@@ -45,6 +58,19 @@ class ManagementService:
                 CREATE INDEX IF NOT EXISTS manager_goals_session_status
                     ON manager_goals(session_id,status);
             """)
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(manager_controllers)")}
+            if "default_execution_workspace" not in columns:
+                conn.execute("ALTER TABLE manager_controllers ADD COLUMN default_execution_workspace TEXT")
+
+    def resolve_execution_workspace(self, value):
+        if value is None:
+            return None
+        if not isinstance(value, dict) or not isinstance(value.get("path"), str) or not isinstance(value.get("platform"), str):
+            raise ValueError("execution workspace requires path and platform")  # noqa: TRY004 - API validation contract
+        if self.workspace_resolver is None:
+            raise ValueError("Execution workspace resolver is unavailable")
+        resolved = self.workspace_resolver(path=value["path"], platform=value["platform"])
+        return resolved.model_dump(mode="json") if hasattr(resolved, "model_dump") else dict(resolved)
 
     @staticmethod
     def _title(title):
@@ -60,7 +86,7 @@ class ManagementService:
             raise ValueError("Model settings must be non-empty strings or null")
         return value.strip() if value is not None else None
 
-    def _create(self, conn, *, title, make_default, llm_client_name, llm_model):
+    def _create(self, conn, *, title, make_default, llm_client_name, llm_model, default_execution_workspace=None):
         session_id = "session_" + uuid4().hex
         now = datetime.now(UTC).isoformat()
         conn.execute(
@@ -68,25 +94,32 @@ class ManagementService:
             "VALUES(?,?,'active','{}','manager',?,?)", (session_id, title, now, now),
         )
         conn.execute(
-            "INSERT INTO manager_controllers(session_id,llm_client_name,llm_model,created_at,updated_at) "
-            "VALUES(?,?,?,?,?)", (session_id, llm_client_name, llm_model, now, now),
+            "INSERT INTO manager_controllers(session_id,llm_client_name,llm_model,created_at,updated_at,default_execution_workspace) "
+            "VALUES(?,?,?,?,?,?)", (session_id, llm_client_name, llm_model, now, now,
+                                     json.dumps(default_execution_workspace) if default_execution_workspace else None),
         )
         if make_default:
             conn.execute("INSERT INTO manager_defaults(slot,session_id) VALUES(1,?) "
                          "ON CONFLICT(slot) DO UPDATE SET session_id=excluded.session_id", (session_id,))
         return session_id
 
-    def create(self, title=None, make_default=False, llm_client_name=None, llm_model=None):
+    def create(self, title=None, make_default=False, llm_client_name=None, llm_model=None, default_execution_workspace=None):
+        workspace = self.resolve_execution_workspace(default_execution_workspace)
         title = self._title(title)
         client = self._model_value(llm_client_name)
         model = self._model_value(llm_model)
         with closing(self._conn()) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
             session_id = self._create(conn, title=title, make_default=make_default,
-                                      llm_client_name=client, llm_model=model)
+                                      llm_client_name=client, llm_model=model, default_execution_workspace=workspace)
         return self.get(session_id)
 
-    def get_default(self):
+    def get_default(self, *, default_execution_workspace=None):
+        with closing(self._conn()) as conn:
+            existing = conn.execute("SELECT session_id FROM manager_defaults WHERE slot=1").fetchone()
+        # Existing default entrypoints ignore create-only configuration, even if
+        # that original directory was removed after a successful creation.
+        workspace = None if existing else self.resolve_execution_workspace(default_execution_workspace)
         with closing(self._conn()) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT session_id FROM manager_defaults WHERE slot=1").fetchone()
@@ -98,7 +131,7 @@ class ManagementService:
                     raise ManagementConflictError("Default management session is unavailable; restore or explicitly replace it")
             else:
                 session_id = self._create(conn, title=self._title(None), make_default=True,
-                                          llm_client_name=None, llm_model=None)
+                                          llm_client_name=None, llm_model=None, default_execution_workspace=workspace)
         return self.get(session_id)
 
     def get(self, session_id):
@@ -111,7 +144,9 @@ class ManagementService:
         session = self.session_service.get_session_or_none(session_id=session_id)
         if session is None:
             raise KeyError(session_id)
-        return {"session": session.model_dump(mode="json"), "controller": dict(row)}
+        controller = dict(row)
+        controller["default_execution_workspace"] = json.loads(controller["default_execution_workspace"]) if controller["default_execution_workspace"] else None
+        return {"session": session.model_dump(mode="json"), "controller": controller}
 
     def list(self, limit=50, offset=0):
         if not isinstance(limit, int) or not 1 <= limit <= 200 or not isinstance(offset, int) or offset < 0:
@@ -122,10 +157,14 @@ class ManagementService:
                                 "ORDER BY s.updated_at DESC,s.session_id LIMIT ? OFFSET ?", (limit, offset)).fetchall()
         return [self.get(row["session_id"]) for row in rows]
 
-    def update(self, session_id, expected_revision, status=None, llm_client_name=_UNSET, llm_model=_UNSET):
+    def update(self, session_id, expected_revision, status=None, llm_client_name=_UNSET, llm_model=_UNSET,
+               default_execution_workspace=_UNSET):
         if status is not None and status not in {"active", "paused"}:
             raise ValueError("status must be active or paused")
         values = {}
+        if default_execution_workspace is not _UNSET:
+            workspace = self.resolve_execution_workspace(default_execution_workspace)
+            values["default_execution_workspace"] = json.dumps(workspace) if workspace else None
         if status is not None:
             values["status"] = status
         for field, value in (("llm_client_name", llm_client_name), ("llm_model", llm_model)):

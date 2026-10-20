@@ -5,6 +5,7 @@ import json
 from contextlib import closing
 from datetime import UTC, datetime
 from hashlib import sha256
+from pathlib import Path, PureWindowsPath
 from uuid import uuid4
 
 from app.core.agent_runs import AgentRunRecord, AgentRunStatus
@@ -59,7 +60,7 @@ class ManagedTaskService:
                 );
             """)
 
-    def caller(self, context, *, mutate=False, conn=None):
+    def caller(self, context, *, mutate=False, conn=None, supervisor_only=False):
         if not self.enabled():
             raise ManagementConflictError("Management pilot is disabled")
         if conn is not None:
@@ -74,6 +75,8 @@ class ManagedTaskService:
         def check(db):
             delegates = getattr(self, "delegates", None)
             if delegates is not None:
+                if supervisor_only and delegates.get_for_session(db, context.session_id) is not None:
+                    raise ManagementConflictError("This tool requires a top-level management supervisor")
                 delegates.check_session(db, context.session_id)
             row = db.execute("SELECT c.status FROM manager_controllers c JOIN agent_sessions s "
                              "ON s.session_id=c.session_id WHERE c.session_id=? "
@@ -275,11 +278,14 @@ class ManagedTaskService:
             debug_info={"command_id": command_id, "original_quote_truncated": bool(original and len(original.content) > 8000)},
         )
 
-    def _new_run(self, session_id, envelope, source=None):
+    def _new_run(self, session_id, envelope, source=None, *, workspace=None):
         metadata = {"entrypoint": "agent.turn", "orchestrator": "langgraph",
                     "input_envelope": envelope.model_dump(mode="json"),
                     "session_policy": {**self.policy(session_id).model_dump(mode="json"),
-                                       "require_high_risk_approval": True}}
+                                       "require_high_risk_approval": True,
+                                       "allow_default_workspace": False,
+                                       "allowed_paths": [workspace["backend_path"]] if workspace else []},
+                    "execution_workspace": workspace}
         metadata.update(self.budget_metadata(source.metadata) if source else {})
         return AgentRunRecord(
             run_id="agent_run_" + uuid4().hex, session_id=session_id, trace_id="agent_turn_" + uuid4().hex,
@@ -405,23 +411,52 @@ class ManagedTaskService:
                 conn.execute("INSERT INTO manager_timer_causes VALUES(?,?,?)",
                              (goal["goal_id"], goal["timer_generation"], _json(paths)))
 
-    def prepare_task(self, context, *, command_id, purpose, title="管理任务", workspace_path=None):
-        """Resolve source context and workspace before taking a SQLite write lock."""
+    def prepare_task(self, context, *, command_id, purpose, title="管理任务", workspace_path=None,
+                     create_workspace=True):
+        """Freeze task scope before the transaction; never inherit the backend checkout."""
         caller = self.caller(context, mutate=True)
+        if not isinstance(command_id, str) or not command_id.strip() or len(command_id) > 128:
+            raise ValueError("command_id must contain 1..128 characters")
+        workspace = None
         delegates = getattr(self, "delegates", None)
-        if delegates is not None:
-            with closing(self._conn()) as conn:
-                delegate = delegates.get_for_session(conn, context.session_id)
-            if delegate is not None:
-                frozen = delegate["workspace"]
-                requested = self.workspace(workspace_path) if workspace_path is not None else frozen
-                if requested != frozen:
-                    raise ManagementConflictError("Subagent execution workspace is frozen by its delegation")
-                return {"title": self.management._title(title),
-                        "envelope": self._envelope(context, caller, command_id, purpose), "workspace": frozen}
+        with closing(self._conn()) as conn:
+            delegate = delegates.get_for_session(conn, context.session_id) if delegates else None
+            prior = conn.execute("SELECT receipt FROM management_commands WHERE manager_session_id=? AND command_id=?",
+                                 (context.session_id, command_id)).fetchone()
+            parent = conn.execute("SELECT default_execution_workspace FROM manager_controllers WHERE session_id=?",
+                                  (context.session_id,)).fetchone()
+            if prior and workspace_path is None:
+                receipt = json.loads(prior["receipt"])
+                original = conn.execute("SELECT record_payload FROM agent_runs WHERE run_id=?",
+                                        (receipt.get("run_id"),)).fetchone()
+                metadata = json.loads(original["record_payload"]).get("metadata", {}) if original else {}
+                if "execution_workspace" in metadata:
+                    workspace = metadata["execution_workspace"]
+                else:
+                    target = conn.execute("SELECT metadata FROM agent_sessions WHERE session_id=?",
+                                          (receipt.get("session_id"),)).fetchone()
+                    workspace = json.loads(target["metadata"]).get("workspace") if target else None
+        if delegate is not None:
+            frozen = delegate["workspace"]
+            requested = self.workspace(workspace_path) if workspace_path is not None else frozen
+            if requested != frozen:
+                raise ManagementConflictError("Subagent execution workspace is frozen by its delegation")
+            workspace = frozen
+        elif workspace_path is not None:
+            workspace = self.workspace(workspace_path)
+        elif not prior and create_workspace and parent and parent["default_execution_workspace"]:
+            base = self.management.resolve_execution_workspace(json.loads(parent["default_execution_workspace"]))
+            # Stable across concurrent retries, distinct for every accepted command/session.
+            name = "task_" + sha256(_json([context.session_id, command_id]).encode()).hexdigest()[:24]
+            directory = Path(base["backend_path"]) / name
+            directory.mkdir(exist_ok=True)
+            if directory.resolve().parent != Path(base["backend_path"]).resolve():
+                raise ValueError("Task workspace must be a child of its configured parent")
+            source_path = PureWindowsPath(base["path"]) if base["platform"] == "windows" else Path(base["path"])
+            workspace = self.management.resolve_execution_workspace({"path": str(source_path / name),
+                                                                     "platform": base["platform"]})
         return {"title": self.management._title(title),
-                "envelope": self._envelope(context, caller, command_id, purpose),
-                "workspace": self.workspace(workspace_path) if workspace_path is not None else None}
+                "envelope": self._envelope(context, caller, command_id, purpose), "workspace": workspace}
 
     def start_task(self, context, *, command_id, purpose, title="管理任务", workspace_path=None):
         prepared = self.prepare_task(context, command_id=command_id, purpose=purpose, title=title, workspace_path=workspace_path)
@@ -464,7 +499,7 @@ class ManagedTaskService:
         conn.execute("INSERT INTO agent_sessions(session_id,title,status,metadata,kind,created_at,updated_at) "
                      "VALUES(?,?,'active',?,'ordinary',?,?)",
                      (sid, title, _json({"workspace": workspace} if workspace else {}), now, now))
-        run = self._new_run(sid, envelope, caller)
+        run = self._new_run(sid, envelope, caller, workspace=workspace)
         self._freeze_delegate_policy(conn, context, run)
         self.run_store.save_run_in_transaction(conn, run.model_dump(mode="json"), updated_at=now)
         if not defer_dispatch:
@@ -483,7 +518,7 @@ class ManagedTaskService:
             if prior:
                 return prior
             self.require_durable_execution()
-            self._target(conn, session_id, manager_session_id=context.session_id)
+            target = self._target(conn, session_id, manager_session_id=context.session_id)
             latest = conn.execute("SELECT record_payload FROM agent_runs WHERE session_id=? "
                                   "AND json_extract(record_payload,'$.parent_run_id') IS NULL "
                                   "ORDER BY created_at DESC,run_id DESC LIMIT 1", (session_id,)).fetchone()
@@ -495,7 +530,9 @@ class ManagedTaskService:
             if old and old["status"] == "paused" and old.get("metadata", {}).get("paused_from_status") in {"waiting_confirmation", "waiting_user"}:
                 raise ManagementConflictError("Resolve the original confirmation or user question before sending instructions")
             if not old or old["status"] in TERMINAL:
-                run = self._new_run(session_id, envelope, caller)
+                workspace = (old or {}).get("metadata", {}).get("execution_workspace",
+                    json.loads(target["metadata"]).get("workspace"))
+                run = self._new_run(session_id, envelope, caller, workspace=workspace)
                 self._freeze_delegate_policy(conn, context, run)
                 # Later user/model configuration cannot widen accepted tools.
                 if old and old.get("metadata", {}).get("delegate_session_id"):

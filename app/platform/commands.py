@@ -15,7 +15,8 @@ IS_WINDOWS = os.name == "nt"
 SHELL_NAME = "powershell" if IS_WINDOWS else "bash"
 
 
-def shell_argv(command: str, *, terminal: bool = False, ready_marker: str | None = None) -> list[str]:
+def shell_argv(command: str, *, terminal: bool = False, ready_marker: str | None = None,
+               load_profile: bool = True) -> list[str]:
     if IS_WINDOWS:
         # EncodedCommand avoids command-line quoting and preserves Unicode on PS 5.1.
         script = (
@@ -42,10 +43,11 @@ def shell_argv(command: str, *, terminal: bool = False, ready_marker: str | None
                          "System32/WindowsPowerShell/v1.0/powershell.exe")
         return [executable, "-NoLogo", "-NoProfile", "-OutputFormat", "Text", "-EncodedCommand",
                 base64.b64encode(script.encode("utf-16le")).decode("ascii")]
-    return ["/bin/bash", "-lc", command]
+    return ["/bin/bash", "-lc", command] if load_profile else ["/bin/bash", "--noprofile", "--norc", "-c", command]
 
 
-def run_sync(command: str, *, cwd: Path, env: dict[str, str], timeout: int) -> tuple[bytes, bytes, int | None, bool]:
+def run_sync(command: str, *, cwd: Path, env: dict[str, str], timeout: int,
+             load_profile: bool = True) -> tuple[bytes, bytes, int | None, bool]:
     if IS_WINDOWS:
         from app.platform.windows_process import WindowsProcess
         process = WindowsProcess(shell_argv(command), cwd=cwd, env=env, terminal=False)
@@ -53,7 +55,7 @@ def run_sync(command: str, *, cwd: Path, env: dict[str, str], timeout: int) -> t
             return process.communicate(timeout)
         finally:
             process.close()
-    process = subprocess.Popen(shell_argv(command), cwd=cwd, env=env,
+    process = subprocess.Popen(shell_argv(command, load_profile=load_profile), cwd=cwd, env=env,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                stdin=subprocess.DEVNULL, start_new_session=True)
     try:
@@ -72,12 +74,12 @@ def run_sync(command: str, *, cwd: Path, env: dict[str, str], timeout: int) -> t
 
 
 class PosixTerminal:
-    def __init__(self, command: str, *, cwd: Path, env: dict[str, str]) -> None:
+    def __init__(self, command: str, *, cwd: Path, env: dict[str, str], load_profile: bool = True) -> None:
         import pty
         self._closed = False
         self.fd, slave = pty.openpty()
         try:
-            self.process = subprocess.Popen(shell_argv(command), cwd=cwd, env=env,
+            self.process = subprocess.Popen(shell_argv(command, load_profile=load_profile), cwd=cwd, env=env,
                                             stdin=slave, stdout=slave, stderr=slave,
                                             start_new_session=True, close_fds=True)
         except BaseException:
@@ -193,7 +195,7 @@ class WindowsTerminal:
         self.process.close()
 
 
-def start_terminal(command: str, *, cwd: Path, env: dict[str, str]):
+def start_terminal(command: str, *, cwd: Path, env: dict[str, str], load_profile: bool = True):
     if IS_WINDOWS:
         return WindowsTerminal(command, cwd=cwd, env=env)
-    return PosixTerminal(command, cwd=cwd, env=env)
+    return PosixTerminal(command, cwd=cwd, env=env, load_profile=load_profile)

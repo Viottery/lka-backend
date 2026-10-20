@@ -52,6 +52,10 @@ class OpenAICompatibleLLMClient:
         available_models: list[str] | None = None,
         timeout_seconds: int = 60,
         supports_stream: bool = True,
+        supports_vision: bool = False,
+        vision_model_overrides: dict[str, bool] | None = None,
+        supports_audio: bool = False,
+        audio_model_overrides: dict[str, bool] | None = None,
         supports_json_mode: bool = False,
         supports_function_calling: bool = False,
         supports_required_tool_choice: bool = False,
@@ -68,6 +72,10 @@ class OpenAICompatibleLLMClient:
         self.default_model = default_model
         self.available_models = available_models or [default_model]
         self.timeout_seconds = timeout_seconds
+        self.vision_model_overrides = vision_model_overrides or {}
+        self.supports_vision = supports_vision
+        self.supports_audio = supports_audio
+        self.audio_model_overrides = audio_model_overrides or {}
         self.supports_stream = supports_stream
         self.supports_json_mode = supports_json_mode
         self.supports_function_calling = supports_function_calling
@@ -75,6 +83,12 @@ class OpenAICompatibleLLMClient:
         self.function_calling_strict = function_calling_strict
         self.supports_reasoning_effort = supports_reasoning_effort
         self.thinking_control = thinking_control
+
+    def supports_image_input(self, model: str) -> bool:
+        return self.vision_model_overrides.get(model, self.supports_vision)
+
+    def supports_audio_input(self, model: str) -> bool:
+        return self.audio_model_overrides.get(model, self.supports_audio)
 
     async def complete(self, request: LLMRequest) -> LLMResponse:
         response_payload, response_headers = await _run_blocking(
@@ -247,6 +261,10 @@ class OpenAICompatibleLLMClient:
         raise LLMResponseParseError("LLM provider stream returned no response.")
 
     def _build_request(self, request: LLMRequest, *, stream: bool) -> urllib.request.Request:
+        if any(message.has_audio for message in request.messages) and not self.supports_audio_input(self._model_for(request)):
+            raise LLMClientError(f"LLM client {self.name} does not support audio input.")
+        if any(message.has_images for message in request.messages) and not self.supports_image_input(self._model_for(request)):
+            raise LLMClientError(f"LLM client {self.name} does not support image input.")
         if request.reasoning_effort is not None and not self.supports_reasoning_effort:
             raise LLMClientError(
                 f"LLM client {self.name} does not support reasoning_effort."
@@ -282,9 +300,12 @@ class OpenAICompatibleLLMClient:
             ]
             payload["tool_choice"] = request.tool_choice or "auto"
 
+        encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        if any(message.has_audio for message in request.messages) and len(encoded) > 20 * 1024 * 1024:
+            raise LLMClientError("Inline audio request exceeds 20 MiB; provide smaller attachments.")
         return urllib.request.Request(
             f"{self.base_url}/chat/completions",
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            data=encoded,
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",

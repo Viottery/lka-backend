@@ -31,8 +31,52 @@ from app.core.agent_turn import AgentTurnResult
 from app.core.llm import LLMResponseMode
 from app.core.multi_agent import Plan, TaskResult
 from app.core.safety import SafetyReviewQueueConflict, SafetyReviewRecord
+from app.domains.session_attachments import SessionAttachmentError
 
 router = APIRouter(prefix="/agent", tags=["agent"])
+
+
+def _prepare_image_payload(payload: AgentTurnRequest, runtime) -> AgentTurnRequest:
+    if not hasattr(runtime, "prepare_agent_image_input"):
+        if payload.attachment_ids:
+            raise HTTPException(422, "Image input is unavailable.")
+        return payload
+    options = payload.llm
+    try:
+        ids = runtime.prepare_agent_image_input(
+            session_id=payload.session_id, attachment_ids=payload.attachment_ids,
+            llm_client_name=options.client_name if options else None,
+            llm_model=options.model if options else None,
+        )
+        updates = {"attachment_ids": ids}
+        resolver = getattr(runtime, "resolve_agent_input_model", None)
+        if callable(resolver):
+            client_name, model = resolver(
+                session_id=payload.session_id, attachment_ids=ids,
+                llm_client_name=options.client_name if options else None,
+                llm_model=options.model if options else None,
+            )
+            if (client_name, model) != (options.client_name if options else None, options.model if options else None):
+                from app.api.schemas import AgentTurnLLMOptions
+
+                updates["llm"] = (options or AgentTurnLLMOptions()).model_copy(
+                    update={"client_name": client_name, "model": model},
+                )
+        if payload.user_input == "[Image input]" and ids:
+            service = getattr(runtime, "session_attachment_service", None)
+            if service is not None:
+                kinds = {service.get(session_id=payload.session_id, attachment_id=item).get("kind", "image") for item in ids}
+                if "document" in kinds:
+                    updates["user_input"] = "[File input]"
+                elif "audio" in kinds:
+                    updates["user_input"] = "[Audio input]"
+    except KeyError as exc:
+        raise HTTPException(404, "Active session or attachment not found.") from exc
+    except SessionAttachmentError as exc:
+        raise HTTPException(exc.status_code, str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(422, "Attachment storage is unavailable.") from exc
+    return payload.model_copy(update=updates)
 
 
 @router.post("/turn", response_model=AgentTurnResponse)
@@ -40,6 +84,7 @@ async def run_agent_turn_endpoint(
     payload: AgentTurnRequest,
     request: Request,
 ) -> AgentTurnResponse | JSONResponse:
+    payload = await asyncio.to_thread(_prepare_image_payload, payload, request.app.state.runtime)
     llm_options = payload.llm
     try:
         result = await request.app.state.runtime.run_agent_turn_async(
@@ -50,6 +95,7 @@ async def run_agent_turn_endpoint(
             llm_response_mode=llm_options.response_mode if llm_options else LLMResponseMode.TEXT,
             safety_review_mode=payload.safety_review_mode,
             **({"resumable": True} if payload.resumable else {}),
+            **({"attachment_ids": payload.attachment_ids} if payload.attachment_ids is not None else {}),
         )
     except AgentTurnWaitingForConfirmation as exc:
         return JSONResponse(
@@ -68,6 +114,7 @@ async def run_agent_turn_endpoint(
 def run_agent_turn(payload: AgentTurnRequest, request: Request) -> AgentTurnResult:
     """Synchronous test helper preserving the old direct-call path."""
 
+    payload = _prepare_image_payload(payload, request.app.state.runtime)
     llm_options = payload.llm
     result = request.app.state.runtime.run_agent_turn(
         session_id=payload.session_id,
@@ -77,6 +124,7 @@ def run_agent_turn(payload: AgentTurnRequest, request: Request) -> AgentTurnResu
         llm_response_mode=llm_options.response_mode if llm_options else LLMResponseMode.TEXT,
         safety_review_mode=payload.safety_review_mode,
         **({"resumable": True} if payload.resumable else {}),
+        **({"attachment_ids": payload.attachment_ids} if payload.attachment_ids is not None else {}),
     )
     return result
 
@@ -86,6 +134,7 @@ async def stream_agent_turn(
     payload: AgentTurnRequest,
     request: Request,
 ) -> StreamingResponse:
+    payload = await asyncio.to_thread(_prepare_image_payload, payload, request.app.state.runtime)
     run = request.app.state.runtime.create_agent_run(
         session_id=payload.session_id,
         user_input=payload.user_input,
@@ -343,6 +392,7 @@ async def replace_agent_run(run_id: str, payload: ReplaceAgentRunRequest, reques
     if payload.session_id is not None and payload.session_id != previous.session_id:
         raise HTTPException(409, "Replacement must remain in the original session.")
     payload = payload.model_copy(update={"session_id": previous.session_id})
+    payload = await asyncio.to_thread(_prepare_image_payload, payload, runtime)
     fingerprint = hashlib.sha256(json.dumps(payload.model_dump(mode="json"), sort_keys=True).encode()).hexdigest()
     try:
         run = await asyncio.to_thread(runtime.replace_agent_run, run_id, user_input=payload.user_input,
@@ -382,6 +432,12 @@ async def resume_agent_run(run_id: str, request: Request) -> AgentRunResponse:
         )
     if run.status not in {AgentRunStatus.RUNNING, AgentRunStatus.PAUSED}:
         raise HTTPException(status_code=409, detail="Agent run has no resumable checkpoint yet.")
+    ancestor_id = run.parent_run_id
+    while ancestor_id is not None:
+        ancestor = run_manager.get_run(ancestor_id)
+        if ancestor is None or ancestor.status in {AgentRunStatus.PAUSED, AgentRunStatus.CANCELLED} or ancestor.metadata.get("pause_requested"):
+            raise HTTPException(status_code=409, detail="Resume the task tree root before resuming a child.")
+        ancestor_id = ancestor.parent_run_id
     if run.status == AgentRunStatus.RUNNING and run.metadata.get("pause_requested"):
         # A restart may retain pause intent without a live worker to acknowledge
         # it. The checkpoint owner can safely acknowledge an idle lease here.
@@ -673,6 +729,7 @@ def _start_agent_turn_task(*, runtime, payload: AgentTurnRequest, run_id: str) -
             llm_response_mode=_stream_turn_llm_response_mode(payload),
             safety_review_mode=payload.safety_review_mode,
             **({"resumable": True} if payload.resumable else {}),
+            **({"attachment_ids": payload.attachment_ids} if payload.attachment_ids is not None else {}),
             existing_run_id=run_id,
         )
     )

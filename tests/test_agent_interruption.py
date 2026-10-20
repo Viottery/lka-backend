@@ -382,7 +382,7 @@ def test_store_rolls_back_inserted_replacement_if_event_validation_fails(tmp_pat
         manager.close()
 
 
-def test_legacy_and_active_children_refuse_resumable_interrupt(tmp_path, monkeypatch):
+def test_legacy_refuses_and_tree_pause_waits_for_children(tmp_path, monkeypatch):
     runtime, _ = runtime_for(tmp_path, monkeypatch, "legacy", [])
     try:
         run = runtime.create_agent_run(session_id="legacy", user_input="Old")
@@ -397,10 +397,15 @@ def test_legacy_and_active_children_refuse_resumable_interrupt(tmp_path, monkeyp
     manager.mark_running(parent.run_id)
     child = manager.create_child_run(parent_run_id=parent.run_id, plan_id="plan", step_id="child",
                                     attempt=1, user_input="Child")
-    with pytest.raises(ValueError, match="child tasks"):
-        manager.request_pause(parent.run_id)
+    manager.request_pause(parent.run_id)
+    assert manager.get_run(child.run_id).metadata["pause_requested"]
+    assert manager.acknowledge_pause(parent.run_id).status == AgentRunStatus.RUNNING
     assert manager.get_run(child.run_id).status == AgentRunStatus.QUEUED
+    manager.acknowledge_pause(child.run_id)
+    assert manager.acknowledge_pause(parent.run_id).status == AgentRunStatus.PAUSED
+    manager.resume_paused(parent.run_id)
     assert not manager.get_run(parent.run_id).metadata.get("pause_requested")
+    assert manager.get_run(child.run_id).status == AgentRunStatus.QUEUED
 
 
 def test_http_replacement_runs_new_message_and_does_not_publish_old_answer(tmp_path, monkeypatch):

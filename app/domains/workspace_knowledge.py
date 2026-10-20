@@ -9,6 +9,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
+from app.domains.file_processing import FileProcessingError, supported_index_extensions
 from app.domains.knowledge import (
     KnowledgeDocumentInput,
     KnowledgeService,
@@ -30,7 +31,7 @@ class WorkspaceKnowledgeResult(BaseModel):
 
 
 class WorkspaceKnowledgeIndexer:
-    """Index text files beneath an explicitly configured workspace root."""
+    """Index supported local documents beneath an explicitly configured workspace root."""
 
     def __init__(
         self,
@@ -73,6 +74,7 @@ class WorkspaceKnowledgeIndexer:
                 stat = canonical.stat()
                 if not canonical.is_file() or stat.st_size > self._max_file_bytes:
                     result.skipped_files += 1
+                    result.errors.append(f"{candidate.name}: not a regular file or file byte limit exceeded")
                     continue
                 if result.bytes_read + stat.st_size > self._max_total_bytes:
                     result.skipped_files += 1
@@ -85,10 +87,9 @@ class WorkspaceKnowledgeIndexer:
                     result.errors.append(f"{candidate.name}: byte limit exceeded while reading")
                     continue
                 result.bytes_read += len(raw)
-                text = raw.decode("utf-8-sig")
+                converted = self._knowledge.file_processor.process_bytes(canonical.name, raw)
                 relative = canonical.relative_to(requested_root).as_posix()
                 uri = f"workspace://{root_key}/{relative}"
-                mime_type = "text/markdown" if canonical.suffix.lower() == ".md" else "text/plain"
                 imported = self._knowledge.import_text_document(
                     KnowledgeDocumentInput(
                         source=KnowledgeSourceInput(
@@ -101,16 +102,19 @@ class WorkspaceKnowledgeIndexer:
                         ),
                         title=canonical.name,
                         uri=uri,
-                        text=text,
-                        mime_type=mime_type,
+                        text=converted.text,
+                        mime_type=converted.mime_type,
                         sensitivity="personal",
                         remote_policy="redact",
-                        metadata={"relative_path": relative},
+                        metadata={"relative_path": relative, **converted.metadata},
                     )
                 )
                 result.imported_files += 1
                 result.imported_chunks += imported.imported_chunks
                 indexed_uris.add(uri)
+            except FileProcessingError as exc:
+                result.failed_files += 1
+                result.errors.append(f"{candidate.name}: {str(exc)[:300]}")
             except (OSError, UnicodeError, ValueError) as exc:
                 result.failed_files += 1
                 # Avoid copying file contents or OS paths into user-facing errors.
@@ -157,7 +161,7 @@ class WorkspaceKnowledgeIndexer:
             dirs[:] = sorted(safe_dirs)
             for name in sorted(files):
                 candidate = current / name
-                if candidate.suffix.lower() in {".md", ".txt"}:
+                if candidate.suffix.lower() in supported_index_extensions():
                     found.append(candidate)
                     if len(found) > max_files:
                         return found, True, errors

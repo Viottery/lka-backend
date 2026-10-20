@@ -8,6 +8,7 @@ from app.core.agent_runs import AgentRunStatus
 from app.core.llm_workloads import LLMWorkloadController, workload_scope
 from app.core.runtime import LocalKnowledgeAgentRuntime
 from app.core.safety import SafetyReviewMode
+from app.core.sessions import SessionRunPolicy
 from app.core.tools import ToolContext
 from app.domains.management import ManagementConflictError
 from tests.test_management_api import runtime as runtime_fixture
@@ -134,7 +135,7 @@ def test_scoped_ownership_workspace_replacement_and_parent_pause(runtime, tmp_pa
     assert not view.full_workspace_authority and view.allowed_paths == (str(workspace),)
     runtime.agent_run_manager._update_run(task_run.run_id, status=AgentRunStatus.PAUSED)
     replaced = runtime.replace_agent_run(task_run.run_id, user_input='Same scope', command_id='r', request_fingerprint='r')
-    assert replaced.metadata['session_policy'] == policy
+    assert SessionRunPolicy.model_validate(replaced.metadata['session_policy']) == SessionRunPolicy.model_validate(policy)
     runtime.management_service.update(context.session_id, expected_revision=2, status='paused')
     with pytest.raises(ManagementConflictError, match='active'):
         runtime.management_coordinator.check_run(replaced.run_id)

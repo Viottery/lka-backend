@@ -1,5 +1,51 @@
 # Local Knowledge Agent OS Eval Benchmarks
 
+## Repository-level software engineering
+
+The [software engineering adapter](datasets/software_engineering/README.md) adds
+a pinned 500-task SWE-bench Verified snapshot, explicit case selection,
+disposable base checkouts, Linux command isolation, blank/reference calibration,
+bounded real-Agent inference, patch export and separate executable grading.
+Listing is offline; downloads/setup and paid dispatch are explicit subcommands.
+Native diagnostic results and official Docker grades use separate protocols.
+The two-case pilot checks the environment and a harder repair; it is not an
+Agent accuracy estimate. Reports and upstream oracle data stay in ignored `data/`.
+
+```bash
+.venv/bin/python -m evals.lka_evals.swe_bench list --pilot
+```
+
+## Atomic conversation context shadow replay
+
+`scripts/eval_atomic_context.py` copies only an explicitly selected session into an isolated SQLite database.
+Source access is read-only; reports and full private history must stay in a Git-ignored output directory.
+Without `--run`, it only freezes history and reports the selected range, with no model/config loading.
+`--through-seq` freezes a historical prefix even while the production conversation grows.
+
+```bash
+.venv/bin/python scripts/eval_atomic_context.py --source /path/to/lka.sqlite3 \
+  --session SESSION_ID --output data/quality_runs/atomic-new --through-seq 256
+```
+
+Authorized remote runs additionally use `--run`, the configured DeepSeek Flash client and a persistent
+evaluation ledger (default 2 USD / 4 requests, no search). `--ledger` reuses the same accounting across
+retries or comparisons. Output is uncapped at the provider boundary, but a conservative full-window
+reservation is made before dispatch; no budget is reset to obtain a successful result.
+For an incremental follow-up, use a successful isolated replay database as `--source` and add
+`--resume-records --keep-tail 0`; retain `--through-seq` and the same `--ledger`. This copies only
+the selected session's atomic state, never jobs or leases, and still writes to a new isolated output.
+Every record delta passes the same schema, source, version and publication checks as background processing.
+New requests use `passage_ids_v1`: content is synthesized; the model selects server-issued passage IDs,
+and the server records original text and receipts. Old exact-quote records remain readable.
+A schema violation or unknown passage ID permits one bounded model repair, followed by full revalidation;
+this is another metered request, not fuzzy-match acceptance or a manually corrected quality pass.
+Multi-source episodes, mixed-role user claims and numeric progress proposals additionally receive one
+small source-support review using only referenced passages and candidate records. It is a separate
+metered call and remains fallible; all reviewed changes must pass the same deterministic validation.
+Reports separate source preservation, prompt latency and provider usage from semantic quality, which
+requires independent review. Schema-valid or fully loaded records are not automatically quality passes.
+No replay result is published into production. Offline contracts are in `tests/test_context_records.py`.
+
 ## Linux real-task quality catalog (2026-10-05)
 
 Historical investigation notes are workspace-local engineering records and are
@@ -86,6 +132,28 @@ dispatch. Reports separate token counts, candidate retention, source attribution
 and provisional reference coverage. Agent-reviewed references are not human gold,
 and a structurally valid response is not semantic success. No result is published
 to production and no report automatically increases a gray rollout percentage.
+
+## Synthetic Vision API Probe
+
+`scripts/probe_vision_api.py` defaults to listing its limits without dispatch.
+With explicit authorization, it sends at most three generated images through the
+configured model: ordinary completion, scanned-PDF rendering plus image tool,
+and streaming. Each request has a 512 output-token limit and a 45-second transport
+timeout; model use is recorded in an isolated ledger. It enables only the selected
+model's image capability in memory and never changes private configuration.
+
+```bash
+.venv/bin/python scripts/probe_vision_api.py
+# Paid calls; use a new, ignored output directory and explicitly authorize first.
+.venv/bin/python scripts/probe_vision_api.py --run \
+  --output docs/_engineering/reports/vision-probe-new
+```
+
+Checks compare random image-only codes, shape counts, table values and sums.
+An accepted image request alone is not a semantic pass; incomplete/limited replies
+fail. The probe stops after the first failed case. Three simple synthetic passes
+establish endpoint compatibility only, not complex-document OCR quality or a
+general accuracy rate. Reports, images and usage stay local.
 
 ## Offline Memory Release Regression Foundation
 
@@ -536,9 +604,16 @@ runtime, or call providers:
 
 Offline selections invoke bounded pytest node IDs against actual ownership,
 lease, restart/deduplication and registered-tool manual approval contracts. These
-passes do not establish real-model semantic quality. Model scenarios require an
-explicit selection, both dispatch gates, a fresh output directory and an
-explicitly authorized budget, for example:
+passes do not establish real-model semantic quality.
+
+The additional offline selections `history_scope` and `simple_matter_capture`
+cover supervisor-only history access, source pagination, compact single-Matter
+creation/editing, safety reviews, revisions and atomic autonomous publication.
+Their scripted harness checks cover both legacy and checkpointed turns; they
+do not claim measured real-provider latency improvements.
+
+Model scenarios require an explicit selection, both dispatch gates, a fresh
+output directory and an explicitly authorized budget, for example:
 
 ```bash
 .venv/bin/python -m evals.lka_evals.management_cases --run --llm-mode real \
@@ -565,3 +640,14 @@ obsolete approval; its earlier budget-limited attempt remains **unvalidated**, n
 a pass. Missing trace evidence, partial runs, unknown results and budget failures
 never count as passes. Structured gates still require independent semantic review;
 inspect local report and trace artifacts before a production release decision.
+
+### Assistant orchestration regression selection
+
+The management catalog also includes offline `assistant_orchestration`,
+`tool_selection_recovery`, `execution_workspace`, and `result_evidence` groups.
+They cover role policy before routing without ordinary-session inheritance,
+legacy/resumable and native/text rejection recovery, read-only parameter grants,
+frontend-configured task directories with no backend fallback, and owned-task
+evidence paging. Select with `python -m evals.lka_evals.management_cases --case <group>`;
+the default remains a plan, never a provider call. Scripted contracts do not
+certify real-model planning quality.

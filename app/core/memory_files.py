@@ -20,6 +20,7 @@ from app.domains.memory import (
     MemoryService,
     MemorySourceInput,
 )
+from app.domains.memory_feedback import MemoryFeedbackInput
 
 _HEADER = "<!-- lka-memory-view:v1 scope={scope} project_id={project_id} -->"
 _MAX_VIEW_BYTES = 8 * 1024 * 1024
@@ -194,7 +195,8 @@ class MemoryFiles:
                 ))
                 updated.append(self.memory.correct(edit.memory_id, content=edit.content,
                                                    expected_version=edit.expected_version,
-                                                   source_id=source_id))
+                                                   source_id=source_id,
+                                                   user_feedback=MemoryFeedbackInput(origin="user_memory_file")))
             except MemoryConflictError as exc:
                 raise MemoryFileConflictError(str(exc)) from exc
         # Imported content is preserved verbatim for user review. Record the

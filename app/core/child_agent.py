@@ -8,6 +8,7 @@ from typing import Any
 
 from app.core.agent_graph import (
     AgentGraphRunner,
+    AgentTurnPaused,
     AgentTurnWaitingForConfirmation,
     AgentTurnWaitingForUser,
 )
@@ -130,6 +131,9 @@ class ChildAgentExecutor:
             return self._from_terminal(child, snapshot)
         except AgentTurnWaitingForUser:
             return self._from_terminal(child, snapshot)
+        except AgentTurnPaused:
+            # Scheduler control, not a terminal task result or failed attempt.
+            raise
         except Exception as exc:  # noqa: BLE001 - convert runner failures into TaskResult.
             current = self.run_manager.get_run(child_run_id)
             if current and current.status in {

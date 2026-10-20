@@ -84,9 +84,11 @@ class SessionRunPolicy(BaseModel):
     """Server-owned defaults frozen into a run, never inferred from metadata."""
 
     allow_default_workspace: bool = True
+    role_instructions: str | None = Field(default=None, max_length=16000)
     llm_client_name: str | None = None
     llm_model: str | None = None
     allowed_tools: list[str] | None = None
+    read_only_tools: list[str] = Field(default_factory=list)
     allowed_paths: list[str] | None = None
     allow_fork: bool = True
     require_high_risk_approval: bool = False
@@ -110,6 +112,11 @@ class SessionService:
     ) -> None:
         self._conn_factory = conn_factory
         self._context_token_counter = context_token_counter
+        self.atomic_context_store = None
+        self.atomic_context_mode = "off"
+        self.atomic_context_projection_tokens = 4096
+        self.atomic_context_enqueue = None
+        self.last_atomic_context_error: str | None = None
         self.run_policy_provider: Callable[[str], SessionRunPolicy] | None = None
         self.before_delete: Callable[..., None] | None = None
         self.after_delete: Callable[..., None] | None = None
@@ -318,6 +325,22 @@ class SessionService:
             session=session,
             messages=[self._message_from_row(row) for row in rows],
         )
+
+    def get_latest_turn_attachment_ids(self, *, session_id: str) -> list[str]:
+        """Read the last persisted foreground input selection without loading history."""
+        if self.get_session_or_none(session_id=session_id) is None:
+            raise KeyError("Active session not found.")
+        conn = self._conn_factory()
+        try:
+            row = conn.execute(
+                "SELECT payload FROM agent_session_messages WHERE session_id=? AND role='user' "
+                "AND json_extract(payload,'$.entrypoint')='agent.turn' "
+                "AND json_type(payload,'$.attachment_ids')='array' ORDER BY rowid DESC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            return self._json_dict(row["payload"]).get("attachment_ids", []) if row else []
+        finally:
+            conn.close()
 
     def get_turn_user_message(self, *, session_id: str, trace_id: str) -> AgentSessionMessage | None:
         """Resolve server-persisted input, never model-supplied evidence or history."""
@@ -718,6 +741,18 @@ class SessionService:
         self, *, session_id: str, token_budget: int | None = None,
     ) -> AgentSessionContextWindow:
         """Return a bounded prompt projection without changing the full raw window."""
+        if self.atomic_context_mode == "active" and self.atomic_context_store is not None:
+            budget = token_budget
+            if budget is None:
+                conn = self._conn_factory()
+                try:
+                    stored = conn.execute("SELECT token_budget FROM agent_session_context_windows WHERE session_id=?", (session_id,)).fetchone()
+                    budget = stored[0] if stored else self.default_context_token_budget
+                finally:
+                    conn.close()
+            atomic = self._get_atomic_prompt_context(session_id, budget)
+            if atomic is not None:
+                return atomic
         raw, state = self._get_context_window_snapshot(session_id=session_id)
         budget = token_budget if token_budget is not None else raw.token_budget
         if raw.token_estimate <= budget:
@@ -778,6 +813,37 @@ class SessionService:
             "summary_metadata": metadata, "recent_messages": recent,
             "token_estimate": estimate,
         })
+
+    def _get_atomic_prompt_context(self, session_id, budget):
+        from app.core.context_projection import render_context
+        from app.storage.context_records import ContextRecordConflict
+
+        try:
+            snapshot = self.atomic_context_store.snapshot(session_id, include_history=False)
+            if not snapshot["revision"]:
+                return None
+            tail = [SessionRecentMessage(**{key: row[key] for key in ("role", "content", "created_at", "trace_id")})
+                    for row in snapshot["messages"] if row["seq"] > snapshot["covered_seq"]]
+            tail_tokens = self._context_token_estimate("", tail)
+            available = min(self.atomic_context_projection_tokens, budget-tail_tokens)
+            if available < 128:
+                self.last_atomic_context_error = "atomic_tail_exceeds_budget"
+                return None
+            projection = render_context(snapshot["records"], covered_seq=snapshot["covered_seq"],
+                                        budget=available, counter=self._active_context_token_counter())
+            estimate = self._context_token_estimate(projection["text"], tail)
+            if not projection["text"] or estimate > budget:
+                return None
+            self.last_atomic_context_error = None
+            return AgentSessionContextWindow(
+                session_id=session_id, token_budget=budget, summary=projection["text"],
+                recent_messages=tail, token_estimate=estimate, updated_at=snapshot["updated_at"],
+                summary_metadata={"method": "atomic_records", "covered_seq": snapshot["covered_seq"],
+                                  "projection_revision": snapshot["revision"], "omitted_records": len(projection["omitted_ids"]),
+                                  "count_method": projection["count_method"], "continuation_tool": "context.read"})
+        except (ContextRecordConflict, sqlite3.Error, ValueError) as exc:
+            self.last_atomic_context_error = type(exc).__name__
+            return None
 
     def record_context_exchange(
         self,
@@ -931,6 +997,18 @@ class SessionService:
                     self._invoke_enqueue(background_enqueue, session_id, revision + 1, target_seq, conn)
                 else:
                     post_commit_enqueue = (revision + 1, target_seq)
+            if self.atomic_context_enqueue is not None:
+                # Intent survives a queue failure; no scan of old sessions is needed.
+                if self.atomic_context_store is not None and next_seq > 1:
+                    self.atomic_context_store.mark_pending(conn, session_id, next_seq-1)
+                conn.execute("SAVEPOINT atomic_context_outbox")
+                try:
+                    self.atomic_context_enqueue(session_id, next_seq + 1, conn=conn)
+                except Exception as exc:  # noqa: BLE001 - derived work must not lose an answer
+                    conn.execute("ROLLBACK TO atomic_context_outbox")
+                    self.last_atomic_context_error = type(exc).__name__
+                finally:
+                    conn.execute("RELEASE atomic_context_outbox")
             conn.commit()
         except Exception:
             conn.rollback()
@@ -1043,14 +1121,12 @@ class SessionService:
                      (effect_id, session_id, now))
         if background_enqueue is not None and estimate >= int(budget * .70):
             self._invoke_enqueue(background_enqueue, session_id, revision + 1, next_seq + 1, conn)
-        atomic_context_enqueue = getattr(self, "atomic_context_enqueue", None)
-        atomic_context_store = getattr(self, "atomic_context_store", None)
-        if atomic_context_enqueue is not None:
-            if atomic_context_store is not None and next_seq > 1:
-                atomic_context_store.mark_pending(conn, session_id, next_seq - 1)
+        if self.atomic_context_enqueue is not None:
+            if self.atomic_context_store is not None and next_seq > 1:
+                self.atomic_context_store.mark_pending(conn, session_id, next_seq - 1)
             conn.execute("SAVEPOINT atomic_context_transaction_outbox")
             try:
-                atomic_context_enqueue(session_id, next_seq + 1, conn=conn)
+                self.atomic_context_enqueue(session_id, next_seq + 1, conn=conn)
             except Exception as exc:  # noqa: BLE001 - retain committed raw context if derived work is unavailable.
                 conn.execute("ROLLBACK TO atomic_context_transaction_outbox")
                 self.last_atomic_context_error = type(exc).__name__

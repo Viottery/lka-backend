@@ -1,0 +1,56 @@
+"""Local user acceptance and inspection of durable session input queues."""
+from __future__ import annotations
+
+from typing import Literal
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel, ConfigDict, Field
+
+from app.api.routes.memories import require_local_memory_control
+from app.core.session_inputs import SessionInputConflict
+from app.domains.session_attachments import SessionAttachmentError
+
+router = APIRouter(prefix='/sessions/{session_id}/inputs', tags=['session inputs'],
+                   dependencies=[Depends(require_local_memory_control)])
+
+
+class InputLLMOptions(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    response_mode: Literal['stream', 'text'] = 'text'
+
+
+class SubmitSessionInput(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    client_message_id: str = Field(min_length=1, max_length=128)
+    user_input: str = Field(max_length=100000)
+    attachment_ids: list[str] = Field(max_length=4)
+    safety_review_mode: Literal['skip', 'llm', 'manual'] | None = None
+    llm: InputLLMOptions | None = None
+
+
+def _call(request, operation, session_id, **kwargs):
+    try:
+        return getattr(request.app.state.runtime.session_inputs, operation)(session_id, **kwargs)
+    except KeyError as exc:
+        raise HTTPException(404, 'session_or_attachment_not_found') from exc
+    except SessionInputConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except SessionAttachmentError as exc:
+        raise HTTPException(exc.status_code, str(exc)) from exc
+    except (ValueError, OSError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@router.post('', status_code=202)
+def submit_input(session_id: str, payload: SubmitSessionInput, request: Request):
+    return _call(request, 'submit', session_id, **payload.model_dump())
+
+
+@router.get('')
+def list_inputs(session_id: str, request: Request):
+    return _call(request, 'snapshot', session_id)
+
+
+@router.post('/resume')
+def resume_inputs(session_id: str, request: Request):
+    return _call(request, 'resume', session_id)

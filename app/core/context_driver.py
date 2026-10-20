@@ -86,6 +86,7 @@ class ToolView(BaseModel):
     max_tool_calls: int | None = Field(default=None, ge=1)
     allowed_packages: tuple[str, ...] = ()
     allowed_tools: tuple[str, ...] = ()
+    read_only_tools: tuple[str, ...] = ()
     allowed_paths: tuple[str, ...] = ()
     allowed_source_ids: tuple[str, ...] = ()
     allowed_account_ids: tuple[str, ...] = ()
@@ -109,7 +110,8 @@ class ToolView(BaseModel):
                 return "package_not_granted"
         elif not package or package not in self.allowed_packages:
             return "package_not_granted"
-        if self.side_effect_level in {SideEffectLevel.NONE, SideEffectLevel.READ} and read_only is not True:
+        if (self.side_effect_level in {SideEffectLevel.NONE, SideEffectLevel.READ}
+                or tool_name in self.read_only_tools) and read_only is not True:
             return "invocation_not_read_only"
         return None
 

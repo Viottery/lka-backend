@@ -22,7 +22,7 @@ def test_workspace_index_imports_supported_files_with_confined_scope(tmp_path):
     root = tmp_path / "workspace"
     root.mkdir()
     (root / "notes.md").write_text("workspace notes searchable", encoding="utf-8")
-    (root / "skip.csv").write_text("not indexed", encoding="utf-8")
+    (root / "skip.bin").write_bytes(b"not indexed")
     (root / "nested").mkdir()
     (root / "nested" / "readme.TXT").write_text("nested workspace facts", encoding="utf-8")
 

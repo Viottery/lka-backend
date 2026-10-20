@@ -41,6 +41,14 @@ default_client = ""
 fallback_client = ""
 default_response_mode = "json"
 max_attempts = 2
+# Image input is opt-in and must be verified on the configured endpoint/model.
+# supports_vision = false
+# vision_model_overrides = { "your-vision-model" = true }
+# Explicit audio attachments temporarily select this client/model for one turn.
+# audio_client = "your-client-name" # Omit to use the default client endpoint/key.
+# audio_model = "gemini-3.8-flash"
+# audio_model_overrides = { "gemini-3.8-flash" = true }
+# supports_audio = false # Enable globally only for an audio-only client.
 # Optional legacy/default-client limits. Capacity and tokenizer apply only to
 # this configured default model; use model_overrides for exact model names.
 # context_window_tokens = 131072
@@ -70,6 +78,9 @@ checkpoint_backend = "sqlite"
 # Maximum decision-loop steps after the initial route. Raise for longer workflows
 # such as sync -> search -> load -> dedupe -> create/update -> verify -> answer.
 max_decision_steps = 10
+# Optional supported-client decision-stage thinking override, not route/answer/review.
+# Leave unset to retain provider defaults and existing recovery behavior.
+# decision_thinking_enabled = false
 # Enable Planner fork operations and bounded DAG scheduling. This requires
 # orchestrator = "langgraph" for parent checkpoint and approval resumption.
 multi_agent_planning_enabled = false
@@ -127,6 +138,10 @@ multi_agent_max_retries = 1
 # supports_stream = true
 # supports_json_mode = true
 # supports_function_calling = true
+# Enable only after verifying image input on this exact endpoint/model.
+# supports_vision = false
+# Mixed-model clients can declare exact capability overrides:
+# vision_model_overrides = { "your-vision-model" = true, "your-text-model" = false }
 # Set true only when this endpoint accepts tool_choice = "required".
 # supports_required_tool_choice = false
 # Set this only when the configured provider/base URL supports strict function schemas.
@@ -222,6 +237,10 @@ max_pending_requests = 16
 request_timeout_seconds = 12
 
 [memory]
+atomic_context_mode = "off" # off | shadow (background records only) | active (prompt projection)
+atomic_context_input_tokens = 24000 # Whole-message background input budget; never clips source history.
+atomic_context_projection_tokens = 4096
+atomic_context_debounce_seconds = 30
 # Local memory store and scoped recall are enabled by default. Background
 # local extraction learns explicit "记住：..." requests and tightly scoped,
 # low-impact enduring preferences such as "我希望以后...". Enabling this
@@ -247,7 +266,8 @@ max_recalled_chars = 2400
 extraction_debounce_seconds = 5
 background_worker_count = 2
 max_job_tokens = 0 # No ordinary memory/compaction allowance; emergency fuses below still apply.
-generation_output_tokens = 4096 # Includes reasoning and final output, not summary size.
+compaction_timeout_seconds = 180 # Per-call fallback deadline; provider timeout also applies.
+generation_output_tokens = 4096 # Extraction/consolidation output cap; compaction does not send a cap.
 recovery_output_tokens = 8192 # One bounded recovery; thinking disabled when supported.
 # Optional separate low-cost route; must declare its context_window_tokens.
 # background_client_name = "background"

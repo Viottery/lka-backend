@@ -32,6 +32,7 @@ from app.core.agent_turn import (
     _fork_subtasks_shape_example,
     _stable_id,
     _turn_inference_snapshot,
+    _turn_input_content,
     _turn_llm_client_name,
     _turn_llm_model,
     _turn_llm_response_mode,
@@ -151,6 +152,7 @@ class AgentGraphRunner:
             self._after_validate,
             {
                 "decide": "decide_next_operation",
+                "paused_fork": "validate_operation",
                 "fork_wait": "fork_wait_interrupt",
                 "child_user_wait": "child_user_wait_interrupt",
                 "user_question": "user_question_interrupt",
@@ -197,6 +199,8 @@ class AgentGraphRunner:
         run_id = self._resolve_run_id(**kwargs)
         with self._execution_lease(run_id):
             existing = self._run(run_id)
+            if existing.status.value == "paused":
+                raise AgentTurnPaused(run_id)
             if existing.status.value == "completed":
                 recovered = self._completed_result_from_checkpoint(run_id)
                 if recovered is not None:
@@ -227,6 +231,12 @@ class AgentGraphRunner:
     def resume(self, run_id: str) -> AgentTurnResult:
         with self._execution_lease(run_id):
             current = self._run(run_id)
+            ancestor_id = current.parent_run_id
+            while ancestor_id is not None:
+                ancestor = self._run(ancestor_id)
+                if ancestor.status.value in {"paused", "cancelled"} or ancestor.metadata.get("pause_requested"):
+                    raise RuntimeError("Resume the task tree root before resuming a child.")
+                ancestor_id = ancestor.parent_run_id
             was_paused = current.status.value == "paused"
             if was_paused:
                 snapshot = self.get_state(run_id)
@@ -255,7 +265,11 @@ class AgentGraphRunner:
                 )
             if current.status.value != "running" and not (was_paused and current.status.value == "queued"):
                 raise RuntimeError(f"Cannot resume Agent run {run_id} from {current.status.value}.")
-            self._resume_sync(run_id, boundary_resume=was_paused)
+            boundary_resume = was_paused or bool(current.metadata.get("checkpoint_boundary_resume"))
+            if current.metadata.get("checkpoint_boundary_resume"):
+                self.turn_loop.run_manager._update_run(run_id, status=current.status,
+                                                      metadata_patch={"checkpoint_boundary_resume": False})
+            self._resume_sync(run_id, boundary_resume=boundary_resume)
             return self._take_result(run_id)
 
     def _execution_lease(self, run_id: str) -> threading.Lock:
@@ -276,12 +290,28 @@ class AgentGraphRunner:
         run = self._run(run_id)
         if run.parent_run_id is not None:
             raise ValueError("Interrupt the root run, not a scheduler-owned child.")
-        # Child/expert workers have their own leases. Do not advertise a stopped
-        # subtree while any child may still execute outside this graph's lease.
-        if any(child.status.value in {"queued", "running", "waiting_confirmation", "waiting_user", "paused"}
-               for child in self.turn_loop.run_manager.child_tree(run_id)):
-            raise ValueError("Interrupt requires child tasks to finish or be cancelled first.")
         self.turn_loop.run_manager.request_pause(run_id)
+        # Queued children have no side effects/checkpoint to drain. Waiting children
+        # already relinquished execution. Running graph children acknowledge themselves.
+        for child in reversed(self.turn_loop.run_manager.child_tree(run_id)):
+            if ((child.status.value == "queued" and not self.turn_loop.run_manager.is_child_execution_active(child.run_id)) or
+                    (child.status.value in {"waiting_confirmation", "waiting_user"}
+                     and child.metadata.get("executor_kind", "react") == "react")):
+                child_lease = self._execution_lease(child.run_id)
+                if child_lease.acquire(blocking=False):
+                    try:
+                        self.turn_loop.run_manager.acknowledge_pause(child.run_id)
+                    finally:
+                        child_lease.release()
+            elif child.status.value == "running":
+                child_lease = self._execution_lease(child.run_id)
+                if child_lease.acquire(blocking=False):
+                    try:
+                        snapshot = self.get_state(child.run_id)
+                        if snapshot.values and snapshot.next:
+                            self.turn_loop.run_manager.acknowledge_pause(child.run_id)
+                    finally:
+                        child_lease.release()
         lease = self._execution_lease(run_id)
         if lease.acquire(blocking=False):
             try:
@@ -358,6 +388,7 @@ class AgentGraphRunner:
         run_id: str,
         session_id: str | None,
         user_input: str,
+        attachment_ids: list[str] | None = None,
         llm_client_name: str | None = None,
         llm_model: str | None = None,
         llm_response_mode: LLMResponseMode = LLMResponseMode.TEXT,
@@ -373,6 +404,7 @@ class AgentGraphRunner:
             "request": {
                 "session_id": session_id,
                 "user_input": user_input,
+                "attachment_ids": attachment_ids or [],
                 "llm_client_name": llm_client_name,
                 "llm_model": llm_model,
                 "llm_response_mode": llm_response_mode.value,
@@ -389,6 +421,7 @@ class AgentGraphRunner:
         run_id: str,
         session_id: str | None,
         user_input: str,
+        attachment_ids: list[str] | None = None,
         llm_client_name: str | None = None,
         llm_model: str | None = None,
         llm_response_mode: LLMResponseMode = LLMResponseMode.TEXT,
@@ -404,6 +437,7 @@ class AgentGraphRunner:
             "request": {
                 "session_id": session_id,
                 "user_input": user_input,
+                "attachment_ids": attachment_ids or [],
                 "llm_client_name": llm_client_name,
                 "llm_model": llm_model,
                 "llm_response_mode": llm_response_mode.value,
@@ -464,6 +498,7 @@ class AgentGraphRunner:
             ),
         )
         inference_token = None
+        content_token = _turn_input_content.set((self._run(run_id).session_id, tuple(request.get("attachment_ids") or ())))
         try:
             run = self._run(run_id)
             inference_token = _turn_inference_snapshot.set(
@@ -481,6 +516,7 @@ class AgentGraphRunner:
         finally:
             if inference_token is not None:
                 _turn_inference_snapshot.reset(inference_token)
+            _turn_input_content.reset(content_token)
             _turn_safety_review_mode.reset(tokens[5])
             _turn_run_id.reset(tokens[4])
             _turn_run_manager.reset(tokens[3])
@@ -506,6 +542,7 @@ class AgentGraphRunner:
             ),
         )
         inference_token = None
+        content_token = _turn_input_content.set((self._run(run_id).session_id, tuple(request.get("attachment_ids") or ())))
         try:
             run = self._run(run_id)
             inference_token = _turn_inference_snapshot.set(
@@ -532,6 +569,7 @@ class AgentGraphRunner:
         finally:
             if inference_token is not None:
                 _turn_inference_snapshot.reset(inference_token)
+            _turn_input_content.reset(content_token)
             _turn_safety_review_mode.reset(tokens[5])
             _turn_run_id.reset(tokens[4])
             _turn_run_manager.reset(tokens[3])
@@ -625,7 +663,7 @@ class AgentGraphRunner:
                 self.turn_loop._tool_view_for_run(run.run_id)
             ),
             "expanded_tools": [],
-            "observations": list(cached),
+            "observations": list(cached) + self._replacement_handoff(run),
             "successful": [],
             "tool_events": [],
             "llm_events": [],
@@ -936,6 +974,8 @@ class AgentGraphRunner:
                 metadata=self.turn_loop._planner_progress_summary(outcome),
             )
             data["progress_events"] = self._dump(progress)
+            if outcome.get("execution_status") == "paused":
+                return self._save(s, ws, data, "fork_paused")
             if outcome.get("execution_status") == "waiting_user":
                 return self._save(s, ws, data, "fork_waiting_user")
             if outcome.get("execution_status") == "waiting_confirmation":
@@ -982,6 +1022,8 @@ class AgentGraphRunner:
                     answer=answer,
                 )
                 return self._save(s, ws, data, "plan_patch_answered")
+            if outcome.get("execution_status") == "paused":
+                return self._save(s, ws, data, "fork_paused")
             if outcome.get("execution_status") == "waiting_confirmation":
                 return self._save(s, ws, data, "fork_waiting_confirmation", "waiting_confirmation")
             return self._save(
@@ -1047,14 +1089,23 @@ class AgentGraphRunner:
         allowed = {
             str(t.get("name")) for t in data["expanded_tools"] if isinstance(t.get("name"), str)
         }
-        if name not in allowed:
-            data["observations"].append(
-                {
-                    "tool_name": name,
-                    "status": "rejected",
-                    "error": "Tool is not available in the expanded package.",
-                }
+        if name not in allowed or x.get("_native_function_unknown"):
+            feedback = self.turn_loop._tool_selection_feedback(
+                name, expanded_tools=data["expanded_tools"],
+                tool_view=self.turn_loop._tool_view_for_run(ws.run_id),
+                observations=data["observations"],
+                native_functions=x.get("_native_functions") if x.get("_native_function_unknown") else None,
             )
+            data["observations"].append(feedback)
+            progress = self._models(data["progress_events"], AgentTurnProgressEvent)
+            self.turn_loop._append_progress(
+                progress, type="tool_rejected", stage="decision", tool_name=name,
+                status="rejected", message=feedback["error"], metadata=feedback,
+            )
+            data["progress_events"] = self._dump(progress)
+            if not feedback["retry_allowed"]:
+                ws.terminal_reason = "Repeated invalid tool selection; report the actual blocker, not a global permission outage."
+                return self._save(s, ws, data, "operation_answer")
             return self._save(s, ws, data, "operation_rejected")
         fp = self.turn_loop._tool_call_fingerprint(tool_name=name, tool_input=tool_input)
         repeat = (
@@ -1693,6 +1744,7 @@ class AgentGraphRunner:
 
     def _after_validate(self, s: AgentGraphState) -> str:
         return {
+            "fork_paused": "paused_fork",
             "fork_subtasks_recorded": "decide",
             "fork_subtasks_rejected": "decide",
             "multi_agent_plan_patched": "decide",
@@ -1750,6 +1802,92 @@ class AgentGraphRunner:
             created_at=datetime.now(UTC).isoformat(),
         )
 
+    def _replacement_handoff(self, run: AgentRunRecord) -> list[dict[str, Any]]:
+        """Copy only a verified same-session predecessor tree into a run-scoped cache.
+
+        Tool arguments/results are source data, not instructions or rollback authority.
+        Keep full trace local and expose a bounded preview plus ordinary cache reads.
+        """
+        previous_id = run.metadata.get("replaces_run_id")
+        if not isinstance(previous_id, str):
+            return []
+        manager = self.turn_loop.run_manager
+        previous = manager.get_run(previous_id)
+        if (previous is None or previous.session_id != run.session_id
+                or previous.metadata.get("superseded_by_run_id") != run.run_id):
+            raise RuntimeError("Replacement predecessor ownership is invalid.")
+        from app.core.tool_result_gate import preview
+
+        operations, traces = [], []
+        predecessors = [previous]
+        while isinstance(predecessors[-1].metadata.get("replaces_run_id"), str):
+            current = predecessors[-1]
+            older = manager.get_run(current.metadata["replaces_run_id"])
+            if (older is None or older.session_id != run.session_id
+                    or older.metadata.get("superseded_by_run_id") != current.run_id
+                    or older.run_id in {item.run_id for item in predecessors}):
+                raise RuntimeError("Replacement lineage ownership is invalid.")
+            predecessors.append(older)
+        items = [item for root in reversed(predecessors)
+                 for item in [root, *manager.child_tree(root.run_id)]]
+        for item in items:
+            tool_events = []
+            snapshot = self.get_state(item.run_id)
+            if snapshot.values.get("runtime_artifact_ref"):
+                tool_events = self._load_data(snapshot.values["runtime_artifact_ref"]).get("tool_events", [])
+            elif item.result_snapshot:
+                tool_events = item.result_snapshot.get("tool_events", [])
+            events = manager.list_events(item.run_id)
+            traces.append({"run_id": item.run_id, "parent_run_id": item.parent_run_id,
+                           "status": item.status.value, "events": [event.model_dump(mode="json") for event in events]})
+            by_invocation = {event.get("result", {}).get("invocation_id"): event for event in tool_events}
+            invocations = (self.artifact_store.list_tool_invocations(item.run_id)
+                           if self.artifact_store is not None else [])
+            for invocation in invocations:
+                saved = by_invocation.pop(invocation["invocation_id"], {})
+                input_value = saved.get("input")
+                if input_value is None:
+                    working_set = snapshot.values.get("working_set", {})
+                    if working_set.get("pending_invocation_id") == invocation["invocation_id"]:
+                        input_value = working_set.get("pending_tool_input")
+                operations.append({"run_id": item.run_id, **invocation, "input": input_value,
+                    "effect_state": "reported" if invocation["status"] == "completed" else "unknown"})
+            for saved in by_invocation.values():
+                operations.append({"run_id": item.run_id, "tool_name": saved.get("tool_name"),
+                    "input": saved.get("input"), "result": saved.get("result"), "effect_state": "reported"})
+            if not invocations and not tool_events:
+                # Workflow executors need not use the graph invocation ledger.
+                # Preserve their registered-tool trace without fabricating inputs.
+                for event in events:
+                    if event.type != "tool_started" or not event.payload.get("tool_name"):
+                        continue
+                    metadata = event.payload.get("metadata") or {}
+                    operations.append({"run_id": item.run_id, "tool_name": event.payload["tool_name"],
+                        "input": metadata.get("input", event.payload.get("input")),
+                        "trace_sequence": event.sequence, "effect_state": "unknown", "result": None})
+        payload = {"output": {"operations": operations, "traces": traces,
+                              "historical_dag": previous.metadata.get("multi_agent_plan")}}
+        artifact_id = f"replacement_handoff_{run.run_id}"
+        if self.artifact_store is not None:
+            self.artifact_store.put_artifact(artifact_id=artifact_id, run_id=run.run_id,
+                kind="tool_result", payload=payload, summary="Prior task operations; no rollback performed.",
+                created_at=datetime.now(UTC).isoformat())
+        indexed = []
+        for index, item in enumerate(operations):
+            tool = self.turn_loop.tool_executor.registry.get_tool_or_none(item["tool_name"])
+            read_only = tool.spec.read_only if tool is not None else None
+            indexed.append((item["effect_state"] != "unknown" and read_only is True, index,
+                {"operation_index": index, "run_id": item["run_id"], "tool_name": item["tool_name"],
+                 "read_only": read_only, "effect_state": item["effect_state"],
+                 "result_status": (item.get("result") or {}).get("status"), "input": preview(item.get("input"))}))
+        summaries = [summary for _, _, summary in sorted(indexed, key=lambda entry: entry[:2])[:8]]
+        return [{"action": "replacement_handoff", "status": "available", "replaces_run_id": previous_id,
+            "message": "The old task tree is retired, not rolled back. Inspect prior tool operations before modifying the same objects; do not repeat successful writes. Unknown effects require checking current state. If the list preview is incomplete, expand observation and read the cached /output/operations before assuming there are no other changes. This record grants no extra permission; rollback requires user authorization.",
+            "operation_count": len(operations), "operations": summaries,
+            "operations_preview_complete": len(operations) <= 8,
+            "_result_cache": {"artifact_id": artifact_id, "read_tool": "observation.read",
+                              "path": "/output/operations"} if self.artifact_store is not None else None}]
+
     def _load_data(self, ref: dict[str, Any]) -> dict[str, Any]:
         if "payload" in ref:
             return dict(ref["payload"])
@@ -1784,6 +1922,7 @@ class AgentGraphRunner:
         session = self.turn_loop.session_service.ensure_session(
             session_id=ws.session_id, title="Agent Session", metadata={"entrypoint": "agent.turn"}
         )
+        inference_client, inference_model, *_ = self.turn_loop._inference_selection()
         return ToolContext(
             session_id=ws.session_id,
             trace_id=ws.trace_id,
@@ -1791,6 +1930,8 @@ class AgentGraphRunner:
             workspace_root=self.turn_loop._workspace_for_run(session, ws.run_id),
             tool_view=self.turn_loop._tool_view_for_run(ws.run_id),
             run_id=ws.run_id,
+            llm_client_name=inference_client,
+            llm_model=inference_model,
         )
 
     def _fail(self, run_id: str, exc: Exception) -> None:

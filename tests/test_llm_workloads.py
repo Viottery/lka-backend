@@ -127,6 +127,44 @@ def test_service_background_capacity_and_timeout_are_separate_from_foreground(tm
     assert "network_timeout_seconds" not in received[1].metadata
 
 
+def test_compaction_timeout_and_uncapped_output_are_request_scoped(tmp_path):
+    import json
+
+    from app.core.background_llm import SelectedBackgroundClient, complete_text_in_worker
+    from app.core.llm.openai_compatible import OpenAICompatibleLLMClient
+
+    service = build_llm_service(LLMProviderConfig(default_client="mock", clients=[
+        LLMClientConfig(name="mock", provider="mock", default_model="m", context_window_tokens=50000),
+    ]))
+    service.workloads = LLMWorkloadController(tmp_path / "usage.db")
+    received = []
+    provider = service.registry.get("mock")
+    original = provider.complete
+
+    async def capture(request):
+        received.append(request)
+        return await original(request)
+
+    provider.complete = capture
+    selected = SelectedBackgroundClient(service, "mock", "m", limit_output_tokens=False,
+                                        request_timeout_seconds=180)
+    with workload_scope("background_memory", task_id="compact"):
+        complete_text_in_worker(selected, system_prompt="s", user_prompt="u", prompt_summary="compact")
+    with workload_scope("background_message", task_id="message"):
+        asyncio.run(service.complete_text(system_prompt="s", user_prompt="u", prompt_summary="message", max_output_tokens=100))
+    asyncio.run(service.complete_text(system_prompt="s", user_prompt="u", prompt_summary="interactive"))
+    assert received[0].max_output_tokens is None
+    assert received[0].metadata["network_timeout_seconds"] == 180
+    assert received[1].max_output_tokens == 100
+    assert received[1].metadata["network_timeout_seconds"] == 30
+    assert "network_timeout_seconds" not in received[2].metadata
+    wire = OpenAICompatibleLLMClient(name="wire", provider_name="wire", api_key="test",
+                                    base_url="https://example.invalid/v1", default_model="m")
+    payload = json.loads(wire._build_request(received[0], stream=False).data)
+    assert "max_tokens" not in payload
+    assert "max_completion_tokens" not in payload
+
+
 def test_memory_has_no_ordinary_quota_and_does_not_charge_message_pool(tmp_path):
     controller = LLMWorkloadController(tmp_path / "usage.db", hourly_tokens=10, daily_tokens=10, daily_cost_limit=1)
 

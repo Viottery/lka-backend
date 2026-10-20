@@ -37,6 +37,14 @@ GET /health
 
 ## 2. Index Workspace
 
+默认只扫描并记录文件数量。传入 `options.index_knowledge=true` 时，才会按文件类型策略
+将支持的本地文档转换、分块并写入知识库；类型列表见 `GET /knowledge/file-types`。
+该操作只接受允许的工作区，保留 `workspace_file` 来源及工作区权限，不启动持续监听。
+单次知识索引最多处理 500 个候选文件（也受服务扫描上限约束），单文件最多 2,000,000
+bytes，总读取最多 20,000,000 bytes。转换失败、无可提取正文或达到限额时返回
+`knowledge_errors`，状态为 `partial` 或 `failed`，不以空结果替换旧证据，也不执行删除清理。
+完整成功的重建才会移除已删除文件的旧索引。
+
 ```http
 POST /workspaces/index
 ```
@@ -203,8 +211,23 @@ GET /capabilities
 
 ## 4. Knowledge Import And Retrieval
 
-`knowledge` 是 source-agnostic 的本地证据库。第一版支持导入 Markdown/TXT 本地文档，
-写入 SQLite FTS，并通过只读工具提供最小必要片段给 Agent。
+`knowledge` 是 source-agnostic 的本地证据库。支持导入文本以及显式工作区索引时转换的
+本地文档，写入 SQLite FTS，并通过只读工具提供最小必要片段给 Agent。
+PDF 使用原生文字层提取；其他支持格式使用本地 MarkItDown 转换。向量同步仍由现有
+语义索引配置控制，文件转换不会自动下载模型或调用 OCR、云服务。
+
+`GET /knowledge/file-types` 返回 `{file_types:[...]}`。每项包含 `extensions`、
+`preferred_processor`、`index_supported`、`source_mime_type` 和 `notes`，由统一处理
+策略表生成。图片、音视频、ZIP 和旧版 DOC/PPT 会列出处理方向，但当前不自动索引。
+未知扩展名不进入工作区索引。
+
+转换文档的 `metadata.extraction` 保存处理器和版本、原文件 SHA-256、原始 MIME 类型及
+信息缺失提示。存储的 MIME 类型表示提取后的文本／Markdown，不表示原始二进制格式。
+PDF 另有页数、页码字符范围及无文字页列表；检索结果与 chunk 回读的
+`metadata.extraction` 保留简短警告、来源字符范围和可定位的 PDF 页码。
+这些范围指向转换文本，而非原始文件字节。文件修改后须显式重建；提取成功不代表视觉
+内容完整，检索快照也不代表源文件仍未变化。`POST /knowledge/import` 继续接受已提供的
+文本，保持原有合同。
 
 网页抓取不由 Agent 工具自动执行。当前公开网页样本先由外部脚本转换为分层本地 Markdown，
 例如 `data/knowledge_samples/minecraft/mobs/creeper.md`，再以
@@ -483,6 +506,71 @@ POST /agent/turn
 后端代码写死。`/agent/turn` 返回用户可见结果和脱敏审计摘要；`POST /agent/turn/stream`
 提供用户可见的 SSE token-delta 输出。
 
+### 会话文件附件
+
+先创建会话，再上传文件。`POST /sessions/{session_id}/attachments` 接收原始文件字节；
+`X-Filename` 是经 URL percent-encoding 的显示文件名，不作为文件路径。文档必须提供
+带支持扩展名的文件名。图片的 `Content-Type` 为 `image/png`、`image/jpeg` 或
+`image/webp`；文档使用与扩展名对应的 MIME，也可省略或使用 `application/octet-stream`。
+类型列表与 `GET /knowledge/file-types` 中的 `index_supported` 文档策略一致：
+TXT/TEXT、MD、PDF、DOCX、PPTX、XLSX/XLS、HTML/HTM、EPUB、CSV、JSON、XML 和 MSG。
+
+成功返回 200 及 `attachment_id`、`kind`（`image`、`document` 或 `audio`）、`filename`、
+`media_type`、`size_bytes`、`sha256`。图片另含 `width`、`height`；文档另含
+`processor`、`total_chars`、`text_size_bytes`、`text_sha256`、`extraction` 解析信息。
+旧图片元数据可不含 `kind`，应按图片处理。图片、文档和音频原文件的上传与下载均最多 256 MiB；图片仍限 400 万像素、
+单帧，文档提取文本仍限 200 万字符。类型不匹配或不支持返回 415，
+上传超限返回 413，解析失败等格式错误返回 422。这些上传和读取接口仅接受 loopback 客户端。
+
+`GET /sessions/{session_id}/attachments/{attachment_id}` 返回附件元数据；
+`GET /sessions/{session_id}/attachments/{attachment_id}/raw` 返回经完整性复核的原文件。
+文档以 `Content-Disposition: attachment` 下载，避免 HTML 等上传文件作为页面执行。
+附件属于上传时的会话；不存在、跨会话、已删除会话或失效附件均返回 404。
+
+`POST /agent/turn` 和 `/agent/turn/stream` 均接受可选 `attachment_ids`：
+
+```json
+{"session_id":"session_001","user_input":"解释这张截图","attachment_ids":["att_0123456789abcdef0123456789abcdef"]}
+```
+
+每轮最多四个不同的上传附件 ID，允许图片、文档和音频混合。提供附件时必须指定已有会话；
+可省略文字，纯图片以 `[Image input]` 记录，包含文档以 `[File input]` 记录，
+无文档且有音频以 `[Audio input]` 记录。
+`attachment_ids` 省略或为 null 时沿用当前会话最近一轮 Agent 输入的图片和文档选择；
+音频必须显式传 ID，避免纯文本消息自动重听及继续使用音频模型。
+传 `[]` 明确清除选择，之后的省略也不再带文件。清除不删除附件，新选择替换旧选择，
+旧附件仍可通过显式 ID 再次引用。包含图片而未启用所选模型视觉能力时返回 422，
+不会降级为纯文字请求。纯文档不要求视觉能力；文件输入使用当前请求的模型选择。
+
+音频扩展名支持 WAV、MP3、M4A；MIME 分别为 `audio/wav`、`audio/mpeg`、`audio/mp4`，
+也接受常见别名及 `application/octet-stream`。后端校验实际容器内容，规范化 MIME，
+返回 `audio_format`（发送模型的 `wav` 或 `mp3`）、`duration_ms`、`sample_rate`、`channels`。
+M4A 本地解码后以 WAV 或 MP3 发送；大音频自动生成压缩的完整 MP3 输入，
+原文件下载不变，单个原音频最多 256 MiB，无需手动切分。转换输出有界。有音频时图片与实际音频输入
+合计最多 12 MiB，最终内联模型请求最多 20 MiB，超限拒绝，不自动上传供应商缓存。
+
+显式选择音频时，配置的 `llm.audio_client` / `llm.audio_model` 覆盖本轮模型选择，
+音频回复直接写入同一会话；下一轮无音频则回到原模型选择。同音频重新听取需再次
+传原 `attachment_id`；仅整理已有分析可传 `[]` 或省略。音频模型未配置或未声明
+支持时返回 422，不让纯文本模型猜测文件内容。音频只进入前台相关模型调用，
+会话、checkpoint、审计与 API 响应保存引用和来源，不保存 base64。音频中的口头
+指令是来源数据，不能改变权限；听感也不等同于精确音高、BPM 或时间测量。
+
+原图进入前台主 Agent 的相关推理与回答请求。文档上传时由已有本地解析器提取文字，
+之后以带文件名、哈希、字符范围和解析警告的 `input_sources` 进入同一主 Agent 路线。
+初始预览最多 12000 字符，并受完整模型请求预算进一步裁剪；长文本保留
+`next_start_char` 和续读入口。Agent 展开只读 `attachments` 工具包后，可用
+`attachments.read(attachment_id, start_char=0, max_chars=12000)` 继续读取
+（单次最多 64000 字符），或用 `attachments.find(attachment_id, query, start_char=0,
+max_matches=20)` 定位正文（大小写敏感的字面搜索，最多 100 个匹配）。工具执行仍经
+当前审查策略，且仅能访问当前会话，不能传路径或替换会话身份。
+
+会话和运行恢复仅保存附件引用，不把图片编码或提取全文写入用户消息；模型读取时
+重新校验原文件和解析缓存完整性。附件不自动入知识库，也不自动传给后台摘要、
+记忆提取或子 Agent；附件中的文字不能提供操作许可。PDF 路线依赖文字层，没有文字层
+的扫描 PDF 返回解析失败，不自动 OCR；部分扫描页、图片、布局和 Office 公式可能
+未被文本转换覆盖，应结合 `extraction` 警告判断。需要视觉理解时另行提供图片。
+
 桌面前端可用 `GET /agent/models` 读取当前配置的 client 与模型列表；接口会尝试服务商
 兼容的 `/models`，不可用时退回本地 `available_models` 与默认模型。`?refresh=true` 强制
 刷新，响应不包含 API key。`GET /agent/ui-defaults` 和 `PUT /agent/ui-defaults` 读取及保存
@@ -659,10 +747,17 @@ bash 工具只通过 Agent tool-call 暴露，不提供独立 HTTP endpoint。�
 或 Server 2019+。Windows 命令使用 PowerShell 语法和 `$env:WORKSPACE_ROOT`，不自动转换
 Unix 命令；工具元数据会说明实际 shell。
 
-`filesystem.read_file` / `filesystem.edit_file` 的 `path` 字段也使用同一 workspace path
+`filesystem.read_file` / `filesystem.edit_file` / `filesystem.create_file` / `filesystem.list_directory` 的 `path` 字段也使用同一 workspace path
 基准：相对路径按当前会话 workspace（未设置时为第一个 configured workspace root）解析，并支持 `$workspace_root`、
 `${workspace_root}`、`$WORKSPACE_ROOT`、`${WORKSPACE_ROOT}`、`$LKA_WORKSPACE_ROOT` 和
 `${LKA_WORKSPACE_ROOT}` 展开。
+
+`filesystem.list_directory` 是只读的浅层目录发现工具，不读取文件正文或递归跟随符号链接。
+`path` 默认 `.`，`limit` 默认 100、最大 200；后续页传 `offset` 和上页的
+`snapshot_id`（作为 `expected_snapshot`），名称或类型变化后须重新枚举。
+每次最多枚举 2000 个条目；`enumeration_complete=false` / `truncated=true` 表示目录
+并未完整枚举，应缩小目录范围。`has_more` 仅表示已枚举条目还有下一页，不能证明目录
+所有条目已读取。目录外访问及子运行路径授权与其他文件工具一致。
 
 路径协议：
 
@@ -748,6 +843,40 @@ Unix 命令；工具元数据会说明实际 shell。
 `Get-ChildItem`、`Get-Content`、`Get-Item`、`Test-Path`、`Select-String`、`Get-Process`、
 `Get-Date` 及相应支持的别名。PowerShell 表达式、变量展开、管道和重定向均进入审查；
 无法判断、非白名单命令默认非只读。
+
+可选参数 `python_environment: "default"` 使用显式准备的独立 Python 环境，始终按
+非只读调用审查。通过 `bash.python_environment` 查询实际可用状态、解释器、Python 与
+包版本和脚本／输出目录。Linux 用 `"$LKA_PYTHON" script.py`，Windows 用
+`& $env:LKA_PYTHON script.py`。同步、后台、超时和退出码合同保持一致；环境未准备时
+明确失败，不回退到后端 Python。继承环境使用系统变量白名单，Linux 不加载 shell profile。
+
+`filesystem.create_file` 参数为 `path`、UTF-8 `content`，仅在父目录存在且目标不存在时创建，
+返回 `resolved_path`、`sha256`、`bytes_written`、`created`。调用经过写审查、工作区及子运行
+路径范围检查，目录外目标需要本次精确路径批准。
+
+### 7.1.1 PDF 与视觉工具
+
+这些能力同样通过通用 Agent 工具协议调用，无专用任务 HTTP 入口。
+
+| 工具 | 主要参数与行为 |
+| --- | --- |
+| `documents.open` | `path`；返回 `sha256`、`page_count`、目录和元数据，尚未提取页面文字 |
+| `documents.read_pages` | `path`、`expected_sha256`；可选 `start_page`、`start_char`、`max_pages`、`max_chars`、`mode`（`plain`／`layout`）；返回页码、文字与续读 `next` |
+| `documents.find` | `path`、`expected_sha256`、`query`；可选起始页／字符、页数和匹配数；返回文字层的区分大小写匹配和续查位置 |
+| `documents.render_page` | `path`、`expected_sha256`、`page`、`output_path`；可选 `dpi`；不覆盖地写入 PNG，返回 `image_sha256` 和尺寸，按写操作审查 |
+| `vision.inspect_image` | `path`、`question`；可选 `expected_sha256`、`client_name`、`model`、`max_output_tokens`；经过审查向模型发送本地图片，返回解释、来源指纹和模型调用审计 |
+
+PDF 页码从 1 开始，字符偏移从 0 开始；每次调用重新授权路径并校验原文件。
+文字层缺失和视觉保真未验证会显式标记，截断内容可继续读取。PDF 上限 64 MiB，
+一次读最多 10 页／64000 字符，一次搜索最多 50 页／100 个匹配；加密文件明确失败。
+渲染 DPI 为 72–200，单页最多 1600 万像素。视觉工具接受单帧 PNG／JPEG／WebP，
+上限 10 MiB／400 万像素，模型须显式配置视觉能力。视觉调用目前不提供给子 Agent，
+以免绕过子运行的模型调用和 token 预算；主运行保留共享模型资源控制和工具调用审计。
+视觉模型调用的审计与用量位于工具结果的 `llm_call` 字段，目前不并入 Agent 的顶层
+`llm_events` 汇总；客户端统计模型总用量时须同时读取这两类记录。容量检查使用保守
+图片 token 估计；未配置模型容量时只能依赖提供方拒绝超限请求。
+视觉工具默认最多输出 1024 token，可显式设置为 128–4096；回复不完整或达到输出上限
+时工具报告失败，保留部分内容和调用审计，避免把截断内容当成完整阅读。
 
 ### 7.2 `bash.read_session`
 
@@ -951,6 +1080,11 @@ SQLite 检查点支持进程重启恢复；`checkpoint_backend="memory"` 只支�
 不能当作已经停止。请求和暂停状态持久化；重复请求幂等。终态或不支持的运行返回 `409`，
 未知 run 返回 `404`。
 
+打断以根 run 为入口，原子登记整棵任务树的暂停意图，停止新节点派发及新的 fork。
+活跃的通用子 Agent 保存各自检查点；尚未派发的子任务停留在原 attempt。
+根 run 只有在自己的检查点写完、全部后代已暂停或终结后才发布 `run_paused`。
+子任务单独出现 `run_paused` 不等于整棵树停稳。已完成节点和已产生结果保持不变。
+
 `AgentRunResponse` 增加 `paused_at`、`pause_requested`、`paused_from_status` 和
 `superseded_by_run_id`。SSE 发布 `run_pause_requested` / `run_paused` / `run_resumed`；
 看到 `paused` 后排空已记录事件并关闭连接。暂停不是取消；继续后用原 run ID 和最后的
@@ -962,9 +1096,11 @@ sequence 重新连接 `/stream`，不会从头回放已完成的工具操作。
   正在等待审批或用户回答，则恢复到该等待状态，仍需走原有 decision / continue 接口；
   普通 resume 不代替审批或用户回答。暂停尚未落稳时返回 `409`。重启留下的待暂停请求
   可在空闲检查点处确认后继续；恢复失败保留错误，不宣称任务完成。
+  根任务恢复时一并恢复暂停的后代，复用原 DAG、上下文快照及 attempt，不重放已保存的
+  工具步骤；预算使用记录不清零。父任务仍在暂停、待暂停或已取消时，单独恢复子任务返回 `409`。
 - **用新消息替换**：`POST /agent/runs/{run_id}/replace`，正文沿用 `AgentTurnRequest`，
   另加必填非空 `command_id`（最长 128 字符）。省略 `session_id` 时使用原会话，显式
-  指定则必须相同；模型与审查选项按新请求正常解析。
+  指定则必须相同；附件继续遵循原请求的上传和会话校验。模型与审查选项按新请求正常解析。
   仅已暂停且执行租约空闲的根运行可替换；尚在执行时快速返回 `409`，不在 HTTP 请求里
   等待模型结束（仅允许最多 100ms 的旧 worker 收尾等待）。旧 run 标记 `cancelled` 并指向新 run，新 run 在原会话排队执行，返回
   `202 AgentRunResponse`。前端连接**新 run ID**的 `/stream` 观察新任务。
@@ -973,6 +1109,17 @@ sequence 重新连接 `/stream`，不会从头回放已完成的工具操作。
 同一完整请求可重试，返回同一个新 run；变更 ID 或内容返回 `409`。重启后也保持这个关联，
 若新 run 尚未启动，重发相同替换请求可重新派发。不会删除原用户消息、工具记录或已发生的
 副作用，也不会把取消的旧任务再次恢复。已有写操作**不会回滚**。
+事务同时取消暂停的后代，将旧 DAG 标记 `cancelled`、未完成节点标记 `cancelled`，
+取消其调度资格而不删除 DAG、父子关联、检查点、审批或 trace。旧树的迟到结果只能留在
+旧 run 的记录中，不能完成旧任务或混入新任务。
+
+新任务在模型观察中获得 `replacement_handoff`：先前工具名称、参数预览、报告的结果状态
+和效果未知标记。完整操作、旧运行事件及历史 DAG 存入新 run 自己的缓存，模型可展开
+`observation`，通过 `observation.read` 读取 `_result_cache.artifact_id` 的
+`/output/operations`、`/output/traces` 或 `/output/historical_dag`；不开放任意跨 run 回读。
+连续替换保留此前替换链上的操作信息。交接资料不是新的执行授权，不代表写操作已撤销；
+无返回结果的调用保守标记未知，回退前应核查现状并取得用户授权。没有修改前快照的操作
+不保证可撤销。工具原始参数与结果继续属于模型上下文／本地审计，不新增普通 API 的公开字段。
 
 ```json
 {
@@ -982,9 +1129,13 @@ sequence 重新连接 `/stream`，不会从头回放已完成的工具操作。
 }
 ```
 
-目前可恢复打断仅支持 LangGraph 根运行，且没有活跃子 Agent / 外部专家。对活跃子任务
-返回 `409`，避免父图暂停而子任务继续执行；可先通过原有控制结束子任务，或使用原有
-`cancel` 永久终止整个任务树。未选择可恢复运行方式的 legacy 任务继续保留原有 cancel。
+可恢复打断需要 LangGraph 根运行；`resumable=true` 根任务的通用 ReAct 子任务自动沿用
+检查点运行方式。未选择可恢复运行方式的 legacy 根任务继续保留原有 cancel。
+当前 `can_resume=false` 的 workflow／外部专家没有可恢复检查点：已获准开始的执行需要
+先安全结束，不会伪造“已暂停”或强杀后重放；此期间根任务仍为 `pause_requested`，
+不能替换。尚未开始的专家子任务可以一起暂停。外部执行若仍等待审批，需要按原审批
+机制解决等待，或选择永久取消；此功能不补造第三方进程的恢复能力。外部专家自己的
+私有原生 trace 继续由原有接口保留，通用交接不保证重建其未登记到工具协议的内部调用。
 执行租约为进程内互斥，不提供多个后端 worker 对同一图的并行执行保证。
 
 安全审查 API 与 SSE 的 `safety_review_*` 事件只返回公开摘要（review ID、工具、风险、状态、
@@ -1319,15 +1470,55 @@ limit 1..200，offset 0..1,000,000，q 最长 500 字符，按字面子串搜索
 | `PATCH /managers/{session_id}` | 修改 status 或模型默认值，必须携带 expected_revision；冲突 409 |
 
 单项响应为 `{session: {...}, controller: {...}}`。controller 包含 session_id、
-status(active/paused)、revision、llm_client_name、llm_model、created_at、updated_at。
+status(active/paused)、revision、llm_client_name、llm_model、created_at、updated_at、default_execution_workspace。
+默认执行父目录通过创建或 PATCH 的 default_execution_workspace:{path,platform} 配置，后端验证并返回 backend_path；null 清除。PATCH 必须使用 expected_revision。POST /managers/default 的目录仅在首次创建时采用，后续不覆盖已有配置。
+此字段不赋予主管自身 session.workspace，也不是审批授权。
 新建时 paused；模型字段省略保持原值，显式 null 清除。未知 client 返回 422。
 make_default=true 表示显式切换默认入口，主控会话无需固定 ID。
 
 对话仍通过通用 `/agent/turn` 或 `/agent/turn/stream`。请求模型覆盖优先于会话默认；
 运行冻结其实际会话策略，恢复沿用原设置，替换的新轮读取当前会话设置。
-主管会话开放 `management` 与 `matter` 的只读工具，不提供默认目录回退；事务线子 agent 的能力和路径按委托冻结。
-Matter 写入统一经过 `management.organize_work`，不开放即时 `matter.update` 等写工具。
+主管会话开放 `management`、专用 `history` 包、`matter` 读取及轻量主管写入工具，以及当前注册且已授权的只读操作。支持按参数只读的工具可被发现，但每次调用均强制验证只读；其他写入不能通过这一授权执行。主管复杂工作默认下发；简单搜索、单次操作可直接处理。
+主管角色策略在首次路由前装载并冻结，普通执行会话不继承；原有安全审查与审批独立生效。事务线子 agent 的能力和路径按委托冻结。
+单条事项可在 `matter` 包使用 `management.create_matter` / `management.update_matter`，无需展开整套管理工具。
+两者复用 `management.organize_work` 的事务、修订和自主发布检查；未开放普通 `matter.update` 等即时写工具。
 controller active 才能发出管理写命令；paused 可对话和读取结果。普通任务和 child 不开放管理包。
+
+默认全局助手支持独立的持久用户消息队列；需启用管理功能和 SQLite 检查点。
+它不依赖 controller active 或自主运行开关。普通会话及事务线子 agent 不开放此入口。
+
+| 接口 | 行为 |
+| --- | --- |
+| `POST /sessions/{session_id}/inputs` | 接收并持久保存一条用户消息，返回 202 和入队回执 |
+| `GET /sessions/{session_id}/inputs` | 查询队列状态及消息处理回执，不执行模型调用 |
+| `POST /sessions/{session_id}/inputs/resume` | 显式继续因失败或取消而暂停的队列，不重试失败消息 |
+
+入队正文包含 `client_message_id`（客户端生成、非空、最长 128 字符）、`user_input`、
+`attachment_ids`（无附件传空数组），以及可选 `safety_review_mode` 和
+`llm: {response_mode: "stream"|"text"}`。空文字需要有效附件。
+同一会话与消息 ID 的相同请求返回原回执，变更内容复用 ID 返回 409。队列最多保留 100 条未完成输入，已满时新输入返回 409；原请求重试仍返回回执。
+附件使用既有上传接口，随每条消息独立绑定，不继承另一条消息的附件。
+
+入队响应为 `{input: {...}, queue: {paused, pending_count, active_run_id}}`；
+查询和继续响应为 `{inputs: [...], paused, pending_count, active_run_id}`。
+每条回执包含 `input_id`、`client_message_id`、`message_id`、`sequence`、`status` 和 `run_id`；
+状态为 queued/running/completed/failed/cancelled，尚未创建运行时 run_id 为 null。
+已接收仅代表持久保存，不代表模型已读取或已完成请求。
+
+队列按服务器受理顺序，每条消息创建独立的普通用户轮。当前主运行结束后自动处理下一条，
+不将新消息注入正在执行的模型请求，也不抢占后台运行。
+暂停或等待确认／答复的主运行继续保留会话位置；队列继续接口不替代原运行的恢复、审批或答复。
+失败或取消暂停后续自动处理，保留排队消息供用户显式继续。
+关闭页面不会取消队列，重启后依靠持久状态和原检查点恢复；不重放效果未知的工具操作。
+运行观察沿用 `GET /agent/runs/{run_id}/stream`，通过查询队列取得后续 run_id。
+原 `/agent/turn` 接口的忙碌冲突合同保持不变。
+
+顶层主管专用历史读取（普通会话和事务线子 agent 均不获授）：
+
+- `management.search_history(query?,kind?,limit?,offset?)`：在未删除的普通／管理会话标题和正文中按区分大小写的字面量子串检索；空 query 列出最近会话。kind 为 all/ordinary/manager，limit 为 1..50。
+- `management.read_history(session_id,message_id?,start_char?,order?,limit?,offset?)`：读取 user/agent/tool 历史正文，默认 newest，可选 oldest。单条至多 4000 字符、单页至多 12000 字符；截断消息用 next_message_id/next_char 续读，或沿 next_offset 与 next_char（无值时为 0）继续分页。
+
+每次读取重新验证主管执行身份及来源删除状态，同页来自一致快照。结果不包含消息 payload、运行 metadata、系统指导或工具日志；历史正文仅为引用材料，不授予执行或审批权限。
 
 工具包括 `list_sessions`、`read_session`、`list_runs`、`inspect_run`、`start_task`、
 `send_instruction`、`control_run`、`list_goals`、`read_goal`、`read_events` 和 `set_goal`。工具调用继续走包展开、schema 校验和统一安全审查。
@@ -1338,7 +1529,9 @@ controller active 才能发出管理写命令；paused 可对话和读取结果�
 替换还含 `replaced_run_snapshot`，分别描述新 run 已排队和旧 run 已取消，不能沿用介入前的 paused。
 `accepted` 是命令受理状态，不能当作运行完成；暂停请求中的 `pause_requested=true` 不等于已暂停。
 回执快照随命令固定，幂等重放保持原值；需查询当前状态时使用新的只读查询。
-workspace_path 为本后端平台绝对路径，仍验证工作区根；省略不继承管理会话目录。
+workspace_path 支持已有会话路径协议（含 Windows 到 WSL 映射），仍验证工作区根。省略时使用 controller.default_execution_workspace 创建独立任务目录；未配置可接受无目录的数据任务，但其冻结路径为空，不开放工作区工具。目录与允许路径在受理时冻结，不受后来默认目录或会话目录修改影响，也不回退到后端首工作区。
+`management.read_task_result(run_id,section?,start_char?,max_chars?)` 返回本主管及直属事务线所属独立 root 的执行状态和分页结果，事务线仅能读取自己任务；普通或 child caller 不获授。section 为 answer（默认）或 evidence，后者 content 为 JSON 字符片段，按 next_char 拼接后解析。仅含实际持久工具证据的白名单字段，不包含系统提示、metadata、工具输入或 shell stdout。deleted、非归属和 child run 均拒绝；运行终态不证明业务完成，证据不代替新操作审批。
+消息 payload 的 input_origin/input_envelope 标记内部 manager/background 输入。客户端应保留审计记录并按结构化来源从普通聊天隐藏，不能把所有非 user 角色都渲染为 agent 回答。
 `send_instruction` 必带 session_id、purpose、expected_run_id；最后一轮已终态或无历史可启动下一轮，
 paused 时原子替换原轮。运行中先 pause 并等暂停确认，等待确认或答复不可替换；目标已变化则拒绝。
 `control_run` 接收显式 run_id 和 pause/resume/cancel；resume 只用于 paused，
@@ -1398,6 +1591,9 @@ Matter 增加一等 `visibility: user|internal`，旧记录为 user。list/searc
 
 `management.overview` 提供有界工作预览，`inspect_work` 读取事项、可选管理扩展及关系；
 `organize_work(command_id,operations)` 在同一事务内执行 1..20 个 create/update/link/bind_goal。
+轻量 `create_matter(command_id,title,summary?,...)` 默认 visibility=user，`update_matter(command_id,matter_id,expected_revision,changes)` 只修改显式字段。
+它们保留稳定命令去重、来源审查与 CAS；自主轮返回 proposed，最终发布成功才写入。applied 回执已包含结果修订号，无需仅为确认回执再次读取。
+排程起止必须成对提供或清空。只有开始时刻而时长未知时，保留准确时刻于 summary 并设置 scheduled_on，不编造结束时间或把约定时间误作截止时间。
 create 默认 internal（须启用开关），update 必带 expected_revision，link 支持 supports/depends_on 并拒绝循环。
 管理扩展分别保存 purpose、responsible_party、next_action、wait_condition、management_state，
 事项允许没有 due_at；不往普通 metadata 存储管理状态或完整提示。
@@ -1643,8 +1839,11 @@ POST /matters
 ### 14.2 List / Search / Update
 
 ```http
-GET /matters?limit=50&status=open
+GET /matters?limit=50&offset=0&status=active&kind=task
+GET /matters?kind=task&parent_matter_id=matter_plan_id
 GET /matters/search?q=ICA&limit=10
+GET /matters/sync?after=0&limit=200
+GET /matters/{matter_id}
 PATCH /matters/{matter_id}
 POST /matters/{matter_id}/source-links
 ```
@@ -1654,6 +1853,36 @@ POST /matters/{matter_id}/source-links
 - `matter` 表是独立本地持久化层，`mail_matters` 只是旧邮件内视图。
 - `matter_source_links` 负责把 matter 关联到邮件、trace、文件或后续其他数据源。
 - Agent 可以通过 `matter` tool package 创建、查询、更新和链接事务。
+- `kind` 默认为 `task`；`kind=plan` 创建无需目录的独立规划，`summary` 可记录目标与完成标准。
+  任务通过 `parent_matter_id` 归属规划，只支持规划下的直接任务，不允许嵌套规划。
+  `project_id` 可选关联已有目录项目；任务继承规划目录，显式不一致会被拒绝。
+  规划已有任务时不能直接更改目录；先移出任务再调整。`kind` 创建后不可修改。
+- 列表返回 `matters`、`total_count` 和 `next_offset`，分页大小为 1..200；并发修改时分页不是冻结快照。
+  支持 `offset`、字面标题/说明搜索 `q`、`kind`、`parent_matter_id`、`project_id`、`status`、
+  `unscheduled=true`、`due_before`（不含上界）与 `due_after`（含下界）。`status=active` 包含
+  `open`、`in_progress`、`waiting`。日期上界与下界允许 ISO 日期或带时区的 ISO 时间；
+  全天日期按边界所写的日历日期筛选，精确时间按实际时刻筛选。客户端应保留本地时区偏移。
+- `scheduled_on` 是可空的 `YYYY-MM-DD` 计划日期；`scheduled_start` / `scheduled_end` 是可空的
+  带时区 ISO 时间，必须成对提供或清空，且结束晚于开始。日程与 `due_at` 截止日期独立，
+  旧记录不会自动把截止日期解释为时间安排。`inbox` 为严格布尔值，默认 `false`；客户端快速收集应显式传 `true`。
+  `section` 是任务阶段名（最多 120 字符），`sort_order` 是有限数值；规划用 `sections` 保存最多 100 个
+  不重复、非空的阶段名，普通任务不能设置非空 `sections`。PATCH 省略字段保持原值。
+  列表另支持 `scheduled_on`（精确日期）、`scheduled_after`（含）、`scheduled_before`（不含）、
+  `inbox` 和 `section`；`unscheduled=true` 筛选没有计划日期和开始时间的任务，截止日期不影响此条件。
+- `/matters/sync` 供完整授权的本地界面建立缓存，不作为 Agent 来源权限的替代接口。
+  返回 `{changes: [{sequence, matter}], cursor, has_more}`；`after` 为非负游标，`limit` 范围 1..500。
+  首次从 0 分页读到 `has_more=false` 才能标记完整覆盖，后续从已保存游标增量读取。
+  同一事项可能重复出现，`matter` 是读取时的完整当前记录，客户端按 `revision` 合并并始终推进游标。
+  日志与事项变更在同一事务提交，旧事项首次自动建档。子任务变化不会合成父规划事件，
+  完整缓存应从全部子任务计算规划进度。目前没有删除接口或删除事件。
+- 详情与列表包含 `revision`；规划额外提供 `progress: {total, done, cancelled}`，覆盖全部直接任务，
+  与当前分页无关。子 Agent 只统计其来源/账号权限内的任务。完成或取消规划不自动改变任务状态。
+- PATCH 可传 `expected_revision`，冲突返回 409 `matter_revision_conflict`，客户端应保留草稿并重新核对。
+  省略 `due_at` 保持原值，显式 `null` 清空；新日期接受 `YYYY-MM-DD` 或带时区的 ISO 时间。
+  `parent_matter_id: null` 移出规划，`project_id: null` 清除可选目录关联，仍受上述归属约束。
+- Agent 的 `matter.create` / `create_many` / `get` / `list` / `search` / `update` 使用相同规划字段；
+  编辑前读取当前 `revision` 并传 `expected_revision`。批量创建仍逐项保存，不保证跨项原子性。
+  消息来源事项继续要求专用人工审批回执，通用页面或工具确认不能绕过该限制。
 - 第一版只做本地持久化和检索，不做主动提醒调度；提醒会在下一阶段接入。
 
 ---
@@ -1958,7 +2187,7 @@ query string 传递 token；它们不暴露 LLM 密钥、原始 prompt、记忆�
 - `POST /background/jobs/{job_id}/retry` 和 `/cancel`：请求
   `{"expected_updated_at":"任务列表中的 updated_at"}`，以任务状态 CAS 防止过期按钮
   重复操作。404 表示任务不存在，409 表示状态已变化或当前状态不能操作。
-  重试只支持 `memory_extract` / `context_compact` / `memory_consolidate` 的 failed/cancelled 任务；其他类型
+  重试只支持 `memory_extract` / `context_compact` / `memory_consolidate` / `context_records` 的 failed/cancelled 任务；其他类型
   返回 422，不能借此重放 Watch 或外部动作。过期 deadline、已清理 payload 不可重试。
   重试保留任务身份、累计用量和已完成输入 checkpoint，不重新发布已处理记忆。
   若自动重试次数已耗尽，用户明确重试会额外授予一次尝试，但不会清零次数或 token 用量。
@@ -1981,11 +2210,28 @@ query string 传递 token；它们不暴露 LLM 密钥、原始 prompt、记忆�
   `revision`、`summary_revision`、`recent_message_count`、`degraded`、`degradation`
   和 `active_compaction_jobs`（queued/retry_wait/running 数量）。token 数是持久化窗口
   在 `estimate_as_of` 时的估算，不是当前完整模型请求的真实用量。
+  可选 `atomic_context` 包含原子系统的 `configured_mode`、`revision`、`covered_seq`、
+  `records`、`lag_messages`、`updated_at` 和 `last_error`；关闭时只提供模式和错误字段。
+  这些是原子维护诊断，不表示 shadow 已替换摘要，也不等于当前请求一定采用原子视图。
 
 全局/项目自动学习开关仍使用 `PUT /memories/learning`，这是立即生效的学习策略，
 不同于上述待重启的系统配置。这里不提供 HTTP 自重启接口，重启由本地应用生命周期管理。
 
 `GET /memories` 默认只列出 active 全局记忆；`scope=project` 需要受允许工作区内的 `workspace_path`。`include_candidates=true` 可查看未发布候选。`POST /memories` 接受 `content`、`memory_type`、`scope`、可选 `workspace_path` 和 `sensitivity`，创建用户确认的记忆。`GET /memories/{memory_id}` 查看一条；项目记忆同样需要匹配的 `workspace_path`。`PATCH /memories/{memory_id}` 接受 `content` 和 `expected_version`，生成可追溯的新版本；`DELETE /memories/{memory_id}?expected_version=N` 撤回，版本冲突返回 409。
+
+纠正正文和撤回的可选 JSON 正文支持 `feedback_reason`，默认 `unspecified`；
+撤回也兼容同名查询参数，正文与查询参数的非默认原因冲突时返回422。
+可选值为 `factual_error`、`wording`、`outdated`、`duplicate`、`not_worth_remembering`、
+`do_not_store`；`wording` 仅适用纠正，`do_not_store` 仅适用撤回，非法组合返回422。
+明确用户操作与反馈在同一版本检查事务中提交，冲突不产生反馈；自动维护不记作用户操作。
+`GET /memories/feedback?scope=global&limit=100&offset=0` 返回 `{feedback:[...],next_offset}`，
+`limit` 为1..100，`offset` 为0..1,000,000。项目范围须提供允许的 `workspace_path`，
+只返回匹配项目记录；采用记忆管理认证，不接受消息凭据。
+记录包含操作、原因、服务端标定的入口、时间、前后版本与非敏感纠正文本，不保存完整提示。
+`personal` 文本不进入反馈样本；`do_not_store` 同时清空该纠正链已保存的反馈文本。
+这不改变记忆软撤回及既有历史／来源审计保留行为。
+不补猜历史操作原因，不自动训练模型；模型整理最多参考3条相关偏好纠正、合计2000个
+JSON字符。反馈不是当前事实证据或工具权限，仍需本轮用户来源支持。
 
 `GET /memories/learning` 与 `PUT /memories/learning` 查看/设置全局或项目自动学习开关。`GET /background/jobs` 返回 payload-free 排队/失败状态。`GET /background/health` 返回队列深度、时长、租约恢复、失败分类，以及 `backpressured_input_count` 和 `llm_workloads`（活动调用、前台等待、近24小时调用/token/估算费用和预算配置）；不返回 payload、来源 ID 或 prompt。默认本地提取支持中英文直接长期要求，普通偏好先作候选，独立重复证据可晋升。`[memory].allow_remote_extraction` 是模型成本开关，不是额外内容审批；功能开启即授权已持久化会话处理，秘密/PII 检查针对长期发布。学习关闭不删除历史记忆；`[memory].enabled=false` 也停止注入。
 

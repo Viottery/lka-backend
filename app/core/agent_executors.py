@@ -59,14 +59,19 @@ class ChildExecutor(Protocol):
 class GeneralAgentExecutor:
     """Compatibility adapter around the existing ReAct child execution path."""
 
-    def __init__(self, legacy_executor: Any, run_child: Callable[..., Awaitable[TaskResult]] | None = None) -> None:
+    def __init__(self, legacy_executor: Any, run_child: Callable[..., Awaitable[TaskResult]] | None = None,
+                 resume_child: Callable[..., Awaitable[Any]] | None = None) -> None:
         self.legacy_executor = legacy_executor
         self.run_child = run_child or legacy_executor.execute
+        self.resume_child = resume_child
 
     async def execute(self, **kwargs: Any) -> TaskResult:
         return await self.run_child(**kwargs)
 
     async def resume(self, child_run_id: str) -> None:
+        if self.resume_child is not None:
+            await self.resume_child(child_run_id)
+            return
         resume = getattr(self.legacy_executor.runner, "resume_async", None)
         if callable(resume):
             await resume(child_run_id)
@@ -390,11 +395,12 @@ class AgentExecutorRegistry:
         return catalog
 
     @classmethod
-    def with_general_agent(cls, legacy_executor: Any, run_child: Callable[..., Awaitable[TaskResult]] | None = None) -> AgentExecutorRegistry:
+    def with_general_agent(cls, legacy_executor: Any, run_child: Callable[..., Awaitable[TaskResult]] | None = None,
+                           resume_child: Callable[..., Awaitable[Any]] | None = None) -> AgentExecutorRegistry:
         registry = cls()
         registry.register(
             AgentDefinition(agent_id=GENERAL_AGENT_ID, version="1", executor_kind="react", can_resume=True,
                             description="General bounded evidence gathering and problem solving through registered tools; use for substantial independent investigations without a more suitable specialist."),
-            GeneralAgentExecutor(legacy_executor, run_child),
+            GeneralAgentExecutor(legacy_executor, run_child, resume_child),
         )
         return registry

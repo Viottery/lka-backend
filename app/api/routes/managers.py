@@ -7,17 +7,29 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.api.routes.memories import require_local_memory_control
-from app.core.sessions import AgentSession
+from app.core.sessions import AgentSession, SessionWorkspace
 from app.domains.management import ManagementConflictError
 
 router = APIRouter(prefix="/managers", tags=["managers"],
                    dependencies=[Depends(require_local_memory_control)])
 
 
+class ExecutionWorkspaceInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    path: str = Field(min_length=1)
+    platform: Literal["linux", "windows", "macos"]
+
+
+class DefaultManagerRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    default_execution_workspace: ExecutionWorkspaceInput | None = None
+
+
 class ManagerController(BaseModel):
     session_id: str
     status: Literal["active", "paused"]
     revision: int
+    default_execution_workspace: SessionWorkspace | None = None
     llm_client_name: str | None
     llm_model: str | None
     created_at: str
@@ -33,6 +45,7 @@ class CreateManagerRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     title: str | None = Field(default=None, min_length=1, max_length=40)
     make_default: bool = False
+    default_execution_workspace: ExecutionWorkspaceInput | None = None
     llm_client_name: str | None = Field(default=None, min_length=1, max_length=200)
     llm_model: str | None = Field(default=None, min_length=1, max_length=200)
 
@@ -47,6 +60,7 @@ class CreateManagerRequest(BaseModel):
 class UpdateManagerRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     expected_revision: int = Field(ge=1)
+    default_execution_workspace: ExecutionWorkspaceInput | None = None
     status: Literal["active", "paused"] | None = None
     llm_client_name: str | None = Field(default=None, min_length=1, max_length=200)
     llm_model: str | None = Field(default=None, min_length=1, max_length=200)
@@ -69,18 +83,23 @@ def _validate_client(request: Request, client_name: str | None):
 
 
 @router.post("/default", response_model=ManagerResponse)
-def default_manager(request: Request):
+def default_manager(request: Request, payload: DefaultManagerRequest | None = None):
     try:
-        return _service(request).get_default()
+        return _service(request).get_default(**payload.model_dump() if payload else {})
     except ManagementConflictError as exc:
         raise HTTPException(409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, detail=str(exc)) from exc
 
 
 @router.post("", response_model=ManagerResponse, status_code=201)
 def create_manager(payload: CreateManagerRequest, request: Request):
     service = _service(request)
     _validate_client(request, payload.llm_client_name)
-    return service.create(**payload.model_dump())
+    try:
+        return service.create(**payload.model_dump())
+    except ValueError as exc:
+        raise HTTPException(422, detail=str(exc)) from exc
 
 
 @router.get("")
@@ -107,6 +126,8 @@ def update_manager(session_id: str, payload: UpdateManagerRequest, request: Requ
         raise HTTPException(404, detail="manager_not_found") from exc
     except ManagementConflictError as exc:
         raise HTTPException(409, detail="management_revision_conflict") from exc
+    except ValueError as exc:
+        raise HTTPException(422, detail=str(exc)) from exc
 
 
 class CreateGoalRequest(BaseModel):

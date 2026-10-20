@@ -15,7 +15,7 @@ from app.api.routes.memories import require_local_memory_control
 from app.api.routes.memory_settings import get_background_config
 
 router = APIRouter(dependencies=[Depends(require_local_memory_control)])
-_RETRYABLE_KINDS = {"memory_extract", "context_compact", "memory_consolidate"}
+_RETRYABLE_KINDS = {"memory_extract", "context_compact", "memory_consolidate", "context_records"}
 
 
 class JobControlRequest(BaseModel):
@@ -153,6 +153,16 @@ def context_status(session_id: str, request: Request):
         ))
         for status in ("queued", "retry_wait", "running")
     }
+    atomic = {"configured_mode": runtime.session_service.atomic_context_mode,
+              "last_error": runtime.session_service.last_atomic_context_error}
+    if runtime.session_service.atomic_context_store is not None:
+        with runtime._conn() as conn:
+            head = conn.execute("SELECT revision,covered_seq,updated_at FROM context_record_heads WHERE session_id=?", (session_id,)).fetchone()
+            count = conn.execute("SELECT count(*) FROM context_records WHERE session_id=?", (session_id,)).fetchone()[0]
+        atomic.update(revision=head["revision"] if head else 0,
+                      covered_seq=head["covered_seq"] if head else 0, records=count,
+                      lag_messages=max(0, (state["next_seq"]-1 if state else 0)-(head["covered_seq"] if head else 0)),
+                      updated_at=head["updated_at"] if head else None)
     return {
         "session_id": session_id,
         "method": metadata.get("method", "none"),
@@ -169,5 +179,6 @@ def context_status(session_id: str, request: Request):
                         if key in {"method", "model", "lossy_fallback_possible", "degraded"}},
         "degraded": metadata.get("method") == "local_fallback" or bool(metadata.get("degraded")),
         "active_compaction_jobs": jobs,
+        "atomic_context": atomic,
         "updated_at": row["updated_at"] if row else None,
     }

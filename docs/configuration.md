@@ -24,8 +24,10 @@ enabled = true
 这启用管理会话、长期目标 API、管理工具包和已接受独立任务的持久派发 worker。
 自动管理轮次另需 `autonomous_enabled=true`，且 controller 为 active；默认关闭。
 管理会话的 client/model 可通过 `/managers/{session_id}` 保存；显式请求覆盖优先，
-每次运行冻结自己的设置，恢复继续使用原设置。管理会话开放 management 工具包及 Matter 只读工具，
-管理会话不自动绑定默认工作区。普通任务不开放管理工具；独立事务线子 agent 具有受限管理能力，继承委托时冻结的模型、工具与工作区设置。
+每次运行冻结自己的设置，恢复继续使用原设置。管理会话开放 management、history 包及 Matter 读取和轻量主管写入工具，
+主管同时可发现来源授权范围内的只读工具和支持只读参数的工具；后者实际调用仍强制按参数验证只读，不能借此执行写命令。
+主管角色在首次路由前生效：复杂执行工作默认下发，简单搜索或明确的单次操作可以直接完成。该角色策略冻结在本次运行中，不加入普通执行会话，也不改变独立安全审查器。
+管理会话不自动绑定自身工作区；controller.default_execution_workspace 独立保存客户端提供的默认执行父目录。新派发会话自动建立独立目录并冻结路径；未配置时允许纯数据任务，但不开放工作区工具，不回退到后端目录。普通任务不开放管理工具；独立事务线子 agent 具有受限管理能力，继承委托时冻结的模型、工具与工作区设置。
 controller 新建为 paused；设为 active 才能发出创建、介入或控制命令，读取仍可用。
 管理生命周期接口沿用现有本机／记忆管理 token 保护，工具写操作仍经统一安全审查。
 智能体创建的事务线及执行会话不会提升权限：高风险或显式 requires_confirmation 工具强制人工审批，skip/llm 不能代批；普通恢复也不能绕过原审批。
@@ -74,6 +76,75 @@ model = "your-model-id"
 模型选择顺序为：当前请求覆盖 → 会话选择 → 后端默认。
 改变默认模型不代表现有会话也会强制切换。流式输出、JSON、工具调用及推理控制
 需要与所用服务商实际能力匹配。
+
+图片输入需要在对应 `[llm]` 或命名客户端配置 `supports_vision = true`。
+同一客户端有不同能力的模型时，使用 `vision_model_overrides = { "模型ID" = true }`
+指定精确模型；未验证的客户端默认不支持视觉。模型名称和官方网站的能力说明不能证明
+第三方中转端点也支持图片输入。`vision.inspect_image` 会向选定模型发送本地图片，
+经过工具审查；可以显式指定视觉客户端和模型，否则沿用当前运行的模型选择。
+
+## 音频文件输入
+
+WAV、MP3 和 M4A 使用会话附件入口。有显式音频附件的当轮临时使用配置的音频模型，
+不修改会话或默认模型；普通文字、图片和文档仍遵循原选择顺序。
+在现有 `[llm]` 表内设置：
+
+```toml
+audio_model = "gemini-3.8-flash"
+# 音频与日常模型共用端点和密钥时省略 audio_client。
+# audio_client = "your-audio-client"
+audio_model_overrides = { "gemini-3.8-flash" = true }
+
+# 保守的应用容量上限；需与端点实际能力相容。
+[llm.model_overrides."gemini-3.8-flash"]
+context_window_tokens = 131072
+output_reserve_tokens = 8192
+```
+
+命名客户端的 `audio_model_overrides` 必须放在对应客户端表内；`audio_model` 和
+`audio_client` 放在 `[llm]`。精确模型能力默认关闭，也可以为仅含音频模型的客户端
+设置 `supports_audio = true`。模型 ID 来自配置，不因名称自动认定支持。
+与其他模型一样，音频模型必须配置自己的 `context_window_tokens`，不可沿用默认
+文本模型的容量。命名客户端的容量设置放在对应 `model_overrides` 表。
+接入使用 OpenAI-compatible `input_audio` 请求，服务商端点必须实际支持；
+[Google 官方兼容接口](https://ai.google.dev/gemini-api/docs/openai#audio-understanding)
+说明了这一请求格式。音频回复直接进入当前会话及 SSE，模型来源和用量沿用运行审计。
+
+M4A 在本地由锁定依赖 `imageio-ffmpeg` 提供的 FFmpeg 转换；小文件使用 PCM WAV，
+大音频使用完整的 128 kbps MP3 输入，转换不联网、原文件保留，不截取前六分钟。
+当前只做文件输入及文字输出，不进行录音、语音播放或精确声学测量。
+本步使用有界内联传输，单个原文件最多 256 MiB；实际模型输入和混合输入限制见
+[会话附件合同](api_contract.md#会话文件附件)。大文件不自动使用供应商 Files API。
+
+## 可选动作阶段推理设置
+
+`[agent]` 的 `decision_thinking_enabled` 默认不设置，沿用模型默认行为。
+设置为 `false` 时，仅在所选客户端明确支持思考控制的情况下关闭动作决策阶段思考，
+不改变独立路由、最终回答或安全审查，也不改变冻结的子 Agent 推理设置。
+此项应先在隔离任务中验证；关闭思考可能影响工具选择和任务完成质量，不建议直接全局启用。
+现有不完整输出恢复策略仍优先，不会因设置为 `true` 而失去原有恢复能力。
+
+## Agent Python 环境
+
+Agent 使用独立于后端 `.venv` 的 uv 虚拟环境，默认位于 `<data_dir>/python`。
+首次显式准备环境：
+
+```bash
+.venv/bin/python scripts/manage_agent_python.py prepare
+.venv/bin/python scripts/manage_agent_python.py status
+```
+
+准备命令需要 uv，可下载 Python 和依赖；工具调用和后端启动不会自动安装。
+默认选择 Python 3.12，环境记录实际解释器版本，依赖解析结果保存在带哈希的
+`requirements.lock` 中，后续准备复用该锁文件。预装 NumPy、pandas、Matplotlib、
+openpyxl 和 Pillow。`--root` 可用于准备隔离验证环境；运行时默认使用配置的数据目录。
+环境与锁文件留在本地，不能作为后端运行依赖或同步到另一台电脑的虚拟环境。
+
+`bash.python_environment` 返回实际解释器、Python／包版本以及当前工作目录。
+`bash.run` 选择 `python_environment = "default"` 后注入 `LKA_PYTHON`，并过滤继承的
+服务凭据。虚拟环境隔离依赖，不是 OS 文件或网络沙箱；脚本仍经过现有执行审查。
+执行前检查实际虚拟环境、Python 版本与锁文件中的依赖版本；准备失败或仍在进行时
+环境不可用。准备命令使用进程锁，避免并发安装互相覆盖，并支持失败后重试。
 
 ## 邮件
 
@@ -149,6 +220,36 @@ Windows 的 `codex_binary_path` 指向原生 `.exe`，不能使用 `.cmd` / `.ba
 基础 TOML 配置重启后加载。通过 `/background/config` 保存的配置具有 active / desired
 两种视图，管理端应展示是否待重启；暂停、恢复和取消是独立的即时控制操作。
 
+后台上下文压缩不下发 `max_tokens` 输出上限；`generation_output_tokens` /
+`recovery_output_tokens` 仍用于其他记忆生成任务，压缩中只作为缺失用量时的预算估算。
+压缩使用 `[memory].compaction_timeout_seconds`（默认 180 秒）作为每次生成的兜底期限，
+不再套用通用后台 30 秒网络限制；所选模型客户端自身的网络超时仍生效。
+服务商默认输出限制及模型窗口仍然存在；摘要完成后仍按现有摘要预算裁剪，
+不把不限生成长度等同于无限上下文。异常消耗熔断、取消与发布租约检查保持有效。
+
+原子会话上下文通过 `[memory].atomic_context_mode` 渐进启用，默认 `off`。
+`shadow` 在后台保存有来源的原子记录，不改变前台摘要；`active` 读取这些记录的可读投影，
+并保留处理水位后的原始消息。不需要每轮前台整理模型调用。旧摘要和完整历史均保留，
+自动更新始终把最新一轮完整问答留作原文，避免最新纠正只剩派生表达。
+改回 `off` 可回退；这些配置也通过 `/background/config` 和 schema 管理，重启生效。
+`atomic_context_input_tokens=24000` 限制单次后台输入，`atomic_context_projection_tokens=4096`
+限制前台原子视图，`atomic_context_debounce_seconds=30` 合并连续触发。
+没有足够空间装载完整新增消息或原子候选时，任务失败而不推进水位，不截断来源后宣称处理完成。
+原子内容是模型整理的语义信息，不要求照抄原文；可引用多个消息片段。
+后台输入提供服务端生成的 `passage_id`，模型只选择 ID；系统解析并保存对应原文、
+字符范围、时间、角色和哈希。片段 ID 绑定会话及消息版本，不授权读取其他会话。
+旧逐字引用记录继续兼容；新生成协议不让模型重新抄写引文。
+结构不符合 schema 或选择了未提供的片段 ID 时，最多追加一次模型修复并重新校验整批结果；
+修复也受输入容量和后台资源控制约束。来源角色、权限和版本错误仍直接拒绝。
+来源合法不代表原子结论正确，仍需语义质量评测。失败保留旧视图和处理水位。
+涉及多来源事件、用户陈述混入 agent 来源或带数值的进度提案时，后台追加一次小范围来源支持复核，
+仅传入提案、相关旧记录及已引用片段，不重复发送全部历史。复核结果仍须通过同样的来源、角色和版本检查；
+这会增加实际模型用量，简单单来源任务不额外调用，前台不等待复核。
+前台原始尾部放不下时退回已有摘要链路，context-status 提供诊断。原子记录保持会话范围，
+不自动升格为全局记忆或修改 AGENTS.md；已有长期记忆整理继续独立运行。
+`context.read` 返回可回访的 `source_fragments`；`context.source` 可以按 `passage_id` 直接分页读取原片段，
+也兼容按 `seq` 读取旧消息。分页 offset 相对所选片段或整条消息，修改/撤回来源后旧 ID 不可继续使用。
+
 记忆提取和自动上下文压缩使用 `background_memory`，消息分析使用
 `background_message`，两者不共享 token／费用额度，但仍共享模型并发及前台优先级。
 `memory.max_job_tokens` 默认 `0`（不设常规任务累计额度）；旧配置显式正数仍生效。
@@ -172,6 +273,14 @@ Windows 的 `codex_binary_path` 指向原生 `.exe`，不能使用 `.cmd` / `.ba
 关闭远程提取时仍可整理字面重复，语义整理不调用模型。
 
 ## 路径与数据保管
+
+本地文档转换的 MarkItDown 版本及 Office 依赖由项目锁文件管理，安装／更新使用
+`uv sync --locked`。文件处理策略在 `app/domains/file_processing.py` 中集中维护；不需要
+额外 API key，默认关闭转换器插件、图片 OCR、音频转录和 Azure 转换。索引权限和隐私
+过滤沿用知识库规则，语义向量是否同步仍由 `embedding.auto_index_on_import` 控制。
+工作区知识索引是显式操作，不因安装转换器而自动扫描已有资料。单次最多 500 个候选文件、
+单文件 2,000,000 bytes、总读取 20,000,000 bytes；PDF 整份索引最多 200 页，提取文本
+最多 2,000,000 字符，超限会报错，不静默截断入库。直接 PDF 阅读仍按工具的分页限额进行。
 
 Windows TOML 路径使用 `"D:/Work/project"` 或单引号的 `'D:\Work\project'`；
 Windows 后端应收到实际可访问的 Windows 路径，而不是 `/mnt/d/...`。

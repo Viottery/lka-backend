@@ -16,6 +16,7 @@ from app.core.llm import (
     LLMResponseMode,
     LLMService,
     LLMStreamEvent,
+    LLMTimeoutError,
 )
 from app.core.llm.registry import LLMClientRegistry
 from app.core.local_config import LLMClientConfig, LLMProviderConfig
@@ -106,6 +107,88 @@ def test_complete_answer_needs_no_recovery(tmp_path):
         assert answer(loop, []) == "complete answer"
     assert len(provider.requests) == 1
     assert provider.requests[0].thinking_enabled is None
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("context_only", [False, True])
+def test_answer_timeout_before_output_retries_once(tmp_path, stream, context_only):
+    loop, provider, manager = make_loop(tmp_path, [LLMTimeoutError("read timed out"), response()])
+    events = []
+    with scope(manager, stream=stream) as run:
+        result = (
+            loop._answer_from_context_with_llm(user_input="hello", route={},
+                                             context_window={}, llm_events=events)
+            if context_only else answer(loop, events)
+        )
+        assert result == "complete answer"
+        assert len([e for e in manager.list_events(run.run_id)
+                    if e.type == "llm_retry_scheduled"]) == 1
+    assert len(provider.requests) == 2
+    assert provider.requests[0].messages == provider.requests[1].messages
+    assert events[0].error_category == "timeout"
+    assert events[0].llm_call_id != events[1].llm_call_id
+
+
+def test_repeated_answer_timeout_keeps_timeout_classification(tmp_path):
+    loop, provider, manager = make_loop(tmp_path, [LLMTimeoutError("first"),
+                                                LLMTimeoutError("second"), response()])
+    loop.llm_max_attempts = 5
+    with scope(manager), pytest.raises(LLMTimeoutError, match="second"):
+        answer(loop, [])
+    assert len(provider.requests) == 2
+
+
+def test_timeout_after_stream_output_is_not_retried(tmp_path):
+    loop, provider, manager = make_loop(tmp_path, [response()])
+
+    async def partial_stream(request):
+        provider.requests.append(request)
+        yield LLMStreamEvent(event_type="llm_delta", stage="answer", client_name="selected",
+                             provider="test", model="test-model", delta="partial answer")
+        raise LLMTimeoutError("after partial output")
+
+    provider.stream = partial_stream
+    with scope(manager, stream=True) as run, pytest.raises(LLMTimeoutError):
+        answer(loop, [])
+    assert len(provider.requests) == 1
+    assert not any(e.type == "llm_retry_scheduled" for e in manager.list_events(run.run_id))
+
+
+@pytest.mark.parametrize("stage,max_attempts,error", [
+    ("route", None, LLMTimeoutError("route timeout")),
+    ("answer", 1, LLMTimeoutError("single dispatch")),
+    ("answer", None, LLMClientError("not a timeout")),
+])
+def test_timeout_retry_does_not_expand_other_dispatch_contracts(tmp_path, stage, max_attempts, error):
+    loop, provider, manager = make_loop(tmp_path, [error, response()])
+    with scope(manager):
+        assert loop._complete_text_with_retry(
+            stage=stage, system_prompt="test", user_prompt="{}", prompt_summary="test",
+            max_output_tokens=1024, llm_events=[], max_attempts=max_attempts,
+        ) is None
+    assert len(provider.requests) == 1
+
+
+def test_timeout_retry_obeys_cancellation(tmp_path):
+    loop, provider, manager = make_loop(tmp_path, [LLMTimeoutError("timeout"), response()])
+    with scope(manager) as run:
+        original = provider.complete
+
+        async def cancel_before_failure(request):
+            manager.cancel_run(run.run_id)
+            return await original(request)
+
+        provider.complete = cancel_before_failure
+        with pytest.raises(AgentRunCancelled):
+            answer(loop, [])
+    assert len(provider.requests) == 1
+
+
+def test_timeout_retry_obeys_child_call_budget(tmp_path):
+    loop, provider, manager = make_loop(tmp_path, [LLMTimeoutError("timeout"), response()])
+    with scope(manager, child_budget={"max_llm_calls": 1}), pytest.raises(RuntimeError, match="budget"):
+        answer(loop, [])
+    assert len(provider.requests) == 1
 
 
 @pytest.mark.parametrize("stream", [False, True])

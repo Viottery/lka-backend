@@ -4,7 +4,7 @@ import hashlib
 import json
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.core.agent_runs import AgentRunEvent, AgentRunRecord, AgentRunStatus
 from app.core.agent_turn import (
@@ -121,10 +121,31 @@ class AgentTurnLLMOptions(BaseModel):
 
 class AgentTurnRequest(BaseModel):
     session_id: str | None = None
-    user_input: str
+    user_input: str = ""
+    attachment_ids: list[str] | None = Field(default=None, max_length=4)
     llm: AgentTurnLLMOptions | None = None
     safety_review_mode: SafetyReviewMode | None = None
     resumable: bool = False
+
+    @field_validator("attachment_ids")
+    @classmethod
+    def validate_attachment_ids(cls, value):
+        import re
+        if value is not None and (len(value) != len(set(value)) or any(
+            re.fullmatch(r"att_[a-f0-9]{32}", item) is None for item in value
+        )):
+            raise ValueError("attachment_ids must be unique uploaded file identifiers.")
+        return value
+
+    @model_validator(mode="after")
+    def require_input(self):
+        if self.attachment_ids and not self.session_id:
+            raise ValueError("File input requires an existing session_id.")
+        if not self.user_input.strip():
+            if not self.attachment_ids:
+                raise ValueError("Provide user_input or attachment_ids.")
+            self.user_input = "[Image input]"
+        return self
 
 
 class ReplaceAgentRunRequest(AgentTurnRequest):

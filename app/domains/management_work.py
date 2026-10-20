@@ -54,8 +54,10 @@ class WorkChanges(StrictModel):
     tags: list[str] | None = Field(default=None, max_length=50)
     visibility: Literal["user", "internal"] = "user"
     scheduled_on: str | None = Field(default=None, max_length=80)
-    scheduled_start: str | None = Field(default=None, max_length=80)
-    scheduled_end: str | None = Field(default=None, max_length=80)
+    scheduled_start: str | None = Field(default=None, max_length=80,
+        description="Time block start; supply with scheduled_end, or clear both with null. Never invent a duration.")
+    scheduled_end: str | None = Field(default=None, max_length=80,
+        description="Time block end, after scheduled_start; supply or clear both endpoints together.")
     inbox: bool = False
     section: str = Field(default="", max_length=120)
     sort_order: float = Field(default=0, allow_inf_nan=False)
@@ -314,6 +316,24 @@ class ManagementWorkService:
         if not authority_checked:
             self.tasks.caller(SimpleNamespace(run_id=row["run_id"], session_id=session_id), mutate=True, conn=conn)
         return row
+
+    def create_matter(self, context, *, command_id, title, summary="", **fields):
+        """Compact capture entry using the existing proposal/publication path."""
+        self.tasks.caller(context, mutate=True, supervisor_only=True)
+        return self.organize_work(context, command_id=command_id, operations=[{
+            "op": "create", "ref": "matter", "fields": {
+                "title": title, "summary": summary, "visibility": "user", **fields,
+            },
+        }])
+
+    def update_matter(self, context, *, command_id, matter_id, expected_revision, changes):
+        self.tasks.caller(context, mutate=True, supervisor_only=True)
+        if not isinstance(changes, dict) or not changes:
+            raise ValueError("changes must contain at least one field")
+        return self.organize_work(context, command_id=command_id, operations=[{
+            "op": "update", "matter_id": matter_id, "expected_revision": expected_revision,
+            "changes": changes,
+        }])
 
     def organize_work(self, context, command_id, operations):
         args = OrganizeWorkInput.model_validate({"command_id": command_id, "operations": operations})

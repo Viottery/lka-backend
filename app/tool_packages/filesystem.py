@@ -6,6 +6,7 @@ import hashlib
 import os
 import tempfile
 from dataclasses import dataclass
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +24,7 @@ MAX_EDIT_FILE_BYTES = 1_000_000
 FILESYSTEM_PACKAGE = ToolPackageSpec(
     name="filesystem",
     description=(
-        "Read and edit specific text files, using the session workspace as the default root. "
+        "List directories, read, create and edit specific text files, using the session workspace as the default root. "
         "An outside-workspace target requires exact-path approval for that invocation. This package "
         "is for explicit file access, not workspace indexing, search, or summaries."
     ),
@@ -32,15 +33,17 @@ FILESYSTEM_PACKAGE = ToolPackageSpec(
     routing_hints=[
         "Use this package when the user asks to read a known file path.",
         "Use this package when the user asks to make a targeted edit to a known text file.",
-        "Do not use this package for directory listing or text search; those belong to shell commands.",
+        "Use list_directory for bounded directory discovery; text search belongs to shell commands or indexed retrieval.",
     ],
     decision_hints=[
         "Read a file before editing it so you can provide expected_sha256.",
+        "Use list_directory for a directory, not read_file. Listing is shallow; enter relevant subdirectories rather than reading an entire tree.",
         "Use relative paths from the default workspace root, or the injected $workspace_root variable.",
         "For an outside-workspace file, provide its path; the normal per-call review evaluates that exact target.",
         "Use edit_file for targeted old_text to new_text replacements only.",
         "If old_text is not unique, read more context and retry with a longer unique snippet.",
         "Do not use edit_file to create new files or replace large files wholesale.",
+        "Use create_file to save a new UTF-8 text file or Python script. The parent directory must exist; existing files are never overwritten.",
     ],
 )
 
@@ -181,6 +184,115 @@ class ReadFileTool:
             status="completed",
             output=payload,
         )
+
+
+class ListDirectoryTool(ReadFileTool):
+    """Shallow, bounded discovery; no symlink traversal or implied text coverage."""
+
+    spec = ToolSpec(
+        name="filesystem.list_directory", package="filesystem", type="local_tool",
+        description="List bounded immediate directory entries, without reading file contents or following symlinks. "
+                    "Pass snapshot_id as expected_snapshot on subsequent pages; narrow path if enumeration is truncated.",
+        risk="low", read_only=True, unrestricted_execution=True,
+        requires_confirmation=False, side_effects=["read_local_file"],
+        scope_path_fields=("path",), scope_uses_workspace=True,
+        input_schema={"type": "object", "properties": {
+            "path": {"type": "string"}, "offset": {"type": "integer", "minimum": 0},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+            "expected_snapshot": {"type": "string", "minLength": 64, "maxLength": 64}},
+            "additionalProperties": False},
+        output_schema={"entries": "array", "snapshot_id": "string", "enumeration_complete": "boolean"},
+    )
+
+    def invoke(self, *, invocation: ToolInvocation, context: ToolContext) -> ToolResult:
+        try:
+            policy = self.policy.for_session_workspace(context.workspace_root)
+            requested = str(invocation.input.get("path", "."))
+            path = policy.resolve(requested, allow_outside=True)
+            _require_child_path_scope(path, context)
+            _require_approved_external_path(path, policy, context)
+            offset, limit = int(invocation.input.get("offset", 0)), int(invocation.input.get("limit", 100))
+            if offset < 0 or not 1 <= limit <= 200:
+                raise ValueError("Invalid directory page")
+            entries = []
+            with os.scandir(path) as iterator:
+                for entry in islice(iterator, 2001):
+                    kind = ("symlink" if entry.is_symlink() else "directory" if entry.is_dir(follow_symlinks=False)
+                            else "file" if entry.is_file(follow_symlinks=False) else "other")
+                    entries.append({"name": entry.name, "kind": kind})
+            complete = len(entries) <= 2000
+            entries = sorted(entries[:2000], key=lambda item: item["name"])
+            signature = hashlib.sha256((str(path) + repr(entries) + str(complete)).encode()).hexdigest()
+            expected = invocation.input.get("expected_snapshot")
+            if offset and not expected:
+                raise ValueError("Continuation requires expected_snapshot")
+            if expected is not None and expected != signature:
+                raise ValueError("Directory changed; restart enumeration")
+            end = min(offset + limit, len(entries))
+            payload = {"path": requested, "resolved_path": str(path), "entries": entries[offset:end],
+                       "snapshot_id": signature, "offset": offset,
+                       "next_offset": end if end < len(entries) else None,
+                       "has_more": end < len(entries), "enumeration_complete": complete,
+                       "enumerated_entries": len(entries), "truncated": not complete,
+                       "evidence_scope": "Immediate entry names only; file contents and subdirectories are not read."}
+            return ToolResult(invocation_id=invocation.invocation_id, tool_name=self.spec.name,
+                              status="completed", output=payload)
+        except (OSError, ValueError, PermissionError) as exc:
+            return ToolResult(invocation_id=invocation.invocation_id, tool_name=self.spec.name,
+                              status="failed", error=str(exc))
+
+
+class CreateFileTool:
+    def __init__(self, policy: FileAccessPolicy) -> None:
+        self.policy = policy
+
+    def workspace_access_request(self, tool_input: dict[str, Any], context: ToolContext) -> list[str]:
+        return workspace_access_request(tool_input, context, self.policy)
+
+    spec = ToolSpec(
+        name="filesystem.create_file", unrestricted_execution=True, package="filesystem",
+        type="local_tool", description="Create a new UTF-8 text file exclusively, including reusable .py scripts. "
+        "Requires an existing parent directory; never overwrites a file. Outside-workspace targets need exact-path approval.",
+        risk="medium", requires_confirmation=False, read_only=False,
+        side_effects=["write_local_file"], scope_path_fields=("path",), scope_uses_workspace=True,
+        input_schema={"type": "object", "required": ["path", "content"],
+                      "properties": {"path": {"type": "string"}, "content": {"type": "string"}}},
+        output_schema={"path": "string", "resolved_path": "string", "sha256": "string",
+                       "bytes_written": "integer", "created": "boolean"},
+    )
+
+    def invoke(self, *, invocation: ToolInvocation, context: ToolContext) -> ToolResult:
+        try:
+            policy = self.policy.for_session_workspace(context.workspace_root)
+            requested = str(invocation.input.get("path") or "")
+            path = policy.resolve(requested, allow_outside=True)
+            _require_child_path_scope(path, context)
+            _require_approved_external_path(path, policy, context)
+            requested_path = Path(policy.expand_workspace_variables(requested)).expanduser()
+            if not requested_path.is_absolute():
+                requested_path = policy.default_root / requested_path
+            # resolve() follows even a dangling leaf symlink. It is already a
+            # user-owned directory entry; do not create its missing target.
+            if requested_path.is_symlink():
+                raise FileExistsError("Target already exists as a symlink")
+            raw = str(invocation.input.get("content", "")).encode("utf-8")
+            if len(raw) > MAX_EDIT_FILE_BYTES:
+                raise ValueError(f"New file exceeds {MAX_EDIT_FILE_BYTES} bytes")
+            if b"\x00" in raw:
+                raise ValueError("New file must be text without NUL bytes")
+            if not path.parent.is_dir():
+                raise FileNotFoundError("Parent directory must already exist")
+            # O_EXCL rejects a competing creator and avoids truncating user files.
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(raw)
+            output = {"path": requested, "resolved_path": str(path),
+                      "sha256": hashlib.sha256(raw).hexdigest(), "bytes_written": len(raw), "created": True}
+        except (OSError, UnicodeError, ValueError, PermissionError) as exc:
+            return ToolResult(invocation_id=invocation.invocation_id, tool_name=self.spec.name,
+                              status="failed", error=str(exc))
+        return ToolResult(invocation_id=invocation.invocation_id, tool_name=self.spec.name,
+                          status="completed", output=output)
 
 
 class EditFileTool:

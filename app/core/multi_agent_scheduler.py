@@ -367,6 +367,9 @@ class MultiAgentScheduler:
                 plan = self._cancel_unfinished_steps(parent_run_id, plan)
                 self._save_plan(parent_run_id, plan, "multi_agent_cancelled", {})
                 return self._result(plan, produced, status="cancelled")
+            if parent.metadata.get("pause_requested") or parent.status == AgentRunStatus.PAUSED:
+                self._save_plan(parent_run_id, plan, "multi_agent_paused", {})
+                return self._result(plan, produced, status="paused")
             if parent.status not in {AgentRunStatus.RUNNING, AgentRunStatus.WAITING_CONFIRMATION}:
                 raise ValueError("Parent run stopped while multi-Agent plan was active.")
 
@@ -430,7 +433,11 @@ class MultiAgentScheduler:
 
             plan = self._block_failed_dependencies(plan)
 
-            ready_ids = plan.ready_step_ids()
+            ready_ids = plan.ready_step_ids() + tuple(
+                step.step_id for step in plan.steps
+                if step.status == PlanStepStatus.RUNNING
+                and step.step_id != "root_coordinator"
+            )
             if not ready_ids:
                 unresolved = [
                     step for step in plan.steps
@@ -462,7 +469,8 @@ class MultiAgentScheduler:
             batch = batch[: self.max_concurrency]
             prepared: list[tuple[PlanStep, Any, Any]] = []
             for step in batch:
-                plan = self._set_step_status(plan, step.step_id, PlanStepStatus.READY)
+                if step.status != PlanStepStatus.RUNNING:
+                    plan = self._set_step_status(plan, step.step_id, PlanStepStatus.READY)
                 try:
                     definition, _ = self._resolved_executor(step)
                     if step.inference_profile_id is not None:
@@ -511,17 +519,18 @@ class MultiAgentScheduler:
                         step if item.step_id == step.step_id else item for item in plan.steps
                     )})
                 plan = self._set_step_status(plan, step.step_id, PlanStepStatus.RUNNING)
-                attempt, child, snapshot, views = await self._prepare_attempt(
-                    parent_run_id,
-                    parent,
-                    plan,
-                    step,
-                    context,
-                    result_by_step,
-                    force_new_attempt=step.step_id in force_new_step_ids,
-                    request_llm_client_name=llm_client_name,
-                    request_llm_model=llm_model,
-                )
+                try:
+                    attempt, child, snapshot, views = await self._prepare_attempt(
+                        parent_run_id, parent, plan, step, context, result_by_step,
+                        force_new_attempt=step.step_id in force_new_step_ids,
+                        request_llm_client_name=llm_client_name, request_llm_model=llm_model,
+                    )
+                except ValueError:
+                    if not self.run_manager.get_run(parent_run_id).metadata.get("pause_requested"):
+                        raise
+                    # No new work can be admitted after the atomic tree-pause intent.
+                    self._save_plan(parent_run_id, plan, "multi_agent_paused", {})
+                    return self._result(plan, produced, status="paused")
                 self._save_plan(parent_run_id, plan, "subtask_started", {
                     "step_id": step.step_id,
                     "child_run_id": child.run_id,
@@ -548,6 +557,8 @@ class MultiAgentScheduler:
                 acquired_global = False
                 acquired_session = False
                 try:
+                    if self.run_manager.get_run(parent_run_id).metadata.get("pause_requested"):
+                        return attempt, self._blocked_result(child, step, "Task tree paused.", code="paused")
                     while not self._global_slots.acquire(blocking=False):
                         self._assert_parent_active(parent_run_id)
                         await asyncio.sleep(0.05)
@@ -562,6 +573,19 @@ class MultiAgentScheduler:
                         self.run_manager.fail_child_run(child.run_id, error_type="source_constraint", error=denial)
                         return attempt, self._blocked_result(child, step, denial, code="source_constraint")
                     executor = self._executor_for(step.model_copy(update={"agent_version": snapshot.agent_version}))
+                    if self.run_manager.get_run(parent_run_id).metadata.get("pause_requested"):
+                        return attempt, self._blocked_result(child, step, "Task tree paused.", code="paused")
+                    if not self.run_manager.admit_child_execution(child.run_id):
+                        current = self.run_manager.get_run(child.run_id)
+                        if current.status == AgentRunStatus.COMPLETED:
+                            from_terminal = getattr(executor, "from_terminal", None)
+                            if from_terminal is None:
+                                from_terminal = getattr(executor, "_from_terminal", None)
+                            if callable(from_terminal):
+                                return attempt, from_terminal(current, snapshot)
+                        if current.status in {AgentRunStatus.QUEUED, AgentRunStatus.PAUSED}:
+                            return attempt, self._blocked_result(child, step, "Task tree paused.", code="paused")
+                        return attempt, self._blocked_result(child, step, "Child execution no longer eligible.", code="cancelled")
                     if child.status == AgentRunStatus.RUNNING:
                         resume = getattr(executor, "resume", None)
                         if callable(resume):
@@ -584,6 +608,8 @@ class MultiAgentScheduler:
                         if timeout_seconds is not None
                         else await runner
                     )
+                    if self.run_manager.get_run(child.run_id).status == AgentRunStatus.PAUSED:
+                        return attempt, self._blocked_result(child, step, "Task tree paused.", code="paused")
                 except TimeoutError:
                     self.run_manager.timeout_child_run(
                         child.run_id,
@@ -610,10 +636,19 @@ class MultiAgentScheduler:
                     raise
                 except Exception as exc:  # noqa: BLE001 - persist child-level execution failure.
                     current = self.run_manager.get_run(child.run_id)
+                    from app.core.agent_graph import AgentTurnPaused
+                    if isinstance(exc, AgentTurnPaused) or (current and current.status == AgentRunStatus.PAUSED):
+                        return attempt, self._blocked_result(child, step, "Task tree paused.", code="paused")
                     if current and current.status in {AgentRunStatus.QUEUED, AgentRunStatus.RUNNING}:
                         self.run_manager.fail_child_run(child.run_id, error_type=type(exc).__name__, error=str(exc))
                     result = self._blocked_result(child, step, str(exc), code=type(exc).__name__)
                 finally:
+                    current = self.run_manager.get_run(child.run_id)
+                    if current and current.status in {AgentRunStatus.QUEUED, AgentRunStatus.RUNNING, AgentRunStatus.PAUSED}:
+                        self.run_manager._update_run(child.run_id, status=current.status,
+                                                     metadata_patch={"executor_active": False})
+                        if current.status == AgentRunStatus.QUEUED and current.metadata.get("pause_requested"):
+                            self.run_manager.acknowledge_pause(child.run_id)
                     if acquired_session:
                         session_slot.release()
                     if acquired_global:
@@ -630,6 +665,10 @@ class MultiAgentScheduler:
             waiting_pairs: list[tuple[PlanStep, Any]] = []
             waiting_user_pairs: list[tuple[PlanStep, Any]] = []
             for (step, child, _), (attempt, result) in zip(prepared, outcomes):
+                if result.failure and result.failure.code == "paused":
+                    # Keep the node RUNNING and the immutable attempt/checkpoint.
+                    # A pause is not a result, failure, retry or consumed budget.
+                    continue
                 if result.failure and result.failure.code == "waiting_user":
                     plan = self._set_step_status(plan, step.step_id, PlanStepStatus.WAITING)
                     waiting_user_pairs.append((step, child))
@@ -895,6 +934,9 @@ class MultiAgentScheduler:
             or self.run_manager.is_cancel_requested(parent_run_id)
         ):
             raise asyncio.CancelledError
+        if parent.metadata.get("pause_requested") or parent.status == AgentRunStatus.PAUSED:
+            from app.core.agent_graph import AgentTurnPaused
+            raise AgentTurnPaused(parent_run_id)
 
     def _waiting_children(self, parent_run_id: str, plan: Plan) -> list[tuple[PlanStep, Any]]:
         parent = self.run_manager.get_run(parent_run_id)

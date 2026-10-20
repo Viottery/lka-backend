@@ -24,6 +24,15 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from app.domains.memory_feedback import (
+    MemoryFeedback,
+    MemoryFeedbackInput,
+    ensure_feedback_schema,
+    feedback_rows,
+    record_feedback,
+    relevant_feedback_rows,
+)
+
 MemoryScope = Literal["global", "project"]
 MemoryStatus = Literal["candidate", "active", "retracted", "superseded"]
 
@@ -222,6 +231,7 @@ class MemoryService:
                 );
                 """
             )
+            ensure_feedback_schema(conn)
             try:
                 conn.execute("""CREATE VIRTUAL TABLE IF NOT EXISTS memory_entries_fts
                     USING fts5(memory_id UNINDEXED, content, memory_type)""")
@@ -1190,11 +1200,14 @@ class MemoryService:
                 source_id: str | None = None, user_confirmed: bool = True,
                 publication_lease: tuple[str, str, int] | None = None,
                 metadata: dict[str, Any] | None = None,
-                expires_at: str | None = None, require_active: bool = False) -> MemoryRecord:
+                expires_at: str | None = None, require_active: bool = False,
+                user_feedback: MemoryFeedbackInput | None = None) -> MemoryRecord:
         """Create a new version and preserve the old claim as superseded history."""
         content = content.strip()
         if not content:
             raise ValueError("Corrected content cannot be blank")
+        if user_feedback is not None and user_feedback.reason == "do_not_store":
+            raise ValueError("do_not_store feedback can only be used when retracting memory")
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -1239,6 +1252,12 @@ class MemoryService:
                 (new_id,old["memory_type"],content,old["scope"],old["project_id"],status,old["confidence"],old["sensitivity"],expires_at if metadata is not None else old["expires_at"],dedupe,1,memory_id,old["extraction_model"],_json(corrected_metadata),now,now))
             conn.execute("INSERT INTO memory_entry_sources VALUES(?,?)",(new_id,new_source))
             self._record_event(conn,new_id,1,"created_by_correction",{"supersedes_id":memory_id,"source_id":new_source,"content":content})
+            if user_feedback is not None:
+                new = conn.execute("SELECT * FROM memory_entries WHERE memory_id=?", (new_id,)).fetchone()
+                record_feedback(
+                    conn, feedback=user_feedback, action="correct", old=old,
+                    old_version=expected_version, new=new, created_at=now,
+                )
             if publication_lease is not None:
                 self._validate_publication_lease(conn, publication_lease)
             conn.commit()
@@ -1249,18 +1268,68 @@ class MemoryService:
         finally:
             conn.close()
 
-    def retract(self, memory_id: str, *, expected_version: int) -> MemoryRecord:
+    def retract(self, memory_id: str, *, expected_version: int,
+                user_feedback: MemoryFeedbackInput | None = None) -> MemoryRecord:
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
+            old = conn.execute("SELECT * FROM memory_entries WHERE memory_id=?", (memory_id,)).fetchone()
+            if old is None:
+                raise KeyError(f"Memory not found: {memory_id}")
+            if int(old["version"]) != expected_version:
+                raise MemoryConflictError(f"Expected version {expected_version}, found {old['version']}")
             self._transition(conn,memory_id,"retracted","retracted",{},expected_version)
             self._clear_conflict_references(conn, memory_id)
+            if user_feedback is not None:
+                if user_feedback.reason == "wording":
+                    raise ValueError("wording feedback requires correcting memory")
+                record_feedback(
+                    conn, feedback=user_feedback, action="discard", old=old,
+                    old_version=expected_version, new=None, created_at=_now(),
+                )
             conn.commit()
         except Exception:
             conn.rollback(); raise
         finally:
             conn.close()
         return self.get(memory_id)
+
+    def feedbacks(self, *, scope: MemoryScope | None = None,
+                  project_id: str | None = None, limit: int = 100,
+                  offset: int = 0) -> list[MemoryFeedback]:
+        """List explicit user feedback in one scope (project data stays isolated)."""
+        if scope == "project" and not project_id:
+            raise ValueError("project_id is required for project feedback")
+        if scope == "global" and project_id is not None:
+            raise ValueError("global feedback cannot have project_id")
+        if not 1 <= limit <= 500 or offset < 0:
+            raise ValueError("feedback pagination requires limit 1..500 and offset >= 0")
+        conn = self._connect()
+        try:
+            return feedback_rows(
+                conn, scope=scope, project_id=project_id, limit=limit, offset=offset,
+            )
+        finally:
+            conn.close()
+
+    def relevant_feedbacks(self, query: str, *, scope: MemoryScope,
+                           project_id: str | None = None, limit: int = 3,
+                           max_json_chars: int = 2000) -> list[dict[str, Any]]:
+        """Return bounded, non-sensitive preference examples, never evidence."""
+        if scope == "project" and not project_id:
+            raise ValueError("project_id is required for project feedback")
+        if scope == "global" and project_id is not None:
+            raise ValueError("global feedback cannot have project_id")
+        if not 1 <= limit <= 3 or not 1 <= max_json_chars <= 2000:
+            raise ValueError("feedback examples are limited to 3 items / 2000 JSON characters")
+        conn = self._connect()
+        try:
+            return relevant_feedback_rows(
+                conn, query=query, scope=scope, project_id=project_id,
+                limit=limit, max_json_chars=max_json_chars,
+            )
+        finally:
+            conn.close()
 
     def export(self, *, scope: MemoryScope | None = None, project_id: str | None = None,
                include_candidates: bool = False) -> dict[str, Any]:

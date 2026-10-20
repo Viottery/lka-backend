@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 import time
@@ -17,6 +18,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from app.domains.file_processing import MAX_SOURCE_BYTES, FileProcessor
 from app.domains.knowledge_retrieval import (
     CallableCandidateRetriever,
     ConfigurableKnowledgeRetriever,
@@ -28,6 +30,7 @@ from app.domains.knowledge_retrieval import (
     SemanticIndex,
 )
 from app.domains.knowledge_sources import KnowledgeSourceProvider
+from app.platform.safe_files import open_file_no_follow
 
 KnowledgeSensitivity = Literal["public", "personal", "sensitive", "secret"]
 KnowledgeRemotePolicy = Literal["allow", "redact", "confirm", "deny"]
@@ -206,6 +209,7 @@ class KnowledgeService:
         auto_index_on_import: bool = False,
         reranker: Reranker | None = None,
         workspace_roots: tuple[Path, ...] = (),
+        file_processor: FileProcessor | None = None,
     ) -> None:
         self._conn_factory = conn_factory
         self.privacy_gateway = PrivacyGateway()
@@ -215,6 +219,7 @@ class KnowledgeService:
         self._auto_index_on_import = auto_index_on_import
         self._reranker = reranker
         self._workspace_roots = tuple(root.resolve(strict=False) for root in workspace_roots)
+        self.file_processor = file_processor or FileProcessor()
         self._candidate_cache: OrderedDict[tuple[Any, ...], tuple[float, RetrievalSelection]] = OrderedDict()
         self._cache_lock = Lock()
         self._cache_ttl_seconds = 30.0
@@ -514,10 +519,29 @@ class KnowledgeService:
                 ),
             )
             removed_chunk_ids.extend(self._delete_document_chunks(conn, document_id))
+            source_cursor = 0
             for index, chunk_text in enumerate(chunks):
                 chunk_sensitivity = sensitivity
                 chunk_remote_policy = remote_policy
-                chunk_metadata: dict[str, Any] = {}
+                chunk_metadata: dict[str, Any] = self._extraction_chunk_metadata(payload.metadata)
+                start = text.find(chunk_text, source_cursor)
+                if start >= 0 and "extraction" in chunk_metadata:
+                    end = start + len(chunk_text)
+                    source_cursor = end
+                    chunk_metadata["extraction"]["source_start_char"] = start
+                    chunk_metadata["extraction"]["source_end_char"] = end
+                    spans = payload.metadata.get("extraction", {}).get("page_spans", [])
+                    if isinstance(spans, list):
+                        chunk_metadata["extraction"]["pages"] = [
+                            span["page"] for span in spans[:200]
+                            if isinstance(span, dict)
+                            and isinstance(span.get("page"), int)
+                            and isinstance(span.get("start_char"), int)
+                            and isinstance(span.get("end_char"), int)
+                            and isinstance(span.get("marker_start_char", span["start_char"]), int)
+                            and span.get("marker_start_char", span["start_char"]) < end
+                            and span["end_char"] > start
+                        ]
                 stored_text = chunk_text
                 if self.privacy_gateway.contains_secret(chunk_text):
                     chunk_sensitivity = "secret"
@@ -592,11 +616,30 @@ class KnowledgeService:
         remote_policy: KnowledgeRemotePolicy = "redact",
         metadata: dict[str, Any] | None = None,
     ) -> KnowledgeImportResult:
+        """Compatibility entry point; supported files use the shared processor registry."""
+        return self.import_file(
+            path=path, source_type=source_type, sensitivity=sensitivity,
+            remote_policy=remote_policy, metadata=metadata,
+        )
+
+    def import_file(
+        self,
+        *,
+        path: Path,
+        source_type: str = "local_document",
+        sensitivity: KnowledgeSensitivity = "personal",
+        remote_policy: KnowledgeRemotePolicy = "redact",
+        metadata: dict[str, Any] | None = None,
+    ) -> KnowledgeImportResult:
+        """Convert one bounded local snapshot before atomically replacing its index."""
         resolved = path.resolve(strict=True)
         roots = [root for root in self._workspace_roots if root == resolved or root in resolved.parents]
         if self._workspace_roots and not roots:
             raise ValueError("file is outside configured workspace roots")
-        text = resolved.read_text(encoding="utf-8")
+        with os.fdopen(open_file_no_follow(resolved), "rb") as stream:
+            raw = stream.read(MAX_SOURCE_BYTES + 1)
+        converted = self.file_processor.process_bytes(resolved.name, raw)
+        document_metadata = {**(metadata or {}), **converted.metadata}
         access_scope = {"workspace_paths": [str(max(roots, key=lambda root: len(root.parts)))]} if roots else {}
         return self.import_text_document(
             KnowledgeDocumentInput(
@@ -611,9 +654,9 @@ class KnowledgeService:
                 ),
                 title=path.name,
                 uri=path.as_posix(),
-                text=text,
-                mime_type=self._mime_type(path),
-                metadata=metadata or {},
+                text=converted.text,
+                mime_type=converted.mime_type,
+                metadata=document_metadata,
                 sensitivity=sensitivity,
                 remote_policy=remote_policy,
             )
@@ -769,6 +812,7 @@ class KnowledgeService:
                     policy_decision=decision.policy_decision,
                     retrieval_channels=candidate.channel.split("+"),
                     retrieval_score=candidate.score,
+                    metadata=self._json_dict(row["metadata"]),
                 )
             )
         provider_results: list[KnowledgeSearchItem] = []
@@ -1139,7 +1183,7 @@ class KnowledgeService:
                 SELECT
                     c.chunk_id, c.document_id, d.source_id, d.title, d.source_type, d.uri,
                     c.chunk_index, c.text, c.char_count, c.token_estimate,
-                    c.source_ref, c.sensitivity, c.remote_policy
+                    c.source_ref, c.sensitivity, c.remote_policy, c.metadata
                 FROM knowledge_chunks c
                 JOIN knowledge_documents d ON d.document_id = c.document_id
                 JOIN knowledge_sources s ON s.source_id = d.source_id
@@ -1190,6 +1234,7 @@ class KnowledgeService:
                     truncated=len(visible_text) < len(decision.text),
                     offset=offset,
                     next_offset=end if end < len(decision.text) else None,
+                    metadata=self._json_dict(row["metadata"]),
                 )
             )
         self._audit(
@@ -1467,7 +1512,7 @@ class KnowledgeService:
                 SELECT
                     c.chunk_id, c.document_id, d.source_id, d.title, d.source_type, d.uri,
                     c.chunk_index, c.text AS snippet, c.source_ref,
-                    c.sensitivity, c.remote_policy
+                    c.sensitivity, c.remote_policy, c.metadata
                 FROM knowledge_chunks c
                 JOIN knowledge_documents d ON d.document_id = c.document_id
                 JOIN knowledge_sources s ON s.source_id = d.source_id
@@ -1731,6 +1776,22 @@ class KnowledgeService:
         except json.JSONDecodeError:
             return {}
         return payload if isinstance(payload, dict) else {}
+
+    @staticmethod
+    def _extraction_chunk_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+        """Carry bounded extraction limitations into evidence previews and reads."""
+        extraction = metadata.get("extraction")
+        if not isinstance(extraction, dict):
+            return {}
+        keys = (
+            "processor", "processor_version", "original_mime_type", "source_sha256",
+            "fidelity_verified", "text_layer_only", "visual_fidelity_verified",
+        )
+        summary = {key: extraction[key] for key in keys if key in extraction}
+        warnings = extraction.get("warnings", [])
+        if isinstance(warnings, list):
+            summary["warnings"] = [str(warning)[:500] for warning in warnings[:10]]
+        return {"extraction": summary}
 
     def _mime_type(self, path: Path) -> str:
         suffix = path.suffix.lower()

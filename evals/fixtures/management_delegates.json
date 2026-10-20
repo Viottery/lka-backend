@@ -124,6 +124,12 @@
     }
   },
   "offline_regressions": {
+    "history_scope": [
+      "tests/test_management_history.py"
+    ],
+    "simple_matter_capture": [
+      "tests/test_management_capture.py"
+    ],
     "ownership": [
       "tests/test_management_delegate_integration.py::test_scoped_ownership_workspace_replacement_and_parent_pause",
       "tests/test_management_delegates.py::test_report_requires_child_execution_and_owned_evidence"
@@ -140,6 +146,18 @@
       "tests/test_management_delegate_approval.py::test_high_risk_managed_effect_requires_original_user_decision_after_restart",
       "tests/test_management_delegate_approval.py::test_frozen_policy_forces_manual_review_for_each_registered_risk_signal",
       "tests/test_management_delegate_approval.py::test_restored_pending_manual_review_cannot_be_autoapproved_by_weaker_current_mode"
+    ],
+    "assistant_orchestration": [
+      "tests/test_assistant_orchestration.py"
+    ],
+    "tool_selection_recovery": [
+      "tests/test_tool_selection_feedback.py"
+    ],
+    "execution_workspace": [
+      "tests/test_management_execution_workspace.py"
+    ],
+    "result_evidence": [
+      "tests/test_management_results.py"
     ]
   }
 }

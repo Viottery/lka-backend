@@ -8,7 +8,7 @@ import os
 import secrets
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.core.memory_files import MemoryFileConflictError, MemoryFileError
@@ -18,6 +18,7 @@ from app.domains.memory import (
     MemoryPublicationSuppressed,
     MemorySourceInput,
 )
+from app.domains.memory_feedback import MemoryFeedbackInput, MemoryFeedbackReason
 
 
 def require_local_memory_control(request: Request) -> None:
@@ -53,6 +54,11 @@ class CreateMemoryRequest(BaseModel):
 class CorrectMemoryRequest(BaseModel):
     content: str = Field(min_length=1, max_length=500)
     expected_version: int = Field(ge=1)
+    feedback_reason: MemoryFeedbackReason = "unspecified"
+
+
+class ForgetMemoryRequest(BaseModel):
+    feedback_reason: MemoryFeedbackReason = "unspecified"
 
 
 class LearningPolicyRequest(BaseModel):
@@ -334,6 +340,22 @@ def import_memory_file(
             "memory_file_status": status}
 
 
+@router.get("/memories/feedback")
+def list_memory_feedback(
+    request: Request, scope: Literal["global", "project"] = "global",
+    workspace_path: str | None = None,
+    limit: int = Query(default=100, ge=1, le=100), offset: int = Query(default=0, ge=0, le=1000000),
+):
+    project_id = _project_id(request, scope, workspace_path, create=False)
+    if scope == "project" and project_id is None:
+        return {"feedback": [], "next_offset": None}
+    rows = request.app.state.runtime.memory_service.feedbacks(
+        scope=scope, project_id=project_id, limit=limit + 1, offset=offset,
+    )
+    return {"feedback": [item.model_dump(mode="json") for item in rows[:limit]],
+            "next_offset": offset + limit if len(rows) > limit else None}
+
+
 @router.get("/memories/{memory_id}")
 def get_memory(memory_id: str, request: Request, workspace_path: str | None = None):
     return _authorized_record(request, memory_id, workspace_path).model_dump(mode="json")
@@ -356,9 +378,12 @@ def correct_memory(
         updated = service.correct(
             current.memory_id, content=payload.content,
             expected_version=payload.expected_version, source_id=source_id,
+            user_feedback=MemoryFeedbackInput(origin="user_api", reason=payload.feedback_reason),
         )
     except MemoryConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     return {**updated.model_dump(mode="json"),
             "memory_file_status": _refresh_file(request, updated.scope, updated.project_id)}
 
@@ -367,14 +392,23 @@ def correct_memory(
 def forget_memory(
     memory_id: str, request: Request, expected_version: int = Query(ge=1),
     workspace_path: str | None = None,
+    feedback_reason: MemoryFeedbackReason = "unspecified",
+    payload: Annotated[ForgetMemoryRequest | None, Body()] = None,
 ):
     current = _authorized_record(request, memory_id, workspace_path)
+    if payload is not None:
+        if feedback_reason != "unspecified" and feedback_reason != payload.feedback_reason:
+            raise HTTPException(status_code=422, detail="Conflicting memory feedback reasons")
+        feedback_reason = payload.feedback_reason
     try:
         updated = request.app.state.runtime.memory_service.retract(
             current.memory_id, expected_version=expected_version,
+            user_feedback=MemoryFeedbackInput(origin="user_api", reason=feedback_reason),
         )
     except MemoryConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     return {**updated.model_dump(mode="json"),
             "memory_file_status": _refresh_file(request, updated.scope, updated.project_id)}
 

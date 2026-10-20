@@ -69,6 +69,9 @@ class ManagementCoordinator:
         return False
 
     def _eligible(self, conn, sid, now):
+        user_input_pending = getattr(self, 'user_input_pending', None)
+        if user_input_pending is not None and user_input_pending(conn, sid):
+            return False
         row = conn.execute("SELECT c.status,c.revision FROM manager_controllers c JOIN agent_sessions s "
                            "ON s.session_id=c.session_id WHERE c.session_id=? "
                            "AND s.status!='deleted'", (sid,)).fetchone()

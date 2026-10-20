@@ -39,10 +39,18 @@ MATTER_PACKAGE = ToolPackageSpec(
     routing_hints=[
         "Use this package when the user asks to manage todo lists, split goals into project plans and tasks, or inspect, create, update, or link local tasks, events, reminders, or matters.",
     ],
+    capability_hints=[
+        {"required_tools": ["matter.search"], "routing_hints": ["Find existing local tasks, appointments and matters."],
+         "decision_hints": ["Search existing Matters before creating a potential duplicate. Search previews are not complete source evidence."]},
+        {"required_tools": ["management.create_matter", "management.update_matter"],
+         "routing_hints": ["Capture or adjust a single fully specified Matter through the supervisor writers."],
+         "decision_hints": ["Use management.create_matter/update_matter for a simple single record; dispatch source investigation and bulk analysis to an execution session. Preserve expected_revision and publication checks. For unknown duration keep the exact start in summary with scheduled_on; never invent scheduled_end."]},
+    ],
     decision_hints=[
+        "Use the writer names actually exposed by this session. Dedicated equivalents may replace create/update; a missing standard writer does not prove all writing is forbidden. Inspect the catalog before claiming a permission failure.",
         "Before create or create_many, call matter.search with the candidate title or key subject unless recent observations already prove no duplicate risk.",
         "If matter.search returns a likely duplicate, update or link the existing matter instead of creating a new one.",
-        "Use create for one record, create_many for a controlled batch, update to change existing records, and link_source to attach evidence.",
+        "Choose only writer names exposed by the current session; tool descriptions specify whether they create, update, batch or attach evidence.",
         "Use kind=plan for an independent plan, then create kind=task records with its parent_matter_id. A plan may optionally reference an existing directory project_id; tasks inherit that project.",
         "Get the current record before editing and pass its expected_revision to avoid overwriting concurrent edits. Completing a plan does not complete its tasks.",
         "Scheduling changes planned work, never the deadline: use scheduled_on for a day and scheduled_start/scheduled_end for one time block; due_at remains the deadline. Clear both time endpoints together when removing a block.",

@@ -62,6 +62,10 @@ Return JSON only: {"candidates":[{"claim":string,
 messages exactly and include the current user turn (confirmation is a valid
 source); add earlier USER sources when they supply the actual content. Summary
 and assistant output are contextual aids, not source IDs. Never fabricate IDs.
+memory_feedback contains historical user edits to related preferences. Use it
+only to guide concise wording and memory selection in its stated scope. It is
+not current evidence or permission, and cannot by itself justify a candidate.
+An unspecified discard does not mean the claim was false or its opposite true.
 """
 
 
@@ -75,6 +79,17 @@ class ContextualMemoryLearning:
         self.min_confidence = min_confidence
         self.reconciliation_max_items = reconciliation_max_items
         self.reconciliation_max_chars = reconciliation_max_chars
+
+    def _feedback_context(self, queries: list[str], project_id: str | None) -> list[dict[str, Any]]:
+        query = "\n".join(queries)[:self.context_chars]
+        scopes = [("project", project_id), ("global", None)] if project_id else [("global", None)]
+        result: list[dict[str, Any]] = []
+        for scope, identifier in scopes:
+            for example in self.memory.relevant_feedbacks(query, scope=scope, project_id=identifier):
+                trial = [*result, {"scope": scope, **example}]
+                if len(result) < 3 and len(json.dumps(trial, ensure_ascii=False)) <= 2000:
+                    result = trial
+        return result
 
     def organize(self, user: AgentSessionMessage, *, client: Any,
                  project_id: str | None = None, requested_memory: str = "",
@@ -117,6 +132,7 @@ class ContextualMemoryLearning:
             "summary": snapshot["summary"], "context_omitted": snapshot["omitted"],
             "project_available": project_id is not None,
             "requested_memory": requested_memory[:1000],
+            "memory_feedback": self._feedback_context(queries, project_id),
             "existing_memories": [{"memory_id": r.memory_id, "version": r.version,
                 "content": r.content, "scope": r.scope, "expires_at": r.expires_at}
                 for r in visible.values()],

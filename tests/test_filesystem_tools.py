@@ -247,6 +247,8 @@ def test_filesystem_package_is_agent_visible(tmp_path, monkeypatch):
 
     assert "filesystem" in package_names
     assert filesystem_tool_names == {
+        "filesystem.create_file",
+        "filesystem.list_directory",
         "filesystem.read_file",
         "filesystem.edit_file",
     }

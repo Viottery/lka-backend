@@ -1035,3 +1035,15 @@ class SqliteAgentRunStore:
             {"tool_name": row["tool_name"], "result": _json_load(row["result_payload"])}
             for row in rows
         ]
+
+    def list_tool_invocations(self, run_id: str) -> list[dict[str, Any]]:
+        """Private harness audit, including effects with no acknowledged result."""
+        with connect(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT invocation_id, tool_name, status, result_payload, claimed_at, updated_at "
+                "FROM agent_tool_invocations WHERE run_id = ? ORDER BY claimed_at, invocation_id",
+                (run_id,),
+            ).fetchall()
+        return [{"invocation_id": row["invocation_id"], "tool_name": row["tool_name"],
+                 "status": row["status"], "result": _json_load(row["result_payload"]) if row["result_payload"] is not None else None,
+                 "claimed_at": row["claimed_at"], "updated_at": row["updated_at"]} for row in rows]

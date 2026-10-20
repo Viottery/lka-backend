@@ -14,8 +14,15 @@ from app.api.schemas import (
     MailKnowledgeMirrorSyncRequest,
     MailKnowledgeMirrorSyncResponse,
 )
+from app.domains.file_processing import file_type_policies
 
 router = APIRouter(prefix="/knowledge", tags=["knowledge"])
+
+
+@router.get("/file-types")
+def list_knowledge_file_types() -> dict:
+    """Expose the maintained local processing preferences without inspecting files."""
+    return {"file_types": file_type_policies()}
 
 
 @router.post("/import", response_model=KnowledgeImportResponse)

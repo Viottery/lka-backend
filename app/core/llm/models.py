@@ -5,7 +5,9 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+IMAGE_INPUT_TOKEN_RESERVATION = 32768
 
 
 class LLMResponseMode(str, Enum):
@@ -22,9 +24,56 @@ class LLMReasoningEffort(str, Enum):
     HIGH = "high"
 
 
+class LLMTextBlock(BaseModel):
+    type: Literal["text"] = "text"
+    text: str
+
+
+class LLMImageURL(BaseModel):
+    url: str = Field(repr=False)
+    detail: Literal["auto", "low", "high"] = "high"
+
+
+class LLMImageBlock(BaseModel):
+    type: Literal["image_url"] = "image_url"
+    image_url: LLMImageURL
+
+
+class LLMAudioInput(BaseModel):
+    data: str = Field(repr=False, min_length=1)
+    format: Literal["wav", "mp3"]
+
+
+class LLMAudioBlock(BaseModel):
+    type: Literal["input_audio"] = "input_audio"
+    input_audio: LLMAudioInput
+    duration_ms: int = Field(gt=0, exclude=True)
+
+    @property
+    def token_reservation(self) -> int:
+        # Conservative audio reservation; encoded bytes are never text tokens.
+        return ((self.duration_ms + 999) // 1000) * 40 + 1024
+
+
 class LLMMessage(BaseModel):
     role: Literal["system", "user", "assistant", "tool"]
-    content: str
+    content: str | list[LLMTextBlock | LLMImageBlock | LLMAudioBlock]
+
+    @model_validator(mode="after")
+    def image_role(self):
+        if self.role != "user" and self.has_images:
+            raise ValueError("Image content is supported only in user messages.")
+        if self.role != "user" and self.has_audio:
+            raise ValueError("Audio content is supported only in user messages.")
+        return self
+
+    @property
+    def has_images(self) -> bool:
+        return isinstance(self.content, list) and any(isinstance(block, LLMImageBlock) for block in self.content)
+
+    @property
+    def has_audio(self) -> bool:
+        return isinstance(self.content, list) and any(isinstance(block, LLMAudioBlock) for block in self.content)
 
 
 class LLMToolDefinition(BaseModel):

@@ -33,6 +33,14 @@ def _is_within(candidate: Path, root: Path) -> bool:
     return True
 
 
+class ToolCapabilityHint(BaseModel):
+    """Guidance exposed only when every referenced operation is granted."""
+
+    required_tools: tuple[str, ...]
+    routing_hints: list[str] = Field(default_factory=list)
+    decision_hints: list[str] = Field(default_factory=list)
+
+
 class ToolPackageSpec(BaseModel):
     name: str
     description: str
@@ -42,6 +50,7 @@ class ToolPackageSpec(BaseModel):
     routing_hints: list[str] = Field(default_factory=list)
     decision_hints: list[str] = Field(default_factory=list)
     observation_cache: dict[str, Any] = Field(default_factory=dict)
+    capability_hints: list[ToolCapabilityHint] = Field(default_factory=list)
 
 
 class ToolSpec(BaseModel):
@@ -132,6 +141,8 @@ class ToolContext(BaseModel):
     approved_paths: list[str] = Field(default_factory=list)
     tool_view: ToolView | None = None
     run_id: str | None = None
+    llm_client_name: str | None = None
+    llm_model: str | None = None
 
 
 class ToolResult(BaseModel):
@@ -749,6 +760,7 @@ class ToolExecutor:
             schema=normalized_schema,
             value=value,
             path=path,
+            strict_properties=True,
         )
 
     def _normalize_schema(self, schema: dict[str, Any]) -> dict[str, Any]:
@@ -778,6 +790,7 @@ class ToolExecutor:
         schema: dict[str, Any],
         value: Any,
         path: str,
+        strict_properties: bool = False,
     ) -> list[str]:
         expected_type = schema.get("type")
         errors: list[str] = []
@@ -810,6 +823,10 @@ class ToolExecutor:
         if self._type_allows(expected_type, "object") and isinstance(value, dict):
             properties = schema.get("properties")
             if isinstance(properties, dict):
+                if strict_properties and schema.get("additionalProperties") is False:
+                    for key in value:
+                        if key not in properties:
+                            errors.append(f"{path}.{key} is not allowed by additionalProperties=false.")
                 required = schema.get("required")
                 if isinstance(required, list):
                     for key in required:
@@ -823,6 +840,7 @@ class ToolExecutor:
                                 schema=property_schema,
                                 value=item,
                                 path=f"{path}.{key}",
+                                strict_properties=strict_properties,
                             )
                         )
 
@@ -835,6 +853,7 @@ class ToolExecutor:
                             schema=item_schema,
                             value=item,
                             path=f"{path}[{index}]",
+                            strict_properties=strict_properties,
                         )
                     )
 

@@ -27,6 +27,16 @@ MAIL_PACKAGE = ToolPackageSpec(
         "When automatic mail synchronization is enabled, normally read local mail without calling mail.sync first, including routine requests for recent mail. Call mail.sync only for an explicit sync/immediate-refresh request, or when automatic synchronization is unavailable and local mail may be stale.",
         "This package reads and syncs mail evidence; use another registered persistence package for tasks, events, or matters.",
     ],
+    capability_hints=[
+        {"required_tools": ["mail.list"],
+         "routing_hints": ["Read a chronological interval of authorized local mail."],
+         "decision_hints": ["mail.list returns metadata cards; follow next_range with the same listing_id until has_more=false or report partial coverage. Read current source evidence instead of substituting old conversation summaries."]},
+        {"required_tools": ["mail.search"],
+         "routing_hints": ["Search currently authorized mail evidence."],
+         "decision_hints": ["mail.search snippets are selected evidence; possible_more is not an exact total. An empty-query quick peek is not complete enumeration."]},
+        {"required_tools": ["mail.load_messages"],
+         "decision_hints": ["Load selected message bodies only when needed to verify requirements, dates and responsibility; do not bulk-read all bodies."]},
+    ],
     observation_cache={
         "tool_names": ["mail.load_messages"],
         "description": "Reuse loaded complete mail records from the same session when relevant.",

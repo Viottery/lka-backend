@@ -57,7 +57,7 @@ class ManagementDelegateService:
         controller = conn.execute('SELECT llm_client_name,llm_model FROM manager_controllers WHERE session_id=?',
                                   (session_id,)).fetchone()
         control = ['management.list_sessions', 'management.read_session', 'management.list_runs',
-                   'management.inspect_run', 'management.start_task', 'management.send_instruction',
+                   'management.inspect_run', 'management.read_task_result', 'management.start_task', 'management.send_instruction',
                    'management.control_run', 'management.read_events', 'management.report_delegate',
                    'management.read_delegate']
         workspace = delegate['workspace']
@@ -170,7 +170,8 @@ class ManagementDelegateService:
         if type(expected_revision) is not int or expected_revision < 1:
             raise ValueError('expected_revision must be positive')
         self.tasks.require_durable_execution()
-        prepared = self.tasks.prepare_task(context, command_id=command_id, purpose=instruction, title='事务线')
+        prepared = self.tasks.prepare_task(context, command_id=command_id, purpose=instruction, title='事务线',
+                                           create_workspace=False)
         args = {'delegate_id': delegate_id, 'expected_revision': expected_revision, 'instruction': instruction}
         with closing(self._conn()) as conn, conn:
             conn.execute('BEGIN IMMEDIATE')

@@ -234,6 +234,117 @@ def test_unlimited_compaction_does_not_fall_back_after_crossing_old_allowance():
     assert coordinator._compaction_state.used_local_fallback is False
 
 
+@pytest.mark.parametrize("long_previous_summary", [False, True])
+def test_compaction_over_16kb_reaches_model_instead_of_local_fallback(long_previous_summary):
+    from app.core.memory_background import MemoryBackgroundCoordinator
+    from app.core.sessions import SessionRecentMessage, SessionService
+
+    old_summary = "既有目标与已完成事项。" * 800 if long_previous_summary else "旧摘要"
+    content = (
+        "更正：这首是原创曲，不是此前识别的曲目。" if long_previous_summary
+        else "\n".join(f"材料第{i}条：保留不同的具体内容。" for i in range(800))
+    )
+    client = SequenceClient([response('{"summary":"整合后的摘要","source_trace_ids":["source-1"]}')])
+    coordinator = MemoryBackgroundCoordinator(
+        db_path=":memory:", memory=None, store=None,
+        session_service=SessionService(lambda: None), llm_client=client, max_job_tokens=0,
+    )
+    summary = coordinator._summarize(old_summary, [SessionRecentMessage(
+        role="user", content=content, created_at="2026-10-09T00:00:00Z", trace_id="source-1",
+    )], 65536)
+    assert len(client.calls) == 1
+    prompt = client.calls[0]["user_prompt"]
+    assert len(prompt.encode("utf-8")) > 16000
+    payload = json.loads(prompt)
+    assert payload["previous_summary"] == old_summary
+    assert payload["messages"][0]["content"] == content
+    assert "整合后的摘要" in summary
+    assert coordinator._compaction_state.used_local_fallback is False
+
+
+def test_compaction_initial_and_recovery_requests_have_no_output_cap():
+    from app.core.memory_background import MemoryBackgroundCoordinator
+    from app.core.sessions import SessionRecentMessage, SessionService
+
+    client = SequenceClient([
+        response("", finish_reason="length"),
+        response('{"summary":"整合完成","source_trace_ids":["source-1"]}',
+                 usage={"prompt_tokens": 500, "completion_tokens": 12000}),
+    ], thinking=True)
+    coordinator = MemoryBackgroundCoordinator(
+        db_path=":memory:", memory=None, store=None,
+        session_service=SessionService(lambda: None), llm_client=client,
+    )
+    summary = coordinator._summarize("旧摘要", [SessionRecentMessage(
+        role="user", content="当前状态已更正", trace_id="source-1", created_at="2026-10-09T00:00:00Z",
+    )], 65536)
+    assert "整合完成" in summary
+    assert len(client.calls) == 2
+    assert all("max_output_tokens" not in call for call in client.calls)
+    assert client.calls[1]["thinking_enabled"] is False
+    assert coordinator._compaction_state.used_local_fallback is False
+
+
+@pytest.mark.parametrize("budget,target", [(65536, 4096), (2048, 512), (64, 32)])
+def test_compaction_prompt_requests_current_scoped_state_without_output_cap(budget, target):
+    from app.core.memory_background import MemoryBackgroundCoordinator
+    from app.core.sessions import SessionRecentMessage, SessionService
+
+    client = SequenceClient([response('{"summary":"当前状态","source_trace_ids":["source-1"]}')])
+    coordinator = MemoryBackgroundCoordinator(
+        db_path=":memory:", memory=None, store=None,
+        session_service=SessionService(lambda: None), llm_client=client,
+    )
+    coordinator._summarize("带有过期待办的旧摘要", [SessionRecentMessage(
+        role="user", content="上一个事项已完成，接下来处理另一个项目。",
+        created_at="2026-10-09T00:00:00Z", trace_id="source-1",
+    )], budget)
+    call = client.calls[0]
+    payload = json.loads(call["user_prompt"])
+    assert payload["summary_target_tokens"] == target
+    assert payload["previous_summary"] == "带有过期待办的旧摘要"
+    assert payload["messages"][0]["trace_id"] == "source-1"
+    prompt = call["system_prompt"]
+    for requirement in (
+        "CURRENT STATE", "completion/cancellation", "superseded", "scoped separately",
+        "only active user goals", "never resolved items", "not a duplicate of the arrays",
+        "Source membership is not factual entailment", "not a limit on reasoning tokens",
+    ):
+        assert requirement in prompt
+    for domain_example in ("AI6103", "AI6104", "deepseek", "Today, Tomorrow"):
+        assert domain_example not in prompt
+    assert "max_output_tokens" not in call
+    assert coordinator._compaction_state.used_local_fallback is False
+
+
+def test_uncapped_selected_client_removes_explicit_output_limit():
+    client = SequenceClient([response("complete")])
+    selected = SelectedBackgroundClient(client, limit_output_tokens=False)
+    assert selected.complete_text(system_prompt="s", user_prompt="u", max_output_tokens=10).content == "complete"
+    assert "max_output_tokens" not in client.calls[0]
+
+
+def test_selected_background_client_fallback_deadline_and_cancellation():
+    from app.core.llm import LLMTimeoutError
+
+    class SlowClient:
+        async def complete_text(self, **kwargs):
+            await asyncio.Event().wait()
+
+    selected = SelectedBackgroundClient(SlowClient(), request_timeout_seconds=.01)
+
+    async def run():
+        with pytest.raises(LLMTimeoutError, match="fallback deadline"):
+            await selected.complete_text(user_prompt="u")
+        task = asyncio.create_task(selected.complete_text(user_prompt="u"))
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run())
+
+
 def test_zero_allowance_allows_bounded_incomplete_generation_recovery():
     from app.core.llm_workloads import workload_scope
 

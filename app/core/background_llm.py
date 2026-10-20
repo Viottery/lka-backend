@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from app.core.llm import LLMService
-from app.core.llm.errors import LLMClientError
+from app.core.llm.errors import LLMClientError, LLMTimeoutError
 
 
 class SelectedBackgroundClient:
@@ -18,15 +18,33 @@ class SelectedBackgroundClient:
     def __init__(
         self, client: Any, client_name: str | None = None, model: str | None = None,
         *, initial_output_tokens: int = 4096, recovery_output_tokens: int = 8192,
+        limit_output_tokens: bool = True, request_timeout_seconds: float | None = None,
     ):
         self.client, self.client_name, self.model = client, client_name, model
         self.initial_output_tokens = initial_output_tokens
         self.recovery_output_tokens = recovery_output_tokens
+        self.limit_output_tokens = limit_output_tokens
+        self.request_timeout_seconds = request_timeout_seconds
 
     def complete_text(self, **kwargs: Any) -> Any:
+        if not self.limit_output_tokens:
+            kwargs.pop("max_output_tokens", None)
         if isinstance(self.client, LLMService):
             kwargs.update(client_name=self.client_name, model=self.model)
-        return self.client.complete_text(**kwargs)
+            if self.request_timeout_seconds is not None:
+                kwargs["metadata"] = {**(kwargs.get("metadata") or {}),
+                                      "background_timeout_seconds": self.request_timeout_seconds}
+        result = self.client.complete_text(**kwargs)
+        if self.request_timeout_seconds is None or not inspect.isawaitable(result):
+            return result
+
+        async def bounded_result():
+            try:
+                return await asyncio.wait_for(result, timeout=self.request_timeout_seconds)
+            except TimeoutError as exc:
+                raise LLMTimeoutError("Background generation exceeded its fallback deadline.") from exc
+
+        return bounded_result()
 
     def supports_thinking_control(self) -> bool:
         if isinstance(self.client, LLMService):
@@ -48,7 +66,9 @@ class SelectedBackgroundClient:
         return max(0, workload.max_tokens - used)
 
     def supports_output_budget(self) -> bool:
-        return isinstance(self.client, LLMService) or _accepts_keyword(self.client, "max_output_tokens")
+        return self.limit_output_tokens and (
+            isinstance(self.client, LLMService) or _accepts_keyword(self.client, "max_output_tokens")
+        )
 
 
 class IncompleteGenerationError(LLMClientError):

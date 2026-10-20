@@ -15,7 +15,7 @@ def test_list_and_dry_run_never_import_runtime(capsys):
     try:
         assert main(["--list", "--json", "--local-config", "/missing/private.toml"]) == 0
         listing = json.loads(capsys.readouterr().out)
-        assert len(listing["cases"]) == 7
+        assert len(listing["cases"]) == 13
         assert "evals.lka_evals.management_runtime" not in sys.modules
         assert main(["--case", "approval_conflict"]) == 0
         assert (

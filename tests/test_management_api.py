@@ -51,7 +51,9 @@ def test_manager_runtime_chat_uses_configured_defaults_without_workspace(runtime
     runtime.agent_turn_loop.llm_client = client
     result = runtime.run_agent_turn(session_id=sid, user_input="Hello")
     assert result.answer == "Ready."
-    assert [package["name"] for package in result.package_catalog] == ["matter", "management"]
+    packages = {package["name"] for package in result.package_catalog}
+    assert {"matter", "management", "history", "mail"} <= packages
+    assert "matter.update" not in runtime._session_run_policy(sid).allowed_tools
     assert all(call["model"] == "pilot-model" for call in client.calls)
     assert runtime.get_session(session_id=sid).session.kind == "manager"
     assert runtime.get_session(session_id=sid).session.workspace is None
@@ -139,3 +141,25 @@ def test_deleted_session_cannot_gain_a_run_after_policy_was_read(runtime):
     assert not any(run.session_id == sid for run in runtime.agent_run_manager._runs.values())
     with runtime._conn() as conn:
         assert conn.execute("SELECT COUNT(*) FROM agent_runs WHERE session_id=?", (sid,)).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("supports_model", ["pilot-vision", "default"])
+def test_image_capability_uses_same_session_model_as_turn(runtime, monkeypatch, supports_model):
+    from app.domains.session_attachments import SessionAttachmentError
+
+    sid = runtime.management_service.create(llm_model="pilot-vision")["session"]["session_id"]
+    metadata = {"kind": "image", "size_bytes": 1}
+    monkeypatch.setattr(runtime.session_attachment_service, "get", lambda **_: metadata)
+
+    class CapabilityProbe:
+        def supports_vision(self, *, client_name=None, model=None):
+            return (model or "default") == supports_model
+
+    runtime.agent_llm_client = CapabilityProbe()
+    if supports_model == "pilot-vision":
+        assert runtime.prepare_agent_attachment_input(session_id=sid, attachment_ids=["test-image"]) == ["test-image"]
+        with pytest.raises(SessionAttachmentError, match="supports_vision"):
+            runtime.prepare_agent_attachment_input(session_id=sid, attachment_ids=["test-image"], llm_model="text")
+    else:
+        with pytest.raises(SessionAttachmentError, match="supports_vision"):
+            runtime.prepare_agent_attachment_input(session_id=sid, attachment_ids=["test-image"])

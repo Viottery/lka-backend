@@ -19,7 +19,9 @@ from app.api.routes.message_reading import router as message_reading_router
 from app.api.routes.messages import router as messages_router
 from app.api.routes.projects import router as projects_router
 from app.api.routes.runtime_debug import router as runtime_debug_router
+from app.api.routes.session_attachments import router as session_attachments_router
 from app.api.routes.session_files import router as session_files_router
+from app.api.routes.session_inputs import router as session_inputs_router
 from app.api.routes.sessions import router as sessions_router
 from app.api.routes.ui_preferences import router as ui_preferences_router
 from app.api.routes.watches import router as watches_router
@@ -67,8 +69,10 @@ def create_app() -> FastAPI:
     app.include_router(agent_router)
     app.include_router(ui_preferences_router)
     app.include_router(sessions_router)
+    app.include_router(session_inputs_router)
     app.include_router(managers_router)
     app.include_router(session_files_router)
+    app.include_router(session_attachments_router)
     app.include_router(knowledge_router)
     app.include_router(mail_router)
     app.include_router(messages_router)

@@ -10,12 +10,16 @@ from typing import TYPE_CHECKING
 
 from app.core.llm.errors import LLMClientError, LLMContextCapacityError
 from app.core.llm.models import (
+    IMAGE_INPUT_TOKEN_RESERVATION,
+    LLMAudioBlock,
+    LLMImageBlock,
     LLMMessage,
     LLMReasoningEffort,
     LLMRequest,
     LLMResponse,
     LLMResponseMode,
     LLMStreamEvent,
+    LLMTextBlock,
     LLMToolDefinition,
 )
 from app.core.llm.registry import LLMClientRegistry
@@ -48,6 +52,10 @@ class LLMService:
     async def complete(self, request: LLMRequest) -> LLMResponse:
         client_name, model = self._resolve_request_identity(request)
         client = self.registry.get(client_name)
+        if any(message.has_audio for message in request.messages) and not self.supports_audio(client_name=client_name, model=model):
+            raise LLMClientError(f"LLM client {client_name} does not support audio input.")
+        if any(message.has_images for message in request.messages) and not self.supports_vision(client_name=client_name, model=model):
+            raise LLMClientError(f"LLM client {client_name} does not support image input.")
         request = request.model_copy(
             update={
                 "client_name": client_name,
@@ -55,6 +63,7 @@ class LLMService:
             }
         )
         request = self._bounded_background_request(request)
+        await self._preflight_multimodal_capacity(request)
         async with self._admission(request) as ticket:
             from app.core.llm_workloads import current_workload
 
@@ -65,8 +74,14 @@ class LLMService:
                 response = await client.complete(request)
                 if ticket is not None:
                     ticket.usage = response.usage
+                if any(message.has_images or message.has_audio for message in request.messages):
+                    response = response.model_copy(update={
+                        "metadata": self._redact_image_diagnostics(response.metadata, request),
+                        "provider_request_id": self._redact_image_diagnostics(response.provider_request_id, request),
+                    })
                 return response
             except Exception as exc:
+                self._sanitize_image_error(exc, request)
                 self._record_workload_error(ticket, exc)
                 raise
 
@@ -87,6 +102,8 @@ class LLMService:
         tools: list[LLMToolDefinition] | None = None,
         tool_choice: str | dict | None = None,
         metadata: dict | None = None,
+        image_blocks: list[LLMImageBlock] | None = None,
+        audio_blocks: list[LLMAudioBlock] | None = None,
     ) -> LLMResponse:
         return await self.complete(
             LLMRequest(
@@ -95,7 +112,7 @@ class LLMService:
                 response_mode=response_mode,
                 messages=[
                     LLMMessage(role="system", content=system_prompt),
-                    LLMMessage(role="user", content=user_prompt),
+                    LLMMessage(role="user", content=[LLMTextBlock(text=user_prompt), *(image_blocks or []), *(audio_blocks or [])] if image_blocks or audio_blocks else user_prompt),
                 ],
                 prompt_summary=prompt_summary,
                 temperature=temperature,
@@ -112,6 +129,10 @@ class LLMService:
     async def stream(self, request: LLMRequest) -> AsyncIterator[LLMStreamEvent]:
         client_name, model = self._resolve_request_identity(request)
         client = self.registry.get(client_name)
+        if any(message.has_audio for message in request.messages) and not self.supports_audio(client_name=client_name, model=model):
+            raise LLMClientError(f"LLM client {client_name} does not support audio input.")
+        if any(message.has_images for message in request.messages) and not self.supports_vision(client_name=client_name, model=model):
+            raise LLMClientError(f"LLM client {client_name} does not support image input.")
         request = request.model_copy(
             update={
                 "client_name": client_name,
@@ -119,6 +140,7 @@ class LLMService:
             }
         )
         request = self._bounded_background_request(request)
+        await self._preflight_multimodal_capacity(request)
         async with self._admission(request) as ticket:
             from app.core.llm_workloads import current_workload
 
@@ -127,6 +149,11 @@ class LLMService:
                 ticket.dispatched = True
             try:
                 async for event in client.stream(request):
+                    if any(message.has_images or message.has_audio for message in request.messages):
+                        event = event.model_copy(update={
+                            "error": self._redact_image_diagnostics(event.error, request),
+                            "metadata": self._redact_image_diagnostics(event.metadata, request),
+                        })
                     if ticket is not None:
                         if isinstance(event.metadata.get("usage"), dict):
                             ticket.usage = event.metadata["usage"]
@@ -134,8 +161,42 @@ class LLMService:
                             ticket.failed = True
                     yield event
             except Exception as exc:
+                self._sanitize_image_error(exc, request)
                 self._record_workload_error(ticket, exc)
                 raise
+
+    @staticmethod
+    def _redact_image_diagnostics(value, request: LLMRequest):
+        tokens = []
+        for message in request.messages:
+            if isinstance(message.content, list):
+                for block in message.content:
+                    if isinstance(block, LLMImageBlock):
+                        tokens.append(block.image_url.url)
+                        if ";base64," in block.image_url.url:
+                            tokens.append(block.image_url.url.split(";base64,", 1)[1])
+                    elif isinstance(block, LLMAudioBlock):
+                        tokens.append(block.input_audio.data)
+        def redact(item):
+            if isinstance(item, str):
+                for token in tokens:
+                    if token:
+                        item = item.replace(token, "[media payload omitted]")
+                return item
+            if isinstance(item, dict):
+                return {key: redact(entry) for key, entry in item.items()}
+            if isinstance(item, list):
+                return [redact(entry) for entry in item]
+            return item
+        return redact(value)
+
+    def _sanitize_image_error(self, exc: Exception, request: LLMRequest) -> None:
+        if not any(message.has_images or message.has_audio for message in request.messages):
+            return
+        exc.args = tuple(self._redact_image_diagnostics(item, request) for item in exc.args)
+        for name in ("error_body", "error_event", "partial_content", "headers", "provider_error_param"):
+            if hasattr(exc, name):
+                setattr(exc, name, self._redact_image_diagnostics(getattr(exc, name), request))
 
     def _record_workload_error(self, ticket, exc: Exception) -> None:
         if ticket is not None:
@@ -150,8 +211,28 @@ class LLMService:
             # Independent Agent tasks use the configured provider deadline;
             # short maintenance jobs retain their separate background timeout.
             return request
+        timeout = request.metadata.get("background_timeout_seconds")
+        if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or not 0 < timeout <= 3600:
+            timeout = self.background_timeout_seconds
         return request.model_copy(update={"metadata": {**request.metadata,
-                                                       "network_timeout_seconds": self.background_timeout_seconds}})
+                                                       "network_timeout_seconds": timeout}})
+
+    async def _preflight_multimodal_capacity(self, request: LLMRequest) -> None:
+        """Check image reservations even without a workload admission controller."""
+        if not any(message.has_images or message.has_audio for message in request.messages):
+            return
+        resolved = self.config.resolve_model_config(request.client_name, request.model)
+        if resolved is None or resolved.context_window_tokens is None:
+            # Unknown capacity retains existing foreground compatibility; configured
+            # background capacity requirements still apply through admission.
+            return
+        input_tokens = await asyncio.to_thread(self._count_request, request, resolved.tokenizer_json_path)
+        output_tokens = request.max_output_tokens or resolved.output_reserve_tokens or 8192
+        if input_tokens + output_tokens > resolved.context_window_tokens:
+            raise LLMContextCapacityError(
+                "Multimodal request exceeds configured model context capacity.",
+                error_category="context_capacity_exceeded",
+            )
 
     @asynccontextmanager
     async def _admission(self, request: LLMRequest):
@@ -192,10 +273,50 @@ class LLMService:
                 except (FileNotFoundError, ValueError, RuntimeError):
                     counter = PromptTokenCounter()
                 self._token_counters[key] = counter
-        count = sum(counter.count_text(message.content).count + 8 for message in request.messages)
+        count = 0
+        for message in request.messages:
+            count += 8
+            if isinstance(message.content, str):
+                count += counter.count_text(message.content).count
+            else:
+                for block in message.content:
+                    # Fixed conservative reservation for bounded local image tools;
+                    # never tokenize base64 as text. Provider actual usage settles budgets.
+                    if isinstance(block, LLMImageBlock):
+                        count += IMAGE_INPUT_TOKEN_RESERVATION
+                    elif isinstance(block, LLMAudioBlock):
+                        count += block.token_reservation
+                    else:
+                        count += counter.count_text(block.text).count
         if request.tools:
             count += counter.count_request("", "", request.tools).count
         return count
+
+    def audio_identity(self) -> tuple[str, str]:
+        """Resolve the configured per-turn audio route without changing defaults."""
+        if not self.config.audio_model:
+            raise LLMClientError("Audio routing requires llm.audio_model configuration.")
+        name = self.config.audio_client or self._client_name_for(LLMRequest(messages=[], prompt_summary="audio route"))
+        model = self.config.audio_model
+        if not self.supports_audio(client_name=name, model=model):
+            raise LLMClientError("Configured audio model has not enabled audio input (supports_audio).")
+        return name, model
+
+    def supports_audio(self, *, client_name: str | None = None, model: str | None = None) -> bool:
+        name = client_name or self.config.default_client
+        client = self.registry.get(name) if name else next(iter(self.registry.list_clients()), None)
+        if client is None:
+            return False
+        checker = getattr(client, "supports_audio_input", None)
+        return bool(checker(model or client.default_model) if checker else getattr(client, "supports_audio", False))
+
+    def supports_vision(self, *, client_name: str | None = None, model: str | None = None) -> bool:
+        name = client_name or self.config.default_client
+        client = self.registry.get(name) if name else next(iter(self.registry.list_clients()), None)
+        if client is None:
+            return False
+        checker = getattr(client, "supports_image_input", None)
+        return bool(checker(model or client.default_model) if checker else getattr(client, "supports_vision", False))
 
     def supports_function_calling(self, *, client_name: str | None = None) -> bool:
         """Return the configured capability for the selected provider client."""

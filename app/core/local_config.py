@@ -46,6 +46,10 @@ class LLMClientConfig(BaseModel):
     timeout_seconds: int = 180
     supports_stream: bool = True
     supports_json_mode: bool = False
+    supports_vision: bool = False
+    vision_model_overrides: dict[str, bool] = Field(default_factory=dict)
+    supports_audio: bool = False
+    audio_model_overrides: dict[str, bool] = Field(default_factory=dict)
     supports_function_calling: bool = False
     supports_required_tool_choice: bool = False
     function_calling_strict: bool = False
@@ -68,6 +72,12 @@ class LLMProviderConfig(BaseModel):
     timeout_seconds: int = 180
     thinking_control: Literal["deepseek"] | None = None
     supports_json_mode: bool = False
+    supports_vision: bool = False
+    vision_model_overrides: dict[str, bool] = Field(default_factory=dict)
+    supports_audio: bool = False
+    audio_model_overrides: dict[str, bool] = Field(default_factory=dict)
+    audio_client: str | None = None
+    audio_model: str | None = None
     supports_function_calling: bool = False
     default_client: str | None = None
     fallback_client: str | None = None
@@ -188,6 +198,10 @@ class LLMProviderConfig(BaseModel):
                 timeout_seconds=self.timeout_seconds,
                 thinking_control=self.thinking_control,
                 supports_json_mode=self.supports_json_mode,
+                supports_vision=self.supports_vision,
+                vision_model_overrides=self.vision_model_overrides,
+                supports_audio=self.supports_audio,
+                audio_model_overrides=self.audio_model_overrides,
                 supports_function_calling=self.supports_function_calling,
                 context_window_tokens=self.context_window_tokens,
                 output_reserve_tokens=self.output_reserve_tokens,
@@ -227,6 +241,8 @@ class AgentConfig(BaseModel):
     max_decision_steps: int = 10
     # Opt-in rollout: choose the first operation in ReAct, without a separate route call.
     unified_entry_enabled: bool = False
+    # Optional decision-stage override; route/answer/review remain unchanged.
+    decision_thinking_enabled: bool | None = None
     orchestrator: Literal["legacy", "langgraph"] = "legacy"
     checkpoint_backend: Literal["memory", "sqlite"] = "sqlite"
     multi_agent_planning_enabled: bool = False
@@ -381,6 +397,11 @@ class WebSearchConfig(BaseModel):
 
 
 class MemoryConfig(BaseModel):
+    # Additive rollout: shadow stores records without replacing legacy summaries.
+    atomic_context_mode: Literal["off", "shadow", "active"] = "off"
+    atomic_context_input_tokens: int = Field(default=24_000, ge=2048, le=131_072)
+    atomic_context_projection_tokens: int = Field(default=4096, ge=128, le=16_384)
+    atomic_context_debounce_seconds: float = Field(default=30, ge=0, le=3600)
     background_worker_count: int = Field(default=2, ge=1, le=8)
     enabled: bool = True
     background_enabled: bool = True
@@ -403,6 +424,7 @@ class MemoryConfig(BaseModel):
     extraction_debounce_seconds: float = Field(default=5, ge=0, le=300)
     # Zero removes the ordinary cumulative allowance; emergency fuses remain.
     max_job_tokens: int = Field(default=0, ge=0, le=500_000)
+    compaction_timeout_seconds: float = Field(default=180, gt=0, le=3600)
     generation_output_tokens: int = Field(default=4096, ge=256, le=131_072)
     recovery_output_tokens: int = Field(default=8192, ge=256, le=131_072)
     background_client_name: str | None = None

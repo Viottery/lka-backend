@@ -84,6 +84,31 @@ class PromptBudgeter:
             user_prompt = serialize_prompt_payload(payload)
             counted = self.counter.count_request(system_prompt, user_prompt, tools)
 
+        # Initial input previews can be recovered from their registered source
+        # routes. Reduce them before evicting observations of later source pages.
+        sources = payload.get("input_sources")
+        while counted.count > input_limit and isinstance(sources, list):
+            candidates = [source for source in sources if isinstance(source, dict)
+                          and isinstance(source.get("text"), str) and len(source["text"]) > 256
+                          and type(source.get("start_char")) is int
+                          and type(source.get("total_chars")) is int
+                          and valid_resource_descriptor(source.get("_resource"))]
+            if not candidates:
+                break
+            source = max(candidates, key=lambda item: len(item["text"]))
+            old_length = len(source["text"])
+            source["text"] = source["text"][:max(256, old_length // 2)]
+            source["end_char"] = source["start_char"] + len(source["text"])
+            source["next_start_char"] = source["end_char"]
+            source["truncated"] = True
+            resource = source["_resource"]
+            source["read_more"] = {
+                "package": resource["read_package"], "tool": resource["read_tool"],
+                "input": {**resource["read_input"], "start_char": source["end_char"]},
+            }
+            omitted["input_source_preview_chars"] = omitted.get("input_source_preview_chars", 0) + old_length - len(source["text"])
+            recount()
+
         observations = payload.get("observations")
         while counted.count > input_limit and isinstance(observations, list) and observations:
             first = observations[0]
@@ -183,7 +208,7 @@ class PromptBudgeter:
         """Carry bounded server counters forward only when another trim is needed."""
         counters = {
             "older_observations", "compacted_fork_results", "lower_ranked_memories",
-            "older_context_messages", "instruction_previews",
+            "older_context_messages", "instruction_previews", "input_source_preview_chars",
         }
         if not isinstance(value, dict) or set(value) - (counters | {"observation_artifact_ids", "observation_resources"}):
             return {}
