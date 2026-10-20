@@ -124,15 +124,19 @@ def test_scoped_ownership_workspace_replacement_and_parent_pause(runtime, tmp_pa
     with pytest.raises(ManagementConflictError, match='own execution'):
         runtime.managed_tasks.read_session(child, session_id=other)
     assert [s['session_id'] for s in runtime.managed_tasks.list_sessions(child)['sessions']] == [task['session_id']]
-    with pytest.raises(ManagementConflictError, match='workspace is frozen'):
-        runtime.managed_tasks.start_task(child, command_id='escape', purpose='Read other workspace', workspace_path=str(tmp_path))
+    relocated = runtime.managed_tasks.start_task(
+        child, command_id='other-directory', purpose='Read other workspace', workspace_path=str(tmp_path),
+    )
+    relocated_run = runtime.agent_run_manager.get_run(relocated['run_id'])
+    assert relocated_run.metadata['execution_workspace']['backend_path'] == str(tmp_path)
+    assert relocated_run.metadata['session_policy']['allowed_tools'] == ['filesystem.read_file']
     task_run = runtime.agent_run_manager.get_run(task['run_id'])
     policy = task_run.metadata['session_policy']
     assert policy['allowed_tools'] == ['filesystem.read_file']
-    assert policy['allowed_paths'] == [str(workspace)]
+    assert policy['allowed_paths'] is None
     assert not policy['allow_fork']
     view = runtime.agent_turn_loop._tool_view_for_run(task_run.run_id)
-    assert not view.full_workspace_authority and view.allowed_paths == (str(workspace),)
+    assert view.full_workspace_authority and view.allowed_paths == ()
     runtime.agent_run_manager._update_run(task_run.run_id, status=AgentRunStatus.PAUSED)
     replaced = runtime.replace_agent_run(task_run.run_id, user_input='Same scope', command_id='r', request_fingerprint='r')
     assert SessionRunPolicy.model_validate(replaced.metadata['session_policy']) == SessionRunPolicy.model_validate(policy)

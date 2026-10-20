@@ -14,6 +14,7 @@ from app.api.schemas import (
     SessionWorkspaceResponse,
     SessionWorkspaceUpdateRequest,
 )
+from app.core.sessions import SessionCreationSource
 
 router = APIRouter(prefix="/sessions", tags=["sessions"])
 
@@ -53,6 +54,8 @@ def list_sessions(
     offset: int = 0,
     q: str | None = None,
     project_id: Annotated[str | None, Query(min_length=1, max_length=100)] = None,
+    creation_source: SessionCreationSource | None = None,
+    creator_session_id: Annotated[str | None, Query(min_length=1, max_length=256)] = None,
 ) -> SessionListResponse:
     if offset < 0:
         raise HTTPException(status_code=422, detail="offset must be non-negative")
@@ -60,7 +63,10 @@ def list_sessions(
         raise HTTPException(status_code=422, detail="q must be at most 500 characters")
     if project_id is not None:
         require_local_memory_control(request)
-    result = request.app.state.runtime.list_sessions(limit=limit, offset=offset, q=q, project_id=project_id)
+    result = request.app.state.runtime.list_sessions(
+        limit=limit, offset=offset, q=q, project_id=project_id,
+        creation_source=creation_source, creator_session_id=creator_session_id,
+    )
     return SessionListResponse(**result.model_dump())
 
 
@@ -70,12 +76,17 @@ def list_deleted_sessions(
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = 0,
     q: str | None = None,
+    creation_source: SessionCreationSource | None = None,
+    creator_session_id: Annotated[str | None, Query(min_length=1, max_length=256)] = None,
 ) -> SessionListResponse:
     if offset < 0:
         raise HTTPException(status_code=422, detail="offset must be non-negative")
     if q is not None and len(q) > 500:
         raise HTTPException(status_code=422, detail="q must be at most 500 characters")
-    result = request.app.state.runtime.list_deleted_sessions(limit=limit, offset=offset, q=q)
+    result = request.app.state.runtime.list_deleted_sessions(
+        limit=limit, offset=offset, q=q,
+        creation_source=creation_source, creator_session_id=creator_session_id,
+    )
     return SessionListResponse(**result.model_dump())
 
 

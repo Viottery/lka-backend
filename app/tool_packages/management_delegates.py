@@ -5,9 +5,12 @@ from app.tool_packages.management import COMMAND, PAGE, PURPOSE, TEXT, Managemen
 def management_delegate_tools(service):
     definitions = [
         ('delegate_work', ('Create a durable child manager for a bounded objective. The child cannot delegate again. '
-         'Default execution tools are a frozen read-only non-management whitelist; explicit names freeze another whitelist.'), False,
+         'Default execution tools are a frozen read-only non-management whitelist; explicit names freeze another whitelist. '
+         'workspace_path selects the default directory, not an access boundary; tasks may select their own directory. '
+         'Outside-workspace access requires per-call review and high-risk operations require user approval.'), False,
          {'command_id': COMMAND, 'objective': PURPOSE, 'title': {'type': 'string', 'minLength': 1, 'maxLength': 40},
-          'workspace_path': {'type': 'string', 'minLength': 1, 'maxLength': 4096},
+          'workspace_path': {'type': 'string', 'minLength': 1, 'maxLength': 4096,
+                             'description': 'Existing default working directory; omit to inherit the frontend default independent workspace.'},
           'allowed_tools': {'type': 'array', 'maxItems': 256, 'items': TEXT}}, ['command_id', 'objective']),
         ('instruct_delegate', ('Send a bounded follow-up to an owned delegate after its current manager root is terminal. '
          'Requires the observed delegate revision. Original approval/question control stays with the user.'), False,

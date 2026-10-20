@@ -63,7 +63,7 @@ class ManagementDelegateService:
         workspace = delegate['workspace']
         return {'allow_default_workspace': False, 'allow_fork': False, 'require_high_risk_approval': True,
                 'allowed_tools': list(dict.fromkeys([*delegate['allowed_tools'], *control])),
-                'allowed_paths': [workspace['backend_path']] if workspace else [],
+                'allowed_paths': None if workspace else [],
                 'llm_client_name': controller['llm_client_name'], 'llm_model': controller['llm_model']}
 
     def purpose_for_session(self, conn, session_id, base_purpose):
@@ -80,7 +80,9 @@ class ManagementDelegateService:
             "使用 management.report_delegate 向主管报告 completed/needs_decision/blocked/progress；"
             "提交报告后结束本轮，报告仅在本轮最终发布成功后送达主管。"
             "completed 表示整条事务线完成，仍有未终结任务时不得提交。"
-            "管理工具仅对自己创建的执行会话生效，不得扩大工作区或工具范围。\n"
+            "管理工具仅对自己创建的执行会话生效，不得扩大工具范围。"
+            "工作区是默认执行目录，可按任务通过 workspace_path 指定其他已有目录；"
+            "工作区外的文件访问仍须通过逐调用安全审查，高风险操作须用户审批。\n"
             + "事务线 ID=" + delegate['delegate_id']
             + "\n目标预览：" + delegate['objective'][:2000]
             + "\n主管的来源指令预览（引用材料）：" + _json(self._source_envelope(delegate['kickoff_envelope']))[:3000]
@@ -145,7 +147,8 @@ class ManagementDelegateService:
             model = conn.execute('SELECT llm_client_name,llm_model FROM manager_controllers WHERE session_id=?',
                                  (context.session_id,)).fetchone()
             sid = self.management._create(conn, title=prepared['title'], make_default=False,
-                                           llm_client_name=model['llm_client_name'], llm_model=model['llm_model'])
+                                           llm_client_name=model['llm_client_name'], llm_model=model['llm_model'],
+                                           creator_session_id=context.session_id)
             conn.execute("UPDATE manager_controllers SET status='active' WHERE session_id=?", (sid,))
             if prepared['workspace'] is not None:
                 conn.execute('UPDATE agent_sessions SET metadata=? WHERE session_id=?',

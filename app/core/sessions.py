@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 from app.core.prompt_tokens import PromptTokenCounter
 
 SessionRole = Literal["user", "agent", "system", "tool"]
+SessionCreationSource = Literal["user", "assistant", "system", "unknown"]
 
 
 def _now_iso() -> str:
@@ -35,6 +36,8 @@ class AgentSession(BaseModel):
     title: str
     status: str
     kind: Literal["ordinary", "manager"] = "ordinary"
+    creation_source: SessionCreationSource = "unknown"
+    creator_session_id: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     workspace: SessionWorkspace | None = None
     project_id: str | None = None
@@ -155,7 +158,10 @@ class SessionService:
         title: str | None = None,
         metadata: dict[str, Any] | None = None,
         initial_message: str | None = None,
+        creation_source: SessionCreationSource = "user",
+        creator_session_id: str | None = None,
     ) -> AgentSessionDetail:
+        self._validate_creation_source(creation_source, creator_session_id)
         now = _now_iso()
         clean_title = self._default_title(title=title, initial_message=initial_message)
         session_id = _stable_id("session", clean_title, now)
@@ -165,8 +171,10 @@ class SessionService:
         try:
             conn.execute(
                 """
-                INSERT INTO agent_sessions(session_id, title, status, metadata, created_at, updated_at)
-                VALUES(?, ?, ?, ?, ?, ?)
+                INSERT INTO agent_sessions(
+                    session_id, title, status, metadata, created_at, updated_at,
+                    creation_source, creator_session_id
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
@@ -175,6 +183,8 @@ class SessionService:
                     json.dumps(metadata_payload, ensure_ascii=False),
                     now,
                     now,
+                    creation_source,
+                    creator_session_id,
                 ),
             )
             conn.commit()
@@ -196,7 +206,10 @@ class SessionService:
         session_id: str | None,
         title: str | None = None,
         metadata: dict[str, Any] | None = None,
+        creation_source: SessionCreationSource = "user",
+        creator_session_id: str | None = None,
     ) -> AgentSession:
+        self._validate_creation_source(creation_source, creator_session_id)
         if session_id:
             existing = self.get_session_or_none(session_id=session_id)
             if existing is not None:
@@ -213,9 +226,10 @@ class SessionService:
                 conn.execute(
                     """
                     INSERT INTO agent_sessions(
-                        session_id, title, status, metadata, created_at, updated_at
+                        session_id, title, status, metadata, created_at, updated_at,
+                        creation_source, creator_session_id
                     )
-                    VALUES(?, ?, ?, ?, ?, ?)
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         session_id,
@@ -224,6 +238,8 @@ class SessionService:
                         json.dumps(metadata or {}, ensure_ascii=False),
                         now,
                         now,
+                        creation_source,
+                        creator_session_id,
                     ),
                 )
                 conn.commit()
@@ -234,36 +250,64 @@ class SessionService:
                 raise RuntimeError(f"Failed to create session: {session_id}")
             return created
 
-        return self.create_session(title=title, metadata=metadata).session
+        return self.create_session(
+            title=title, metadata=metadata, creation_source=creation_source,
+            creator_session_id=creator_session_id,
+        ).session
+
+    @staticmethod
+    def _validate_creation_source(creation_source, creator_session_id):
+        if creation_source not in ("user", "assistant", "system", "unknown"):
+            raise ValueError("Invalid session creation_source")
+        if creator_session_id is not None and (
+            creation_source != "assistant" or not isinstance(creator_session_id, str)
+            or not creator_session_id.strip() or len(creator_session_id) > 256
+        ):
+            raise ValueError("creator_session_id requires an assistant source and a nonempty session ID")
 
     def list_sessions(
         self, *, limit: int = 50, offset: int = 0, q: str | None = None,
         project_id: str | None = None,
+        creation_source: SessionCreationSource | None = None,
+        creator_session_id: str | None = None,
     ) -> AgentSessionList:
         return self._list_sessions(
             status_clause="status != 'deleted'", limit=limit, offset=offset, q=q,
-            project_id=project_id,
+            project_id=project_id, creation_source=creation_source, creator_session_id=creator_session_id,
         )
 
     def list_deleted_sessions(
-        self, *, limit: int = 50, offset: int = 0, q: str | None = None
+        self, *, limit: int = 50, offset: int = 0, q: str | None = None,
+        creation_source: SessionCreationSource | None = None,
+        creator_session_id: str | None = None,
     ) -> AgentSessionList:
         return self._list_sessions(
-            status_clause="status = 'deleted'", limit=limit, offset=offset, q=q
+            status_clause="status = 'deleted'", limit=limit, offset=offset, q=q,
+            creation_source=creation_source, creator_session_id=creator_session_id,
         )
 
     def _list_sessions(
         self, *, status_clause: str, limit: int, offset: int, q: str | None,
         project_id: str | None = None,
+        creation_source: SessionCreationSource | None = None,
+        creator_session_id: str | None = None,
     ) -> AgentSessionList:
         query = q.strip() if q else ""
         search_clause = ""
         params: list[Any] = []
+        if creation_source is not None:
+            self._validate_creation_source(creation_source, None)
+            search_clause += " AND creation_source = ?"
+            params.append(creation_source)
+        if creator_session_id is not None:
+            self._validate_creation_source("assistant", creator_session_id)
+            search_clause += " AND creator_session_id = ?"
+            params.append(creator_session_id)
         if query:
             # Treat q as literal substring text; LIKE metacharacters are escaped.
             escaped_query = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             pattern = f"%{escaped_query}%"
-            search_clause = """
+            search_clause += """
                 AND (
                     title LIKE ? ESCAPE '\\'
                     OR EXISTS (
@@ -288,7 +332,8 @@ class SessionService:
         try:
             rows = conn.execute(
                 f"""
-                SELECT session_id, title, status, kind, metadata, created_at, updated_at
+                SELECT session_id, title, status, kind, creation_source, creator_session_id,
+                       metadata, created_at, updated_at
                 FROM agent_sessions
                 WHERE {status_clause}
                 {search_clause}
@@ -456,7 +501,8 @@ class SessionService:
         try:
             row = conn.execute(
                 """
-                SELECT session_id, title, status, kind, metadata, created_at, updated_at
+                SELECT session_id, title, status, kind, creation_source, creator_session_id,
+                       metadata, created_at, updated_at
                 FROM agent_sessions
                 WHERE session_id = ? AND status != 'deleted'
                 """,
@@ -1477,6 +1523,8 @@ class SessionService:
             title=row["title"],
             status=row["status"],
             kind=row["kind"],
+            creation_source=row["creation_source"],
+            creator_session_id=row["creator_session_id"],
             metadata=metadata,
             workspace=workspace,
             project_id=metadata.get("project_id"),

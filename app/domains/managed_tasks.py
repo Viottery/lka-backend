@@ -119,7 +119,8 @@ class ManagedTaskService:
             delegates = getattr(self, "delegates", None)
             scoped = delegates is not None and delegates.get_for_session(conn, context.session_id) is not None
             rows = conn.execute(
-                "SELECT s.session_id,s.title,s.status,s.updated_at,r.record_payload AS latest_run_payload "
+                "SELECT s.session_id,s.title,s.status,s.creation_source,s.creator_session_id,"
+                "s.updated_at,r.record_payload AS latest_run_payload "
                 "FROM agent_sessions s LEFT JOIN agent_runs r ON r.run_id=("
                 "SELECT a.run_id FROM agent_runs a WHERE a.session_id=s.session_id "
                 "AND json_extract(a.record_payload,'$.parent_run_id') IS NULL "
@@ -284,7 +285,7 @@ class ManagedTaskService:
                     "session_policy": {**self.policy(session_id).model_dump(mode="json"),
                                        "require_high_risk_approval": True,
                                        "allow_default_workspace": False,
-                                       "allowed_paths": [workspace["backend_path"]] if workspace else []},
+                                       "allowed_paths": None if workspace else []},
                     "execution_workspace": workspace}
         metadata.update(self.budget_metadata(source.metadata) if source else {})
         return AgentRunRecord(
@@ -305,7 +306,7 @@ class ManagedTaskService:
             "allow_default_workspace": False, "allow_fork": False,
             "require_high_risk_approval": True,
             "allowed_tools": delegate["allowed_tools"],
-            "allowed_paths": [delegate["workspace"]["backend_path"]] if delegate["workspace"] else [],
+            "allowed_paths": None if run.metadata.get("execution_workspace") else [],
             "llm_client_name": controller[0], "llm_model": controller[1],
         }
 
@@ -437,11 +438,9 @@ class ManagedTaskService:
                                           (receipt.get("session_id"),)).fetchone()
                     workspace = json.loads(target["metadata"]).get("workspace") if target else None
         if delegate is not None:
-            frozen = delegate["workspace"]
-            requested = self.workspace(workspace_path) if workspace_path is not None else frozen
-            if requested != frozen:
-                raise ManagementConflictError("Subagent execution workspace is frozen by its delegation")
-            workspace = frozen
+            # A line's default directory is stable; each task may select a
+            # different existing directory without changing its tool grant.
+            workspace = self.workspace(workspace_path) if workspace_path is not None else delegate["workspace"]
         elif workspace_path is not None:
             workspace = self.workspace(workspace_path)
         elif not prior and create_workspace and parent and parent["default_execution_workspace"]:
@@ -496,9 +495,9 @@ class ManagedTaskService:
         envelope = prepared["envelope"]
         sid = "session_" + uuid4().hex
         now = datetime.now(UTC).isoformat()
-        conn.execute("INSERT INTO agent_sessions(session_id,title,status,metadata,kind,created_at,updated_at) "
-                     "VALUES(?,?,'active',?,'ordinary',?,?)",
-                     (sid, title, _json({"workspace": workspace} if workspace else {}), now, now))
+        conn.execute("INSERT INTO agent_sessions(session_id,title,status,metadata,kind,created_at,updated_at,"
+                     "creation_source,creator_session_id) VALUES(?,?,'active',?,'ordinary',?,?,'assistant',?)",
+                     (sid, title, _json({"workspace": workspace} if workspace else {}), now, now, context.session_id))
         run = self._new_run(sid, envelope, caller, workspace=workspace)
         self._freeze_delegate_policy(conn, context, run)
         self.run_store.save_run_in_transaction(conn, run.model_dump(mode="json"), updated_at=now)

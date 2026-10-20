@@ -86,12 +86,14 @@ class ManagementService:
             raise ValueError("Model settings must be non-empty strings or null")
         return value.strip() if value is not None else None
 
-    def _create(self, conn, *, title, make_default, llm_client_name, llm_model, default_execution_workspace=None):
+    def _create(self, conn, *, title, make_default, llm_client_name, llm_model, default_execution_workspace=None,
+                creator_session_id=None):
         session_id = "session_" + uuid4().hex
         now = datetime.now(UTC).isoformat()
         conn.execute(
-            "INSERT INTO agent_sessions(session_id,title,status,metadata,kind,created_at,updated_at) "
-            "VALUES(?,?,'active','{}','manager',?,?)", (session_id, title, now, now),
+            "INSERT INTO agent_sessions(session_id,title,status,metadata,kind,created_at,updated_at,"
+            "creation_source,creator_session_id) VALUES(?,?,'active','{}','manager',?,?,?,?)",
+            (session_id, title, now, now, "assistant" if creator_session_id else "user", creator_session_id),
         )
         conn.execute(
             "INSERT INTO manager_controllers(session_id,llm_client_name,llm_model,created_at,updated_at,default_execution_workspace) "

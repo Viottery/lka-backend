@@ -1269,6 +1269,20 @@ GET /sessions?limit=50&offset=0&q=invoice
 `GET /sessions/deleted` 支持相同的 `limit`、`offset` 和 `q` 参数，但只搜索回收站中的会话。
 不带新增参数的旧请求保持原有默认行为。
 
+列表、详情与回收站中的 session 另含服务端保存的 `creation_source` 和 `creator_session_id`：
+`user` 表示用户／客户端直接创建，`assistant` 表示助理或子 Agent 创建，`system` 表示定时关注等系统创建，
+`unknown` 表示旧记录没有足够的创建证据。该来源独立于 `kind: ordinary|manager`，不会因后来介入、
+补充指令、删除或恢复改变；用户创建的主助理会话仍为 `user`，助理派发的执行会话与事务线为 `assistant`。
+`creator_session_id` 为发起创建的会话 ID，无会话发起者时为 null。metadata、标题、提示词以及普通
+`POST /sessions` 中自报的来源不能改写这些字段；它们不赋予额外读取或执行权限。
+
+`GET /sessions` 和 `GET /sessions/deleted` 可用 `creation_source=user|assistant|system|unknown` 与
+`creator_session_id=session_xxx` 独立或组合筛选，筛选在分页前执行，参数非法返回 422。省略时仍返回全部来源。
+例如 `/sessions?creation_source=user` 获取人为创建的会话，
+`/sessions?creation_source=assistant&creator_session_id=session_xxx` 获取指定助理派发的会话。
+旧库启动时自动加列、建立索引，并依据明确的创建命令、委派／子运行及定时关注关系回填；
+仅有介入关系或可编辑 metadata 不作为创建证据，其余保留 `unknown`，不删除或重排历史消息。
+
 响应：
 
 ```json
@@ -1479,7 +1493,7 @@ make_default=true 表示显式切换默认入口，主控会话无需固定 ID�
 对话仍通过通用 `/agent/turn` 或 `/agent/turn/stream`。请求模型覆盖优先于会话默认；
 运行冻结其实际会话策略，恢复沿用原设置，替换的新轮读取当前会话设置。
 主管会话开放 `management`、专用 `history` 包、`matter` 读取及轻量主管写入工具，以及当前注册且已授权的只读操作。支持按参数只读的工具可被发现，但每次调用均强制验证只读；其他写入不能通过这一授权执行。主管复杂工作默认下发；简单搜索、单次操作可直接处理。
-主管角色策略在首次路由前装载并冻结，普通执行会话不继承；原有安全审查与审批独立生效。事务线子 agent 的能力和路径按委托冻结。
+主管角色策略在首次路由前装载并冻结，普通执行会话不继承；原有安全审查与审批独立生效。事务线子 agent 的工具能力按委托冻结；默认执行目录与文件访问授权分别处理。
 单条事项可在 `matter` 包使用 `management.create_matter` / `management.update_matter`，无需展开整套管理工具。
 两者复用 `management.organize_work` 的事务、修订和自主发布检查；未开放普通 `matter.update` 等即时写工具。
 controller active 才能发出管理写命令；paused 可对话和读取结果。普通任务和 child 不开放管理包。
@@ -1529,7 +1543,7 @@ controller active 才能发出管理写命令；paused 可对话和读取结果�
 替换还含 `replaced_run_snapshot`，分别描述新 run 已排队和旧 run 已取消，不能沿用介入前的 paused。
 `accepted` 是命令受理状态，不能当作运行完成；暂停请求中的 `pause_requested=true` 不等于已暂停。
 回执快照随命令固定，幂等重放保持原值；需查询当前状态时使用新的只读查询。
-workspace_path 支持已有会话路径协议（含 Windows 到 WSL 映射），仍验证工作区根。省略时使用 controller.default_execution_workspace 创建独立任务目录；未配置可接受无目录的数据任务，但其冻结路径为空，不开放工作区工具。目录与允许路径在受理时冻结，不受后来默认目录或会话目录修改影响，也不回退到后端首工作区。
+workspace_path 支持已有会话路径协议（含 Windows 到 WSL 映射），仍验证工作区根。省略时使用 controller.default_execution_workspace 创建独立任务目录；未配置可接受无目录的数据任务，但其冻结路径为空，不开放工作区工具。默认执行目录在受理时冻结，不受后来默认目录或会话目录修改影响，也不回退到后端首工作区。有执行目录的助理任务不把该目录作为文件访问边界；工作区外文件与 Bash cwd 进入现有逐调用安全审查，所有高风险操作仍等待用户审批，工具白名单与数据源授权不变。指定另一位置的新项目时，可选择其已有父目录，让执行会话创建项目目录与文件。
 `management.read_task_result(run_id,section?,start_char?,max_chars?)` 返回本主管及直属事务线所属独立 root 的执行状态和分页结果，事务线仅能读取自己任务；普通或 child caller 不获授。section 为 answer（默认）或 evidence，后者 content 为 JSON 字符片段，按 next_char 拼接后解析。仅含实际持久工具证据的白名单字段，不包含系统提示、metadata、工具输入或 shell stdout。deleted、非归属和 child run 均拒绝；运行终态不证明业务完成，证据不代替新操作审批。
 消息 payload 的 input_origin/input_envelope 标记内部 manager/background 输入。客户端应保留审计记录并按结构化来源从普通聊天隐藏，不能把所有非 user 角色都渲染为 agent 回答。
 `send_instruction` 必带 session_id、purpose、expected_run_id；最后一轮已终态或无历史可启动下一轮，
@@ -1558,6 +1572,8 @@ waiting_confirmation 仅提示 requires_original_approval，不转交审批权�
 管理派发要求 SQLite checkpoint；memory 配置拒绝新增派发，幂等命令仍可查原回执。
 结果可由后续管理轮按需读取；启用 `autonomous_enabled` 后，任务终态和目标到期还可唤醒自动轮。
 外部主动结果通知尚未实现。
+
+自动后台轮仅注入当前事件因果关联的目标 `goal_id` 与 `revision`，不注入全部活跃目标及 objective 预览。一般任务终态未关联目标时 goals 为空；定时、关注及等待指定任务的目标仅携带自身引用。完整要求通过 `management.read_goal` 按需读取，目标列表由显式 `management.list_goals` 查询。关联目标继续接受版本／生命周期复验，无关目标的修改不再使该轮失效。
 
 长期目标与后台记录接口同样沿用本地授权：
 
@@ -1614,10 +1630,10 @@ get/list_goal 返回 matter_id/matter_revision/matter_status，拒绝直接改�
 
 排队与关注工具：
 
-- `delegate_work(command_id,objective,title?,workspace_path?,allowed_tools?)`：创建独立持久事务线子 agent，返回 delegate_id、session_id、state、revision。当前主管轮可结束，子 agent 独立推进；默认只授予已注册的非管理只读工具，显式工具清单不能包含管理工具。workspace_path 冻结路径范围；省略不获得默认目录权限。子 agent 仅可管理自己创建的普通执行会话，不能递归创建下级主管。
+- `delegate_work(command_id,objective,title?,workspace_path?,allowed_tools?)`：创建独立持久事务线子 agent，返回 delegate_id、session_id、state、revision。当前主管轮可结束，子 agent 独立推进；默认只授予已注册的非管理只读工具，显式工具清单不能包含管理工具。workspace_path 选择默认执行目录；省略时使用前端默认独立工作区，未配置则无工作目录。已有工作目录不构成文件访问边界，外部访问仍须逐调用审查。子 agent 仅可管理自己创建的普通执行会话，不能递归创建下级主管。
 - `list_delegates(limit?,offset?)`／`read_delegate(delegate_id,start_char?)`：读取本主管名下（或子 agent 自身）归属、最新运行和分页目标／报告／证据。来源原文不进入普通返回字段。
 - `report_delegate(command_id,kind,summary,evidence?)`：子 agent 报告 progress/completed/needs_decision/blocked；evidence 引用自己名下 session_id、run_id、message_id，服务端复验归属。回执 proposed，只在当前轮最终发布事务成功后提交报告、主管事件与本轮终态；失败不发送。completed 要求没有未终结执行任务。
-- `instruct_delegate(command_id,delegate_id,expected_revision,instruction)`：父主管向空闲子 agent 补充指令并唤醒新轮，支持继续已完成事务线。冻结工具／路径保持不变；忙碌时冲突，不能取代原用户确认或答复。重复命令返回原回执。
+- `instruct_delegate(command_id,delegate_id,expected_revision,instruction)`：父主管向空闲子 agent 补充指令并唤醒新轮，支持继续已完成事务线。冻结工具清单与该事务线默认目录保持不变；该事务线创建执行会话时可按任务显式选择 workspace_path。忙碌时冲突，不能取代原用户确认或答复。重复命令返回原回执。
 - `control_delegate(command_id,delegate_id,expected_revision,action)`：父主管 pause/cancel 事务线，先持久收回后续执行权限，再取消该线与其执行会话中的未终态运行；重复命令重发原取消信号。pause 是停止推进而非保留运行检查点的暂停；原运行终结后可 instruct_delegate 继续，cancel 不可复活。
 - 智能体创建的事务线及执行会话强制冻结高风险人工审批策略；已注册工具声明 high 风险或 requires_confirmation 时，不能因 skip/llm 模式自动批准。等待确认保留原 review/run 身份，由原用户审批入口决定，主管与子 agent 都不能代批；重启、恢复、替换不能降低此策略。
 - 显式事务线和回报不依赖 autonomous_enabled；父子 controller 均需 active。回报唤醒主管的新 run，经既有消息／SSE 与 delivery 索引交付；失败／等待用户也持久捕获，重复扫描不重复交付。

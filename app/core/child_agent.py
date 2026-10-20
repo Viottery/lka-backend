@@ -107,6 +107,8 @@ class ChildAgentExecutor:
                 session_id=child.session_id,
                 title=f"Child task: {child.step_id or child.run_id}",
                 metadata={"entrypoint": "agent.child"},
+                creation_source="assistant",
+                creator_session_id=parent.session_id if parent is not None else None,
             )
             if parent_session is not None and parent_session.workspace is not None:
                 session_service.set_workspace(

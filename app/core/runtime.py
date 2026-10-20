@@ -71,6 +71,7 @@ from app.core.sessions import (
     AgentSessionDetail,
     AgentSessionList,
     AgentSessionMessage,
+    SessionCreationSource,
     SessionRole,
     SessionRunPolicy,
     SessionService,
@@ -2384,17 +2385,27 @@ class LocalKnowledgeAgentRuntime:
     def list_sessions(
         self, *, limit: int = 50, offset: int = 0, q: str | None = None,
         project_id: str | None = None,
+        creation_source: SessionCreationSource | None = None,
+        creator_session_id: str | None = None,
     ) -> AgentSessionList:
         """Return recent agent sessions for frontend session switching."""
 
-        return self.session_service.list_sessions(limit=limit, offset=offset, q=q, project_id=project_id)
+        return self.session_service.list_sessions(
+            limit=limit, offset=offset, q=q, project_id=project_id,
+            creation_source=creation_source, creator_session_id=creator_session_id,
+        )
 
     def list_deleted_sessions(
-        self, *, limit: int = 50, offset: int = 0, q: str | None = None
+        self, *, limit: int = 50, offset: int = 0, q: str | None = None,
+        creation_source: SessionCreationSource | None = None,
+        creator_session_id: str | None = None,
     ) -> AgentSessionList:
         """Return soft-deleted sessions for the frontend recycle bin."""
 
-        return self.session_service.list_deleted_sessions(limit=limit, offset=offset, q=q)
+        return self.session_service.list_deleted_sessions(
+            limit=limit, offset=offset, q=q,
+            creation_source=creation_source, creator_session_id=creator_session_id,
+        )
 
     def get_session(self, *, session_id: str) -> AgentSessionDetail:
         """Return one session with its ordered message history."""

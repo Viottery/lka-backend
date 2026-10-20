@@ -183,7 +183,7 @@ def test_start_work_uses_same_default_workspace_preparation(runtime, manager_con
     assert run["metadata"]["execution_workspace"] == workspace.model_dump()
 
 
-def test_delegate_workspace_remains_frozen_when_supervisor_default_changes(runtime, manager_context, tmp_path):
+def test_delegate_default_is_stable_and_tasks_can_select_another_workspace(runtime, manager_context, tmp_path):
     from tests.test_management_delegates import child_context
 
     configure(runtime, manager_context, tmp_path)
@@ -195,8 +195,11 @@ def test_delegate_workspace_remains_frozen_when_supervisor_default_changes(runti
     result = runtime.managed_tasks.start_task(context, command_id="child-task", purpose="Inspect")
     workspace = runtime.get_session(session_id=result["session_id"]).session.workspace
     assert workspace.model_dump() == frozen
-    with pytest.raises(ManagementConflictError, match="frozen"):
-        runtime.managed_tasks.start_task(context, command_id="bad-child", purpose="Inspect", workspace_path=str(tmp_path))
+    other = runtime.managed_tasks.start_task(
+        context, command_id="other-directory", purpose="Inspect", workspace_path=str(tmp_path),
+    )
+    assert runtime.get_session(session_id=other["session_id"]).session.workspace.backend_path == str(tmp_path)
+    assert runtime.get_session(session_id=result["session_id"]).session.workspace.model_dump() == frozen
 
 
 def test_no_workspace_executor_rejects_file_and_shell_access_without_side_effects(runtime, manager_context, tmp_path):

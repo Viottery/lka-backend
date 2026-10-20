@@ -224,6 +224,7 @@ class WatchScheduler:
             self.runtime.session_service.ensure_session(
                 session_id=session_id,
                 title=f"Update: {watch['title']}",
+                creation_source="system",
                 metadata={
                     "entrypoint": "watch",
                     "watch_id": watch_id,

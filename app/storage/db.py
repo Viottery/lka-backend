@@ -5,6 +5,8 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+from app.storage.session_origins import add_session_origin_columns, backfill_session_origins
+
 CURRENT_TRACE_COLUMNS = {
     "trace_id",
     "session_id",
@@ -75,6 +77,7 @@ def _prepare_schema_migrations(conn: sqlite3.Connection) -> None:
     _migrate_agent_session_context_windows(conn)
     if _table_exists(conn, "agent_sessions") and "kind" not in _table_columns(conn, "agent_sessions"):
         conn.execute("ALTER TABLE agent_sessions ADD COLUMN kind TEXT NOT NULL DEFAULT 'ordinary'")
+    add_session_origin_columns(conn)
 
 
 def _migrate_agent_session_context_windows(conn: sqlite3.Connection) -> None:
@@ -174,6 +177,9 @@ def init_db(db_path: Path) -> None:
                 title TEXT NOT NULL,
                 status TEXT NOT NULL,
                 kind TEXT NOT NULL DEFAULT 'ordinary',
+                creation_source TEXT NOT NULL DEFAULT 'unknown'
+                    CHECK(creation_source IN ('user','assistant','system','unknown')),
+                creator_session_id TEXT,
                 metadata TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -197,6 +203,12 @@ def init_db(db_path: Path) -> None:
 
             CREATE INDEX IF NOT EXISTS idx_agent_sessions_updated_at
                 ON agent_sessions(updated_at);
+
+            CREATE INDEX IF NOT EXISTS idx_agent_sessions_creation_source
+                ON agent_sessions(creation_source, status, updated_at DESC, session_id DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_agent_sessions_creator
+                ON agent_sessions(creator_session_id, status, updated_at DESC, session_id DESC);
 
             CREATE INDEX IF NOT EXISTS idx_agent_session_messages_session_id
                 ON agent_session_messages(session_id, created_at);
@@ -495,6 +507,7 @@ def init_db(db_path: Path) -> None:
                 ON agent_tool_invocations(run_id, claimed_at);
             """
         )
+        backfill_session_origins(conn)
         conn.commit()
     finally:
         conn.close()

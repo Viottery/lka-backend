@@ -146,9 +146,12 @@ class MailExpertExecutor:
             child_run_id, snapshot=snapshot.model_dump(mode="json"), views=views.model_dump(mode="json"),
         )
         if self.session_service is not None:
+            parent = self.run_manager.get_run(child.parent_run_id)
             self.session_service.ensure_session(
                 session_id=child.session_id, title=f"Mail expert: {child.step_id or child.run_id}",
                 metadata={"entrypoint": "agent.child.mail_expert"},
+                creation_source="assistant",
+                creator_session_id=parent.session_id if parent is not None else None,
             )
         self.run_manager.mark_child_running(child_run_id)
         usage = _Usage()

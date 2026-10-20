@@ -83,6 +83,8 @@ def test_scheduler_creates_one_occurrence_and_briefing_without_blocking_api(tmp_
     assert briefings[0]["evidence"][0]["ref"] == "https://example.org/tickets"
     assert briefings[0]["session_id"] == runs[0]["session_id"]
     detail = runtime.session_service.get_session(session_id=briefings[0]["session_id"])
+    assert detail.session.creation_source == "system"
+    assert detail.session.creator_session_id is None
     assert detail.messages[0].content.startswith("请跟进：")
     assert detail.messages[-1].content == briefings[0]["summary"]
     second = service.create_occurrence(watch["watch_id"], now - timedelta(days=1))
