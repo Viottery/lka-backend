@@ -15,7 +15,18 @@ def test_list_and_dry_run_never_import_runtime(capsys):
     try:
         assert main(["--list", "--json", "--local-config", "/missing/private.toml"]) == 0
         listing = json.loads(capsys.readouterr().out)
-        assert len(listing["cases"]) == 13
+        assert len(listing["cases"]) == 16
+        indexed = {case["case_id"]: case for case in listing["cases"]}
+        for name in ("session_progress_cache", "management_notifications", "management_result_recovery"):
+            assert indexed[name]["kind"] == "offline_contract"
+            expected = [f"tests/test_{name}.py"]
+            if name == "session_progress_cache":
+                expected += ["tests/test_progress_continuation_integration.py", "tests/test_observation_read_recovery.py",
+                             "tests/test_cached_result_read_routes.py", "tests/test_observation_artifact_lineage.py",
+                             "tests/test_prompt_budget.py", "tests/test_answer_evidence_calibration_quality.py",
+                             "tests/test_task_progress.py", "tests/test_task_progress_runtime.py",
+                             "tests/test_progress_review_safety.py"]
+            assert indexed[name]["nodeids"] == expected
         assert "evals.lka_evals.management_runtime" not in sys.modules
         assert main(["--case", "approval_conflict"]) == 0
         assert (

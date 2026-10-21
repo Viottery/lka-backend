@@ -55,6 +55,7 @@ from app.domains.message_reading_selection import (
 from app.domains.message_reading_selection import (
     select_message_candidates,
 )
+from app.storage.sqlite_timing import connect_sqlite
 from app.tool_packages import message_reading_analysis as reading_v3
 
 LOG = logging.getLogger(__name__)
@@ -379,7 +380,7 @@ class MessageAnalysisCoordinator:
     def _historical_message_task_ids(self) -> tuple[str, ...]:
         """Return ledger task IDs attributable to durable message reading records."""
         uri = f"{Path(self.service.db_path).resolve().as_uri()}?mode=ro"
-        conn = sqlite3.connect(uri, uri=True)
+        conn = connect_sqlite(uri, uri=True)
         conn.row_factory = sqlite3.Row
         try:
             tables = {row[0] for row in conn.execute(

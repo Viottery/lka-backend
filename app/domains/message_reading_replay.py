@@ -10,6 +10,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from app.storage.sqlite_timing import connect_sqlite
+
 
 def canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -53,7 +55,7 @@ def create_snapshot(
         raise ValueError("snapshot_destination_must_be_new")
     output.parent.mkdir(parents=True, exist_ok=True)
     output.mkdir(mode=0o700)
-    with sqlite3.connect(source.resolve().as_uri() + "?mode=ro", uri=True) as conn:
+    with connect_sqlite(source.resolve().as_uri() + "?mode=ro", uri=True) as conn:
         conn.row_factory = sqlite3.Row
         conn.execute("BEGIN")
         selected = []

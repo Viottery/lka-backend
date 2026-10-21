@@ -110,44 +110,75 @@ class PromptBudgeter:
             recount()
 
         observations = payload.get("observations")
-        while counted.count > input_limit and isinstance(observations, list) and observations:
-            first = observations[0]
-            if isinstance(first, dict) and first.get("action") == "fork_subtasks":
-                if not first.get("_prompt_budget_compacted"):
-                    observations[0] = self._fork_status_summary(first)
+        # Shrink child reports before sacrificing context for them. Never
+        # replace a small verdict with a larger synthetic envelope.
+        if isinstance(observations, list):
+            for index, item in enumerate(observations):
+                if counted.count <= input_limit:
+                    break
+                if not isinstance(item, dict) or item.get("action") != "fork_subtasks" or item.get("_prompt_budget_compacted"):
+                    continue
+                compacted = self._fork_status_summary(item)
+                if len(serialize_prompt_payload(compacted).encode("utf-8")) < len(serialize_prompt_payload(item).encode("utf-8")):
+                    observations[index] = compacted
                     omitted["compacted_fork_results"] = omitted.get("compacted_fork_results", 0) + 1
                     recount()
-                    continue
-                if len(observations) == 1:
-                    # The Planner must retain a replan/failure signal. Fail
-                    # explicitly rather than silently turn a child outcome
-                    # into an apparent absence of evidence.
+
+        recent_view_limit = min(4096, input_limit // 2)
+        recent_views = {id(item) for item in observations[-2:]
+                        if len(serialize_prompt_payload(item).encode("utf-8")) <= recent_view_limit
+                        } if isinstance(observations, list) else set()
+        if isinstance(observations, list):
+            for item in reversed(observations):
+                if (isinstance(item, dict) and isinstance(item.get("tool_name"), str)
+                        and isinstance(item.get("result"), dict)):
+                    # Keep one small source observation even when recent
+                    # control feedback follows it. Never search its prose for
+                    # supposedly important facts or truncate its qualifiers.
+                    if len(serialize_prompt_payload(item).encode("utf-8")) <= recent_view_limit:
+                        recent_views.add(id(item))
                     break
-            old = observations.pop(0)
-            projection = self._projection_omissions(old)
-            old_count, old_refs = projection if projection is not None else (1, [])
-            omitted["older_observations"] = omitted.get("older_observations", 0) + old_count
-            if projection is None and isinstance(old, dict):
-                cache = old.get("_result_cache")
-                if isinstance(cache, dict) and isinstance(cache.get("artifact_id"), str):
-                    old_refs = [cache["artifact_id"]]
-            for artifact_id in old_refs:
-                refs = omitted.setdefault("observation_artifact_ids", [])
-                if len(refs) >= 20:
+
+        def trim_observations(*, keep_recent: bool) -> None:
+            while counted.count > input_limit and isinstance(observations, list) and observations:
+                index = next((i for i, item in enumerate(observations)
+                              if not keep_recent or id(item) not in recent_views), None)
+                if index is None:
                     break
-                if artifact_id not in refs:
-                    refs.append(artifact_id)
-            resources = []
-            if isinstance(old, dict):
-                if projection is not None:
-                    resources = old.get("omitted_resources", [])
-                elif valid_resource_descriptor(old.get("_resource")):
-                    resources = [old["_resource"]]
-            for resource in resources:
-                kept = omitted.setdefault("observation_resources", [])
-                if len(kept) < 4 and not any(item["identity"] == resource["identity"] for item in kept):
-                    kept.append(resource)
-            recount()
+                first = observations[index]
+                if isinstance(first, dict) and first.get("action") == "fork_subtasks" and len(observations) == 1:
+                    # Keep the failure/replan signal even when it cannot
+                    # be compacted. Mandatory overflow remains explicit.
+                    break
+                old = observations.pop(index)
+                projection = self._projection_omissions(old)
+                old_count, old_refs = projection if projection is not None else (1, [])
+                omitted["older_observations"] = omitted.get("older_observations", 0) + old_count
+                if id(old) in recent_views:
+                    omitted["recent_observations"] = omitted.get("recent_observations", 0) + 1
+                if projection is None and isinstance(old, dict):
+                    cache = old.get("_result_cache")
+                    if isinstance(cache, dict) and isinstance(cache.get("artifact_id"), str):
+                        old_refs = [cache["artifact_id"]]
+                for artifact_id in old_refs:
+                    refs = omitted.setdefault("observation_artifact_ids", [])
+                    if len(refs) >= 20:
+                        break
+                    if artifact_id not in refs:
+                        refs.append(artifact_id)
+                resources = []
+                if isinstance(old, dict):
+                    if projection is not None:
+                        resources = old.get("omitted_resources", [])
+                    elif valid_resource_descriptor(old.get("_resource")):
+                        resources = [old["_resource"]]
+                for resource in resources:
+                    kept = omitted.setdefault("observation_resources", [])
+                    if len(kept) < 4 and not any(item["identity"] == resource["identity"] for item in kept):
+                        kept.append(resource)
+                recount()
+
+        trim_observations(keep_recent=True)
 
         window = payload.get("session_context_window")
         if isinstance(window, dict):
@@ -193,6 +224,11 @@ class PromptBudgeter:
                     omitted["instruction_previews"] = omitted.get("instruction_previews", 0) + 1
                     recount()
 
+        # Recent evidence has priority over old context/memory previews, but
+        # never enlarges the verified input budget. Preserve handles and mark
+        # omissions when even this bounded working view cannot fit.
+        trim_observations(keep_recent=False)
+
         if counted.count > input_limit:
             raise PromptBudgetExceeded(
                 needed=counted.count, limit=input_limit,
@@ -209,6 +245,7 @@ class PromptBudgeter:
         counters = {
             "older_observations", "compacted_fork_results", "lower_ranked_memories",
             "older_context_messages", "instruction_previews", "input_source_preview_chars",
+            "recent_observations",
         }
         if not isinstance(value, dict) or set(value) - (counters | {"observation_artifact_ids", "observation_resources"}):
             return {}
@@ -271,6 +308,11 @@ class PromptBudgeter:
                 str(key)[:80]: str(value or "")[:300] for key, value in list(notes.items())[:8]
             }
             summary["omitted_degradation_note_count"] = max(0, len(notes) - 8)
+        verification = observation.get("verification")
+        if isinstance(verification, dict):
+            # Keep the verdict together with its qualifications and failed
+            # requirements. A status alone can overstate what was verified.
+            summary["verification"] = verification
         remaining = 20
         for field in ("task_results", "historical_task_results"):
             results = observation.get(field)

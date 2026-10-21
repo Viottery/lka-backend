@@ -155,10 +155,17 @@ class UpdateInstructionsTool:
     )
 
     def invoke(self, *, invocation: ToolInvocation, context: ToolContext) -> ToolResult:
-        message = self.sessions.get_turn_user_message(
-            session_id=context.session_id, trace_id=context.trace_id or "",
-        ) if self.sessions is not None and context.tool_view is None else None
-        if message is None or not _requests_guidance_edit(message.content):
+        messages = []
+        if self.sessions is not None and context.tool_view is None:
+            plural = getattr(self.sessions, "get_turn_user_messages", None)
+            if plural is not None:
+                messages = plural(session_id=context.session_id, trace_id=context.trace_id or "")
+            else:
+                message = self.sessions.get_turn_user_message(
+                    session_id=context.session_id, trace_id=context.trace_id or "",
+                )
+                messages = [message] if message is not None else []
+        if not any(_requests_guidance_edit(message.content) for message in messages):
             return ToolResult(
                 invocation_id=invocation.invocation_id, tool_name=self.spec.name,
                 status="rejected", execution_started=False,

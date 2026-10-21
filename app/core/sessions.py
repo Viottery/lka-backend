@@ -90,10 +90,12 @@ class SessionRunPolicy(BaseModel):
     role_instructions: str | None = Field(default=None, max_length=16000)
     llm_client_name: str | None = None
     llm_model: str | None = None
+    safety_review_mode: Literal["skip", "llm", "manual"] | None = None
     allowed_tools: list[str] | None = None
     read_only_tools: list[str] = Field(default_factory=list)
     allowed_paths: list[str] | None = None
     allow_fork: bool = True
+    # Legacy snapshot compatibility; mandatory review is now invocation-specific.
     require_high_risk_approval: bool = False
 
 
@@ -384,6 +386,23 @@ class SessionService:
                 (session_id,),
             ).fetchone()
             return self._json_dict(row["payload"]).get("attachment_ids", []) if row else []
+        finally:
+            conn.close()
+
+    def get_turn_user_messages(self, *, session_id: str, trace_id: str) -> list[AgentSessionMessage]:
+        """Resolve every persisted user source for a turn, in insertion order."""
+        if not trace_id:
+            return []
+        conn = self._conn_factory()
+        try:
+            rows = conn.execute(
+                "SELECT m.message_id,m.session_id,m.role,m.content,m.payload,m.created_at "
+                "FROM agent_session_messages m JOIN agent_sessions s ON s.session_id=m.session_id "
+                "WHERE m.session_id=? AND m.role='user' AND s.status!='deleted' "
+                "AND json_extract(m.payload,'$.trace_id')=? ORDER BY m.rowid",
+                (session_id, trace_id),
+            ).fetchall()
+            return [self._message_from_row(row) for row in rows]
         finally:
             conn.close()
 

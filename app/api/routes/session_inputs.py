@@ -24,6 +24,7 @@ class SubmitSessionInput(BaseModel):
     client_message_id: str = Field(min_length=1, max_length=128)
     user_input: str = Field(max_length=100000)
     attachment_ids: list[str] = Field(max_length=4)
+    replace_run_id: str | None = Field(default=None, min_length=1, max_length=128)
     safety_review_mode: Literal['skip', 'llm', 'manual'] | None = None
     llm: InputLLMOptions | None = None
 

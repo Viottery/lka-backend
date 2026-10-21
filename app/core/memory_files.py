@@ -9,7 +9,6 @@ from __future__ import annotations
 import hashlib
 import os
 import re
-import sqlite3
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,6 +20,7 @@ from app.domains.memory import (
     MemorySourceInput,
 )
 from app.domains.memory_feedback import MemoryFeedbackInput
+from app.storage.sqlite_timing import connect_sqlite
 
 _HEADER = "<!-- lka-memory-view:v1 scope={scope} project_id={project_id} -->"
 _MAX_VIEW_BYTES = 8 * 1024 * 1024
@@ -117,7 +117,7 @@ class MemoryFiles:
         """Write a view only when absent or still equal to our prior generation."""
         path = self.path_for(scope=scope, project_id=project_id)
         path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.memory.db_path, timeout=10) as conn:
+        with connect_sqlite(self.memory.db_path, timeout=10) as conn:
             conn.execute("PRAGMA busy_timeout=10000")
             conn.execute("CREATE TABLE IF NOT EXISTS memory_file_hashes "
                          "(path TEXT PRIMARY KEY, digest TEXT NOT NULL)")
@@ -272,7 +272,7 @@ class MemoryFiles:
             raise
 
     def _last_hash(self, path: Path) -> str | None:
-        with sqlite3.connect(self.memory.db_path, timeout=10) as conn:
+        with connect_sqlite(self.memory.db_path, timeout=10) as conn:
             conn.execute("CREATE TABLE IF NOT EXISTS memory_file_hashes "
                          "(path TEXT PRIMARY KEY, digest TEXT NOT NULL)")
             row = conn.execute("SELECT digest FROM memory_file_hashes WHERE path=?",
@@ -280,7 +280,7 @@ class MemoryFiles:
             return str(row[0]) if row else None
 
     def _set_last_hash(self, path: Path, digest: str) -> None:
-        with sqlite3.connect(self.memory.db_path, timeout=10) as conn:
+        with connect_sqlite(self.memory.db_path, timeout=10) as conn:
             conn.execute("CREATE TABLE IF NOT EXISTS memory_file_hashes "
                          "(path TEXT PRIMARY KEY, digest TEXT NOT NULL)")
             conn.execute("INSERT INTO memory_file_hashes(path,digest) VALUES(?,?) "

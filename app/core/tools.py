@@ -143,6 +143,7 @@ class ToolContext(BaseModel):
     run_id: str | None = None
     llm_client_name: str | None = None
     llm_model: str | None = None
+    safety_review_mode: Literal["skip", "llm", "manual"] | None = None
 
 
 class ToolResult(BaseModel):
@@ -211,6 +212,17 @@ def effective_tool_read_only(tool: Tool, tool_input: dict[str, Any]) -> bool | N
     except Exception:  # noqa: BLE001 - unknown classification cannot grant read-only authority.
         return None
     return tool.spec.read_only
+
+
+def tool_manual_review_reason(tool: Tool, tool_input: dict[str, Any]) -> str | None:
+    """Tools own invocation-specific operations that always require a human."""
+    checker = getattr(tool, "manual_review_reason", None)
+    if not callable(checker):
+        return None
+    try:
+        return checker(tool_input)
+    except Exception:  # noqa: BLE001 - a broken mandatory-review rule must fail closed.
+        return "The tool's mandatory manual review classifier failed."
 
 
 def effective_tool_effect_domains(tool: Tool, tool_input: dict[str, Any]) -> set[str]:

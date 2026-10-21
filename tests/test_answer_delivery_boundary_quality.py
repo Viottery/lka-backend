@@ -10,6 +10,7 @@ from app.core.agent_runs import AgentRunCancelled
 from app.core.agent_storage import SqliteAgentRunStore
 from app.core.context_driver import ToolView
 from app.core.multi_agent import SideEffectLevel
+from app.core.observation_context import ANSWER_READING_POLICY
 from app.core.prompt_budget import serialize_prompt_payload
 from app.core.tools import (
     ToolContext,
@@ -39,10 +40,10 @@ def reader():
                                         description="Read records", type="local_tool", read_only=True))
 
 
-def store_result(store, run, result):
+def store_result(store, run, result, *, source_artifact=None):
     store.put_artifact(artifact_id=f"tool_result_{result.invocation_id}", run_id=run.run_id,
         kind="tool_result", payload=result.model_dump(mode="json"), summary="source result",
-        created_at=datetime.now(UTC).isoformat())
+        created_at=datetime.now(UTC).isoformat(), source_artifact=source_artifact)
 
 
 def observe(loop, run, result):
@@ -126,11 +127,12 @@ def test_registered_cache_reader_receipt_maps_back_to_original_cache_value(tmp_p
         store.put_artifact(artifact_id="page", run_id=run.run_id, kind="tool_result",
             payload={"output": {"text": "原文" * 6000}}, summary="cached page",
             created_at=datetime.now(UTC).isoformat())
+        read_input = {"artifact_id": "page", "path": "/output/text", "offset": 3000, "max_chars": 4000}
         raw = tool.invoke(invocation=ToolInvocation(invocation_id="read-page", tool=tool.spec,
-            session_id=run.session_id, context_id="test", input={"artifact_id": "page",
-            "path": "/output/text", "offset": 3000}),
+            session_id=run.session_id, context_id="test", input=read_input),
             context=ToolContext(session_id=run.session_id, run_id=run.run_id))
-        store_result(store, run, raw)
+        assert raw.status == "completed", raw.error
+        store_result(store, run, raw, source_artifact=tool.result_artifact_source(tool_input=read_input, result=raw))
         dispatch(loop, [observe(loop, run, raw)])
     receipt, = provider_payload(provider)["context_delivery"]
     assert receipt["artifact_id"] == "page" and receipt["total_chars"] == 12000
@@ -174,7 +176,7 @@ def test_optional_receipts_cannot_spend_child_answer_output_reserve(tmp_path):
         store_result(store, run, raw)
         observations = [observe(loop, run, raw)]
         prompt = serialize_prompt_payload({"user_input": "Report evidence.", "observations": observations})
-        initial = loop._budget_llm_prompt(system_prompt="Answer from delivered evidence.",
+        initial = loop._budget_llm_prompt(system_prompt="Answer from delivered evidence.\n" + ANSWER_READING_POLICY,
             user_prompt=prompt, max_output_tokens=1024, tools=None)
         overhead = loop._child_budget_for_prompt()["prompt_overhead_tokens"]
         manager._update_run(run.run_id, status=run.status, metadata_patch={"context_snapshot": {

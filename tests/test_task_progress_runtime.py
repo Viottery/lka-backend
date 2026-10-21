@@ -9,6 +9,7 @@ import pytest
 from app.core.agent_checkpoints import create_sqlite_checkpoint_runtime
 from app.core.agent_graph import AgentGraphRunner
 from app.core.llm import LLMResponse, LLMToolCall
+from app.core.task_progress import PROGRESS_POLICY
 from tests.test_unified_entry_quality import operation, runtime_for
 
 
@@ -49,7 +50,8 @@ def test_duplicate_skips_execution_then_allows_edit_and_verification(tmp_path, m
         assert recovery["task_working_state"]["review_required"] is True
         feedback = next(item for item in recovery["observations"] if item.get("action") == "tool_duplicate_feedback")
         assert feedback["evidence_ids"] == [result.tool_events[0].result["invocation_id"]]
-        assert recovery["task_working_state"]["remaining_steps"] < 10
+        initial_steps = json.loads(client.calls[0]["user_prompt"])["task_working_state"]["remaining_steps"]
+        assert recovery["task_working_state"]["remaining_steps"] == initial_steps - 3
     finally:
         runtime.stop()
 
@@ -62,10 +64,6 @@ def test_varied_reads_trigger_review_without_forcing_write_or_finish(tmp_path, m
     runtime, client = runtime_for(tmp_path, monkeypatch, orchestrator, [
         operation("expand_package", package_name="filesystem"),
         *(operation("tool_call", tool_name="filesystem.read_file", tool_input={"path": str(path)}) for path in paths),
-        envelope("tool_call", tool_name="filesystem.read_file", tool_input={"path": str(paths[-1])},
-                 working_state={"focus_gap": "The fourth source has not been read"},
-                 purpose={"gap": "Missing fourth source", "question": "What fact does the final source contain?",
-                          "expected_observable": "Its source fact completes the requested comparison"}),
         operation("final_answer", reason="Compared the sources."), "Comparison.",
     ])
     try:
@@ -76,10 +74,14 @@ def test_varied_reads_trigger_review_without_forcing_write_or_finish(tmp_path, m
         assert state["review_required"] is True
         assert state["tool_calls"] == 3
         assert state["calls_since_milestone"] == 3
-        repair = json.loads(client.calls[5]["user_prompt"])
-        assert any(item.get("action") == "task_progress_review_feedback" for item in repair["observations"])
-        assert any(event.type == "task_progress_review_required" for event in result.progress_events)
-        assert "expected_observable" in state["instruction"]
+        after_fourth = json.loads(client.calls[5]["user_prompt"])
+        assert after_fourth["task_working_state"]["tool_calls"] == 4
+        assert not any(item.get("action") == "task_progress_review_feedback" for item in after_fourth["observations"])
+        reviews = [event for event in result.progress_events if event.type == "task_progress_review_required"]
+        assert reviews and all(event.metadata["operation_deferred"] is False for event in reviews)
+        assert "instruction" not in state
+        assert client.calls[4]["system_prompt"].count(PROGRESS_POLICY) == 1
+        assert len(client.calls) == 7  # No extra decision just to restate progress notes.
         assert result.answer == "Comparison."
         assert result.task_outcome == "unknown"
     finally:
@@ -87,24 +89,26 @@ def test_varied_reads_trigger_review_without_forcing_write_or_finish(tmp_path, m
 
 
 @pytest.mark.parametrize("orchestrator", ["legacy", "langgraph"])
-def test_unanswered_review_defers_only_once_and_preserves_execution_budget(tmp_path, monkeypatch, orchestrator):
+def test_unanswered_review_is_advisory_and_preserves_execution_budget(tmp_path, monkeypatch, orchestrator):
     paths = [tmp_path / f"fact-{index}.md" for index in range(5)]
     for index, path in enumerate(paths):
         path.write_text(f"Required fact {index}")
     reads = [operation("tool_call", tool_name="filesystem.read_file", tool_input={"path": str(path)})
              for path in paths]
     runtime, client = runtime_for(tmp_path, monkeypatch, orchestrator, [
-        operation("expand_package", package_name="filesystem"), *reads[:4], reads[3], reads[4],
+        operation("expand_package", package_name="filesystem"), *reads,
         operation("final_answer", reason="All five sources read."), "Five facts compared.",
     ])
     try:
         result = runtime.run_agent_turn(session_id="bounded-review", user_input="Compare all five source facts.")
         assert len(result.tool_events) == 5
-        assert len(client.calls) == 9
-        assert sum(event.type == "task_progress_review_required" for event in result.progress_events) == 1
-        assert sum(event.type == "task_progress_review_unresolved" for event in result.progress_events) == 2
-        after_deferral = json.loads(client.calls[5]["user_prompt"])["task_working_state"]
-        assert after_deferral["review_required"] is True and after_deferral["review_deferrals"] == 1
+        assert len(client.calls) == 8
+        reviews = [event for event in result.progress_events if event.type == "task_progress_review_required"]
+        assert len(reviews) == 2
+        assert all(event.metadata["operation_deferred"] is False for event in reviews)
+        after_fourth = json.loads(client.calls[5]["user_prompt"])["task_working_state"]
+        assert after_fourth["review_required"] is True and after_fourth["review_deferrals"] == 0
+        assert after_fourth["calls_since_milestone"] == 4
         assert not any(event.source == "local" and event.action == "final_answer" for event in result.decision_events)
         assert result.answer == "Five facts compared."
     finally:

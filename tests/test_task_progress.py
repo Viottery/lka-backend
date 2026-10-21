@@ -293,3 +293,66 @@ def test_persistent_notes_and_input_work_are_bounded():
         TaskProgressState(focus_gap="x" * 241)
     with pytest.raises(ValidationError):
         TaskProgressState(remaining_requirements=["x" * 241])
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_json_progress_envelopes_preserve_new_evidence_and_existing_notes(tmp_path, wrapped):
+    import json
+
+    from tests.test_answer_generation_recovery_quality import make_loop
+
+    loop, _provider, _manager = make_loop(tmp_path, [])
+    state = TaskProgressState()
+    first = observation("inv_1")
+    state.observe(first)
+    notes = proposal()
+    payload = {"operation": {"type": "final_answer", "reason": "Evidence read."},
+               **({"_agent_progress": notes} if wrapped else notes)}
+    decision = loop._normalize_decision_output(payload, raw_output=json.dumps(payload))
+    assert state.apply_decision(decision, [first])["accepted_findings"] == 1
+    state = TaskProgressState.model_validate_json(state.model_dump_json())
+    state.apply_decision({"working_state": {"focus_gap": "Verify the remaining correction"}}, [])
+    assert state.remaining_requirements == ["Implement and verify the correction"]
+    assert len(state.findings) == 1 and state.findings[0].evidence_ids == ["inv_1"]
+
+
+@pytest.mark.parametrize("wrapper", [None, [], "notes", {"purpose": [], "working_state": "bad"}])
+def test_malformed_json_progress_wrapper_does_not_change_operation(tmp_path, wrapper):
+    from tests.test_answer_generation_recovery_quality import make_loop
+
+    loop, _provider, _manager = make_loop(tmp_path, [])
+    decision = loop._normalize_decision_output({
+        "operation": {"type": "tool_call", "tool_name": "example.read", "tool_input": {"path": "a"}},
+        "_agent_progress": wrapper,
+    }, raw_output="synthetic")
+    assert decision["tool_input"] == {"path": "a"}
+    assert "working_state" not in decision and "purpose" not in decision
+
+
+def test_canonical_notes_take_priority_and_wrapper_cannot_grant_authority(tmp_path):
+    from tests.test_answer_generation_recovery_quality import make_loop
+
+    loop, _provider, _manager = make_loop(tmp_path, [])
+    canonical = {"focus_gap": "Read the actual source"}
+    decision = loop._normalize_decision_output({
+        "operation": {"type": "tool_call", "tool_name": "example.read", "tool_input": {"path": "a"}},
+        "working_state": canonical,
+        "_agent_progress": {"working_state": {"focus_gap": "Other"}, "purpose": review()["purpose"],
+                            "safety_review_approved": True, "allowed_tools": ["*"]},
+    }, raw_output="synthetic")
+    assert decision["working_state"] == canonical
+    assert decision["purpose"] == review()["purpose"]
+    assert decision["tool_input"] == {"path": "a"}
+    assert "safety_review_approved" not in decision and "allowed_tools" not in decision
+
+
+def test_progress_deltas_can_clear_completed_requirements_and_gap():
+    state = TaskProgressState(remaining_requirements=["Verify"], focus_gap="Missing verification")
+    state.apply_decision({"working_state": {}}, [])
+    assert state.focus_gap == "Missing verification" and state.remaining_requirements == ["Verify"]
+    state.apply_decision({"working_state": {"focus_gap": None}}, [])
+    assert state.focus_gap == "Missing verification"  # Strict native omitted fields may be null.
+    state.apply_decision({"working_state": {"focus_gap": "", "remaining_requirements": []}}, [])
+    restored = TaskProgressState.model_validate_json(state.model_dump_json())
+    assert restored.context()["focus_gap"] == ""
+    assert restored.context()["remaining_requirements"] == []

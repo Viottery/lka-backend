@@ -10,13 +10,25 @@ from uuid import uuid4
 
 from app.core.agent_runs import AgentRunRecord, AgentRunStatus
 from app.core.turn_input import TurnInputEnvelope
-from app.domains.management import ManagementConflictError
+from app.domains.management import ManagementConflictError, ManagementPausedError
 
 TERMINAL = {"completed", "failed", "cancelled", "timed_out"}
 
 
 def _json(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+class ManagedTaskRunMismatchError(ManagementConflictError):
+    """A stale or invalid reference, without claiming a concurrent update."""
+
+    code = "expected_run_mismatch"
+
+    def __init__(self, *, expected_run_id, current_run):
+        super().__init__("Target run changed or expected_run_id is incorrect; use the current run view to reassess")
+        self.expected_run_id = expected_run_id
+        self.current_run = current_run
+        self.observed_at = datetime.now(UTC).isoformat()
 
 
 class ManagedTaskService:
@@ -81,8 +93,10 @@ class ManagedTaskService:
             row = db.execute("SELECT c.status FROM manager_controllers c JOIN agent_sessions s "
                              "ON s.session_id=c.session_id WHERE c.session_id=? "
                              "AND s.kind='manager' AND s.status!='deleted'", (context.session_id,)).fetchone()
-            if row is None or (mutate and row["status"] != "active"):
+            if row is None:
                 raise ManagementConflictError("Activate the management controller before issuing commands")
+            if mutate and row["status"] != "active":
+                raise ManagementPausedError("Management is paused. No task was accepted. Activate the management controller before issuing commands.")
         if conn is not None:
             check(conn)
         else:
@@ -269,21 +283,33 @@ class ManagedTaskService:
         return result
 
     def _envelope(self, context, run, command_id, purpose):
-        original = self.sessions.get_turn_user_message(session_id=context.session_id, trace_id=run.trace_id)
+        plural = getattr(self.sessions, "get_turn_user_messages", None)
+        if plural is not None:
+            originals = plural(session_id=context.session_id, trace_id=run.trace_id)
+        else:
+            original = self.sessions.get_turn_user_message(session_id=context.session_id, trace_id=run.trace_id)
+            originals = [original] if original else []
+        quoted = [message for message in originals[:8] if message.content]
         return TurnInputEnvelope(
             origin="manager", input_id=sha256(_json([context.session_id, command_id]).encode()).hexdigest(),
             sender_label="管理会话 " + context.session_id, purpose=purpose,
-            original_user_message_refs=[original.message_id] if original else [],
-            original_user_quotes=[original.content[:8000]] if original else [],
+            original_user_message_refs=[message.message_id for message in originals[:16]],
+            original_user_quotes=[message.content[:8000] for message in quoted],
             related_session_id=context.session_id, related_run_id=run.run_id,
-            debug_info={"command_id": command_id, "original_quote_truncated": bool(original and len(original.content) > 8000)},
+            debug_info={"command_id": command_id,
+                        "original_quote_truncated": len(originals) > len(quoted) or any(len(message.content) > 8000 for message in quoted),
+                        "original_refs_truncated": len(originals) > 16},
         )
 
-    def _new_run(self, session_id, envelope, source=None, *, workspace=None):
+    def _new_run(self, session_id, envelope, source=None, *, workspace=None, safety_review_mode=None):
+        policy = self.policy(session_id).model_dump(mode="json")
+        if policy.get("safety_review_mode") is None:
+            policy["safety_review_mode"] = safety_review_mode or (
+                source.metadata.get("session_policy", {}).get("safety_review_mode") if source else None
+            )
         metadata = {"entrypoint": "agent.turn", "orchestrator": "langgraph",
                     "input_envelope": envelope.model_dump(mode="json"),
-                    "session_policy": {**self.policy(session_id).model_dump(mode="json"),
-                                       "require_high_risk_approval": True,
+                    "session_policy": {**policy,
                                        "allow_default_workspace": False,
                                        "allowed_paths": None if workspace else []},
                     "execution_workspace": workspace}
@@ -304,10 +330,10 @@ class ManagedTaskService:
         run.metadata["delegate_session_id"] = context.session_id
         run.metadata["session_policy"] = {
             "allow_default_workspace": False, "allow_fork": False,
-            "require_high_risk_approval": True,
             "allowed_tools": delegate["allowed_tools"],
             "allowed_paths": None if run.metadata.get("execution_workspace") else [],
             "llm_client_name": controller[0], "llm_model": controller[1],
+            "safety_review_mode": run.metadata["session_policy"].get("safety_review_mode"),
         }
 
     @staticmethod
@@ -498,7 +524,8 @@ class ManagedTaskService:
         conn.execute("INSERT INTO agent_sessions(session_id,title,status,metadata,kind,created_at,updated_at,"
                      "creation_source,creator_session_id) VALUES(?,?,'active',?,'ordinary',?,?,'assistant',?)",
                      (sid, title, _json({"workspace": workspace} if workspace else {}), now, now, context.session_id))
-        run = self._new_run(sid, envelope, caller, workspace=workspace)
+        run = self._new_run(sid, envelope, caller, workspace=workspace,
+                            safety_review_mode=context.safety_review_mode)
         self._freeze_delegate_policy(conn, context, run)
         self.run_store.save_run_in_transaction(conn, run.model_dump(mode="json"), updated_at=now)
         if not defer_dispatch:
@@ -523,7 +550,8 @@ class ManagedTaskService:
                                   "ORDER BY created_at DESC,run_id DESC LIMIT 1", (session_id,)).fetchone()
             old = json.loads(latest[0]) if latest else None
             if (old["run_id"] if old else None) != expected_run_id:
-                raise ManagementConflictError("Target run changed; inspect it before sending")
+                raise ManagedTaskRunMismatchError(expected_run_id=expected_run_id,
+                                                  current_run=self._run_view(old) if old else None)
             if old and old["status"] not in TERMINAL | {"paused"}:
                 raise ManagementConflictError("Pause the target and wait for run_paused before replacing it")
             if old and old["status"] == "paused" and old.get("metadata", {}).get("paused_from_status") in {"waiting_confirmation", "waiting_user"}:
@@ -531,12 +559,14 @@ class ManagedTaskService:
             if not old or old["status"] in TERMINAL:
                 workspace = (old or {}).get("metadata", {}).get("execution_workspace",
                     json.loads(target["metadata"]).get("workspace"))
-                run = self._new_run(session_id, envelope, caller, workspace=workspace)
+                run = self._new_run(session_id, envelope, caller, workspace=workspace,
+                                    safety_review_mode=context.safety_review_mode)
                 self._freeze_delegate_policy(conn, context, run)
                 # Later user/model configuration cannot widen accepted tools.
                 if old and old.get("metadata", {}).get("delegate_session_id"):
+                    preference = run.metadata["session_policy"].get("safety_review_mode")
                     run.metadata["session_policy"] = {**old["metadata"]["session_policy"],
-                                                      "require_high_risk_approval": True}
+                                                      "safety_review_mode": preference}
                 if old:
                     run.metadata.update(self.budget_metadata(old.get("metadata", {}), caller.metadata))
                 self.run_store.save_run_in_transaction(conn, run.model_dump(mode="json"), updated_at=run.created_at)

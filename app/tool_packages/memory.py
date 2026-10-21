@@ -62,25 +62,38 @@ class RememberMemoryTool:
 
         if context.tool_view is not None:
             return reject("Child agents cannot publish user memory.")
-        user = self.sessions.get_turn_user_message(
-            session_id=context.session_id, trace_id=context.trace_id or "",
-        )
-        if user is None:
+        plural = getattr(self.sessions, "get_turn_user_messages", None)
+        if plural is not None:
+            users = plural(session_id=context.session_id, trace_id=context.trace_id or "")
+        else:
+            user = self.sessions.get_turn_user_message(
+                session_id=context.session_id, trace_id=context.trace_id or "",
+            )
+            users = [user] if user is not None else []
+        if not users:
             return reject("No persisted current-turn user source is available.")
         evidence = str(invocation.input.get("evidence") or "").strip()
         proposal = str(invocation.input.get("content") or evidence).strip()
         if not proposal:
             return reject("Provide the preference or the user's request to remember it.")
-        matches = [item for item in extract_user_memories(
+        matches = [(user, item) for user in users for item in extract_user_memories(
             source_id=user.message_id, content=user.content,
         ) if item.evidence == evidence]
         if len(matches) != 1:
             if self.contextual_remember is None:
                 return reject("Contextual memory learning is unavailable; nothing was saved.")
             project = self.service.resolve_project(context.workspace_root) if context.workspace_root else None
-            records, file_status = self.contextual_remember(
-                user, project_id=project, requested_memory=proposal,
-            )
+            records, file_status, seen = [], "not_saved", set()
+            for user in users:
+                learned, source_file_status = self.contextual_remember(
+                    user, project_id=project, requested_memory=proposal,
+                )
+                if learned:
+                    file_status = source_file_status
+                for record in learned:
+                    if record.memory_id not in seen:
+                        records.append(record)
+                        seen.add(record.memory_id)
             if not records:
                 return reject("No clear long-term memory could be resolved from this conversation. Nothing was saved; clarify only if its meaning is ambiguous.")
             return ToolResult(
@@ -91,7 +104,7 @@ class RememberMemoryTool:
                     "memory_file_status": file_status,
                 },
             )
-        candidate = matches[0]
+        user, candidate = matches[0]
         scope = "project" if candidate.kind == "project_decision" else "global"
         if scope == "project" and not context.workspace_root:
             return reject("A project decision requires the current session workspace.")

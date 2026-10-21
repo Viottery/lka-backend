@@ -238,7 +238,7 @@ class AgentInferenceProfile(BaseModel):
 
 
 class AgentConfig(BaseModel):
-    max_decision_steps: int = 10
+    max_decision_steps: int = 32
     # Opt-in rollout: choose the first operation in ReAct, without a separate route call.
     unified_entry_enabled: bool = False
     # Optional decision-stage override; route/answer/review remain unchanged.

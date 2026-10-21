@@ -26,6 +26,19 @@ from app.storage.db import connect
 from app.tool_packages.mail import MAIL_PACKAGE
 from app.tool_packages.mail_expert_tools import MailBatchLoadTool, MailSnapshotTool
 
+
+def test_mail_guidance_batches_identified_messages_and_preserves_evidence_limits():
+    package = MAIL_PACKAGE.model_dump(mode="python")
+    guidance = " ".join(package["decision_hints"])
+    capability_guidance = " ".join(
+        hint for capability in package["capability_hints"]
+        for hint in capability.get("decision_hints", [])
+    )
+    assert "batch-load those records" in capability_guidance
+    assert "actual read coverage and any truncation" in capability_guidance
+    assert "calendar date versus timestamp" in guidance
+    assert "report conflicts" in capability_guidance
+
 pytestmark = pytest.mark.anyio
 
 

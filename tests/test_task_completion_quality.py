@@ -114,6 +114,18 @@ def test_no_progress_finish_stops_instead_of_repeating_recovery():
     assert state.stop_reason == "no_new_evidence"
 
 
+def test_loading_historical_pages_cannot_reopen_recovery_as_fresh_source():
+    state = TaskCompletionState()
+    pending = {"answer_checks": [{"requirement": "Verify the current state", "status": "pending",
+                                  "gap": "Current state is still unknown"}]}
+    assert not assess_finish(state, operation=pending, observations=[], can_continue=True)
+    loaded = {"historical_only": True, "tool_name": "observation.read", "result": {
+        "status": "completed", "invocation_id": "new-cache-reader", "output": "Old source body",
+    }}
+    assert assess_finish(state, operation=pending, observations=[loaded], can_continue=True)
+    assert state.stop_reason == "no_new_evidence"
+
+
 def test_new_completed_output_allows_second_recovery_but_not_a_third():
     state = TaskCompletionState()
     assert not assess_finish(

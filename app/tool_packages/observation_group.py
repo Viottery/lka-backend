@@ -7,6 +7,11 @@ import math
 from typing import Any
 
 from app.core.tools import ToolContext, ToolInvocation, ToolResult, ToolSpec
+from app.tool_packages.observation import (
+    cached_result_source_binding,
+    mark_historical_import,
+    register_cached_result_reader,
+)
 
 _MAX_RECORDS = 100_000
 _MAX_GROUPS = 5_000
@@ -21,8 +26,11 @@ _SAMPLE_STRING_CHARS = 256
 class ObservationGroupTool:
     """Count exact typed scalar values in a cached array, then page the groups."""
 
+    result_artifact_source = staticmethod(cached_result_source_binding)
+
     def __init__(self, store: Any) -> None:
         self.store = store
+        register_cached_result_reader(store, self.spec.name)
 
     spec = ToolSpec(
         name="observation.group",
@@ -106,7 +114,7 @@ class ObservationGroupTool:
 
         payload = self.store.load_tool_result_artifact(artifact_id, context.run_id)
         if payload is None:
-            return rejected("Tool result artifact was not found in the current run.")
+            return rejected("Tool result artifact is unavailable in the current run or lacks verifiable source lineage. Read the original authorized source artifact again; do not repeat a business operation merely to reload its cached page.")
         try:
             records = _resolve_pointer(payload, path)
         except (KeyError, IndexError, ValueError, TypeError):
@@ -163,6 +171,7 @@ class ObservationGroupTool:
             "groups": [],
             "scan_complete": True,
         }
+        mark_historical_import(output, artifact_id, store=self.store, run_id=context.run_id, payload=payload)
         shown_samples = [_render_group(group, sample_fields) for group in selected]
         visible_count = len(selected)
         while True:

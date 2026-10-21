@@ -64,7 +64,9 @@ def web(tmp_path):
 
     def context(session="s", run="r", child=False, view=None):
         with connect(db) as conn:
-            conn.execute("INSERT OR IGNORE INTO agent_sessions VALUES (?,?,'active','{}','now','now')", (session, session))
+            conn.execute("INSERT OR IGNORE INTO agent_sessions "
+                         "(session_id,title,status,metadata,created_at,updated_at) "
+                         "VALUES (?,?,'active','{}','now','now')", (session, session))
             record = {"run_id": run, "session_id": session, "parent_run_id": "parent" if child else None,
                       "metadata": {}}
             conn.execute("INSERT OR IGNORE INTO agent_runs VALUES (?,?,'running',?,'now','now')",

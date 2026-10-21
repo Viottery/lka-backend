@@ -27,6 +27,7 @@ from app.domains.message_reading_results import (
     TopicUpdate,
 )
 from app.domains.message_reading_runtime import MessageReadingRuntimeMixin
+from app.storage.sqlite_timing import connect_sqlite
 
 ANALYSIS_JOB_KIND = "message_analysis"
 _FACT_KINDS = {"fact", "event", "decision", "task_candidate", "question", "correction"}
@@ -286,7 +287,7 @@ class MessageHistoryService(MessageMetadataMixin, MessageDossierMixin, MessageRe
         self.configure_reading({})
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=10, isolation_level=None)
+        conn = connect_sqlite(self.db_path, timeout=10, isolation_level=None)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=10000")
         conn.execute("PRAGMA journal_mode=WAL")

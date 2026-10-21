@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from hashlib import sha256
 from typing import Any
 
 from app.core.tools import ToolContext, ToolInvocation, ToolPackageSpec, ToolResult, ToolSpec
@@ -24,6 +25,8 @@ MAIL_PACKAGE = ToolPackageSpec(
         "Use mail.search for content discovery; its empty-query time order is a quick peek, not exhaustive enumeration. The 100-result cap and possible_more signal do not provide an exact total.",
         "mail.sync next_link/delta_link track remote provider sync progress, not mail.list pagination; use listing_id for local pages.",
         "Do not request complete message bodies in bulk. Use the returned evidence snippets unless exact source text is essential.",
+        "After search identifies a small set of relevant messages, load those messages together with mail.load_messages instead of loading them one at a time or searching the same query again. Reuse loaded records from this session when they still answer the question.",
+        "Treat search excerpts and truncated loaded text as partial evidence; preserve which messages and text ranges were actually read. Do not describe an excerpt or truncated result as the full message. Keep the source's date precision (calendar date versus timestamp) and surface conflicting message dates or displayed timestamps for reconciliation rather than silently choosing one.",
         "When automatic mail synchronization is enabled, normally read local mail without calling mail.sync first, including routine requests for recent mail. Call mail.sync only for an explicit sync/immediate-refresh request, or when automatic synchronization is unavailable and local mail may be stale.",
         "This package reads and syncs mail evidence; use another registered persistence package for tasks, events, or matters.",
     ],
@@ -33,9 +36,9 @@ MAIL_PACKAGE = ToolPackageSpec(
          "decision_hints": ["mail.list returns metadata cards; follow next_range with the same listing_id until has_more=false or report partial coverage. Read current source evidence instead of substituting old conversation summaries."]},
         {"required_tools": ["mail.search"],
          "routing_hints": ["Search currently authorized mail evidence."],
-         "decision_hints": ["mail.search snippets are selected evidence; possible_more is not an exact total. An empty-query quick peek is not complete enumeration."]},
+         "decision_hints": ["mail.search snippets are selected evidence; possible_more is not an exact total. An empty-query quick peek is not complete enumeration. Once a few relevant IDs are identified, batch-load those records and reuse the loaded result; state the actual read coverage and any truncation."]},
         {"required_tools": ["mail.load_messages"],
-         "decision_hints": ["Load selected message bodies only when needed to verify requirements, dates and responsibility; do not bulk-read all bodies."]},
+         "decision_hints": ["Load a small set of already identified relevant messages together when needed to verify requirements, dates and responsibility; do not bulk-read all bodies or repeat an equivalent search. Preserve exact read coverage and truncation. Keep date-only evidence as a calendar date, not an invented end-of-day timestamp, and report conflicts among source dates/timestamps."]},
     ],
     observation_cache={
         "tool_names": ["mail.load_messages"],
@@ -114,8 +117,78 @@ class ListMailTool:
         except ValueError as exc:
             return ToolResult(invocation_id=invocation.invocation_id, tool_name=self.spec.name,
                               status="rejected", error=str(exc))
+        output = result.model_dump(mode="json")
+        # Opaque authorization inventory permits later revocation checks without
+        # exposing account IDs or invalidating history when new mail arrives.
+        output["_authorization_source_tokens"] = [self._account_token(account) for account in accounts]
         return ToolResult(invocation_id=invocation.invocation_id, tool_name=self.spec.name,
-                          status="completed", output=result.model_dump(mode="json"))
+                          status="completed", output=output)
+
+    @staticmethod
+    def _account_token(account_id):
+        return sha256(("mail-authorization-v1:" + account_id).encode()).hexdigest()
+
+    def allow_cached_observation(self, *, tool_input, result, context):
+        """Revalidate the complete listing snapshot against current mail grants."""
+        try:
+            output = result.get("output") if isinstance(result, dict) else None
+            if not isinstance(tool_input, dict) or not isinstance(output, dict):
+                return False
+            tokens = output.get("_authorization_source_tokens")
+            if isinstance(tokens, list):
+                if (any(not isinstance(token, str) or len(token) != 64 for token in tokens)
+                        or len(tokens) != len(set(tokens))):
+                    return False
+            else:
+                tokens = None  # Legacy rows lack the invocation-time account inventory.
+            accounts = sorted(self.mail_knowledge_mirror.active_account_ids(session_id=context.session_id))
+            scope = context.tool_view
+            if scope is not None:
+                if (scope.child_run_id is not None and not scope.full_data_authority
+                        and not scope.allowed_account_ids and not scope.allowed_source_ids):
+                    return False
+                if not scope.full_data_authority and scope.allowed_account_ids:
+                    accounts = [account for account in accounts if account in scope.allowed_account_ids]
+                if not scope.full_data_authority and scope.allowed_source_ids:
+                    accounts = [account for account in accounts
+                                if MailKnowledgeMirror.source_id_for_account(account) in scope.allowed_source_ids]
+            if tokens is not None:
+                active_tokens = {self._account_token(account) for account in accounts}
+                if not set(tokens).issubset(active_tokens):
+                    return False
+            messages = output.get("messages")
+            if not isinstance(messages, list) or any(not isinstance(item, dict) for item in messages):
+                return False
+            message_ids = [item.get("message_id") for item in messages]
+            if any(not isinstance(message_id, str) for message_id in message_ids):
+                return False
+            owners = self.mail_service.get_message_account_ids(message_ids, account_ids=accounts)
+            if set(owners) != set(message_ids):
+                return False
+            source_ids = set(self.mail_knowledge_mirror.active_source_ids(session_id=context.session_id))
+            owners_valid = all(
+                MailKnowledgeMirror.source_id_for_account(owners[item["message_id"]]) in source_ids
+                and (tokens is None or self._account_token(owners[item["message_id"]]) in set(tokens))
+                for item in messages
+            )
+            if not owners_valid:
+                return False
+            if tokens is not None:
+                return True
+            # Legacy limitation: no invocation-time account inventory was saved.
+            # Permit only if current authorized data produces the same complete
+            # visible page; process-local listing_id is deliberately excluded.
+            current = self.mail_service.list_messages(
+                received_from=tool_input.get("received_from"),
+                received_before=tool_input.get("received_before"),
+                start_rank=tool_input.get("start_rank", 1), end_rank=tool_input.get("end_rank"),
+                folder=tool_input.get("folder"), account_ids=accounts,
+            ).model_dump(mode="json")
+            visible = ("total_matches", "requested_range", "returned_count", "has_more", "next_range",
+                       "applied_limit", "coverage", "messages")
+            return all(current.get(key) == output.get(key) for key in visible)
+        except (KeyError, TypeError, ValueError):
+            return False
 
 
 class SearchMailTool:
@@ -205,8 +278,9 @@ class SearchMailTool:
 
 
 class LoadMailMessagesTool:
-    def __init__(self, mail_service: MailService) -> None:
+    def __init__(self, mail_service: MailService, mail_knowledge_mirror: MailKnowledgeMirror | None = None) -> None:
         self.mail_service = mail_service
+        self.mail_knowledge_mirror = mail_knowledge_mirror
 
     spec = ToolSpec(
         name="mail.load_messages",
@@ -280,6 +354,46 @@ class LoadMailMessagesTool:
             status="completed",
             output={"messages": output_messages},
         )
+
+    def allow_cached_observation(self, *, tool_input, result, context):
+        """Ensure every historical message remains inside active account sources."""
+        try:
+            if self.mail_knowledge_mirror is None or not isinstance(tool_input, dict) or not isinstance(result, dict):
+                return False
+            requested = tool_input.get("message_ids")
+            output = result.get("output")
+            if (not isinstance(requested, list) or not requested or len(requested) > 3
+                    or any(not isinstance(item, str) or not item for item in requested)
+                    or len(set(requested)) != len(requested) or not isinstance(output, dict)
+                    or not isinstance(output.get("messages"), list)):
+                return False
+            accounts = set(self.mail_knowledge_mirror.active_account_ids(session_id=context.session_id))
+            scope = context.tool_view
+            if scope is not None:
+                if (scope.child_run_id is not None and not scope.full_data_authority
+                        and not scope.allowed_account_ids and not scope.allowed_source_ids):
+                    return False
+                if not scope.full_data_authority and scope.allowed_account_ids:
+                    accounts.intersection_update(scope.allowed_account_ids)
+                if not scope.full_data_authority and scope.allowed_source_ids:
+                    accounts = {account for account in accounts
+                                if MailKnowledgeMirror.source_id_for_account(account) in scope.allowed_source_ids}
+            authorized_by_id = self.mail_service.get_message_account_ids(requested, account_ids=sorted(accounts))
+            active_sources = set(self.mail_knowledge_mirror.active_source_ids(session_id=context.session_id))
+            delivered = [item for item in output["messages"] if isinstance(item, dict)]
+            if len(delivered) != len(output["messages"]):
+                return False
+            delivered_ids = [item.get("message_id") for item in delivered]
+            if len(delivered_ids) != len(set(delivered_ids)) or set(delivered_ids) != set(authorized_by_id):
+                return False
+            for item in delivered:
+                account_id = authorized_by_id.get(item["message_id"])
+                if (account_id is None or MailKnowledgeMirror.source_id_for_account(account_id)
+                        not in active_sources):
+                    return False
+            return True
+        except (KeyError, TypeError, ValueError):
+            return False
 
 
 class PersistMailMattersTool:

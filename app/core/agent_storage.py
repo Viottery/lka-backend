@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from contextvars import ContextVar
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
@@ -11,6 +12,9 @@ from typing import Any
 
 from app.core.session_admission import TERMINAL_RUN_STATUSES, SessionAdmissionStore
 from app.storage.db import connect, init_db
+
+_artifact_read_stack: ContextVar[tuple[tuple[str, str, str], ...]] = ContextVar("artifact_read_stack", default=())
+_MAX_ARTIFACT_LINEAGE_DEPTH = 16
 
 
 def _json_dump(value: dict[str, Any]) -> str:
@@ -67,9 +71,14 @@ class SqliteAgentRunStore:
 
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
+        self._lineage_required_producers: set[str] = set()
         init_db(db_path)
         with connect(self.db_path) as conn:
             SessionAdmissionStore.ensure_schema(conn)
+            conn.execute("""CREATE TABLE IF NOT EXISTS agent_artifact_lineage (
+                artifact_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, artifact_hash TEXT NOT NULL,
+                source_artifact_id TEXT NOT NULL, source_run_id TEXT NOT NULL, source_hash TEXT NOT NULL
+            )""")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS agent_user_continuations (
@@ -910,10 +919,19 @@ class SqliteAgentRunStore:
         payload: dict[str, Any],
         summary: str,
         created_at: str,
+        source_artifact: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         serialized = _json_dump(payload)
         content_hash = sha256(serialized.encode("utf-8")).hexdigest()
         with connect(self.db_path) as conn:
+            if source_artifact is not None and (
+                kind != "tool_result" or source_artifact.get("run_id") != run_id
+                or not isinstance(source_artifact.get("artifact_id"), str)
+                or not 0 < len(source_artifact["artifact_id"]) <= 200
+                or not isinstance(source_artifact.get("content_hash"), str)
+                or len(source_artifact["content_hash"]) != 64
+            ):
+                raise ValueError("Invalid trusted tool artifact source binding.")
             conn.execute(
                 """
                 INSERT INTO agent_run_artifacts(
@@ -937,6 +955,15 @@ class SqliteAgentRunStore:
                     created_at,
                 ),
             )
+            if source_artifact is not None:
+                conn.execute("""INSERT INTO agent_artifact_lineage(
+                    artifact_id,run_id,artifact_hash,source_artifact_id,source_run_id,source_hash
+                    ) VALUES(?,?,?,?,?,?) ON CONFLICT(artifact_id) DO UPDATE SET
+                    run_id=excluded.run_id,artifact_hash=excluded.artifact_hash,
+                    source_artifact_id=excluded.source_artifact_id,source_run_id=excluded.source_run_id,
+                    source_hash=excluded.source_hash""",
+                    (artifact_id, run_id, content_hash, source_artifact["artifact_id"],
+                     source_artifact["run_id"], source_artifact["content_hash"]))
         return {
             "artifact_id": artifact_id,
             "kind": kind,
@@ -952,14 +979,89 @@ class SqliteAgentRunStore:
         return _json_load(row["payload"]) if row is not None else None
 
     def load_tool_result_artifact(self, artifact_id: str, run_id: str) -> dict[str, Any] | None:
-        """Load a tool result only when both its artifact kind and owning run match."""
+        """Revalidate the whole trusted source chain, including ordinary reader copies."""
+        stack = _artifact_read_stack.get()
+        key = (str(self.db_path), run_id, artifact_id)
+        if key in stack or len(stack) >= _MAX_ARTIFACT_LINEAGE_DEPTH:
+            return None
+        token = _artifact_read_stack.set((*stack, key))
+        try:
+            if artifact_id.startswith("progress_import_"):
+                validate = getattr(self, "progress_import_validator", None)
+                if not callable(validate) or validate(artifact_id, run_id) is not True:
+                    return None
+            with connect(self.db_path) as conn:
+                row = conn.execute(
+                    """SELECT payload FROM agent_run_artifacts
+                       WHERE artifact_id = ? AND run_id = ? AND kind = 'tool_result'""",
+                    (artifact_id, run_id),
+                ).fetchone()
+                lineage = conn.execute("SELECT * FROM agent_artifact_lineage WHERE artifact_id=?", (artifact_id,)).fetchone()
+            if row is None:
+                return None
+            payload = _json_load(row["payload"])
+            if (lineage is None and not artifact_id.startswith("progress_import_")
+                    and payload.get("status") == "completed"
+                    and payload.get("tool_name") in self._lineage_required_producers):
+                # Old reader artifacts cannot prove their original source.
+                # Keep their private audit body, but do not expose it as a new
+                # source or silently reconstruct authority from descriptive JSON.
+                return None
+            if lineage is not None:
+                if (lineage["run_id"] != run_id or lineage["source_run_id"] != run_id
+                        or sha256(_json_dump(payload).encode()).hexdigest() != lineage["artifact_hash"]):
+                    return None
+                source = self.load_tool_result_artifact(lineage["source_artifact_id"], run_id)
+                if source is None or sha256(_json_dump(source).encode()).hexdigest() != lineage["source_hash"]:
+                    return None
+            return payload
+        finally:
+            _artifact_read_stack.reset(token)
+
+    def register_tool_result_lineage_producer(self, tool_name: str) -> None:
+        """Called by a trusted reader constructor, never by source JSON."""
+        self._lineage_required_producers.add(tool_name)
+
+    def tool_result_requires_lineage(self, tool_name: str) -> bool:
+        return isinstance(tool_name, str) and tool_name in self._lineage_required_producers
+
+    def tool_result_artifact_is_historical(self, artifact_id: str, run_id: str) -> bool:
+        """Use only server-owned lineage, never historical flags inside source JSON.
+
+        Callers first load through the authorized reader above. This descriptor
+        lookup neither returns source content nor grants access.
+        """
+        visited: set[str] = set()
         with connect(self.db_path) as conn:
-            row = conn.execute(
-                """SELECT payload FROM agent_run_artifacts
-                   WHERE artifact_id = ? AND run_id = ? AND kind = 'tool_result'""",
-                (artifact_id, run_id),
-            ).fetchone()
-        return _json_load(row["payload"]) if row is not None else None
+            for _ in range(_MAX_ARTIFACT_LINEAGE_DEPTH):
+                if artifact_id.startswith("progress_import_"):
+                    return True
+                if artifact_id in visited:
+                    return False
+                visited.add(artifact_id)
+                row = conn.execute("SELECT source_artifact_id,source_run_id,run_id FROM agent_artifact_lineage WHERE artifact_id=?",
+                                   (artifact_id,)).fetchone()
+                if row is None or row["run_id"] != run_id or row["source_run_id"] != run_id:
+                    return False
+                artifact_id = row["source_artifact_id"]
+        return False
+
+    def tool_result_source_is_readable(self, source: dict[str, str], run_id: str) -> bool:
+        if source.get("run_id") != run_id or not isinstance(source.get("artifact_id"), str):
+            return False
+        payload = self.load_tool_result_artifact(source["artifact_id"], run_id)
+        return payload is not None and sha256(_json_dump(payload).encode()).hexdigest() == source.get("content_hash")
+
+    def list_session_progress(self, session_id: str, *, limit: int = 48) -> list[dict[str, Any]]:
+        """Private, bounded index lookup; callers must revalidate each owning run."""
+        with connect(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT a.payload FROM agent_run_artifacts a JOIN agent_runs r ON r.run_id=a.run_id "
+                "WHERE a.kind='session_progress' AND json_extract(r.record_payload,'$.session_id')=? "
+                "ORDER BY a.updated_at DESC, a.artifact_id DESC LIMIT ?",
+                (session_id, min(64, max(1, limit))),
+            ).fetchall()
+        return [_json_load(row["payload"]) for row in rows]
 
     def claim_tool_invocation(
         self,

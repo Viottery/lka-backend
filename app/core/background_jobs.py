@@ -27,6 +27,7 @@ from app.core.llm.errors import (
     LLMTimeoutError,
 )
 from app.core.llm_workloads import BackgroundBudgetDeferred, BackgroundTaskBudgetExceeded
+from app.storage.sqlite_timing import connect_sqlite
 
 STATUSES = ("queued", "running", "retry_wait", "succeeded", "failed", "cancelled")
 _TERMINAL = {"succeeded", "failed", "cancelled"}
@@ -95,7 +96,7 @@ class BackgroundJobStore:
         self.max_pending_jobs = max(1, max_pending_jobs)
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=10, isolation_level=None)
+        conn = connect_sqlite(self.db_path, timeout=10, isolation_level=None)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=10000")
         conn.execute("PRAGMA journal_mode=WAL")
@@ -873,10 +874,13 @@ class BackgroundJobWorker:
             except Exception:  # noqa: BLE001 - keep worker alive after unexpected errors.
                 self._stop.wait(self.poll_seconds)
 
-    def stop(self, timeout: float = 5) -> None:
+    def stop(self, timeout: float | None = 5) -> None:
         self._stop.set()
         for thread in self._threads:
-            thread.join(timeout=max(0, timeout))
+            if timeout is None:
+                thread.join()
+            else:
+                thread.join(timeout=max(0, timeout))
         # A timed-out handler cannot be killed safely. Retain its thread and
         # stop event so an immediate start cannot revive it beside a new pool.
         self._threads = [thread for thread in self._threads if thread.is_alive()]

@@ -77,7 +77,7 @@ orchestrator = "legacy"
 checkpoint_backend = "sqlite"
 # Maximum decision-loop steps after the initial route. Raise for longer workflows
 # such as sync -> search -> load -> dedupe -> create/update -> verify -> answer.
-max_decision_steps = 10
+max_decision_steps = 32
 # Optional supported-client decision-stage thinking override, not route/answer/review.
 # Leave unset to retain provider defaults and existing recovery behavior.
 # decision_thinking_enabled = false

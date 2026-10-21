@@ -17,6 +17,7 @@ from app.core.background_jobs import BackgroundJobWorker
 from app.core.llm_workloads import BudgetQuota, workload_scope
 from app.core.session_admission import SessionBusyError
 from app.core.turn_input import TurnInputEnvelope
+from app.domains.management_notifications import ManagementNotificationService
 
 _logger = logging.getLogger(__name__)
 _TERMINAL = {"completed", "failed", "cancelled", "timed_out"}
@@ -37,6 +38,7 @@ class ManagementCoordinator:
         self.goals, self.management, self.tasks = goals, management, tasks
         self.sessions, self.run_store, self.run_manager = sessions, run_store, run_manager
         self.dispatcher, self.config, self.workloads = dispatcher, config, workloads
+        self.notifications = ManagementNotificationService(conn_factory, tasks)
         self.worker = BackgroundJobWorker(dispatcher.store, {"manager_wake": self._bind},
                                           poll_seconds=config.poll_seconds)
         self._stop = threading.Event()
@@ -44,6 +46,7 @@ class ManagementCoordinator:
         self.last_error = None
 
     def ensure_schema(self):
+        self.notifications.ensure_schema()
         with closing(self._conn()) as conn, conn:
             conn.execute("""CREATE TABLE IF NOT EXISTS manager_wake_counters (
                 session_id TEXT PRIMARY KEY, generation INTEGER NOT NULL)""")
@@ -170,6 +173,21 @@ class ManagementCoordinator:
             return delegates is not None and delegates.validate_event(conn, event, consuming_run_id=consuming_run_id)
         if payload.get("task_waiting"):
             return self.goals.waiting_event_current(conn, event)
+        if event.get("kind") == "task_terminal":
+            run_id = payload.get("run_id")
+            if not isinstance(run_id, str) or payload.get("status") not in _TERMINAL:
+                return False
+            row = conn.execute(
+                "SELECT r.status FROM agent_runs r JOIN agent_sessions s ON s.session_id=r.session_id "
+                "WHERE r.run_id=? AND s.kind='ordinary' AND s.status!='deleted' "
+                "AND EXISTS (SELECT 1 FROM managed_session_links l "
+                "WHERE l.run_id=r.run_id AND l.manager_session_id=?)",
+                (run_id, event["session_id"]),
+            ).fetchone()
+            # A terminal notification may remain in the durable inbox after its
+            # task session is deleted. Preserve the audit event, but never
+            # schedule a management turn to inspect deleted task data.
+            return row is not None and row["status"] == payload["status"]
         if "attention_policy_revision" in payload:
             service = getattr(self, "attention", None)
             return service is not None and service.validate_event(conn, event)
@@ -369,6 +387,7 @@ class ManagementCoordinator:
                     metadata={"entrypoint": "agent.turn", "orchestrator": "langgraph", "session_policy": policy,
                               "input_envelope": envelope.model_dump(mode="json"),
                               "manager_execution_id": execution_id, "work_budget_scopes": scopes,
+                              "manager_notification_required": True,
                               "manager_explicit_delegation": self._explicit_work(conn, sid),
                               "manager_matter_versions": matter_versions,
                               "manager_delivery_revision": delivery_policy["revision"] if delivery_policy else 0,
@@ -522,6 +541,20 @@ class ManagementCoordinator:
                 completed = AgentRunRecord.model_validate(record)
             else:
                 self.check_run(run_id, conn=conn)
+                visibility = self.notifications.apply(conn, record)
+                completed_snapshot = {**completed_snapshot, **visibility}
+                if "progress_events" in completed_snapshot:
+                    completed_snapshot["progress_events"] = [
+                        {**event, "metadata": {**event.get("metadata", {}), **visibility}}
+                        if event.get("type") == "final_answer" else event
+                        for event in completed_snapshot["progress_events"]
+                    ]
+                for event in result.progress_events:
+                    if event.type == "final_answer":
+                        event.metadata = {**event.metadata, **visibility}
+                for field, value in visibility.items():
+                    if field in type(result).model_fields:
+                        setattr(result, field, value)
                 self.tasks.apply_goal_proposals(conn, execution["execution_id"], current.session_id)
                 work = getattr(self, "work_service", None)
                 if work is not None:
@@ -543,10 +576,11 @@ class ManagementCoordinator:
                 payload = {**message_payload, "manager_execution_id": execution["execution_id"],
                            "context_window": {"token_budget": updated.token_budget, "token_estimate": updated.token_estimate,
                                               "recent_message_count": len(updated.recent_messages)}}
-                self.sessions.append_message_in_transaction(
-                    conn, session_id=current.session_id, role="agent", content=result.answer,
-                    payload=payload, message_id=message_id,
-                )
+                if visibility["user_visible"]:
+                    self.sessions.append_message_in_transaction(
+                        conn, session_id=current.session_id, role="agent", content=result.answer,
+                        payload={**payload, **visibility}, message_id=message_id,
+                    )
                 now = datetime.now(UTC).isoformat()
                 for event_id in json.loads(execution["event_ids"]):
                     changed = conn.execute("UPDATE manager_inbox SET consumed_execution_id=? WHERE event_id=? "
@@ -556,19 +590,29 @@ class ManagementCoordinator:
                         raise ManagementExecutionFenced("manager_event_already_consumed")
                 conn.execute("UPDATE manager_executions SET status='completed',updated_at=? WHERE execution_id=?",
                              (now, execution["execution_id"]))
-                conn.execute("INSERT INTO manager_deliveries(delivery_id,session_id,execution_id,run_id,message_id,created_at) "
-                             "VALUES(?,?,?,?,?,?)", ("delivery_" + execution["execution_id"], current.session_id,
-                                                   execution["execution_id"], run_id, message_id, now))
+                if visibility["user_visible"]:
+                    conn.execute("INSERT INTO manager_deliveries(delivery_id,session_id,execution_id,run_id,message_id,created_at) "
+                                 "VALUES(?,?,?,?,?,?)", ("delivery_" + execution["execution_id"], current.session_id,
+                                                       execution["execution_id"], run_id, message_id, now))
                 # No other writer can change revisions inside this transaction,
                 # but time-based ownership can expire during context projection.
                 self.dispatcher.check_run(run_id, conn=conn)
                 self._publication_time_fence(conn, execution)
                 completed = self.run_manager.complete_run_in_transaction(
                     conn, run_id, result_snapshot=completed_snapshot, log_path=result.log_path,
-                    event_payload={"answer_length": len(result.answer), "manager_execution_id": execution["execution_id"]},
+                    event_payload={"answer_length": len(result.answer), "manager_execution_id": execution["execution_id"],
+                                   **visibility},
                     final_answer_event=next((e.model_dump(mode="json") for e in reversed(result.progress_events)
                                              if e.type == "final_answer"), None),
                 )
+        visibility = {key: completed.result_snapshot[key] for key in ("notification", "user_visible")
+                      if key in (completed.result_snapshot or {})}
+        for event in result.progress_events:
+            if event.type == "final_answer":
+                event.metadata = {**event.metadata, **visibility}
+        for field, value in visibility.items():
+            if field in type(result).model_fields:
+                setattr(result, field, value)
         self.run_manager.refresh_after_transaction(completed)
         return True
 

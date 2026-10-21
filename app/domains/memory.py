@@ -32,6 +32,7 @@ from app.domains.memory_feedback import (
     record_feedback,
     relevant_feedback_rows,
 )
+from app.storage.sqlite_timing import connect_sqlite
 
 MemoryScope = Literal["global", "project"]
 MemoryStatus = Literal["candidate", "active", "retracted", "superseded"]
@@ -264,7 +265,7 @@ class MemoryService:
             conn.close()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=10)
+        conn = connect_sqlite(self.db_path, timeout=10)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=10000")

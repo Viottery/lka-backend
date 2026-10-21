@@ -7,7 +7,7 @@ def management_delegate_tools(service):
         ('delegate_work', ('Create a durable child manager for a bounded objective. The child cannot delegate again. '
          'Default execution tools are a frozen read-only non-management whitelist; explicit names freeze another whitelist. '
          'workspace_path selects the default directory, not an access boundary; tasks may select their own directory. '
-         'Outside-workspace access requires per-call review and high-risk operations require user approval.'), False,
+         'Outside-workspace access requires per-call review and the initiating approval preference is inherited; blacklisted destructive operations require user approval.'), False,
          {'command_id': COMMAND, 'objective': PURPOSE, 'title': {'type': 'string', 'minLength': 1, 'maxLength': 40},
           'workspace_path': {'type': 'string', 'minLength': 1, 'maxLength': 4096,
                              'description': 'Existing default working directory; omit to inherit the frontend default independent workspace.'},

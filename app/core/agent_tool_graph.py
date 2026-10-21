@@ -139,6 +139,12 @@ class AgentToolLifecycleGraph:
         claim = self._claim(state)
         if claim["status"] == "completed":
             result = ToolResult.model_validate(claim["result"])
+            try:
+                source = self._registered_result_source(state, result)
+            except (ValueError, KeyError, TypeError):
+                source = {"run_id": "", "artifact_id": "", "content_hash": ""}
+            if source is not None and not self.artifact_store.tool_result_source_is_readable(source, str(state["run_id"])):
+                result = self._unreadable_result_source(state)
             self._set_result(state["invocation_id"], result)
             self.append_progress(
                 "tool_recovered",
@@ -191,7 +197,17 @@ class AgentToolLifecycleGraph:
 
     def _build_observation(self, state: ToolLifecycleState) -> ToolLifecycleState:
         result = self._result_for(state["invocation_id"])
+        try:
+            source = self._registered_result_source(state, result)
+        except (ValueError, KeyError, TypeError):
+            result = self._unreadable_result_source(state)
+            self._set_result(state["invocation_id"], result)
+            source = None
         artifact_ref = self._store_result_artifact(state, result)
+        if (source is not None and self.artifact_store is not None
+                and self.artifact_store.load_tool_result_artifact(artifact_ref["artifact_id"], str(state["run_id"])) is None):
+            result = self._unreadable_result_source(state)
+            self._set_result(state["invocation_id"], result)
         if state.get("phase") != "execution_skipped":
             self.append_progress(
                 "tool_completed",
@@ -220,6 +236,7 @@ class AgentToolLifecycleGraph:
     ) -> dict[str, Any]:
         if self.artifact_store is None or state.get("run_id") is None:
             return {}
+        source = self._registered_result_source(state, result)
         return self.artifact_store.put_artifact(
             artifact_id=f"tool_result_{state['invocation_id']}",
             run_id=str(state["run_id"]),
@@ -227,7 +244,20 @@ class AgentToolLifecycleGraph:
             payload=result.model_dump(mode="json"),
             summary=f"{result.tool_name}: {result.status}",
             created_at=_now_iso(),
+            **({"source_artifact": source} if source is not None else {}),
         )
+
+    def _registered_result_source(self, state: ToolLifecycleState, result: ToolResult) -> dict[str, str] | None:
+        tool = self.tool_executor.registry.get_tool_or_none(state["tool_name"])
+        hook = getattr(tool, "result_artifact_source", None)
+        return (hook(tool_input=state["tool_input"], result=result)
+                if callable(hook) and result.tool_name == state["tool_name"] else None)
+
+    @staticmethod
+    def _unreadable_result_source(state: ToolLifecycleState) -> ToolResult:
+        return ToolResult(invocation_id=state["invocation_id"], tool_name=state["tool_name"],
+                          status="rejected", error="Cached tool result source is no longer readable.",
+                          execution_started=False)
 
     def _context_for(self, invocation_id: str) -> ToolContext:
         with self._lock:

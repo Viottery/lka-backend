@@ -112,6 +112,7 @@ from app.core.multi_agent_fast_path import (
 )
 from app.core.multi_agent_replan import PlanPatchRejected, apply_plan_patch
 from app.core.observation_context import (
+    ANSWER_READING_POLICY,
     OBSERVATION_CHAR_LIMIT,
     OBSERVATION_TOKEN_BUDGET,
     READING_POLICY,
@@ -162,11 +163,12 @@ from app.core.tools import (
     ToolExecutor,
     ToolResult,
     effective_tool_read_only,
+    tool_manual_review_reason,
     tool_scope_discovery_denial,
 )
 from app.core.turn_input import TurnInputEnvelope
 
-DEFAULT_MAX_DECISION_STEPS = 10
+DEFAULT_MAX_DECISION_STEPS = 32
 ROOT_COORDINATOR_STEP_ID = "root_coordinator"
 DECISION_OBSERVATION_MAX_STRING_CHARS = 4_000
 DECISION_OBSERVATION_MAX_LIST_ITEMS = 20
@@ -685,6 +687,8 @@ class AgentTurnResult(BaseModel):
     session_id: str
     trace_id: str
     answer: str
+    user_visible: bool = True
+    notification: dict[str, Any] | None = None
     task_outcome: Literal["unknown", "incomplete"] = "unknown"
     stop_reason: str | None = None
     selected_package: str | None = None
@@ -769,6 +773,7 @@ class AgentTurnLoop:
         background_compaction_callback: Callable[..., Any] | None = None,
         memory_pre_turn_callback: Callable[[str | None, str], list[str]] | None = None,
         input_content_provider: Callable[[str, tuple[str, ...]], AgentInputContent | list[LLMImageBlock]] | None = None,
+        session_progress_cache: Any | None = None,
     ) -> None:
         self.session_service = session_service
         self.input_content_provider = input_content_provider
@@ -797,6 +802,10 @@ class AgentTurnLoop:
         self.safety_manual_wait_poll_seconds = safety_manual_wait_poll_seconds
         self.execution_guard: Callable[[str], None] | None = None
         self.tool_invocation_store = tool_invocation_store
+        self.session_progress_cache = session_progress_cache
+        self.answer_visibility_provider: Callable[[str], dict[str, Any] | None] | None = None
+        if session_progress_cache is not None:
+            session_progress_cache.bind_turn_loop(self)
         self.fork_policy = fork_policy
         self.agent_catalog_provider = agent_catalog_provider
         self.fork_scope_resolver = fork_scope_resolver
@@ -837,21 +846,23 @@ class AgentTurnLoop:
         except ValueError:
             return SafetyReviewMode.SKIP
 
-    def _effective_safety_review_mode(self, tool_name: str | None = None) -> SafetyReviewMode:
-        """Requests and frozen run policy may increase review strictness."""
-        if tool_name is not None and self._session_run_policy().require_high_risk_approval:
-            tool = self.tool_executor.registry.get_tool_or_none(tool_name)
-            if tool is not None and (tool.spec.requires_confirmation or tool.spec.risk == "high"):
-                return SafetyReviewMode.MANUAL
+    def _safety_review_preference(self) -> SafetyReviewMode:
+        """Carry the selected preference independently of per-tool risk escalation."""
         requested = _turn_safety_review_mode.get()
-        priority = {
-            SafetyReviewMode.SKIP: 0,
-            SafetyReviewMode.LLM: 1,
-            SafetyReviewMode.MANUAL: 2,
-        }
-        if requested is None or priority[requested] <= priority[self.safety_review_mode]:
-            return self.safety_review_mode
-        return requested
+        if requested is not None:
+            return requested
+        inherited = self._session_run_policy().safety_review_mode
+        return SafetyReviewMode(inherited) if inherited is not None else self.safety_review_mode
+
+    def _effective_safety_review_mode(
+        self, tool_name: str | None = None, tool_input: dict[str, Any] | None = None,
+    ) -> SafetyReviewMode:
+        """Honor the selected preference except for a tool's mandatory manual rules."""
+        if tool_name is not None:
+            tool = self.tool_executor.registry.get_tool_or_none(tool_name)
+            if tool is not None and tool_manual_review_reason(tool, tool_input or {}):
+                return SafetyReviewMode.MANUAL
+        return self._safety_review_preference()
 
     def run(
         self,
@@ -1131,6 +1142,7 @@ class AgentTurnLoop:
             run_id=run_id,
             llm_client_name=inference_client,
             llm_model=inference_model,
+            safety_review_mode=self._safety_review_preference().value,
         )
         user_input, _input_message = self._persist_turn_input(
             session_id=session.session_id, run_id=run_id, trace_id=trace_id, user_input=user_input,
@@ -1325,6 +1337,7 @@ class AgentTurnLoop:
             verification_warnings=verification_warnings,
             llm_events=llm_events,
         )
+        result = result.model_copy(update=self._answer_publication(result.run_id))
         log_path = self._write_log(result=result, user_input=user_input)
         result = result.model_copy(update={"log_path": str(log_path)})
         self.session_service.append_message(
@@ -1642,9 +1655,6 @@ class AgentTurnLoop:
                     metadata={"action": action, "step_index": step_index + 1},
                 )
 
-            if decision.get("_progress_review_required"):
-                continue
-
             if action in {"fork_subtasks", "fork_subtasks_invalid"}:
                 run_id = _turn_run_id.get()
                 if isinstance(run_id, str):
@@ -1894,6 +1904,10 @@ class AgentTurnLoop:
             repeat_successful_call = bool(
                 operation.get("repeat_successful_call") if isinstance(operation, dict) else False
             )
+            if self._rejected_tool_repeat_feedback(
+                working_state, tool_name, tool_input, observations, progress_events,
+            ):
+                continue
             if call_fingerprint in successful_call_fingerprints and not repeat_successful_call:
                 self._duplicate_tool_feedback(
                     working_state, tool_name, tool_input, observations, progress_events,
@@ -1938,6 +1952,10 @@ class AgentTurnLoop:
             )
             working_state.observe({"tool_name": tool_name, "input": tool_input,
                                    "result": tool_result.model_dump(mode="json")}, decision.get("purpose"))
+            if getattr(self, "session_progress_cache", None) is not None:
+                self.session_progress_cache.record(context=context,
+                    tool_events=[event.model_dump(mode="json") for event in tool_events],
+                    working_state=working_state.context())
             if tool_result.status == "completed":
                 if self._completed_tool_call_changes_state(
                     tool_name=tool_name,
@@ -2048,32 +2066,20 @@ class AgentTurnLoop:
         observations: list[dict[str, Any]], progress_events: list[AgentTurnProgressEvent],
     ) -> None:
         diagnostics = state.apply_decision(decision, observations)
-        if (state.review_required and decision.get("action") == "call_tool"
-                and state.defer_review_once()):
-            decision["_progress_review_required"] = True
-            feedback = {
-                "action": "task_progress_review_feedback", "status": "not_executed",
-                "required_fields": ["working_state.focus_gap", "purpose.gap", "purpose.question", "purpose.expected_observable"],
-                "instruction": (
-                    "Review was requested and this tool was not executed. In the next decision, "
-                    "preserve established findings and hypotheses ruled out, state the concrete "
-                    "remaining gap in working_state.focus_gap, and supply all purpose fields "
-                    "explaining how the next observation distinguishes remaining hypotheses or "
-                    "advances the requested work. You may choose a justified diagnostic, action, "
-                    "verification, or honest final answer. No edit is required. Do not rephrase "
-                    "old evidence as new progress; original scope, safety and budgets still apply."
-                ),
-            }
-            observations.append(feedback)
+        run_id = _turn_run_id.get()
+        if self.session_progress_cache is not None and run_id:
+            self.session_progress_cache.record(
+                context=self.session_progress_cache._context_for_run(run_id),
+                tool_events=[], working_state=state.context())
+        if state.review_required and decision.get("action") == "call_tool":
+            # Optional notes are not an authorization or semantic-quality gate.
+            # Keep the review in the next decision's working state without
+            # spending another model call solely to restate a valid operation.
             self._append_progress(
                 progress_events, type="task_progress_review_required", stage="decision", status="needs_work",
-                message="Reviewing the remaining gap before the next operation.", metadata=feedback,
-            )
-        elif state.review_required and decision.get("action") == "call_tool":
-            self._append_progress(
-                progress_events, type="task_progress_review_unresolved", stage="decision", status="needs_work",
-                message="Review remains unanswered; continuing within the original execution budget.",
-                metadata={"status": "unresolved", "review_deferrals": state.review_deferrals},
+                message="Progress review remains advisory; the proposed operation still requires normal validation and safety review.",
+                metadata={"status": "advisory", "operation_deferred": False,
+                          "review_reasons": list(state.review_reasons)},
             )
         self._append_run_event(
             type="task_working_state_updated", stage="decision",
@@ -2108,6 +2114,33 @@ class AgentTurnLoop:
             status="skipped", message=f"Skipped duplicate `{tool_name}`; continuing unfinished work.",
             metadata=feedback,
         )
+
+    def _rejected_tool_repeat_feedback(
+        self, state: TaskProgressState, tool_name: str, tool_input: dict[str, Any],
+        observations: list[dict[str, Any]], progress_events: list[AgentTurnProgressEvent],
+    ) -> bool:
+        """Do not reexecute inputs a registered adapter has already rejected."""
+        fingerprint = self._tool_call_fingerprint(tool_name=tool_name, tool_input=tool_input)
+        for observation in reversed(observations):
+            if (observation.get("tool_name") != tool_name or "result" not in observation
+                    or self._tool_call_fingerprint(tool_name=tool_name,
+                                                  tool_input=observation.get("input") or {}) != fingerprint):
+                continue
+            feedback = observation.get("feedback") or {}
+            recovery = feedback.get("recovery")
+            if (feedback.get("source") != "local" or not isinstance(recovery, dict)
+                    or recovery.get("retry_same_input") is not False):
+                return False
+            state.duplicate()
+            skipped = {"action": "tool_rejected_repeat_feedback", "status": "skipped",
+                       "tool_name": tool_name, "recovery": recovery,
+                       "instruction": "The registered tool already rejected these exact inputs. Use its recovery request or change the actual invalid argument. Repeating the same request cannot repair it; do not redo completed work."}
+            observations.append(skipped)
+            self._append_progress(progress_events, type="tool_duplicate_blocked", stage="decision",
+                                  tool_name=tool_name, status="skipped",
+                                  message=f"Skipped unchanged rejected `{tool_name}` request.", metadata=skipped)
+            return True
+        return False
 
     def _multi_agent_replan_pending(self, run_id: str | None = None) -> bool:
         manager = getattr(self, "run_manager", None)
@@ -4452,9 +4485,15 @@ class AgentTurnLoop:
 
     def _normalize_decision_output(self, parsed: dict[str, Any], *, raw_output: str) -> dict[str, Any]:
         decision = self._normalize_decision_operation(parsed, raw_output=raw_output)
+        notes = parsed.get("_agent_progress")
+        notes = notes if isinstance(notes, dict) else {}
         for key in ("working_state", "purpose"):
-            if isinstance(parsed.get(key), dict):
-                decision[key] = parsed[key]
+            # Relays can mix the JSON and native progress-note envelopes.
+            # Only known control metadata is normalized; it never becomes
+            # executable tool input. Explicit canonical fields take priority.
+            value = parsed.get(key) if isinstance(parsed.get(key), dict) else notes.get(key)
+            if isinstance(value, dict):
+                decision[key] = value
         return decision
 
     def _normalize_decision_operation(
@@ -4731,6 +4770,26 @@ class AgentTurnLoop:
         run = self.run_manager.get_run(run_id) if self.run_manager else None
         accepted_message_id = run.metadata.get('session_input_message_id') if run else None
         if accepted_message_id:
+            batch = run.metadata.get('session_input_batch')
+            if batch:
+                from app.core.session_inputs import SessionInputQueue
+
+                messages = self.session_service.get_turn_user_messages(session_id=session_id, trace_id=trace_id)
+                if [message.message_id for message in messages] != [item['message_id'] for item in batch]:
+                    raise ValueError('Accepted session input history is unavailable or changed')
+                rendered = []
+                for message, item in zip(messages, batch, strict=True):
+                    if (sha256(message.content.encode()).hexdigest() != item['content_sha256']
+                            or message.payload.get('input_id') != item['input_id']
+                            or message.payload.get('attachment_ids') != item['attachment_ids']):
+                        raise ValueError('Accepted session input history is unavailable or changed')
+                    rendered.append({**item, 'user_input': message.content})
+                if SessionInputQueue.render_batch(rendered) != user_input:
+                    raise ValueError('Accepted session input history is unavailable or changed')
+                session = self.session_service.ensure_session(session_id=session_id)
+                for message in messages:
+                    self._apply_memory_pre_turn_gate(self._workspace_for_run(session, run_id), message.content, message.message_id)
+                return user_input, messages[0]
             message = self.session_service.get_turn_user_message(session_id=session_id, trace_id=trace_id)
             if message is None or message.message_id != accepted_message_id or message.content != user_input:
                 raise ValueError('Accepted session input history is unavailable or changed')
@@ -5233,6 +5292,14 @@ class AgentTurnLoop:
         limit: int = 8,
         query: str = "",
     ) -> list[dict[str, Any]]:
+        if getattr(self, "session_progress_cache", None) is not None:
+            try:
+                index = self.session_progress_cache.search(context=context, query=query, limit=limit)
+            except (ValueError, KeyError):
+                return []
+            return [{"action": "session_progress_index", **index}] if (
+                index.get("entries") or index.get("index_available") is True
+            ) else []
         cacheable_tool_names = self._cacheable_tool_names()
         if not cacheable_tool_names:
             return []
@@ -5450,6 +5517,9 @@ class AgentTurnLoop:
         for observation in cached_observations:
             if not isinstance(observation, dict):
                 continue
+            if observation.get("action") == "session_progress_index":
+                observations.append(observation)
+                continue
             tool_name = observation.get("tool_name")
             result = observation.get("result")
             if not isinstance(tool_name, str) or not isinstance(result, dict):
@@ -5539,6 +5609,12 @@ class AgentTurnLoop:
             "result": compacted_result,
             "feedback": feedback,
         }
+        if isinstance(tool_result.output, dict) and tool_result.output.get("historical_only") is True:
+            # A newly executed cache reader does not refresh the original
+            # source. Keep this on the observation, outside result previews,
+            # so progress/completion checks cannot count it as current evidence.
+            observation["historical_only"] = True
+            observation["_cache"] = {"historical_only": True, "current_evidence": False}
         warning = external_content_warning(tool_result.output)
         if warning:
             observation["_external_content_warning"] = warning
@@ -6045,6 +6121,9 @@ class AgentTurnLoop:
                 ),
             )
         )
+        if getattr(self, "session_progress_cache", None) is not None:
+            self.session_progress_cache.record(context=context,
+                tool_events=[event.model_dump(mode="json") for event in tool_events])
         return result
 
     def prepare_graph_safety_review(
@@ -6067,7 +6146,7 @@ class AgentTurnLoop:
         if tool is None:
             return None, None
         read_only = effective_tool_read_only(tool, tool_input)
-        review_mode = self._effective_safety_review_mode(tool_name)
+        review_mode = self._effective_safety_review_mode(tool_name, tool_input)
         run_manager = _turn_run_manager.get()
         run_id = _turn_run_id.get()
         if run_manager is None or run_id is None:
@@ -6100,7 +6179,7 @@ class AgentTurnLoop:
                     side_effects=tool.spec.side_effects,
                     read_only=read_only,
                     mode=review_mode,
-                    reason=self._safety_review_reason(read_only=read_only),
+                    reason=tool_manual_review_reason(tool, tool_input) or self._safety_review_reason(read_only=read_only),
                     created_at=_now_iso(),
                 )
             )
@@ -6202,6 +6281,9 @@ class AgentTurnLoop:
                 ),
             )
         )
+        if getattr(self, "session_progress_cache", None) is not None:
+            self.session_progress_cache.record(context=context,
+                tool_events=[event.model_dump(mode="json") for event in tool_events])
         return result
 
     def _review_tool_call_before_execute(
@@ -6218,7 +6300,7 @@ class AgentTurnLoop:
         if tool is None:
             return None, None
         read_only = effective_tool_read_only(tool, tool_input)
-        review_mode = self._effective_safety_review_mode(tool_name)
+        review_mode = self._effective_safety_review_mode(tool_name, tool_input)
         run_manager = _turn_run_manager.get()
         run_id = _turn_run_id.get()
         if run_manager is None or run_id is None:
@@ -6237,7 +6319,7 @@ class AgentTurnLoop:
                 ),
                 None,
             )
-        reason = self._safety_review_reason(read_only=read_only)
+        reason = tool_manual_review_reason(tool, tool_input) or self._safety_review_reason(read_only=read_only)
         review = run_manager.create_safety_review(
             SafetyReviewRequest(
                 review_id=stable_safety_review_id(run_id, invocation_id, tool_name),
@@ -6459,6 +6541,24 @@ class AgentTurnLoop:
             llm_output=response.content if response is not None else None,
         )
 
+    def _answer_publication(self, run_id: str | None = None, *, pending: bool = False) -> dict[str, Any]:
+        provider = getattr(self, "answer_visibility_provider", None)
+        run_id = run_id or _turn_run_id.get()
+        projection = provider(run_id) if callable(provider) and run_id else None
+        if projection is None:
+            return {}
+        if type(projection.get("user_visible")) is not bool:
+            raise ValueError("Publication visibility must be an explicit server boolean")
+        publication = {"user_visible": projection["user_visible"],
+                       "notification": projection.get("notification")}
+        manager = getattr(self, "run_manager", None)
+        run = manager.get_run(run_id) if pending and manager is not None else None
+        if run is not None and run.metadata.get("defer_answer_publication") is True:
+            # A staged notification cannot publish text ahead of transactional
+            # revision/lease checks. The committed final event reveals it.
+            publication.update(user_visible=False, publication_pending=True)
+        return publication
+
     def _append_progress(
         self,
         progress_events: list[AgentTurnProgressEvent],
@@ -6472,6 +6572,9 @@ class AgentTurnLoop:
         metadata: dict[str, Any] | None = None,
         persist: bool = True,
     ) -> None:
+        metadata = dict(metadata or {})
+        if type in {"final_answer", "assistant_message"}:
+            metadata.update(self._answer_publication(pending=type == "assistant_message"))
         progress_events.append(
             AgentTurnProgressEvent(
                 event_index=len(progress_events) + 1,
@@ -6628,6 +6731,15 @@ class AgentTurnLoop:
             tool_name=tool_result.tool_name,
             result=tool_result,
         )
+        registry = getattr(getattr(self, "tool_executor", None), "registry", None)
+        resolve = getattr(registry, "get_tool_or_none", None)
+        tool = resolve(tool_result.tool_name) if callable(resolve) else None
+        recover = getattr(tool, "result_recovery", None)
+        if tool_result.status == "rejected" and callable(recover):
+            recovery = recover(tool_input=decision.get("tool_input") or {}, result=tool_result)
+            if isinstance(recovery, dict):
+                return {**local_feedback, "recovery": recovery,
+                        "remaining_work": "Follow the registered tool's structured recovery; do not repeat unchanged inputs."}
         if (
             local_feedback.get("status") == "accepted" or self.llm_client is None
             or "source_constraint_denial" in local_feedback
@@ -7082,6 +7194,7 @@ class AgentTurnLoop:
             raise LLMClientError("No LLM client is configured.")
         content_role = self._llm_content_role_for_stage(stage)
         display_target = self._llm_display_target_for_stage(stage)
+        visibility = self._answer_publication(pending=True) if display_target == "assistant_answer" else {}
 
         async def collect() -> tuple[str, dict[str, Any]]:
             self._check_execution_allowed()
@@ -7188,6 +7301,7 @@ class AgentTurnLoop:
                         "stream_part": "llm_delta",
                         "content_role": content_role,
                         "display_target": display_target,
+                        **visibility,
                         "llm_call_id": llm_call_id,
                         "client_name": event.client_name,
                         "provider": event.provider,
@@ -7582,8 +7696,9 @@ class AgentTurnLoop:
 
         # All model stages, including answer/result-check/child/safety prompts,
         # keep the source trust boundary even when observations are compacted.
-        if READING_POLICY not in system_prompt:
-            system_prompt += "\n" + READING_POLICY
+        reading_policy = ANSWER_READING_POLICY if stage in {"answer", "context_answer"} else READING_POLICY
+        if reading_policy not in system_prompt and READING_POLICY not in system_prompt:
+            system_prompt += "\n" + reading_policy
         content_reference = self._input_content_reference(stage)
         user_prompt, input_content = self._input_prompt(stage, user_prompt)
         image_reservation = input_content.token_reservation
@@ -8397,12 +8512,15 @@ class AgentTurnLoop:
         run_id = _turn_run_id.get()
         if run_manager is None or run_id is None:
             return
+        event_payload = dict(payload or {})
+        if type in {"assistant_message", "final_answer"}:
+            event_payload.update(self._answer_publication(run_id, pending=type == "assistant_message"))
         run_manager.append_event(
             run_id,
             type,
             message,
             stage=stage,
-            payload=payload or {},
+            payload=event_payload,
         )
 
     def _complete_current_run(self, result: AgentTurnResult) -> None:

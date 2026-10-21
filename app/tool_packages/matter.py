@@ -54,6 +54,8 @@ MATTER_PACKAGE = ToolPackageSpec(
         "Use kind=plan for an independent plan, then create kind=task records with its parent_matter_id. A plan may optionally reference an existing directory project_id; tasks inherit that project.",
         "Get the current record before editing and pass its expected_revision to avoid overwriting concurrent edits. Completing a plan does not complete its tasks.",
         "Scheduling changes planned work, never the deadline: use scheduled_on for a day and scheduled_start/scheduled_end for one time block; due_at remains the deadline. Clear both time endpoints together when removing a block.",
+        "When recording deadlines, preserve the source precision: a date-only deadline remains YYYY-MM-DD; do not convert it to an invented time such as 23:59. Keep an explicitly stated timestamp and timezone intact, and retain conflicting source dates as unresolved evidence until reconciled.",
+        "Do not mark an item cancelled merely because a broadcast or class-wide notice has no individual deadline. Check whether it requires a personal action such as self-checking, and preserve that action as an open matter when applicable. Cancel only when evidence says the action is cancelled, withdrawn, or no longer required.",
         "Use inbox=true for unorganized captured tasks and inbox=false after organizing. A task without dates is not automatically an inbox task. Plans may store ordered sections even when they have no tasks.",
         "Message-derived matters require their dedicated human review workflow; ordinary tool approval cannot authorize their mutation.",
         "Follow every tool input_schema exactly, especially required fields and allowed_values.",

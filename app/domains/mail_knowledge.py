@@ -42,6 +42,10 @@ class MailKnowledgeMirror:
             if self.source_id_for_account(account_id) in active_sources
         )
 
+    def active_source_ids(self, *, session_id: str | None = None) -> tuple[str, ...]:
+        """Return currently authorized mail mirror sources for a session."""
+        return tuple(self._knowledge_service.list_authorized_source_ids(session_id=session_id))
+
     def sync(
         self,
         *,

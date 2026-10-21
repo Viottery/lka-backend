@@ -42,6 +42,42 @@ _DELIVERY_LIMIT = 24
 _DELIVERY_MISSING = object()
 
 
+def mark_historical_import(output: dict[str, Any], artifact_id: str, *, store: Any = None,
+                           run_id: str | None = None, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Build provenance from the authorized source, not fields inside its body."""
+    history = getattr(store, "tool_result_artifact_is_historical", None)
+    historical = history(artifact_id, run_id) if callable(history) and run_id else artifact_id.startswith("progress_import_")
+    if historical:
+        output.update({"historical_only": True, "current_evidence": False,
+                       "freshness": "historical_source_not_revalidated",
+                       "source_artifact_id": artifact_id})
+    if payload is not None and run_id and callable(history):
+        output["_source_artifact"] = {"protocol": "tool-result-source.v1", "artifact_id": artifact_id,
+                                      "run_id": run_id, "content_hash": _artifact_content_hash(payload)}
+    return output
+
+
+def register_cached_result_reader(store: Any, tool_name: str) -> None:
+    register = getattr(store, "register_tool_result_lineage_producer", None)
+    if callable(register):
+        register(tool_name)
+
+
+def cached_result_source_binding(*, tool_input: dict[str, Any], result: ToolResult) -> dict[str, str] | None:
+    """Registered reader hook for its own envelope and the actual invocation input.
+
+    Source JSON is always nested in the reader response; it cannot supply or
+    overwrite the reader's top-level server-generated source descriptor.
+    """
+    if result.status != "completed":
+        return None
+    binding = result.output.get("_source_artifact")
+    if (not isinstance(binding, dict) or binding.get("protocol") != "tool-result-source.v1"
+            or binding.get("artifact_id") != tool_input.get("artifact_id")):
+        raise ValueError("Completed cache reader result lacks its trusted source binding.")
+    return {key: binding[key] for key in ("artifact_id", "run_id", "content_hash")}
+
+
 def _artifact_content_hash(payload: dict[str, Any]) -> str:
     # Exactly SqliteAgentRunStore's existing serialization; not a text-only hash.
     serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True,
@@ -240,13 +276,22 @@ def _context_delivery_bindings(
 
 
 class ObservationReadTool:
+    result_artifact_source = staticmethod(cached_result_source_binding)
     def __init__(self, store: Any) -> None:
         self.store = store
+        register_cached_result_reader(store, self.spec.name)
 
     def context_delivery_bindings(self, *, result_payload, view_payload, context, check_cancel=None):
         return _context_delivery_bindings(
             self, result_payload=result_payload, view_payload=view_payload, context=context,
             check_cancel=check_cancel)
+
+    def result_recovery(self, *, tool_input: dict[str, Any], result: ToolResult) -> dict[str, Any] | None:
+        recovery = result.output.get("recovery")
+        if (result.status == "rejected" and result.tool_name == self.spec.name
+                and isinstance(recovery, dict) and recovery.get("protocol") == "observation.read.v1"):
+            return recovery
+        return None
 
     spec = ToolSpec(
         name="observation.read",
@@ -260,7 +305,10 @@ class ObservationReadTool:
             "Array has_more=false does not mean projected fields are complete. Use a truncated field's "
             "read_path with fields omitted to read its text; max_chars controls string pages (default 8000, "
             "up to 16000). Selected pages are delivered intact when the model request budget permits; "
-            "inspect any remaining partial markers before advancing. next_offset on that field skips its visible prefix."
+            "inspect any remaining partial markers before advancing. next_offset on that field skips its visible prefix. "
+            "Object entries are a response wrapper, not part of the artifact path. Use read_paths for exact nested paths. "
+            "Object has_more/next_offset page object keys, independently of each string's text_coverage. "
+            "A rejected read may provide recovery.read_request; correct the input instead of repeating it."
         ),
         risk="low",
         requires_confirmation=False,
@@ -271,7 +319,8 @@ class ObservationReadTool:
         output_selected_content=True,
         output_preview_priority_fields=["text", "items", "entries", "path", "value_type", "has_more",
                                         "next_offset", "total", "projected_fields", "_delivery_view",
-                                        "value", "keys"],
+                                        "value", "keys", "read_paths", "text_coverage",
+                                        "pagination_scope", "recovery"],
         input_schema={
             "type": "object",
             "required": ["artifact_id"],
@@ -280,8 +329,8 @@ class ObservationReadTool:
                 "path": {"type": "string", "default": ""},
                 "offset": {"type": "integer", "minimum": 0, "default": 0},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 5},
-                "max_chars": {"type": "integer", "minimum": 1, "maximum": 16000, "default": 8000,
-                              "description": "String page size only; does not change record pagination."},
+                "max_chars": {"type": "integer", "minimum": 1, "maximum": 16000,
+                              "description": "Optional string page size (omitted: 8000). Omit for objects and arrays; this parameter never controls record pagination."},
                 "fields": {
                     "type": "array", "minItems": 1, "maxItems": 12,
                     "items": {"type": "string", "minLength": 1, "maxLength": 64},
@@ -293,12 +342,13 @@ class ObservationReadTool:
     )
 
     def invoke(self, *, invocation: ToolInvocation, context: ToolContext) -> ToolResult:
-        def rejected(message: str) -> ToolResult:
+        def rejected(message: str, recovery: dict[str, Any] | None = None) -> ToolResult:
             return ToolResult(
                 invocation_id=invocation.invocation_id,
                 tool_name=self.spec.name,
                 status="rejected",
                 error=message,
+                output={"recovery": recovery} if recovery is not None else {},
             )
 
         if not context.run_id:
@@ -335,17 +385,25 @@ class ObservationReadTool:
 
         payload = self.store.load_tool_result_artifact(artifact_id, context.run_id)
         if payload is None:
-            return rejected("Tool result artifact was not found in the current run.")
+            return rejected("Tool result artifact is unavailable in the current run or lacks verifiable source lineage. Read the original authorized source artifact again; do not repeat a business operation merely to reload its cached page.")
         try:
             value = _resolve_pointer(payload, path)
         except (KeyError, IndexError, ValueError, TypeError):
-            return rejected("path does not identify a value in the tool result.")
+            return rejected("path does not identify a value in the tool result.",
+                            _read_path_recovery(payload, path, artifact_id))
         if fields is not None and not isinstance(value, list):
             return rejected("fields projection requires path to identify an array.")
         if "max_chars" in invocation.input and not isinstance(value, str):
-            return rejected("max_chars requires path to identify a string.")
+            request = {key: item for key, item in invocation.input.items() if key != "max_chars"}
+            request["path"] = path
+            return rejected("max_chars requires path to identify a string.", {
+                "protocol": "observation.read.v1", "code": "max_chars_requires_string",
+                "retryable": True, "retry_same_input": False, "read_request": request,
+                "value_type": _value_type(value),
+            })
 
-        output = {"path": path, "value_type": _value_type(value)}
+        output = mark_historical_import({"path": path, "value_type": _value_type(value)}, artifact_id,
+                                       store=self.store, run_id=context.run_id, payload=payload)
         if isinstance(value, list):
             items: list[Any] = []
             used = 0
@@ -411,16 +469,25 @@ class ObservationReadTool:
         elif isinstance(value, dict):
             keys = list(value.keys())
             entries: dict[str, Any] = {}
+            read_paths: dict[str, str] = {}
+            text_coverage: dict[str, str] = {}
             used = 0
             for key in keys[offset:offset + limit]:
                 item_preview = _preview(value[key])
-                size = len(json.dumps({key: item_preview}, ensure_ascii=False, default=str))
+                read_path = _pointer_child(path, key)
+                text_state = "complete" if item_preview == value[key] else "partial_preview"
+                size = len(json.dumps({"entry": {key: item_preview}, "read_path": read_path,
+                                       "text_coverage": text_state if isinstance(value[key], str) else None},
+                                      ensure_ascii=False, default=str))
                 if entries and used + size > _PAGE_PREVIEW_CHARS:
                     break
                 if size > _PAGE_PREVIEW_CHARS:
                     item_preview = {"type": _value_type(value[key]), "preview_omitted": True}
                     size = len(json.dumps({key: item_preview}))
                 entries[key] = item_preview
+                read_paths[key] = read_path
+                if isinstance(value[key], str):
+                    text_coverage[key] = "complete" if item_preview == value[key] else "partial_preview"
                 used += size
             end = offset + len(entries)
             page_keys = list(entries)
@@ -428,13 +495,20 @@ class ObservationReadTool:
                 "entries": entries,
                 "total": len(keys),
                 "keys": page_keys,
+                "read_paths": read_paths,
+                "text_coverage": text_coverage,
+                "pagination_scope": "object_keys_only; has_more does not describe nested text coverage",
                 "has_more": end < len(keys),
                 "next_offset": end if end < len(keys) else None,
             })
+            if end < len(keys):
+                output["next_read_request"] = {"artifact_id": artifact_id, "path": path,
+                                               "offset": end, "limit": limit}
         elif isinstance(value, str):
             end = min(offset + max_chars, len(value))
             output.update({
                 "text": value[offset:end],
+                "pagination_scope": "string_characters",
                 "total": len(value),
                 "has_more": end < len(value),
                 "next_offset": end if end < len(value) else None,
@@ -456,9 +530,12 @@ class ObservationReadTool:
 class ObservationSearchTool:
     """Find literal text in a bounded portion of a current-run cached result."""
 
+    result_artifact_source = staticmethod(cached_result_source_binding)
+
     def __init__(self, store: Any, registry: Any = None) -> None:
         self.store = store
         self.registry = registry
+        register_cached_result_reader(store, self.spec.name)
 
     def context_delivery_bindings(self, *, result_payload, view_payload, context, check_cancel=None):
         return _context_delivery_bindings(
@@ -547,7 +624,7 @@ class ObservationSearchTool:
 
         payload = self.store.load_tool_result_artifact(artifact_id, context.run_id)
         if payload is None:
-            return rejected("Tool result artifact was not found in the current run.")
+            return rejected("Tool result artifact is unavailable in the current run or lacks verifiable source lineage. Read the original authorized source artifact again; do not repeat a business operation merely to reload its cached page.")
         try:
             root = _resolve_pointer(payload, path)
         except (KeyError, IndexError, ValueError, TypeError):
@@ -678,6 +755,7 @@ class ObservationSearchTool:
             "chars_scanned": chars_scanned,
             "total_matches": total_matches if complete else None,
         }
+        mark_historical_import(output, artifact_id, store=self.store, run_id=context.run_id, payload=payload)
         # Distinct-context suppression was based on these full windows. Shrink
         # them afterwards and skipped neighbors can lose their only visible
         # context. Page fewer intact windows instead; legacy occurrence mode
@@ -731,6 +809,39 @@ class ObservationSearchTool:
 def _pointer_child(parent: str, part: str | int) -> str:
     escaped = str(part).replace("~", "~0").replace("/", "~1")
     return f"{parent}/{escaped}"
+
+
+def _read_path_recovery(payload: dict[str, Any], path: str, artifact_id: str) -> dict[str, Any]:
+    """Describe the deepest existing parent; never infer a corrected source path.
+
+    The caller has already revalidated artifact access. Keys are literal source
+    names; preview wrapper names such as `entries` receive no special treatment.
+    """
+    parent_path, parent = "", payload
+    if path.startswith("/"):
+        prefix = ""
+        for token in path[1:].split("/")[:64]:
+            candidate = f"{prefix}/{token}"
+            try:
+                value = _resolve_pointer(payload, candidate)
+            except (KeyError, IndexError, ValueError, TypeError):
+                break
+            prefix = parent_path = candidate
+            parent = value
+    recovery: dict[str, Any] = {
+        "protocol": "observation.read.v1", "code": "invalid_path",
+        "retryable": True, "retry_same_input": False, "parent_path": parent_path,
+        "read_request": {"artifact_id": artifact_id, "path": parent_path},
+        "parent_type": _value_type(parent),
+        "note": "Read the existing parent or use one of its exact keys; response wrappers are not artifact paths.",
+    }
+    if isinstance(parent, dict):
+        keys = [key for key in list(parent)[:20] if len(key) <= 128]
+        recovery.update(available_keys=keys, keys_total=len(parent),
+                        keys_preview_complete=len(keys) == len(parent))
+    elif isinstance(parent, list):
+        recovery["array_length"] = len(parent)
+    return recovery
 
 
 def _shrink_snippet(match: dict[str, Any]) -> None:

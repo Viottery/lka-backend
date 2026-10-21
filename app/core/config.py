@@ -20,6 +20,13 @@ class Settings(BaseSettings):
     host: str = Field(default="127.0.0.1", alias="LKA_HOST")
     port: int = Field(default=8765, alias="LKA_PORT")
     data_dir: Path = Field(default=Path("./data/runtime"), alias="LKA_DATA_DIR")
+    db_timing_enabled: bool = Field(default=True, alias="LKA_DB_TIMING_ENABLED")
+    db_timing_sample_rate: float = Field(
+        default=0.01, alias="LKA_DB_TIMING_SAMPLE_RATE", ge=0, le=1, allow_inf_nan=False,
+    )
+    db_timing_slow_ms: float = Field(
+        default=50, alias="LKA_DB_TIMING_SLOW_MS", ge=0, allow_inf_nan=False,
+    )
     messages_media_cache_dir: Path | None = Field(
         default=None, alias="LKA_MESSAGES_MEDIA_CACHE_DIR"
     )

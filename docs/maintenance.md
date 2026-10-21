@@ -132,6 +132,43 @@ Windows CurrentUser DPAPI 凭据需重新配对，邮箱或外部模型服务也
 按随包的检查工具校验。它可能含真实凭据，不作为公开下载包上传。
 软件更新不会自动同步两台电脑的会话、记忆或资料。
 
+## 数据库耗时排查
+
+后端启动时默认向实际数据目录的 `logs/database_timing.jsonl` 写入 JSONL。
+单文件上限 10 MiB，保留 3 份轮转文件（`.1` 至 `.3`）；不依赖 Uvicorn 的访问日志格式。
+配置开关、采样率与慢阈值见[配置说明](configuration.md#配置放在哪里)。
+
+每条记录有 UTC `timestamp`，`kind` 区分：
+
+- `sqlite`：连接、SQL 执行、结果读取、显式写锁获取、提交或回滚的明细；
+  普通明细默认采样 1%，达到 50 ms 或失败的操作全部保留。
+- `sqlite_summary`：全部受监测操作的固定分桶统计，持续有操作时约每 60 秒输出，
+  正常关闭时补记剩余统计。`count`、`errors`、`total_ms`、`max_ms` 与
+  `bucket_counts` 不经过采样；`p50_upper_ms`、`p95_upper_ms`、`p99_upper_ms`
+  是对应分桶的上界估计，非精确分位数。最后一桶和分位上界的 `null` 表示超过 10 秒。
+  样本单位是一次阶段 API 调用；`fetchall` 按一批计，游标迭代按每次取行计。
+- `http`：请求的响应头耗时 `headers_ms`、完整响应耗时 `elapsed_ms`，以及
+  各数据库阶段的次数与累计耗时 `database_phases`。响应头 `X-Request-ID` 与
+  日志 `request_id` 关联；记录路由模板，不记录路径参数、查询参数或请求正文。
+  慢请求、5xx、未处理异常以及含慢／失败数据库操作的请求会额外保留。
+
+数据库阶段 `connect` 仅测连接建立，初始化 PRAGMA 计入 `execute`。
+`acquire_write` 测量显式 `BEGIN IMMEDIATE`／`BEGIN EXCLUSIVE`，包括获取写锁的等待和语句执行，
+不能当作纯锁等待时间。`execute` 包括语句内部的锁等待；`fetch` 包括 SQLite 后续步进、
+取行和 Python 行转换。`script` 包括整个 `executescript` 及其隐式提交；
+上下文管理器的提交失败可能包含 SQLite 自身的回滚。各阶段不应被解释为数据库内部 CPU 时间。
+
+SQL 明细只记录操作类别与语句哈希 `statement_id`，不保存 SQL 原文、绑定参数、结果、
+异常消息或数据库路径。语句哈希未做模板归一化；字面量不同可能产生不同哈希。
+线程池通过继承的请求上下文关联；无请求上下文的后台操作 `request_id` 为 `null`。
+并行数据库操作的累计时间可能大于请求墙钟时间，SSE 的完整响应时间还包含连接保持时间。
+不要从偏向慢操作的明细样本直接计算全体操作的分位数，应使用完整分桶统计。
+
+监测覆盖后端通用 SQLite 连接、消息历史、记忆、后台任务、额度账本和 LangGraph 检查点库。
+异步检查点操作由 aiosqlite 独立线程执行，不关联 HTTP 请求 ID。
+独立消息连接器和 Windows 前端不在 SQL 计时范围内；
+前端发往后端的请求可通过后端 HTTP 记录排查。日志写入失败不改变业务结果。
+
 ## 常见情况
 
 | 现象 | 先检查 |

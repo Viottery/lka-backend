@@ -58,3 +58,9 @@ def test_conditional_supervisor_reader_does_not_grant_write_commands(runtime, tm
     assert result.status == 'rejected' and result.execution_started is False
     assert result.output['authorization_denial']['code'] == 'invocation_not_read_only'
     assert not (tmp_path/'must-not-exist.txt').exists()
+
+
+def test_supervisor_reviews_report_gaps_without_rescanning_sources():
+    assert "只针对缺口给出补充指令" in SUPERVISOR_INSTRUCTIONS
+    assert "复用返回的证据和结果，不为补齐报告而重扫原资料" in SUPERVISOR_INSTRUCTIONS
+    assert "日期精度或来源冲突" in SUPERVISOR_INSTRUCTIONS

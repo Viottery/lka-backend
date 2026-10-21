@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Iterator
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager, closing, contextmanager
 from pathlib import Path
 
+import aiosqlite
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+from app.storage.sqlite_timing import connect_sqlite
 
 
 class SqliteCheckpointRuntime:
@@ -19,13 +22,16 @@ class SqliteCheckpointRuntime:
 
     @asynccontextmanager
     async def async_saver(self) -> AsyncIterator[AsyncSqliteSaver]:
-        async with AsyncSqliteSaver.from_conn_string(str(self.path)) as saver:
+        # Use aiosqlite's connector so opening and operations in its worker are timed.
+        async with aiosqlite.Connection(lambda: connect_sqlite(str(self.path)), iter_chunk_size=64) as conn:
+            saver = AsyncSqliteSaver(conn)
             await saver.setup()
             yield saver
 
     @contextmanager
     def sync_saver(self) -> Iterator[SqliteSaver]:
-        with SqliteSaver.from_conn_string(str(self.path)) as saver:
+        with closing(connect_sqlite(str(self.path), check_same_thread=False)) as conn:
+            saver = SqliteSaver(conn)
             saver.setup()
             yield saver
 

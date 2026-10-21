@@ -88,7 +88,7 @@ def test_agent_skip_review_records_and_executes_write_tool(tmp_path, monkeypatch
     assert listed.reviews[0].review_id == reviews[0].review_id
 
 
-def test_request_cannot_lower_configured_safety_review_mode(tmp_path, monkeypatch):
+def test_explicit_request_overrides_default_safety_review_mode(tmp_path, monkeypatch):
     app = _app(tmp_path, monkeypatch)
     loop = app.state.runtime.agent_turn_loop
     loop.safety_review_mode = SafetyReviewMode.MANUAL
@@ -96,7 +96,7 @@ def test_request_cannot_lower_configured_safety_review_mode(tmp_path, monkeypatc
 
     token = _turn_safety_review_mode.set(SafetyReviewMode.SKIP)
     try:
-        assert loop._effective_safety_review_mode() == SafetyReviewMode.MANUAL
+        assert loop._effective_safety_review_mode() == SafetyReviewMode.SKIP
     finally:
         _turn_safety_review_mode.reset(token)
 

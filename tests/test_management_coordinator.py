@@ -48,7 +48,15 @@ def bind(runtime):
     return runtime.agent_run_manager.get_run(row[0])
 
 
-def finalize(runtime, run):
+def finalize(runtime, run, *, notify_user=True):
+    current = runtime.agent_run_manager.get_run(run.run_id)
+    if (notify_user is not None and current.status == AgentRunStatus.RUNNING
+            and not current.metadata.get("cancel_requested") and not current.metadata.get("pause_requested")):
+        runtime.management_coordinator.notifications.decide_notification(
+            ToolContext(session_id=run.session_id, run_id=run.run_id, safety_review_approved=True),
+            command_id="test-notification-" + run.run_id, notify_user=notify_user,
+            reason="Publish the verified update for this notification test.",
+        )
     result = AgentTurnResult(run_id=run.run_id, session_id=run.session_id, trace_id=run.trace_id, answer="Checked.",
                              progress_events=[AgentTurnProgressEvent(
                                  event_index=1, created_at=datetime.now(UTC).isoformat(), type="final_answer",
@@ -112,7 +120,12 @@ def test_bound_before_restart_executes_original_and_publishes_once(runtime):
     runtime.stop()
     reopened = LocalKnowledgeAgentRuntime(runtime.settings)
     try:
-        client = ScriptedClient([operation("final_answer", reason="Report timer check"), "Checked after restart."])
+        client = ScriptedClient([
+            operation("expand_package", package_name="management"),
+            operation("tool_call", tool_name="management.decide_notification", tool_input={
+                "command_id": "restart-notification", "notify_user": True, "reason": "The requested timer check is complete."}),
+            operation("final_answer", reason="Report timer check"), "Checked after restart.",
+        ])
         reopened.agent_turn_loop.llm_client = client
         assert reopened.agent_dispatch.run_one()
         run = reopened.agent_run_manager.get_run(original.run_id)
@@ -196,6 +209,8 @@ def test_real_harness_stages_goal_tool_and_publishes(runtime):
         operation("expand_package", package_name="management"),
         operation("tool_call", tool_name="management.set_goal", tool_input={
             "command_id": "done", "goal_id": goal["goal_id"], "expected_revision": 1, "status": "completed"}),
+        operation("tool_call", tool_name="management.decide_notification", tool_input={
+            "command_id": "goal-notification", "notify_user": True, "reason": "The requested goal check is complete."}),
         operation("final_answer", reason="One-shot check is complete"), "The check is complete.",
     ])
     runtime.agent_turn_loop.llm_client = client
@@ -451,6 +466,8 @@ def test_task_terminal_wakes_manager_to_read_result_without_user_poll(runtime):
     client = ScriptedClient([
         operation("expand_package", package_name="management"),
         operation("tool_call", tool_name="management.read_session", tool_input={"session_id": receipt["session_id"]}),
+        operation("tool_call", tool_name="management.decide_notification", tool_input={
+            "command_id": "result-notification", "notify_user": True, "reason": "The user requested this task result."}),
         operation("final_answer", reason="The task result was read"), "Task result: SYNTHETIC_RESULT_713",
     ])
     runtime.agent_turn_loop.llm_client = client
@@ -461,6 +478,33 @@ def test_task_terminal_wakes_manager_to_read_result_without_user_poll(runtime):
     delivery = runtime.management_goals.list_deliveries(sid)["deliveries"][0]
     assert delivery["run_id"] == manager.run_id
     assert runtime.management_coordinator.tick() == {"captured": 0, "scheduled": 0}
+
+
+def test_deleted_task_terminal_event_is_obsoleted_before_manager_wake(runtime):
+    enable(runtime)
+    sid = runtime.management_service.create()["session"]["session_id"]
+    runtime.management_service.update(sid, expected_revision=1, status="active")
+    parent = runtime.create_agent_run(session_id=sid, user_input="Start a task", resumable=True)
+    runtime.agent_run_manager.mark_running(parent.run_id)
+    receipt = runtime.managed_tasks.start_task(
+        ToolContext(session_id=sid, run_id=parent.run_id, safety_review_approved=True),
+        command_id="deleted-task-terminal", purpose="Finish a synthetic background task",
+    )
+    runtime.agent_run_manager.complete_run(parent.run_id)
+    task_run = runtime.agent_run_manager.get_run(receipt["run_id"])
+    runtime.agent_run_manager.mark_running(task_run.run_id)
+    runtime.agent_run_manager.complete_run(task_run.run_id)
+
+    assert runtime.management_goals.capture_events() == 1
+    event = runtime.management_goals.list_events(sid)["events"][0]
+    assert event["kind"] == "task_terminal" and event["consumed_execution_id"] is None
+
+    assert runtime.delete_session(session_id=receipt["session_id"])
+    with closing(runtime._conn()) as conn, conn:
+        assert runtime.management_coordinator._pending(conn, sid) == []
+
+    event = runtime.management_goals.list_events(sid)["events"][0]
+    assert event["consumed_execution_id"] == "obsolete"
 
 
 def test_wake_lease_expiring_during_binding_rolls_back_dispatch(runtime, monkeypatch):

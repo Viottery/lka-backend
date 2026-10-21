@@ -131,6 +131,11 @@ class ReadFileTool:
         requires_confirmation=False,
         read_only=True,
         side_effects=["read_local_file"],
+        output_evidence_roles=[
+            {"path": "/content", "role": "source_content"},
+            {"path": "/resolved_path", "role": "source_locator"},
+            {"path": "/sha256", "role": "source_version"},
+        ],
         scope_path_fields=("path",),
         scope_uses_workspace=True,
         input_schema={

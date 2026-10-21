@@ -154,10 +154,29 @@
       "tests/test_tool_selection_feedback.py"
     ],
     "execution_workspace": [
-      "tests/test_management_execution_workspace.py"
+      "tests/test_management_execution_workspace.py",
+      "tests/test_management_dispatch_defaults.py"
     ],
     "result_evidence": [
       "tests/test_management_results.py"
+    ],
+    "session_progress_cache": [
+      "tests/test_session_progress_cache.py",
+      "tests/test_progress_continuation_integration.py",
+      "tests/test_observation_read_recovery.py",
+      "tests/test_cached_result_read_routes.py",
+      "tests/test_observation_artifact_lineage.py",
+      "tests/test_prompt_budget.py",
+      "tests/test_answer_evidence_calibration_quality.py",
+      "tests/test_task_progress.py",
+      "tests/test_task_progress_runtime.py",
+      "tests/test_progress_review_safety.py"
+    ],
+    "management_notifications": [
+      "tests/test_management_notifications.py"
+    ],
+    "management_result_recovery": [
+      "tests/test_management_result_recovery.py"
     ]
   }
 }

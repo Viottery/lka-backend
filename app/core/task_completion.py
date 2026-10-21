@@ -52,6 +52,9 @@ def _evidence_digest(observations: list[dict[str, Any]]) -> str:
     # evidence. Only successful tool output can reopen a recovery opportunity.
     evidence = set()
     for observation in observations:
+        cache = observation.get("_cache")
+        if observation.get("historical_only") or isinstance(cache, dict) and cache.get("historical_only"):
+            continue
         result = observation.get("result")
         if not isinstance(result, dict) or result.get("status") != "completed":
             continue

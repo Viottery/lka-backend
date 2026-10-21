@@ -641,6 +641,7 @@ class AgentGraphRunner:
             window["recalled_memories"] = recalled
         cached = self.turn_loop._cached_tool_observations_from_session(
             session_id=session.session_id,
+            query=turn_user_input,
             context=self._context(
                 AgentTurnWorkingSet(
                     run_id=run.run_id,
@@ -913,9 +914,6 @@ class AgentGraphRunner:
         ws, data = self._data(s)
         x = ws.pending_decision
         action = str(x.get("action") or "")
-        if x.get("_progress_review_required"):
-            ws.pending_decision = {}
-            return self._save(s, ws, data, "operation_rejected")
         if action in {"invalid_structured_decision", "invalid_plain_text_decision", "invalid_empty_decision", "malformed_tool_call", "invalid_final_answer"}:
             progress = self._models(data["progress_events"], AgentTurnProgressEvent)
             self.turn_loop._record_incomplete(progress, "decision_protocol_invalid")
@@ -1131,6 +1129,13 @@ class AgentGraphRunner:
             if isinstance(x.get("operation"), dict)
             else False
         )
+        progress = self._models(data["progress_events"], AgentTurnProgressEvent)
+        if self.turn_loop._rejected_tool_repeat_feedback(
+            ws.task_working_state, name, tool_input, data["observations"], progress,
+        ):
+            data["progress_events"] = self._dump(progress)
+            ws.pending_decision = {}
+            return self._save(s, ws, data, "operation_rejected")
         if fp in data["successful"] and not repeat:
             progress = self._models(data["progress_events"], AgentTurnProgressEvent)
             self.turn_loop._duplicate_tool_feedback(
@@ -1533,6 +1538,7 @@ class AgentGraphRunner:
             verification_warnings=self._models(data["warnings"], AgentTurnVerificationWarning),
             llm_events=self._models(data["llm_events"], AgentTurnLLMEvent),
         )
+        result = result.model_copy(update=self.turn_loop._answer_publication(ws.run_id))
         log = self.turn_loop._write_log(result=result, user_input=ws.user_input)
         result = result.model_copy(update={"log_path": str(log)})
         # Persist the recoverable result before competing with cancellation.  The
@@ -1545,6 +1551,8 @@ class AgentGraphRunner:
             "answer": result.answer,
             "task_outcome": result.task_outcome,
             "stop_reason": result.stop_reason,
+            "user_visible": result.user_visible,
+            "notification": result.notification,
             "selected_package": result.selected_package,
             "initial_package": result.initial_package,
             "expanded_packages": result.expanded_packages,
@@ -1805,6 +1813,10 @@ class AgentGraphRunner:
         phase: str,
         status: str = "running",
     ) -> AgentGraphState:
+        cache = getattr(self.turn_loop, "session_progress_cache", None)
+        if cache is not None:
+            cache.record(context=self._context(ws), tool_events=data.get("tool_events", []),
+                         working_state=ws.task_working_state.context())
         return {
             "working_set": ws.model_dump(mode="json"),
             "runtime_artifact_ref": self._save_data(s["run_id"], data),
@@ -1960,6 +1972,7 @@ class AgentGraphRunner:
             run_id=ws.run_id,
             llm_client_name=inference_client,
             llm_model=inference_model,
+            safety_review_mode=self.turn_loop._safety_review_preference().value,
         )
 
     def _fail(self, run_id: str, exc: Exception) -> None:

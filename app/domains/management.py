@@ -11,6 +11,10 @@ class ManagementConflictError(ValueError):
     """The requested transition conflicts with persisted management state."""
 
 
+class ManagementPausedError(ManagementConflictError):
+    """A paused controller cannot accept work, regardless of safety approval."""
+
+
 _UNSET = object()
 _TERMINAL_RUNS = ("completed", "failed", "cancelled", "timed_out")
 
@@ -23,13 +27,13 @@ class ManagementService:
         self.workspace_resolver = workspace_resolver
 
     @staticmethod
-    def allowed_tool_names(tools, *, manager):
+    def allowed_tool_names(tools, *, manager, active=True):
         """Keep supervisor capabilities out of ordinary sessions across packages."""
         def management_tool(tool):
             return tool.package == "management" or tool.name.startswith("management.")
 
         return [tool.name for tool in tools if (
-            (management_tool(tool) and tool.name != "management.report_delegate")
+            (management_tool(tool) and tool.name != "management.report_delegate" and (active or tool.read_only is True))
             or tool.read_only is True or tool.supports_read_only_invocations
         )] if manager else [tool.name for tool in tools if not management_tool(tool)]
 

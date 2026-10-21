@@ -1,4 +1,4 @@
-"""Managed high-risk effects wait for original human approval across restart."""
+"""Blacklisted effects keep human approval; generic risk follows user preference."""
 from contextlib import closing
 
 import pytest
@@ -21,11 +21,15 @@ def runtime(tmp_path, monkeypatch):
 
 
 class SensitiveOperation:
-    def __init__(self, effects, *, risk="high", confirmation=False):
+    def __init__(self, effects, *, risk="high", confirmation=False, blacklisted=False):
         self.effects = effects
+        self.blacklisted = blacklisted
         self.spec = ToolSpec(name="approval_probe.write", package="approval_probe", type="local_tool",
             description="Record an isolated synthetic operation", risk=risk, requires_confirmation=confirmation,
             read_only=False, side_effects=["synthetic_write"], input_schema={"type": "object", "properties": {}})
+
+    def manual_review_reason(self, tool_input):
+        return "Synthetic destructive blacklist rule" if self.blacklisted else None
 
     def invoke(self, *, invocation, context):
         self.effects.append(context.run_id)
@@ -40,9 +44,9 @@ def register(runtime, effects, **kwargs):
 
 @pytest.mark.parametrize("target", ["execution", "delegate"])
 @pytest.mark.parametrize("decision", [SafetyReviewDecision.APPROVE, SafetyReviewDecision.REJECT])
-def test_high_risk_managed_effect_requires_original_user_decision_after_restart(runtime, target, decision):
+def test_blacklisted_managed_effect_requires_original_user_decision_after_restart(runtime, target, decision):
     effects = []
-    register(runtime, effects)
+    register(runtime, effects, blacklisted=True)
     parent = manager_context_fixture.__wrapped__(runtime)
     delegation = runtime.management_delegates.delegate_work(parent, command_id="delegate", objective="Inspect one bounded line",
                                                             allowed_tools=["approval_probe.write"])
@@ -56,7 +60,7 @@ def test_high_risk_managed_effect_requires_original_user_decision_after_restart(
         run_id = run.run_id
         runtime.agent_dispatch.enqueue(run_id)
     before = runtime.agent_run_manager.get_run(run_id)
-    assert before.metadata["session_policy"]["require_high_risk_approval"] is True
+    assert not before.metadata["session_policy"].get("require_high_risk_approval")
     runtime.agent_turn_loop.safety_review_mode = SafetyReviewMode.SKIP
     runtime.agent_turn_loop.llm_client = ScriptedClient([
         operation("expand_package", package_name="approval_probe"),
@@ -73,14 +77,14 @@ def test_high_risk_managed_effect_requires_original_user_decision_after_restart(
     runtime.stop()
     reopened = LocalKnowledgeAgentRuntime(runtime.settings)
     try:
-        register(reopened, effects)
+        register(reopened, effects, blacklisted=True)
         reopened.agent_turn_loop.safety_review_mode = SafetyReviewMode.SKIP
         reopened.agent_turn_loop.llm_client = ScriptedClient([
             operation("final_answer", reason="The user decision was respected."), "Decision respected.",
         ])
         restored = reopened.agent_run_manager.get_safety_review(original.review_id)
         assert restored.status == SafetyReviewStatus.PENDING and restored.mode == SafetyReviewMode.MANUAL
-        assert reopened.agent_run_manager.get_run(run_id).metadata["session_policy"]["require_high_risk_approval"] is True
+        assert not reopened.agent_run_manager.get_run(run_id).metadata["session_policy"].get("require_high_risk_approval")
         with pytest.raises(AgentTurnWaitingForConfirmation):
             reopened.resume_agent_run(run_id)
         assert reopened.agent_run_manager.get_run(run_id).metadata["confirmation_id"] == original.review_id
@@ -114,7 +118,7 @@ def test_high_risk_managed_effect_requires_original_user_decision_after_restart(
 
 @pytest.mark.parametrize("mode", [SafetyReviewMode.SKIP, SafetyReviewMode.LLM])
 @pytest.mark.parametrize("risk,confirmation", [("high", False), ("low", True)])
-def test_frozen_policy_forces_manual_review_for_each_registered_risk_signal(runtime, mode, risk, confirmation):
+def test_generic_risk_markers_do_not_override_selected_preference(runtime, mode, risk, confirmation):
     from app.core.agent_turn import _turn_run_id, _turn_safety_review_mode
 
     register(runtime, [], risk=risk, confirmation=confirmation)
@@ -125,20 +129,20 @@ def test_frozen_policy_forces_manual_review_for_each_registered_risk_signal(runt
     mode_token = _turn_safety_review_mode.set(SafetyReviewMode.SKIP)
     runtime.agent_turn_loop.safety_review_mode = mode
     try:
-        assert runtime.agent_turn_loop._effective_safety_review_mode("approval_probe.write") == SafetyReviewMode.MANUAL
-        assert runtime.agent_turn_loop._effective_safety_review_mode("filesystem.read_file") == mode
+        assert runtime.agent_turn_loop._effective_safety_review_mode("approval_probe.write") == SafetyReviewMode.SKIP
+        assert runtime.agent_turn_loop._effective_safety_review_mode("filesystem.read_file") == SafetyReviewMode.SKIP
     finally:
         _turn_safety_review_mode.reset(mode_token)
         _turn_run_id.reset(run_token)
 
 
-def test_legacy_frozen_policy_waits_for_human_even_when_configured_llm_and_requested_skip(runtime, monkeypatch):
+def test_legacy_blacklisted_operation_waits_for_human_in_skip_mode(runtime, monkeypatch):
     from threading import Thread
 
     from tests.test_safety_reviews import _wait_for_review
 
     effects = []
-    register(runtime, effects)
+    register(runtime, effects, blacklisted=True)
     run = runtime.create_agent_run(session_id="legacy-policy", user_input="Exercise frozen approval")
     assert runtime.agent_run_orchestrator(run.run_id) == "legacy"
     runtime.agent_run_manager._update_run(run.run_id, status=run.status,

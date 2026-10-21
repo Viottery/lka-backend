@@ -24,6 +24,7 @@ from typing import Any
 from uuid import uuid4
 
 from app.core.llm.errors import LLMClientError
+from app.storage.sqlite_timing import connect_sqlite
 
 _BACKGROUND_POOLS = {"background_memory", "background_message", "background_io", "background_agent"}
 _logger = logging.getLogger(__name__)
@@ -382,7 +383,7 @@ class LLMWorkloadController:
 
     @contextmanager
     def _connect(self):
-        conn = sqlite3.connect(self.db_path, timeout=10)
+        conn = connect_sqlite(self.db_path, timeout=10)
         conn.row_factory = sqlite3.Row
         try:
             with conn:

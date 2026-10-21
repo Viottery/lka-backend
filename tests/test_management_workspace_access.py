@@ -67,6 +67,7 @@ def test_task_workspace_external_bash_effect_requires_manual_decision_and_never_
     workspace.mkdir()
     external.mkdir()
     target = external / "effect.txt"
+    manager_context.safety_review_mode = "manual"
     receipt = runtime.managed_tasks.start_task(
         manager_context, command_id=f"bash-{decision.value}", purpose="Run the requested local command",
         workspace_path=str(workspace),

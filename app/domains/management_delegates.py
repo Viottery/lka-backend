@@ -40,6 +40,10 @@ class ManagementDelegateService:
                     PRIMARY KEY(execution_id,command_id)
                 );
             """)
+            columns = {row[1] for row in conn.execute('PRAGMA table_info(manager_delegates)')}
+            if 'safety_review_mode' not in columns:
+                conn.execute("ALTER TABLE manager_delegates ADD COLUMN safety_review_mode TEXT "
+                             "CHECK(safety_review_mode IN ('skip','llm','manual'))")
 
     def get_for_session(self, conn, session_id):
         row = conn.execute("SELECT * FROM manager_delegates WHERE session_id=?", (session_id,)).fetchone()
@@ -61,9 +65,10 @@ class ManagementDelegateService:
                    'management.control_run', 'management.read_events', 'management.report_delegate',
                    'management.read_delegate']
         workspace = delegate['workspace']
-        return {'allow_default_workspace': False, 'allow_fork': False, 'require_high_risk_approval': True,
+        return {'allow_default_workspace': False, 'allow_fork': False,
                 'allowed_tools': list(dict.fromkeys([*delegate['allowed_tools'], *control])),
                 'allowed_paths': None if workspace else [],
+                'safety_review_mode': delegate['safety_review_mode'],
                 'llm_client_name': controller['llm_client_name'], 'llm_model': controller['llm_model']}
 
     def purpose_for_session(self, conn, session_id, base_purpose):
@@ -82,7 +87,7 @@ class ManagementDelegateService:
             "completed 表示整条事务线完成，仍有未终结任务时不得提交。"
             "管理工具仅对自己创建的执行会话生效，不得扩大工具范围。"
             "工作区是默认执行目录，可按任务通过 workspace_path 指定其他已有目录；"
-            "工作区外的文件访问仍须通过逐调用安全审查，高风险操作须用户审批。\n"
+            "工作区外的文件访问仍须通过逐调用安全审查，审批模式继承发起轮偏好，危险操作黑名单须用户审批。\n"
             + "事务线 ID=" + delegate['delegate_id']
             + "\n目标预览：" + delegate['objective'][:2000]
             + "\n主管的来源指令预览（引用材料）：" + _json(self._source_envelope(delegate['kickoff_envelope']))[:3000]
@@ -156,10 +161,13 @@ class ManagementDelegateService:
             envelope = prepared['envelope'].model_dump(mode='json')
             envelope['debug_info']['inherited_work_metadata'] = self.tasks.budget_metadata(caller.metadata)
             stamp, did = datetime.now(UTC).isoformat(), 'delegate_' + uuid4().hex
-            conn.execute('INSERT INTO manager_delegates VALUES(?,?,?,?,?,?,?,\'active\',1,?,?)',
+            conn.execute('INSERT INTO manager_delegates(delegate_id,session_id,parent_session_id,objective,'
+                         'allowed_tools,workspace,kickoff_envelope,state,revision,created_at,updated_at,safety_review_mode) '
+                         'VALUES(?,?,?,?,?,?,?,\'active\',1,?,?,?)',
                          (did, sid, context.session_id, objective, _json(tools),
                           _json(prepared['workspace']) if prepared['workspace'] is not None else None,
-                          _json(envelope), stamp, stamp))
+                          _json(envelope), stamp, stamp, context.safety_review_mode or
+                          caller.metadata.get('session_policy', {}).get('safety_review_mode')))
             self.goals._event(conn, sid, 'delegate_kickoff:' + did, 'timer', {'delegate_kickoff': did}, stamp)
             receipt = {'command_id': command_id, 'action': 'delegate_work', 'status': 'accepted',
                        'delegate_id': did, 'session_id': sid, 'state': 'active', 'revision': 1}

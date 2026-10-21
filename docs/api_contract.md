@@ -576,8 +576,9 @@ max_matches=20)` 定位正文（大小写敏感的字面搜索，最多 100 个�
 刷新，响应不包含 API key。`GET /agent/ui-defaults` 和 `PUT /agent/ui-defaults` 读取及保存
 本机共享的前端默认设置，字段为 `llm_client`、`llm_model`、`safety_mode`、`stream`、
 `workspace_parent`。默认设置只影响前端之后发出的请求或新建工作区，不修改已有会话。
-请求可选带 `safety_review_mode`（`skip`、`llm`、`manual`）。后端取请求与本地配置中
-更严格的模式，因此前端可以提高审查级别，但不能绕过后端配置；省略时使用本地配置。
+请求可选带 `safety_review_mode`（`skip`、`llm`、`manual`）。显式选择优先于继承偏好及本地默认配置；省略时使用会话继承偏好，再回退本地配置。
+命中工具的危险操作黑名单时，无论选择 skip 或 llm 均要求人工审批；已有待人工审批记录保持原决策入口。
+Bash 黑名单包括递归删除（`rm -r/-rf`、`Remove-Item -Recurse`、`rd /s`、`find -delete`）、磁盘格式化／擦除、原始设备覆写，以及 `git reset --hard`／`git clean -f`。常见包装命令、命令替换和终端输入也检查；这是显式命令检查，不是 OS 沙箱或任意脚本的语义分析。
 每次 LLM 调用都会在响应的 `llm_events` 中带上 `llm_call_id`、provider / model、
 response mode、耗时、usage、finish reason、provider request id、rate-limit headers、
 错误分类和 retry 判断等审计字段。完整 prompt / output 仍只写入本地 markdown run log；
@@ -639,7 +640,7 @@ audit record 和本地日志路径均不属于正常 HTTP 响应；它们只保�
   decision hints 和 cache policy 提供。
 - 展开 package 后，Agent 会进入单次 turn 内的 step-limited loop：每一步生成一个
   `decision_event`，动作可以是调用一个工具、展开 package、请求确认，或进入最终回答阶段；
-  工具结果作为 observation 进入下一步。默认 step budget 为 10，可通过
+  工具结果作为 observation 进入下一步。默认 step budget 为 32，可通过
   `config/local.toml` 的 `[agent].max_decision_steps` 调整。
 - 当当前 LLM client 在 `config/local.toml` 声明 `supports_function_calling = true` 时，
   decision stage 优先使用 provider-native Function Calling：已展开工具的 input schema 与通用
@@ -743,10 +744,21 @@ audit record 和本地日志路径均不属于正常 HTTP 响应；它们只保�
   `llm_started` 事件带输入估算、上限及计数方法。
 - 每次 Agent turn 会把确定性的 `current_time` 注入 session context window，包含 UTC、
   本地时间、时区和当前日期；这让 LLM 能处理“今天/明天/8月5号之后”等相对时间。
-- Agent 会从同一 session 的历史工具结果中恢复由 Tool Package metadata 标记为可缓存的
-  本地资源。缓存以 `cached_tool_observations` 注入 context window；如果追问可以由缓存
-  observation 回答，Agent 应直接回答或把缓存作为已有 observation 使用，不再重复调用
-  等价工具。
+- 同一 session 的后续独立 root 先获得按当前任务相关度选择的有界进度／证据索引，
+  包含来源 run、时间、实际操作句柄、剩余要求和未验证的历史结论，不预装旧工具正文。
+  `progress.search(query?,limit?)` 检索最近 16 个 root 索引，limit 默认为 8、上限 12，
+  coverage=bounded 不表示遍历全部历史。`progress.load(source_run_id,evidence_id)`
+  在复验会话、项目、工作区和当前权限后将允许的旧结果复制为当前 run 的缓存句柄，
+  返回可直接执行的 `read_request`；注册元数据声明且实际存在唯一正文时，该请求直达正文字符串。
+  多正文或未知结构仍以完整输出对象为入口，`source_content_reads` 提供有界正文路径，
+  `container_read_request` 始终保留完整结果入口。正文路径只来自注册声明，不接受来源自报。
+  再经 `observation.read/search/group` 分页读取；不会开放 observation 的任意跨 run 读取。
+  失败轮的实际成功操作也可继续读取，历史工作记录不证明业务完成，不授权重复写入。
+  来源运行撤回、缓存原文变更、权限收窄或 history_reset_at 变化会使旧索引／已复制句柄失效；
+  经读取、检索或分组产生的二级及后续工具结果保留服务端来源链，后续读取递归复验来源与版本，
+  并继承历史标记；循环或超过有界深度的来源链拒绝读取。来源正文中的自报字段不能建立来源关系。
+  child 不继承更广历史范围，跨会话只能经另有服务端归属授权的管理结果工具读取。
+  完整读取后仍标 historical_only=true、current_evidence=false，当前状态需另行核验。
 - 如果某个 package 需要同步、刷新或跨 package 工作流，这些策略必须写在该 package 的
   metadata / tool descriptions / schemas 中，由 Agent core 注入 prompt 后让 LLM 决策。
 - context window 未满时不做摘要；超过预算时触发独立 `context_summarize` LLM 调用，
@@ -1520,7 +1532,7 @@ make_default=true 表示显式切换默认入口，主控会话无需固定 ID�
 主管角色策略在首次路由前装载并冻结，普通执行会话不继承；原有安全审查与审批独立生效。事务线子 agent 的工具能力按委托冻结；默认执行目录与文件访问授权分别处理。
 单条事项可在 `matter` 包使用 `management.create_matter` / `management.update_matter`，无需展开整套管理工具。
 两者复用 `management.organize_work` 的事务、修订和自主发布检查；未开放普通 `matter.update` 等即时写工具。
-controller active 才能发出管理写命令；paused 可对话和读取结果。普通任务和 child 不开放管理包。
+controller active 才能发出管理写命令；paused 可对话和读取结果，新轮工具目录仅开放管理读取，并明确提示管理暂停。运行创建后才切为暂停时，管理写工具返回 management_paused、task_accepted=false、retryable=false，不能把安全审查通过解释为任务已受理，也不应更换 command_id 重试。普通任务和 child 不开放管理包。
 
 默认全局助手支持独立的持久用户消息队列；需启用管理功能和 SQLite 检查点。
 它不依赖 controller active 或自主运行开关。普通会话及事务线子 agent 不开放此入口。
@@ -1534,6 +1546,9 @@ controller active 才能发出管理写命令；paused 可对话和读取结果�
 入队正文包含 `client_message_id`（客户端生成、非空、最长 128 字符）、`user_input`、
 `attachment_ids`（无附件传空数组），以及可选 `safety_review_mode` 和
 `llm: {response_mode: "stream"|"text"}`。空文字需要有效附件。
+可选 `replace_run_id` 为非空、最长 128 字符的运行 ID：显式替换本会话已暂停的根任务，
+并将本条输入直接关联替代运行。运行中、等待确认／答复、目标已变化或执行租约仍被占用时返回 409，
+不保存新消息或创建替代运行。该字段也属于请求幂等指纹；精确重试始终返回原回执。
 同一会话与消息 ID 的相同请求返回原回执，变更内容复用 ID 返回 409。队列最多保留 100 条未完成输入，已满时新输入返回 409；原请求重试仍返回回执。
 附件使用既有上传接口，随每条消息独立绑定，不继承另一条消息的附件。
 
@@ -1543,10 +1558,20 @@ controller active 才能发出管理写命令；paused 可对话和读取结果�
 状态为 queued/running/completed/failed/cancelled，尚未创建运行时 run_id 为 null。
 已接收仅代表持久保存，不代表模型已读取或已完成请求。
 
-队列按服务器受理顺序，每条消息创建独立的普通用户轮。当前主运行结束后自动处理下一条，
-不将新消息注入正在执行的模型请求，也不抢占后台运行。
+队列按服务器受理顺序处理。当前主运行结束后预留下一轮；该轮首次执行、读取模型上下文前，
+原子冻结当时已受理且设置兼容的连续消息，合并为一次普通用户轮。冻结后到达的消息留到后续轮次，
+恢复检查点不会扩充原批次，不将新消息注入正在执行的模型请求，也不抢占后台运行。
+每条消息保留原文、附件关联及独立幂等回执；同一批回执可以共享 `run_id`，该批统一回复一次。
+批次仅合并相同 `safety_review_mode` 和 `llm.response_mode` 的连续输入，去重后的附件合计最多 4 个，
+同时遵守既有媒体大小限制及批次文字上限 100000 字符；不兼容时在该条之前结束批次，保持 FIFO，
+不丢弃已接收输入。原有单条输入和回执字段保持兼容。
 暂停或等待确认／答复的主运行继续保留会话位置；队列继续接口不替代原运行的恢复、审批或答复。
-失败或取消暂停后续自动处理，保留排队消息供用户显式继续。
+已暂停时带 `replace_run_id` 发送新指令，复用原运行替换语义，取消旧任务并立即派发新轮；
+消息保存、替代运行、队列观察位置与派发 outbox 在同一事务提交，其他排队消息保留，随后继续处理；替换轮不会合并其之前排队的旧指令。
+原消息、操作记录和已完成的操作保留；不带该字段仍按普通 FIFO 排队。桌面助理在已暂停时发送的第一条新指令会带上该字段，
+空输入点击“继续”则通过原 resume 接口恢复原任务。
+用户轮失败或取消暂停后续自动处理，保留排队消息供用户显式继续；后台管理轮的失败或策略取消不会暂停用户消息队列。
+历史版本已经写入且原因不明的暂停继续保留，需用户显式继续，不自动重放旧指令。
 关闭页面不会取消队列，重启后依靠持久状态和原检查点恢复；不重放效果未知的工具操作。
 运行观察沿用 `GET /agent/runs/{run_id}/stream`，通过查询队列取得后续 run_id。
 原 `/agent/turn` 接口的忙碌冲突合同保持不变。
@@ -1567,8 +1592,11 @@ controller active 才能发出管理写命令；paused 可对话和读取结果�
 替换还含 `replaced_run_snapshot`，分别描述新 run 已排队和旧 run 已取消，不能沿用介入前的 paused。
 `accepted` 是命令受理状态，不能当作运行完成；暂停请求中的 `pause_requested=true` 不等于已暂停。
 回执快照随命令固定，幂等重放保持原值；需查询当前状态时使用新的只读查询。
-workspace_path 支持已有会话路径协议（含 Windows 到 WSL 映射），仍验证工作区根。省略时使用 controller.default_execution_workspace 创建独立任务目录；未配置可接受无目录的数据任务，但其冻结路径为空，不开放工作区工具。默认执行目录在受理时冻结，不受后来默认目录或会话目录修改影响，也不回退到后端首工作区。有执行目录的助理任务不把该目录作为文件访问边界；工作区外文件与 Bash cwd 进入现有逐调用安全审查，所有高风险操作仍等待用户审批，工具白名单与数据源授权不变。指定另一位置的新项目时，可选择其已有父目录，让执行会话创建项目目录与文件。
-`management.read_task_result(run_id,section?,start_char?,max_chars?)` 返回本主管及直属事务线所属独立 root 的执行状态和分页结果，事务线仅能读取自己任务；普通或 child caller 不获授。section 为 answer（默认）或 evidence，后者 content 为 JSON 字符片段，按 next_char 拼接后解析。仅含实际持久工具证据的白名单字段，不包含系统提示、metadata、工具输入或 shell stdout。deleted、非归属和 child run 均拒绝；运行终态不证明业务完成，证据不代替新操作审批。
+workspace_path 支持已有会话路径协议（含 Windows 到 WSL 映射），仍验证工作区根。省略时使用 controller.default_execution_workspace 创建独立任务目录；未配置可接受无目录的数据任务，但其冻结路径为空，不开放工作区工具。默认执行目录在受理时冻结，不受后来默认目录或会话目录修改影响，也不回退到后端首工作区。有执行目录的助理任务不把该目录作为文件访问边界；工作区外文件与 Bash cwd 进入现有逐调用安全审查，审批模式继承发起轮选择，命中危险操作黑名单时等待用户审批，工具白名单与数据源授权不变。指定另一位置的新项目时，可选择其已有父目录，让执行会话创建项目目录与文件。
+`management.start_task` 的可选 `workspace_path` 可省略或传 null，两者均使用已配置的前端默认独立工作区；显式路径仍须为有效的已有目录，审批照常执行。
+
+`management.read_task_result(run_id,section?,start_char?,max_chars?,evidence_offset?,invocation_id?)` 返回本主管及直属事务线所属独立 root 的执行状态和分页结果，事务线仅能读取自己任务；普通或 child caller 不获授。section 为 answer（默认）、evidence 或 observation。结果还附有界 `execution_receipts`：保留已注册 Matter 写工具明确返回的记录 ID、修订号、标题、状态与日期字段，并标明未确认执行、缺失字段或截断；仅为历史执行回执，不代表当前状态、语义正确或业务事项完成。可按回执的 `read_evidence` 和证据长度继续读取完整的安全字段投影。`mail_coverage_receipts` 经过与历史来源读取相同的权限、来源版本及操作记录校验，提供已执行查询的时间范围、数量、分页状态和各邮件正文交付长度／截断标记，不提供正文、发件人或语义判断；来源不可重验时标为不可用，必要正文沿 `read_observation` 获取。两类回执的默认预览总量有界（不超过 12000 JSON 字符），省略项在分页证据中仍可读取。evidence 的 content 为 JSON 字符片段，按 next_char 拼接后解析；保留实际持久工具证据的白名单字段，不包含系统提示、metadata、工具输入或 shell stdout。每次结果附有界 evidence_index（按 evidence_offset 每页 20 条）、successful_operation_count、error_type、task_outcome 和恢复提示，失败或空回答也可保留成功工具结果；操作计数来自原始工具结果 artifact，不代表业务完成。section=observation 必带 invocation_id，仅为仍授权的只读、非 Bash 原工具结果返回当前 run 的 observation 句柄；缓存 reader 的代理输出不能代替原工具权限，需选择原始生产者的证据条目；其 evidence 回执只保留状态与索引，不投影代理正文；原文通过 observation.read/search/group 按需读取。每次回读复验归属、会话存活、权限和原始／复制内容版本，完整读完仍标 historical_only=true、current_evidence=false。deleted、非归属和 child run 均拒绝，证据不代替新操作审批。
+任务／会话已删除或缺失时，结果和状态读取工具返回 task_source_unavailable、retryable=false，不返回已删除数据；这是来源生命周期拒绝，不表示安全审批失败。尚未消费的旧 task_terminal 事件在唤醒前复验所属会话、管理关联及运行终态，来源已不可读取的事件标记为 obsolete，保留审计记录。
 消息 payload 的 input_origin/input_envelope 标记内部 manager/background 输入。客户端应保留审计记录并按结构化来源从普通聊天隐藏，不能把所有非 user 角色都渲染为 agent 回答。
 `send_instruction` 必带 session_id、purpose、expected_run_id；最后一轮已终态或无历史可启动下一轮，
 paused 时原子替换原轮。运行中先 pause 并等暂停确认，等待确认或答复不可替换；目标已变化则拒绝。
@@ -1595,6 +1623,7 @@ waiting_confirmation 仅提示 requires_original_approval，不转交审批权�
 派发 worker 在 API 生命周期运行，按检查点恢复原运行；无安全检查点则失败并保留记录。
 管理派发要求 SQLite checkpoint；memory 配置拒绝新增派发，幂等命令仍可查原回执。
 结果可由后续管理轮按需读取；启用 `autonomous_enabled` 后，任务终态和目标到期还可唤醒自动轮。
+绑定到后台执行的管理轮可调用 `management.decide_notification(command_id,notify_user,reason)` 暂存本轮是否交付用户的决定；需通过工具安全审查，前台运行不得调用。每次 execution 只允许一个不可变决定，同 command_id 同参重试幂等。决定随回答、内部上下文、目标提案、事件水位和运行终态在同一事务生效；notify_user=false 保留内部结果，且不创建用户消息或 delivery。新后台轮未决定时默认静默；此前已排队的旧运行沿用原交付行为。结果及 final_answer/run_completed 事件携带 user_visible，客户端应据此隐藏内部处理，普通用户轮保持可见。
 外部主动结果通知尚未实现。
 
 自动后台轮仅注入当前事件因果关联的目标 `goal_id` 与 `revision`，不注入全部活跃目标及 objective 预览。一般任务终态未关联目标时 goals 为空；定时、关注及等待指定任务的目标仅携带自身引用。完整要求通过 `management.read_goal` 按需读取，目标列表由显式 `management.list_goals` 查询。关联目标继续接受版本／生命周期复验，无关目标的修改不再使该轮失效。
@@ -1659,7 +1688,7 @@ get/list_goal 返回 matter_id/matter_revision/matter_status，拒绝直接改�
 - `report_delegate(command_id,kind,summary,evidence?)`：子 agent 报告 progress/completed/needs_decision/blocked；evidence 引用自己名下 session_id、run_id、message_id，服务端复验归属。回执 proposed，只在当前轮最终发布事务成功后提交报告、主管事件与本轮终态；失败不发送。completed 要求没有未终结执行任务。
 - `instruct_delegate(command_id,delegate_id,expected_revision,instruction)`：父主管向空闲子 agent 补充指令并唤醒新轮，支持继续已完成事务线。冻结工具清单与该事务线默认目录保持不变；该事务线创建执行会话时可按任务显式选择 workspace_path。忙碌时冲突，不能取代原用户确认或答复。重复命令返回原回执。
 - `control_delegate(command_id,delegate_id,expected_revision,action)`：父主管 pause/cancel 事务线，先持久收回后续执行权限，再取消该线与其执行会话中的未终态运行；重复命令重发原取消信号。pause 是停止推进而非保留运行检查点的暂停；原运行终结后可 instruct_delegate 继续，cancel 不可复活。
-- 智能体创建的事务线及执行会话强制冻结高风险人工审批策略；已注册工具声明 high 风险或 requires_confirmation 时，不能因 skip/llm 模式自动批准。等待确认保留原 review/run 身份，由原用户审批入口决定，主管与子 agent 都不能代批；重启、恢复、替换不能降低此策略。
+- 智能体创建的事务线及执行会话继承发起轮的 skip/llm/manual 审批偏好并持久保存，排队、重启、恢复、后续运行和下级派发继续沿用。high 风险或 requires_confirmation 标记本身不强制转人工。命中工具危险操作黑名单时强制人工审批；等待确认保留原 review/run 身份，主管与子 agent 不能代批。
 - 显式事务线和回报不依赖 autonomous_enabled；父子 controller 均需 active。回报唤醒主管的新 run，经既有消息／SSE 与 delivery 索引交付；失败／等待用户也持久捕获，重复扫描不重复交付。
 - `queue_work(command_id,purpose,matter_id?,expected_revision?,priority?,deadline?,read_only_work?,workspace_path?,write_resources?)`：立即持久受理独立 root，等待验证过的依赖及写资源后才派发。Matter 与 expected_revision 必须同时提供或都省略；无 Matter 的临时任务也可排队。priority 为 low/normal/high/urgent，默认 normal；deadline 必须带时区，只参与排序，不是超时取消。回执仍为 accepted，另含 queue_id、queue_state=pending、queue_revision，不能当作已执行。
 - `list_queue(limit?,offset?)`：返回 items、next_offset，可见 pending/paused/blocked/released/finished 及 issue、当前 revision。

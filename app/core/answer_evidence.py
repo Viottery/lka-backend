@@ -133,6 +133,65 @@ def _value_at(output: Any, parts: list[str]) -> Any:
     return output
 
 
+def cached_result_read_routes(
+    *, artifact_id: str, output: dict[str, Any], roles: list[OutputEvidenceRole],
+) -> dict[str, Any]:
+    """Offer exact reader inputs from registered roles, without loading text.
+
+    These are structural routes into an already authorized snapshot. They do
+    not certify completeness, freshness, or the content's meaning. Unknown or
+    multi-body structures retain the full object as their default reader.
+    """
+    targets: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    limited = False
+    visited = 0
+    for declaration in roles:
+        if declaration.role != "source_content":
+            continue
+        stack = [(output, _segments(declaration.path), "/output")]
+        while stack:
+            value, parts, path = stack.pop()
+            visited += 1
+            if visited > 128:
+                limited = True
+                break
+            if not parts:
+                if (isinstance(value, str) and path not in seen
+                        and _role_at(path[len("/output"):], roles, output) == "source_content"):
+                    if len(targets) == 8:
+                        limited = True
+                        break
+                    seen.add(path)
+                    targets.append({"path": path, "value_type": "string", "total_chars": len(value),
+                                    "read_request": {"artifact_id": artifact_id, "path": path}})
+                continue
+            token, rest = parts[0], parts[1:]
+            if token == "*" and isinstance(value, list):
+                if len(value) > 8:
+                    limited = True
+                stack.extend((item, rest, f"{path}/{index}")
+                             for index, item in reversed(list(enumerate(value[:8]))))
+            elif token != "*" and isinstance(value, dict) and token in value:
+                escaped = token.replace("~", "~0").replace("/", "~1")
+                stack.append((value[token], rest, f"{path}/{escaped}"))
+            elif isinstance(value, list) and token.isascii() and token.isdigit() and str(int(token)) == token:
+                index = int(token)
+                if index < len(value):
+                    stack.append((value[index], rest, f"{path}/{index}"))
+        if visited > 128:
+            break
+    container = {"artifact_id": artifact_id, "path": "/output"}
+    single_text = len(targets) == 1 and not limited
+    return {
+        "read_request": targets[0]["read_request"] if single_text else container,
+        "path_value_type": "string" if single_text else "object",
+        "container_read_request": container,
+        "source_content_reads": targets, "source_content_routes_limited": limited,
+        "string_only_parameters": ["max_chars"],
+    }
+
+
 def _role_at(path: str, roles: list[OutputEvidenceRole], output: Any) -> str:
     parts = _segments(path)
     matches = []

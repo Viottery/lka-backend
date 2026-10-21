@@ -710,6 +710,30 @@ def test_worker_stop_then_restart_does_not_overlap_a_live_handler(tmp_path):
     assert store.status(second["job_id"])["status"] == "succeeded"
 
 
+def test_worker_stop_accepts_none_and_waits_for_handler(tmp_path):
+    store = make_store(tmp_path)
+    store.enqueue("kind", "scope-a", "one", {})
+    entered, release, stopped = threading.Event(), threading.Event(), threading.Event()
+
+    def handler(_job):
+        entered.set()
+        assert release.wait(timeout=3)
+
+    worker = BackgroundJobWorker(store, {"kind": handler}, worker_count=1, poll_seconds=0.01)
+    worker.start()
+    assert entered.wait(timeout=2)
+
+    stopper = threading.Thread(target=lambda: (worker.stop(timeout=None), stopped.set()), daemon=True)
+    stopper.start()
+    assert not stopped.wait(timeout=0.05)
+    release.set()
+    assert stopped.wait(timeout=2)
+    stopper.join(timeout=1)
+    assert not stopper.is_alive()
+    assert worker._threads == []
+    assert store.list()[0]["status"] == "succeeded"
+
+
 @pytest.mark.parametrize(
     ("error", "expected_class", "retryable"),
     [

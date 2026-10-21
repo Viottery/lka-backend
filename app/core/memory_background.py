@@ -36,6 +36,7 @@ from app.domains.memory import (
     MemoryService,
     MemorySourceInput,
 )
+from app.storage.sqlite_timing import connect_sqlite
 
 
 def _bounded_compaction_refs(refs) -> tuple[list[str], bool]:
@@ -170,7 +171,7 @@ class MemoryBackgroundCoordinator:
             lease_seconds=600, poll_seconds=1,
         )
         if memory is not None:
-            with sqlite3.connect(self.db_path, timeout=10) as conn:
+            with connect_sqlite(self.db_path, timeout=10) as conn:
                 conn.execute("""CREATE TABLE IF NOT EXISTS memory_maintenance_state(
                     scope_id TEXT PRIMARY KEY, observed_signature TEXT NOT NULL,
                     dirty_at TEXT NOT NULL, queued_key TEXT NOT NULL DEFAULT '',
@@ -265,7 +266,7 @@ class MemoryBackgroundCoordinator:
         if not self.store.heartbeat(job["job_id"], job["lease_owner"], job["lease_epoch"], 600):
             raise MemoryPublicationSuppressed("Maintenance lease is stale")
         file_status = self.learning.sync(records)
-        with sqlite3.connect(self.db_path, timeout=10) as conn:
+        with connect_sqlite(self.db_path, timeout=10) as conn:
             conn.row_factory = sqlite3.Row
             conn.execute("BEGIN IMMEDIATE")
             self.memory._validate_publication_lease(
@@ -276,7 +277,7 @@ class MemoryBackgroundCoordinator:
 
     def maintenance_status(self, *, scope: str = "global", project_id: str | None = None):
         scope_id = "global" if scope == "global" else "project:" + (project_id or "")
-        with sqlite3.connect(self.db_path, timeout=10) as conn:
+        with connect_sqlite(self.db_path, timeout=10) as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute("SELECT * FROM memory_maintenance_state WHERE scope_id=?", (scope_id,)).fetchone()
         jobs = self.store.list(scope_id=scope_id, kind="memory_consolidate", limit=5)
@@ -293,7 +294,7 @@ class MemoryBackgroundCoordinator:
         scope_id = "global" if scope == "global" else "project:" + project_id
         signature = self.consolidator.signature(scope, project_id)
         now = datetime.now(UTC)
-        with sqlite3.connect(self.db_path, timeout=10) as conn:
+        with connect_sqlite(self.db_path, timeout=10) as conn:
             conn.row_factory = sqlite3.Row
             conn.execute("BEGIN IMMEDIATE")
             state = conn.execute("SELECT * FROM memory_maintenance_state WHERE scope_id=?", (scope_id,)).fetchone()
@@ -321,7 +322,7 @@ class MemoryBackgroundCoordinator:
             return result
 
     def schedule_maintenance(self):
-        with sqlite3.connect(self.db_path, timeout=10) as conn:
+        with connect_sqlite(self.db_path, timeout=10) as conn:
             scopes = conn.execute("SELECT DISTINCT scope,project_id FROM memory_entries WHERE status='active'").fetchall()
         for scope, project_id in scopes:
             self.enqueue_maintenance(scope=scope, project_id=project_id)
@@ -431,7 +432,7 @@ class MemoryBackgroundCoordinator:
         session_id = job["scope_id"]
         revision = job["payload"]["revision"]
         target_seq = job["payload"]["target_seq"]
-        conn = sqlite3.connect(self.db_path, timeout=10)
+        conn = connect_sqlite(self.db_path, timeout=10)
         conn.row_factory = sqlite3.Row
         try:
             conn.execute("BEGIN")  # One snapshot for summary, fence, and source membership.
@@ -550,7 +551,7 @@ class MemoryBackgroundCoordinator:
             },
         )
         if published and target_seq < requested_target:
-            with sqlite3.connect(self.db_path, timeout=10) as conn:
+            with connect_sqlite(self.db_path, timeout=10) as conn:
                 self.enqueue_compaction(session_id, revision + 1, requested_target, conn=conn)
 
     def _summarize(
@@ -730,7 +731,7 @@ class MemoryBackgroundCoordinator:
 
     def _extract_one(self, job: dict[str, Any], remote_client: Any = None) -> None:
         message_id = job["payload"]["message_id"]
-        conn = sqlite3.connect(self.db_path, timeout=10)
+        conn = connect_sqlite(self.db_path, timeout=10)
         conn.row_factory = sqlite3.Row
         try:
             answer = conn.execute(
@@ -763,18 +764,28 @@ class MemoryBackgroundCoordinator:
             # User messages are already persisted before Agent execution. The
             # matching trace ID ties extraction to a completed answer only.
             rows = conn.execute(
-                "SELECT message_id,substr(content,1,20001) AS content,payload FROM agent_session_messages "
-                "WHERE session_id=? AND role='user' AND json_extract(payload,'$.trace_id')=? ORDER BY rowid DESC LIMIT 1",
+                "SELECT message_id,session_id,role,substr(content,1,20001) AS content,payload,created_at "
+                "FROM agent_session_messages WHERE session_id=? AND role='user' "
+                "AND json_extract(payload,'$.trace_id')=? ORDER BY rowid",
                 (answer["session_id"], trace_id),
             )
-            user = next((row for row in rows if _trace_id(row["payload"]) == trace_id), None)
-            if user is None:
+            users = [row for row in rows if _trace_id(row["payload"]) == trace_id]
+            if not users:
                 return
             project_path = answer_payload.get("workspace_backend_path")
             project_id_at_turn = answer_payload.get("memory_project_id")
         finally:
             conn.close()
 
+        for index, user in enumerate(users):
+            if index and not self.store.heartbeat(
+                job["job_id"], job["lease_owner"], job["lease_epoch"], lease_seconds=600,
+            ):
+                return
+            self._extract_user_source(job, user, project_path, project_id_at_turn, remote_client)
+
+    def _extract_user_source(self, job, user, project_path, project_id_at_turn, remote_client):
+        """Publish from one real message; answer-level retries keep source identity."""
         if not self.memory.learning_enabled(scope="global"):
             return
         project_id_for_policy = (
@@ -789,9 +800,7 @@ class MemoryBackgroundCoordinator:
         used_local = bool(candidates)
         if not candidates:
             if self.allow_remote_extraction and len(user["content"]) <= 20000:
-                persisted_user = self.session_service.get_turn_user_message(
-                    session_id=answer["session_id"], trace_id=trace_id,
-                )
+                persisted_user = self.session_service._message_from_row(user)
                 if persisted_user is not None:
                     self.learning.organize(
                         persisted_user, client=remote_client, project_id=project_id_for_policy,
@@ -808,7 +817,7 @@ class MemoryBackgroundCoordinator:
                                                      project_id=project_id_for_policy, related_only=True)
             exact_claims = {canonical_memory(r.content) for r in related}
             if related and any(canonical_memory(c.claim) not in exact_claims for c in candidates):
-                persisted_user = self.session_service.get_turn_user_message(session_id=answer["session_id"], trace_id=trace_id)
+                persisted_user = self.session_service._message_from_row(user)
                 if persisted_user is not None:
                     records, _ = self.learning.organize(persisted_user, client=remote_client, project_id=project_id_for_policy,
                         publication_lease=(job["job_id"], job["lease_owner"], job["lease_epoch"]))
@@ -897,7 +906,7 @@ class MemoryBackgroundCoordinator:
     def initialize_recovery(self) -> None:
         """Do not silently import all historical conversations on first enable."""
 
-        conn = sqlite3.connect(self.db_path, timeout=10)
+        conn = connect_sqlite(self.db_path, timeout=10)
         try:
             conn.execute("CREATE TABLE IF NOT EXISTS memory_pipeline_state "
                          "(id INTEGER PRIMARY KEY CHECK(id=1), baseline_rowid INTEGER NOT NULL)")
@@ -915,7 +924,7 @@ class MemoryBackgroundCoordinator:
         self.initialize_recovery()
         queued = 0
         while True:
-            conn = sqlite3.connect(self.db_path, timeout=10)
+            conn = connect_sqlite(self.db_path, timeout=10)
             conn.row_factory = sqlite3.Row
             try:
                 baseline = conn.execute(
@@ -931,7 +940,7 @@ class MemoryBackgroundCoordinator:
                 conn.close()
             if not rows:
                 break
-            conn = sqlite3.connect(self.db_path, timeout=10)
+            conn = connect_sqlite(self.db_path, timeout=10)
             conn.row_factory = sqlite3.Row
             try:
                 conn.execute("BEGIN IMMEDIATE")

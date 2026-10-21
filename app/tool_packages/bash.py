@@ -16,6 +16,7 @@ from app.core.tools import ToolContext, ToolInvocation, ToolPackageSpec, ToolRes
 from app.platform.commands import IS_WINDOWS, SHELL_NAME, run_sync, start_terminal
 from app.platform.python_environment import ManagedPythonEnvironment
 from app.platform.workspace_access import approved_path, require_child_path_scope
+from app.tool_packages.bash_manual_review import command_manual_review_reason
 
 DEFAULT_SYNC_TIMEOUT_SECONDS = 30
 MAX_SYNC_TIMEOUT_SECONDS = 300
@@ -333,7 +334,8 @@ class BashRunTool:
         description=(
             f"Run a native {SHELL_NAME} command in sync or background mode. The command is classified "
             "per invocation as read_only only for whitelisted commands with safe arguments; "
-            "otherwise it is non-read-only. Every invocation requires the configured safety review."
+            "otherwise it is non-read-only. Every invocation uses the selected safety review mode. "
+            "Blacklisted destructive commands (including recursive deletion) always require manual review."
             " Optional python_environment=default uses the separate managed Python environment, "
             "filters inherited service credentials, and exposes LKA_PYTHON. Use the explicit interpreter "
             "($LKA_PYTHON on bash, & $env:LKA_PYTHON on PowerShell) to run saved .py scripts."
@@ -378,6 +380,9 @@ class BashRunTool:
         if tool_input.get("python_environment") is not None:
             return False
         return is_read_only_command(str(tool_input.get("command") or ""))
+
+    def manual_review_reason(self, tool_input: dict[str, Any]) -> str | None:
+        return command_manual_review_reason(str(tool_input.get("command") or ""))
 
     def workspace_access_request(self, tool_input: dict[str, Any], context: ToolContext) -> list[str]:
         """Return an out-of-root cwd for review; command operands are not fenced."""
@@ -687,6 +692,9 @@ class BashReadSessionTool:
 class BashWriteSessionTool:
     def __init__(self, session_manager: BashSessionManager) -> None:
         self.session_manager = session_manager
+
+    def manual_review_reason(self, tool_input: dict[str, Any]) -> str | None:
+        return command_manual_review_reason(str(tool_input.get("text") or ""))
 
     spec = ToolSpec(
         name="bash.write_session",

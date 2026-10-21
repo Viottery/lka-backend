@@ -29,10 +29,20 @@ from app.api.routes.workspaces import router as workspaces_router
 from app.core.config import get_settings
 from app.core.runtime import LocalKnowledgeAgentRuntime
 from app.core.session_admission import SessionBusyError
+from app.storage.sqlite_timing import (
+    DatabaseTimingMiddleware,
+    close_sqlite_timing,
+    configure_sqlite_timing,
+)
 
 
 def create_app() -> FastAPI:
     settings = get_settings()
+    timing = configure_sqlite_timing(
+        settings.data_dir / "logs" / "database_timing.jsonl",
+        enabled=settings.db_timing_enabled, sample_rate=settings.db_timing_sample_rate,
+        slow_ms=settings.db_timing_slow_ms,
+    )
     runtime = LocalKnowledgeAgentRuntime(settings)
 
     @asynccontextmanager
@@ -42,10 +52,14 @@ def create_app() -> FastAPI:
         try:
             yield
         finally:
-            runtime.stop()
+            try:
+                runtime.stop()
+            finally:
+                close_sqlite_timing(timing)
 
     app = FastAPI(title=settings.app_name, version=settings.version, lifespan=lifespan)
     app.state.runtime = runtime
+    app.add_middleware(DatabaseTimingMiddleware)
 
     @app.exception_handler(SessionBusyError)
     async def session_busy(request, exc):

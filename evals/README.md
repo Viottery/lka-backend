@@ -648,6 +648,41 @@ The management catalog also includes offline `assistant_orchestration`,
 They cover role policy before routing without ordinary-session inheritance,
 legacy/resumable and native/text rejection recovery, read-only parameter grants,
 frontend-configured task directories with no backend fallback, and owned-task
-evidence paging. Select with `python -m evals.lka_evals.management_cases --case <group>`;
+evidence paging, nullable default task workspaces without parameter-repair turns,
+and bounded Matter write/mail coverage receipts alongside the answer, with
+historical scope, source/permission revalidation, and continuation for incomplete
+evidence. Select with `python -m evals.lka_evals.management_cases --case <group>`;
 the default remains a plan, never a provider call. Scripted contracts do not
 certify real-model planning quality.
+
+The offline selections `session_progress_cache`, `management_notifications`, and
+`management_result_recovery` cover cross-turn continuation without replaying
+successful operations, revocable historical result pages, explicit background
+notification decisions and atomic silent publication, and failed-run evidence
+indexes with owned-task result recovery. They use synthetic temporary data and
+no provider calls. Historical pages remain historical after a complete read;
+successful operation counts do not certify business completion.
+The cache selection also checks exact registered source-text read requests,
+two- and three-level derived-artifact revocation, historical-origin propagation,
+cycle/depth rejection, and completed-reader recovery after source revocation.
+It also covers tight provider-input budgets: recent historical evidence retains
+its negation and partial-result qualifications ahead of old context, omitted
+views retain their continuation routes, and fork compaction preserves the
+verification verdict and its constraints without increasing the input budget.
+Progress continuation also covers JSON/native progress-note envelopes, incremental
+notes and resolved-gap clearing, advisory review without field-only model retries,
+and mandatory write approval despite progress review. Exact duplicate execution
+and source/evidence validation still apply. These are offline protocol checks,
+not measured real-model latency or semantic-quality improvements.
+Source-controlled provenance claims never establish an artifact lineage.
+
+```bash
+# Selection only; no runtime, private configuration, or provider dispatch.
+.venv/bin/python -m evals.lka_evals.management_cases \
+  --case session_progress_cache --case management_notifications \
+  --case management_result_recovery
+# Execute only these offline regressions and preserve their report.
+.venv/bin/python -m evals.lka_evals.management_cases --run \
+  --case session_progress_cache --case management_notifications \
+  --case management_result_recovery --output /tmp/management-recovery-contracts-new
+```

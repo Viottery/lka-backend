@@ -6,6 +6,7 @@ import sqlite3
 from pathlib import Path
 
 from app.storage.session_origins import add_session_origin_columns, backfill_session_origins
+from app.storage.sqlite_timing import connect_sqlite
 
 CURRENT_TRACE_COLUMNS = {
     "trace_id",
@@ -37,7 +38,7 @@ def get_db_path(data_dir: Path) -> Path:
 def connect(db_path: Path) -> sqlite3.Connection:
     """Open a SQLite connection with row access by column name."""
 
-    conn = sqlite3.connect(db_path, timeout=5.0)
+    conn = connect_sqlite(db_path, timeout=5.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout = 5000")
     return conn

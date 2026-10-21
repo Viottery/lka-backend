@@ -28,9 +28,12 @@ WORKING_STATE_SCHEMA = {
     "type": "object", "additionalProperties": False,
     "properties": {
         "remaining_requirements": {"type": "array", "maxItems": 32,
+                                   "description": "Replace only when requirements change; omit unchanged requirements.",
                                    "items": {"type": "string", "maxLength": 240}},
-        "focus_gap": {"type": "string", "maxLength": 240},
-        "findings": {"type": "array", "maxItems": 32, "items": {
+        "focus_gap": {"type": "string", "maxLength": 240,
+                      "description": "Omit unchanged gaps; use an empty string to clear a resolved gap."},
+        "findings": {"type": "array", "maxItems": 32,
+                     "description": "Only new evidence-linked notes; the server retains earlier findings.", "items": {
             "type": "object", "additionalProperties": False,
             "properties": {
                 "kind": {"type": "string", "enum": ["finding", "ruled_out", "change", "validation"]},
@@ -42,20 +45,32 @@ WORKING_STATE_SCHEMA = {
     },
 }
 PROGRESS_POLICY = (
-    "Keep optional task notes short, without long reasoning. In JSON put working_state and "
-    "purpose beside operation. For native functions put both inside optional _agent_progress. "
+    "Return one next operation, with brief optional progress deltas rather than a new full plan. "
+    "Omit unchanged working_state fields; earlier requirements and findings remain on the server. "
+    "Clear a resolved focus_gap with an empty string and completed remaining_requirements with []. "
+    "Send only newly established evidence-linked findings, not copies or rewordings of old notes. "
+    "In JSON put working_state and purpose beside operation; an _agent_progress wrapper is also accepted. "
+    "For native functions put both inside optional _agent_progress, never inside tool_input. "
     "Strict functions encode omitted notes as _agent_progress=null; unused note fields can be null. "
     "working_state has remaining_requirements (strings), focus_gap (string), and findings "
     "(objects with kind=finding|ruled_out|change|validation, summary, evidence_ids). "
-    "Maintain stable remaining requirements. Before a tool "
-    "operation, describe purpose.gap, question and expected_observable. Link findings to "
+    "Before a tool operation, purpose.gap, question and expected_observable need only a short clause each. Link findings to "
     "actual result.invocation_id values. A failed diagnostic or empty search can rule out "
     "a hypothesis; read_only is a safety property, not a progress category. When review_required, "
     "reconcile known findings and the concrete remaining gap, and choose a discriminating next "
     "operation, a justified alternative, or report an actual blocker. Rephrasing notes is not "
-    "new evidence. Review can defer at most one tool proposal per period without an accepted "
-    "milestone; unresolved review stays visible instead of consuming repeated field-only retries. "
-    "Review never requires an edit or an automatic final answer."
+    "new evidence. Progress review is advisory: resolve it within normal decisions, not a separate "
+    "field-only retry. It never postpones an otherwise valid operation, requires an edit, or "
+    "forces an automatic final answer. Tool schema, scope and safety gates still apply. "
+    "When session_progress_index provides a relevant local checkpoint, load its missing evidence "
+    "through the supplied progress/observation handles before reacquiring the same source. "
+    "Carry unfinished requirements into continuation; do not reconstruct already completed work "
+    "from a short final answer alone. A failed run may still have successful operations. "
+    "A versioned write response containing the updated record is evidence of that write; "
+    "do not add a second verification solely for reassurance unless independent read-back is "
+    "requested, the response is incomplete, or a specific conflict/freshness requirement exists. "
+    "Every new tool call must resolve a concrete gap. A status read already included in a "
+    "result, an unchanged source, or a differently worded note is not a new gap."
 )
 
 
@@ -212,7 +227,7 @@ class TaskProgressState(BaseModel):
                 text for item in requirements[:32] if (text := _short(item))
             ))
         gap = _short(working.get("focus_gap"))
-        if gap:
+        if isinstance(working.get("focus_gap"), str):
             self.focus_gap = gap
         purpose = _purpose(decision.get("purpose"))
         if purpose:
@@ -284,5 +299,4 @@ class TaskProgressState(BaseModel):
             "review_reasons": self.review_reasons, "review_count": self.review_count,
             "review_deferrals": self.review_deferrals,
             "remaining_steps": remaining_steps, "remaining_seconds": remaining_seconds,
-            "instruction": PROGRESS_POLICY,
         }

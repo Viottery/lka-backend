@@ -77,9 +77,9 @@ def test_observation_paginates_object_keys_and_bounds_long_strings(tmp_path):
     assert page.output["next_offset"] == 5
 
     text = _invoke(tool, artifact_id="large", path="/output/long")
-    assert len(text.output["text"]) == 4000
+    assert len(text.output["text"]) == 8000
     assert text.output["has_more"] is True
-    assert text.output["next_offset"] == 4000
+    assert text.output["next_offset"] == 8000
 
 
 def test_observation_rejects_invalid_bounds_and_pointer(tmp_path):

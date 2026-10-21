@@ -453,7 +453,7 @@ class LocalKnowledgeAgentRuntime:
         )
         self.tool_registry.register_tool(SearchMailTool(self.mail_knowledge_mirror))
         self.tool_registry.register_tool(ListMailTool(self.mail_service, self.mail_knowledge_mirror))
-        self.tool_registry.register_tool(LoadMailMessagesTool(self.mail_service))
+        self.tool_registry.register_tool(LoadMailMessagesTool(self.mail_service, self.mail_knowledge_mirror))
         self.tool_registry.register_tool(SyncMailTool(self.sync_outlook_mail))
         if self.local_app_config.agent.mail_expert_enabled:
             self.tool_registry.register_tool(MailSnapshotTool(self.mail_service, self.mail_knowledge_mirror))
@@ -533,6 +533,20 @@ class LocalKnowledgeAgentRuntime:
         self.agent_run_manager = InMemoryAgentRunManager(
             durable_store=self.agent_run_store
         )
+        from app.core.session_progress_cache import SessionProgressCacheService
+        from app.tool_packages.progress import (
+            PROGRESS_PACKAGE,
+            ProgressLoadTool,
+            ProgressSearchTool,
+        )
+
+        self.session_progress_cache = SessionProgressCacheService(
+            store=self.agent_run_store, session_service=self.session_service,
+            registry=self.tool_registry, run_manager=self.agent_run_manager,
+        )
+        self.tool_registry.register_package(PROGRESS_PACKAGE.model_copy(deep=True))
+        self.tool_registry.register_tool(ProgressSearchTool(self.session_progress_cache))
+        self.tool_registry.register_tool(ProgressLoadTool(self.session_progress_cache))
         # A new Runtime cannot answer an app-server request held by a process
         # owned by the previous Runtime. Never leave such approvals actionable
         # or pretend a restarted Codex turn can safely resume its side effects.
@@ -639,6 +653,7 @@ class LocalKnowledgeAgentRuntime:
         )
         self.last_background_error: str | None = None
         self.agent_turn_loop = AgentTurnLoop(
+            session_progress_cache=self.session_progress_cache,
             input_content_provider=self._load_agent_input_content,
             unified_entry_enabled=self.local_app_config.agent.unified_entry_enabled,
             decision_thinking_enabled=self.local_app_config.agent.decision_thinking_enabled,
@@ -874,6 +889,8 @@ class LocalKnowledgeAgentRuntime:
             self._conn, sessions=self.session_service, run_store=self.agent_run_store,
             dispatcher=self.agent_dispatch, authorize=self._authorize_session_input,
             policy=self._session_run_policy, validate_attachments=self.prepare_agent_attachment_input,
+            replace=self.replace_agent_run,
+            batch_attachments_fit=self._session_input_batch_attachments_fit,
         )
         self.session_inputs.ensure_schema()
         from app.domains.management_goals import ManagementGoalService
@@ -956,6 +973,7 @@ class LocalKnowledgeAgentRuntime:
         self.management_coordinator.work_queue = self.management_queue
         self.agent_turn_loop.execution_guard = self.management_coordinator.check_run
         self.agent_turn_loop.finalization_handler = self.management_coordinator.finalize
+        self.agent_turn_loop.answer_visibility_provider = self.management_coordinator.notifications.for_run
         self.managed_tasks.guard = self.management_coordinator.check_run
         self.managed_tasks.goals = self.management_goals
         from app.domains.management_history import ManagementHistoryService
@@ -980,10 +998,19 @@ class LocalKnowledgeAgentRuntime:
                 self.tool_registry.register_tool(tool)
             for tool in management_tools(self.managed_tasks):
                 self.tool_registry.register_tool(tool)
+            from app.tool_packages.management import management_notification_tools
+
+            for tool in management_notification_tools(self.management_coordinator.notifications):
+                self.tool_registry.register_tool(tool)
             from app.domains.management_results import ManagementResultService
             from app.tool_packages.management_results import management_result_tools
 
-            self.management_results = ManagementResultService(tasks=self.managed_tasks)
+            self.management_results = ManagementResultService(tasks=self.managed_tasks, registry=self.tool_registry)
+            self.agent_run_store.progress_import_validator = (
+                lambda artifact_id, run_id: self.management_results.can_read_import(artifact_id, run_id)
+                if artifact_id.startswith("progress_import_management_")
+                else self.session_progress_cache.can_read_import(artifact_id, run_id)
+            )
             for tool in management_result_tools(self.management_results):
                 self.tool_registry.register_tool(tool)
             from app.tool_packages.management import management_work_tools
@@ -1047,6 +1074,8 @@ class LocalKnowledgeAgentRuntime:
                  else workload_scope("background_agent", task_id=run.run_id,
                                           before_dispatch=lambda: self.management_coordinator.check_run(run.run_id)))
         try:
+            if not resume and run.metadata.get('session_input_id'):
+                run = self.session_inputs.freeze_for_dispatch(run, guard)
             with scope:
                 # A queued autonomous run has not yet entered running status.
                 # The harness guard checks its frozen control fence on entry.
@@ -1076,6 +1105,14 @@ class LocalKnowledgeAgentRuntime:
                 return None
             raise
 
+    def _session_input_batch_attachments_fit(self, session_id, attachment_ids):
+        media_bytes = 0
+        for attachment_id in attachment_ids:
+            metadata = self.session_attachment_service.get(session_id=session_id, attachment_id=attachment_id)
+            if metadata.get('kind', 'image') in {'image', 'audio'}:
+                media_bytes += metadata.get('input_size_bytes', metadata['size_bytes'])
+        return media_bytes <= 12 * 1024 * 1024
+
     def _session_run_policy(self, session_id: str) -> SessionRunPolicy:
         session = self.session_service.get_session_or_none(session_id=session_id)
         if session is None or session.kind != "manager":
@@ -1088,7 +1125,7 @@ class LocalKnowledgeAgentRuntime:
                                        (session_id,)).fetchone()
                     if row:
                         frozen = json.loads(row[0])["metadata"]["session_policy"]
-                        return SessionRunPolicy.model_validate({**frozen, "require_high_risk_approval": True})
+                        return SessionRunPolicy.model_validate(frozen)
             return SessionRunPolicy(allowed_tools=self.management_service.allowed_tool_names(
                 self.tool_registry.list_tools(), manager=False,
             )) if self.local_app_config.management.enabled else SessionRunPolicy()
@@ -1101,14 +1138,14 @@ class LocalKnowledgeAgentRuntime:
                 with closing(self._conn()) as conn:
                     policy = delegates.policy_for_session(conn, session_id)
                 return SessionRunPolicy.model_validate(policy)
-        from app.domains.management_role import SUPERVISOR_INSTRUCTIONS
+        from app.domains.management_role import supervisor_instructions
 
         return SessionRunPolicy(
-            role_instructions=SUPERVISOR_INSTRUCTIONS, require_high_risk_approval=True,
+            role_instructions=supervisor_instructions(active=controller["status"] == "active"),
             read_only_tools=[tool.name for tool in self.tool_registry.list_tools()
                              if tool.package != "management" and not tool.name.startswith("management.")],
             allow_default_workspace=False, allowed_tools=self.management_service.allowed_tool_names(
-                self.tool_registry.list_tools(), manager=True,
+                self.tool_registry.list_tools(), manager=True, active=controller["status"] == "active",
             ), allow_fork=False,
             llm_client_name=controller["llm_client_name"], llm_model=controller["llm_model"],
         )

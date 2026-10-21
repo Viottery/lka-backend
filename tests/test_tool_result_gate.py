@@ -34,6 +34,23 @@ def test_generic_gate_exposes_recoverable_handle_without_full_payload():
     assert prompt_view[0]["_result_cache"] == observed["_result_cache"]
 
 
+def test_loaded_history_keeps_its_origin_outside_compacted_result():
+    loop = object.__new__(AgentTurnLoop)
+    loop.tool_invocation_store = object()
+    result = ToolResult(
+        invocation_id="historical-page", tool_name="observation.read", status="completed",
+        output={"historical_only": True, "current_evidence": False,
+                "text": "Previously read source " * 1000},
+    )
+    observed = loop._observation_for_decision_prompt(
+        tool_name=result.tool_name, tool_input={}, tool_result=result,
+        feedback={"status": "completed"}, run_id="new-run",
+    )
+    assert observed["historical_only"] is True
+    assert observed["_cache"]["current_evidence"] is False
+    assert loop._observations_within_prompt_budget([observed])[0]["historical_only"] is True
+
+
 def test_adversarially_wide_preview_retains_root_paths():
     value = {f"key-{index}": ["x" * 900] * 4 for index in range(100)}
     result = bounded_preview(value)
@@ -90,7 +107,6 @@ def test_registered_reader_uses_executor_and_rejects_other_runs(tmp_path, monkey
     get_settings.cache_clear()
     runtime = create_app().state.runtime
     first = runtime.create_agent_run(session_id="gate-session", user_input="first")
-    second = runtime.create_agent_run(session_id="gate-session", user_input="second")
     runtime.agent_run_store.put_artifact(
         artifact_id="tool_result_gate", run_id=first.run_id, kind="tool_result",
         payload={"output": {"ids": list(range(25))}}, summary="test",
@@ -121,12 +137,6 @@ def test_registered_reader_uses_executor_and_rejects_other_runs(tmp_path, monkey
     )
     assert result.status == "completed"
     assert result.output["items"] == [0, 1, 2, 3, 4]
-    denied = reviewed_execute(
-        invocation_id="read-other", tool_name="observation.read",
-        tool_input={"artifact_id": "tool_result_gate"},
-        context=ToolContext(session_id="gate-session", run_id=second.run_id),
-    )
-    assert denied.status == "rejected"
     found = reviewed_execute(
         invocation_id="search-gate", tool_name="observation.search",
         tool_input={"artifact_id": "tool_result_gate", "query": "not in numeric results"},
@@ -148,9 +158,20 @@ def test_registered_reader_uses_executor_and_rejects_other_runs(tmp_path, monkey
     )
     assert grouped.status == "completed"
     assert [group["count"] for group in grouped.output["groups"]] == [2, 1]
+    # Sequential roots respect session admission while still testing the
+    # stricter run boundary within the very same session.
+    runtime.agent_run_manager.complete_run(first.run_id)
+    second = runtime.create_agent_run(session_id="gate-session", user_input="second")
+    denied = reviewed_execute(
+        invocation_id="read-other", tool_name="observation.read",
+        tool_input={"artifact_id": "tool_result_gate"},
+        context=ToolContext(session_id="gate-session", run_id=second.run_id),
+    )
+    assert denied.status == "rejected"
     denied_group = reviewed_execute(
         invocation_id="group-other", tool_name="observation.group",
         tool_input={"artifact_id": "tool_result_groups", "path": "/output/rows", "field": "team"},
         context=ToolContext(session_id="gate-session", run_id=second.run_id),
     )
     assert denied_group.status == "rejected"
+    runtime.stop()

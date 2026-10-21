@@ -21,12 +21,12 @@ from app.api.schemas import (
 from app.core.config import get_settings
 from app.core.llm import LLMResponse
 from app.core.tools import ToolContext
+from app.domains.mail_knowledge import MailKnowledgeMirror
 from app.domains.matters import (
     MatterCreateInput,
     MatterSourceLinkInput,
     MatterUpdateInput,
 )
-from app.domains.mail_knowledge import MailKnowledgeMirror
 
 
 def test_matter_api_create_search_update_and_link(tmp_path, monkeypatch):
@@ -138,6 +138,9 @@ def test_matter_tools_are_registered(tmp_path, monkeypatch):
     assert "Before create or create_many, call matter.search" in " ".join(
         matter_package.decision_hints
     )
+    matter_guidance = " ".join(matter_package.decision_hints)
+    assert "date-only deadline remains YYYY-MM-DD" in matter_guidance
+    assert "Do not mark an item cancelled merely because a broadcast" in matter_guidance
     create_schema = matter_tool_specs["matter.create"].input_schema
     create_many_schema = matter_tool_specs["matter.create_many"].input_schema
     assert create_schema["required"] == ["title", "summary"]

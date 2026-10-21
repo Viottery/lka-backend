@@ -694,6 +694,30 @@ class MailService:
             for row in rows
         ]
 
+    def get_message_account_ids(
+        self, message_ids: list[str], *, account_ids: list[str] | None = None,
+    ) -> dict[str, str]:
+        """Resolve message ownership without reading mail content."""
+        if not message_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in message_ids)
+        params: list[str] = list(message_ids)
+        account_clause = ""
+        if account_ids is not None:
+            if not account_ids:
+                return {}
+            account_clause = f" AND account_id IN ({', '.join('?' for _ in account_ids)})"
+            params.extend(account_ids)
+        conn = self._conn_factory()
+        try:
+            rows = conn.execute(
+                f"SELECT message_id, account_id FROM mail_messages WHERE message_id IN ({placeholders}){account_clause}",
+                params,
+            ).fetchall()
+        finally:
+            conn.close()
+        return {str(row["message_id"]): str(row["account_id"]) for row in rows}
+
     def _attachments_by_message(
         self,
         conn: sqlite3.Connection,

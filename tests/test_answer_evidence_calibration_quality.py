@@ -6,6 +6,7 @@ import json
 import pytest
 
 from app.core import agent_turn as turn
+from app.core.observation_context import ANSWER_READING_POLICY, READING_POLICY
 from tests.test_answer_generation_recovery_quality import make_loop, response, scope
 
 CALIBRATION = (
@@ -41,6 +42,8 @@ def test_both_provider_prompts_calibrate_evidence_without_changing_format(
     assert len(provider.requests) == 1
     request = provider.requests[0]
     assert request.messages[0].content.count(CALIBRATION) == 1
+    assert request.messages[0].content.count(ANSWER_READING_POLICY) == 1
+    assert READING_POLICY not in request.messages[0].content
     assert "user-requested language and deliverable format" in request.messages[0].content
     assert turn.USER_STATEMENT_POLICY in request.messages[0].content
     assert "Do not wrap the answer in JSON" not in request.messages[0].content

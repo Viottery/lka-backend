@@ -255,7 +255,6 @@ def test_revoked_attachment_preflight_fails_and_pauses_without_stranding_root(ru
 def test_real_graph_reuses_accepted_history_and_retains_trace_lookup(runtime):
     session_id = sid(runtime)
     first = submit(runtime, session_id, 'one', 'First question')
-    submit(runtime, session_id, 'two', 'Second question')
     client = ScriptedClient([operation('final_answer', reason='Answer first'), 'First answer',
                              operation('final_answer', reason='Answer second'), 'Second answer'])
     runtime.agent_turn_loop.llm_client = client
@@ -267,6 +266,7 @@ def test_real_graph_reuses_accepted_history_and_retains_trace_lookup(runtime):
     assert message.message_id == first['input']['message_id']
     window = runtime.session_service.get_prompt_context_window(session_id=session_id)
     assert [m.content for m in window.recent_messages] == ['First question', 'First answer']
+    submit(runtime, session_id, 'two', 'Second question')
     runtime.session_inputs.tick()
     second_run = input_run(runtime, session_id)
     assert runtime.agent_dispatch.run_one()
@@ -450,3 +450,290 @@ def test_delegate_remains_excluded_even_if_default_slot_is_stale(runtime):
                  lambda: runtime.session_inputs.resume(delegate_sid)]:
         with pytest.raises(SessionInputConflict, match='default_manager'):
             call()
+
+
+def pause(runtime, run):
+    runtime.agent_run_manager.mark_running(run.run_id)
+    runtime.agent_run_manager.request_pause(run.run_id)
+    assert runtime.agent_run_manager.acknowledge_pause(run.run_id).status == AgentRunStatus.PAUSED
+
+
+@pytest.mark.parametrize('queued_source', [False, True])
+def test_explicit_replacement_binds_receipt_before_preserved_fifo(runtime, queued_source):
+    session_id = sid(runtime)
+    if queued_source:
+        submit(runtime, session_id, 'old')
+        runtime.session_inputs.tick()
+        old = input_run(runtime, session_id)
+    else:
+        old = runtime.create_agent_run(session_id=session_id, user_input='old', resumable=True)
+    pause(runtime, old)
+    later = [submit(runtime, session_id, key)['input'] for key in ['later-a', 'later-b']]
+    # An earlier queue pause is cleared only by this explicit replacement.
+    with closing(runtime._conn()) as conn, conn:
+        conn.execute('UPDATE session_input_queues SET paused=1 WHERE session_id=?', (session_id,))
+    receipt = submit(runtime, session_id, 'replacement', replace_run_id=old.run_id)
+    new = input_run(runtime, session_id)
+    assert receipt['input']['run_id'] == new.run_id != old.run_id
+    assert receipt['queue']['paused'] is False
+    assert new.metadata['replaces_run_id'] == old.run_id
+    assert new.metadata['session_input_id'] == receipt['input']['input_id']
+    assert new.metadata['session_input_message_id'] == receipt['input']['message_id']
+    superseded = runtime.agent_run_manager.get_run(old.run_id)
+    assert superseded.status == AgentRunStatus.CANCELLED
+    assert superseded.metadata['cancel_reason'] == 'superseded'
+    for waiting in later:
+        item = next(i for i in runtime.session_inputs.snapshot(session_id)['inputs'] if i['input_id'] == waiting['input_id'])
+        assert item == waiting
+    runtime.session_inputs.tick()
+    assert input_run(runtime, session_id).run_id == new.run_id
+    for key in ['later-a', 'later-b']:
+        complete(runtime, input_run(runtime, session_id))
+        runtime.session_inputs.tick()
+        assert input_run(runtime, session_id).user_input == key
+        assert not runtime.session_inputs.snapshot(session_id)['paused']
+    with closing(runtime._conn()) as conn:
+        assert conn.execute("SELECT count(*) FROM background_jobs WHERE kind='agent_dispatch' AND "
+                            "json_extract(payload_json,'$.run_id')=?", (new.run_id,)).fetchone()[0] == 1
+
+
+def test_replacement_dispatch_reuses_accepted_history_and_options(runtime, monkeypatch):
+    session_id = sid(runtime)
+    old = runtime.create_agent_run(session_id=session_id, user_input='old', resumable=True)
+    pause(runtime, old)
+    receipt = submit(runtime, session_id, 'replacement', 'New question', replace_run_id=old.run_id,
+                     safety_review_mode='manual', llm={'response_mode': 'text'})
+    new = input_run(runtime, session_id)
+    assert new.metadata['session_input_options']['safety_review_mode'] == 'manual'
+    assert new.metadata['session_input_options']['llm'] == {'response_mode': 'text'}
+    client = ScriptedClient([operation('final_answer', reason='Answer'), 'New answer'])
+    runtime.agent_turn_loop.llm_client = client
+    assert runtime.agent_dispatch.run_one()
+    assert runtime.agent_run_manager.get_run(new.run_id).status == AgentRunStatus.COMPLETED
+    message = runtime.session_service.get_turn_user_message(session_id=session_id, trace_id=new.trace_id)
+    assert message.message_id == receipt['input']['message_id']
+    messages = runtime.get_session(session_id=session_id).messages
+    assert [m.content for m in messages if m.role == 'user'] == ['New question']
+    assert [m.content for m in messages if m.role == 'agent'] == ['New answer']
+    assert client.calls
+    assert 'replacement_handoff' in client.calls[0]['user_prompt']
+
+
+def test_replacement_full_request_retry_survives_completion_default_switch_and_restart(runtime, monkeypatch):
+    session_id = sid(runtime)
+    old = runtime.create_agent_run(session_id=session_id, user_input='old', resumable=True)
+    pause(runtime, old)
+    options = {'replace_run_id': old.run_id, 'attachment_ids': ['file-a'],
+               'safety_review_mode': 'manual', 'llm': {'response_mode': 'stream'}}
+    monkeypatch.setattr(runtime.session_inputs, 'validate_attachments', lambda **kw: kw['attachment_ids'])
+    receipt = submit(runtime, session_id, 'replacement', **options)
+    new = input_run(runtime, session_id)
+    complete(runtime, new)
+    runtime.management_service.create(make_default=True)
+    runtime.stop()
+    reopened = LocalKnowledgeAgentRuntime(runtime.settings)
+    try:
+        monkeypatch.setattr(reopened.session_inputs, 'validate_attachments', lambda **kw: pytest.fail('retry revalidation'))
+        retry = submit(reopened, session_id, 'replacement', **options)
+        assert retry['input'] == {**receipt['input'], 'status': 'completed'}
+        for changed in [options | {'replace_run_id': new.run_id}, options | {'attachment_ids': []},
+                        options | {'llm': {'response_mode': 'text'}}]:
+            with pytest.raises(SessionInputConflict, match='client_message_id_conflict'):
+                submit(reopened, session_id, 'replacement', **changed)
+        assert len(reopened.get_session(session_id=session_id).messages) == 1
+        with closing(reopened._conn()) as conn:
+            assert conn.execute('SELECT count(*) FROM agent_runs WHERE session_id=?', (session_id,)).fetchone()[0] == 2
+    finally:
+        reopened.stop()
+
+
+@pytest.mark.parametrize('status', ['queued', 'running', 'waiting_user', 'waiting_confirmation', 'completed', 'cancelled'])
+def test_nonpaused_replacement_rejected_without_ghost_input(runtime, status):
+    session_id = sid(runtime)
+    old = runtime.create_agent_run(session_id=session_id, user_input='old', resumable=True)
+    runtime.agent_run_manager._update_run(old.run_id, status=AgentRunStatus(status))
+    with pytest.raises(SessionInputConflict):
+        submit(runtime, session_id, 'replacement', replace_run_id=old.run_id)
+    assert runtime.session_inputs.snapshot(session_id)['inputs'] == []
+    assert runtime.get_session(session_id=session_id).messages == []
+    assert runtime.agent_run_manager.get_run(old.run_id).status.value == status
+    with closing(runtime._conn()) as conn:
+        assert conn.execute('SELECT count(*) FROM session_input_queues').fetchone()[0] == 0
+        assert conn.execute("SELECT count(*) FROM background_jobs WHERE kind='agent_dispatch'").fetchone()[0] == 0
+
+
+def test_replacement_rejects_cross_session_and_child_before_callback(runtime, monkeypatch):
+    session_id = sid(runtime)
+    other = runtime.session_service.create_session().session.session_id
+    root = runtime.create_agent_run(session_id=other, user_input='private', resumable=True)
+    child = runtime.agent_run_manager.create_child_run(parent_run_id=root.run_id, plan_id='plan',
+                                                      step_id='child', attempt=1, user_input='child', executor_kind='react')
+    pause(runtime, child)
+    pause(runtime, root)
+    own_root = runtime.create_agent_run(session_id=session_id, user_input='own', resumable=True)
+    own_child = runtime.agent_run_manager.create_child_run(parent_run_id=own_root.run_id, plan_id='plan',
+                                                          step_id='child', attempt=1, user_input='child', executor_kind='react')
+    monkeypatch.setattr(runtime.session_inputs, 'replace', lambda *a, **kw: pytest.fail('unauthorized replacement'))
+    for run_id in [root.run_id, child.run_id, own_child.run_id, 'missing']:
+        with pytest.raises(SessionInputConflict, match='same_session_root'):
+            submit(runtime, session_id, 'replacement', replace_run_id=run_id)
+    assert runtime.agent_run_manager.get_run(root.run_id).status == AgentRunStatus.PAUSED
+    assert runtime.session_inputs.snapshot(session_id)['inputs'] == []
+
+
+def test_replacement_transaction_failure_rolls_back_history_binding_watch_and_dispatch(runtime, monkeypatch):
+    session_id = sid(runtime)
+    submit(runtime, session_id, 'old')
+    runtime.session_inputs.tick()
+    old = input_run(runtime, session_id)
+    pause(runtime, old)
+    submit(runtime, session_id, 'later')
+    before = runtime.session_inputs.snapshot(session_id)
+    enqueue = runtime.agent_dispatch.enqueue
+
+    def fail(*args, **kwargs):
+        enqueue(*args, **kwargs)
+        raise RuntimeError('replacement transaction rollback')
+
+    monkeypatch.setattr(runtime.agent_dispatch, 'enqueue', fail)
+    with pytest.raises(RuntimeError, match='rollback'):
+        submit(runtime, session_id, 'replacement', replace_run_id=old.run_id)
+    assert runtime.session_inputs.snapshot(session_id) == before
+    assert runtime.agent_run_manager.get_run(old.run_id).status == AgentRunStatus.PAUSED
+    assert not runtime.agent_run_manager.is_cancel_requested(old.run_id)
+    assert [m.content for m in runtime.get_session(session_id=session_id).messages] == ['old', 'later']
+    with closing(runtime._conn()) as conn:
+        assert conn.execute('SELECT count(*) FROM agent_runs').fetchone()[0] == 1
+        assert conn.execute("SELECT count(*) FROM background_jobs WHERE kind='agent_dispatch'").fetchone()[0] == 1
+        assert conn.execute('SELECT watched_run_id FROM session_input_queues').fetchone()[0] == old.run_id
+
+
+@pytest.mark.parametrize('same_key', [False, True])
+def test_concurrent_replacements_have_one_run_and_one_history_message(runtime, same_key):
+    session_id = sid(runtime)
+    old = runtime.create_agent_run(session_id=session_id, user_input='old', resumable=True)
+    pause(runtime, old)
+
+    def replace(index):
+        try:
+            return submit(runtime, session_id, 'same' if same_key else f'key-{index}', replace_run_id=old.run_id)
+        except SessionInputConflict:
+            return None
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        receipts = list(pool.map(replace, range(4)))
+    accepted = [r for r in receipts if r is not None]
+    assert len(accepted) == (4 if same_key else 1)
+    assert len({r['input']['run_id'] for r in accepted}) == 1
+    assert len(runtime.get_session(session_id=session_id).messages) == 1
+    with closing(runtime._conn()) as conn:
+        assert conn.execute('SELECT count(*) FROM agent_runs').fetchone()[0] == 2
+        assert conn.execute('SELECT count(*) FROM session_inputs').fetchone()[0] == 1
+        assert conn.execute("SELECT count(*) FROM background_jobs WHERE kind='agent_dispatch'").fetchone()[0] == 1
+
+
+def test_replacement_respects_execution_lease_and_retains_paused_children(runtime):
+    session_id = sid(runtime)
+    old = runtime.create_agent_run(session_id=session_id, user_input='old', resumable=True)
+    child = runtime.agent_run_manager.create_child_run(parent_run_id=old.run_id, plan_id='plan',
+                                                      step_id='child', attempt=1, user_input='child', executor_kind='react')
+    pause(runtime, child)
+    pause(runtime, old)
+    lease = runtime._runner_for_turn(existing_run_id=old.run_id)._execution_lease(old.run_id)
+    with lease, pytest.raises(SessionInputConflict, match='still executing'):
+        submit(runtime, session_id, 'replacement', replace_run_id=old.run_id)
+    assert runtime.session_inputs.snapshot(session_id)['inputs'] == []
+    receipt = submit(runtime, session_id, 'replacement', replace_run_id=old.run_id)
+    retired = runtime.agent_run_manager.get_run(child.run_id)
+    assert retired.status == AgentRunStatus.CANCELLED
+    assert retired.metadata['superseded_by_run_id'] == receipt['input']['run_id']
+    assert runtime.agent_run_manager.get_run(old.run_id).child_run_ids == (child.run_id,)
+
+
+def test_replacement_of_freshly_loaded_paused_root_without_queue_state(runtime):
+    session_id = sid(runtime)
+    old = runtime.create_agent_run(session_id=session_id, user_input='old', resumable=True)
+    pause(runtime, old)
+    runtime.stop()
+    reopened = LocalKnowledgeAgentRuntime(runtime.settings)
+    try:
+        receipt = submit(reopened, session_id, 'replacement', replace_run_id=old.run_id)
+        assert receipt['input']['run_id'] == input_run(reopened, session_id).run_id
+        assert receipt['queue']['paused'] is False
+        assert len(reopened.get_session(session_id=session_id).messages) == 1
+    finally:
+        reopened.stop()
+
+
+def test_replacement_keeps_safety_budgets_and_dispatches_its_own_attachment_options(runtime, monkeypatch):
+    session_id = sid(runtime)
+    old = runtime.create_agent_run(session_id=session_id, user_input='old', resumable=True)
+    budget = [{'scope_id': 'existing-cap', 'max_runs': 3}]
+    policy = {**old.metadata['session_policy'], 'require_high_risk_approval': True}
+    runtime.agent_run_manager._update_run(old.run_id, status=old.status,
+                                         metadata_patch={'session_policy': policy, 'work_budget_scopes': budget})
+    pause(runtime, old)
+    monkeypatch.setattr(runtime.session_inputs, 'validate_attachments', lambda **kw: kw['attachment_ids'])
+    submit(runtime, session_id, 'replacement', replace_run_id=old.run_id, attachment_ids=['new-file'],
+           safety_review_mode='manual', llm={'response_mode': 'stream'})
+    new = input_run(runtime, session_id)
+    assert new.metadata['session_policy']['require_high_risk_approval'] is True
+    assert new.metadata['work_budget_scopes'] == budget
+    seen = []
+
+    def execute(**kwargs):
+        seen.append(kwargs)
+        complete(runtime, new)
+
+    monkeypatch.setattr(runtime, 'run_agent_turn', execute)
+    assert runtime.agent_dispatch.run_one()
+    assert seen[0]['attachment_ids'] == ['new-file']
+    assert seen[0]['safety_review_mode'] == SafetyReviewMode.MANUAL
+    assert seen[0]['llm_response_mode'] == LLMResponseMode.STREAM
+
+
+def test_http_replacement_validation_conflicts_and_receipt(runtime):
+    app = FastAPI()
+    app.state.runtime = runtime
+    app.include_router(router)
+    session_id = sid(runtime)
+    old = runtime.create_agent_run(session_id=session_id, user_input='old', resumable=True)
+    pause(runtime, old)
+
+    async def exercise():
+        async with AsyncClient(transport=ASGITransport(app=app, client=('127.0.0.1', 9999)), base_url='http://test') as client:
+            path = f'/sessions/{session_id}/inputs'
+            body = {'client_message_id': 'replacement', 'user_input': 'New question',
+                    'attachment_ids': [], 'replace_run_id': old.run_id}
+            for invalid in ['', '   ', 'x' * 129]:
+                response = await client.post(path, json=body | {'replace_run_id': invalid})
+                assert response.status_code == 422
+            assert runtime.session_inputs.snapshot(session_id)['inputs'] == []
+            response = await client.post(path, json=body)
+            assert response.status_code == 202
+            receipt = response.json()
+            assert receipt['input']['run_id'] and receipt['input']['status'] == 'queued'
+            assert set(receipt) == {'input', 'queue'}
+            assert (await client.post(path, json=body)).json() == receipt
+            assert (await client.post(path, json=body | {'replace_run_id': 'other'})).status_code == 409
+            assert (await client.post(path, json=body | {'client_message_id': 'stale'})).status_code == 409
+            assert len(runtime.session_inputs.snapshot(session_id)['inputs']) == 1
+
+    asyncio.run(exercise())
+
+
+def test_session_input_replacement_uses_runtime_replacement_guard(runtime, monkeypatch):
+    session_id = sid(runtime)
+    old = runtime.create_agent_run(session_id=session_id, user_input='old', resumable=True)
+    pause(runtime, old)
+
+    def reject(run_id):
+        assert run_id == old.run_id
+        raise ValueError('custom replacement guard')
+
+    monkeypatch.setattr(runtime.management_queue, 'guard_replacement', reject)
+    with pytest.raises(SessionInputConflict, match='custom replacement guard'):
+        submit(runtime, session_id, 'replacement', replace_run_id=old.run_id)
+    assert runtime.agent_run_manager.get_run(old.run_id).status == AgentRunStatus.PAUSED
+    assert runtime.session_inputs.snapshot(session_id)['inputs'] == []
+    assert runtime.get_session(session_id=session_id).messages == []
