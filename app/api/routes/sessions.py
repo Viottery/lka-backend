@@ -164,12 +164,30 @@ def set_session_workspace(
             session_id=session_id,
             path=payload.path,
             platform=payload.platform,
+            reserve=payload.reserve,
         )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     session = request.app.state.runtime.session_service.get_session_or_none(session_id=session_id)
+    return SessionWorkspaceResponse(session_id=session_id, workspace=workspace,
+                                    project_id=session.project_id if session else None)
+
+
+@router.post("/{session_id}/workspace/materialize", response_model=SessionWorkspaceResponse)
+def materialize_session_workspace(session_id: str, request: Request) -> SessionWorkspaceResponse:
+    """Create a reserved session workspace on explicit user request (upload, file panel)."""
+    runtime = request.app.state.runtime
+    try:
+        workspace = runtime.materialize_session_workspace(session_id=session_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Cannot create session workspace: {exc}") from exc
+    session = runtime.session_service.get_session_or_none(session_id=session_id)
     return SessionWorkspaceResponse(session_id=session_id, workspace=workspace,
                                     project_id=session.project_id if session else None)
 

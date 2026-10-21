@@ -63,6 +63,8 @@ def _get_workspace(request: Request, session_id: str) -> Path:
     workspace = detail.session.workspace
     if workspace is None or not workspace.backend_path:
         raise HTTPException(status_code=409, detail="Session has no bound workspace.")
+    if getattr(workspace, "state", "created") == "reserved":
+        raise HTTPException(status_code=409, detail="session_workspace_reserved")
     bound_root = Path(workspace.backend_path)
     try:
         root = bound_root.resolve(strict=True)

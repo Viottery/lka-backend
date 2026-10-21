@@ -76,6 +76,14 @@ class DocumentTool:
             raise PermissionError("path is outside allowed workspace roots and was not approved for this invocation")
         return target
 
+    def workspace_write_targets(self, tool_input: dict[str, Any], context: ToolContext) -> list[str]:
+        if self.operation != "render_page":
+            return []
+        try:
+            return [str(self._resolve(str(tool_input.get("output_path") or ""), context, authorize=False))]
+        except (OSError, ValueError, PermissionError):
+            return []
+
     def workspace_access_request(self, tool_input: dict[str, Any], context: ToolContext) -> list[str]:
         targets = []
         try:

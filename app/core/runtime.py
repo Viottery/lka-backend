@@ -524,6 +524,8 @@ class LocalKnowledgeAgentRuntime:
             BashTerminateSessionTool(self.bash_session_manager)
         )
         self.tool_executor = ToolExecutor(self.tool_registry)
+        self._workspace_materialize_lock = threading.Lock()
+        self.tool_executor.workspace_materializer = self.materialize_workspace_for_write
         register_message_constraints(self.tool_registry)
         self.tool_executor.constraint_store = ToolConstraintStore(self._conn)
         self.agent_run_store = SqliteAgentRunStore(self.db_path)
@@ -2410,9 +2412,16 @@ class LocalKnowledgeAgentRuntime:
             metadata.update(project_id=project_id, workspace=workspace.model_dump(mode="json"))
         elif isinstance(metadata.get("workspace"), dict):
             supplied = metadata["workspace"]
-            workspace = self._resolve_session_workspace(path=supplied.get("path", ""), platform=supplied.get("platform", ""))
-            project = self.project_service.register(workspace.backend_path, Path(workspace.backend_path).name[:120] or "Project")
-            metadata.update(project_id=project["project_id"], workspace=workspace.model_dump(mode="json"))
+            workspace = self._resolve_session_workspace(
+                path=supplied.get("path", ""), platform=supplied.get("platform", ""),
+                reserve=supplied.get("state") == "reserved",
+            )
+            if workspace.state == "reserved":
+                metadata["workspace"] = workspace.model_dump(mode="json")
+                metadata.pop("project_id", None)
+            else:
+                project = self.project_service.register(workspace.backend_path, Path(workspace.backend_path).name[:120] or "Project")
+                metadata.update(project_id=project["project_id"], workspace=workspace.model_dump(mode="json"))
         return self.session_service.create_session(
             title=title,
             metadata=metadata,
@@ -2527,16 +2536,57 @@ class LocalKnowledgeAgentRuntime:
         session_id: str,
         path: str,
         platform: str,
+        reserve: bool = False,
     ) -> SessionWorkspace:
-        """Persist a workspace and its canonical project identity together."""
+        """Persist a workspace and its canonical project identity together.
+
+        With ``reserve`` a missing default folder is stored by path only; it gets no
+        project until :meth:`materialize_session_workspace` creates it on disk.
+        """
         if self.session_service.get_session_or_none(session_id=session_id) is None:
             raise KeyError(f"Session not found: {session_id}")
-        workspace = self._resolve_session_workspace(path=path, platform=platform)
+        workspace = self._resolve_session_workspace(path=path, platform=platform, reserve=reserve)
+        if workspace.state == "reserved":
+            self.session_service.set_workspace(session_id=session_id, workspace=workspace, project_id=None)
+            return workspace
         project = self.project_service.register(workspace.backend_path, Path(workspace.backend_path).name[:120] or "Project")
         self.session_service.set_workspace(session_id=session_id, workspace=workspace, project_id=project["project_id"])
         return workspace
 
-    def _resolve_session_workspace(self, *, path: str, platform: str) -> SessionWorkspace:
+    def materialize_session_workspace(self, *, session_id: str) -> SessionWorkspace:
+        """Create a reserved session folder and register its project; idempotent."""
+        with self._workspace_materialize_lock:
+            session = self.session_service.get_session_or_none(session_id=session_id)
+            if session is None:
+                raise KeyError(f"Session not found: {session_id}")
+            workspace = session.workspace
+            if workspace is None:
+                raise ValueError("session has no workspace")
+            if workspace.state == "created":
+                return workspace
+            target = Path(workspace.backend_path)
+            resolved = self.path_resolver.resolve_workspace(str(target))
+            if not self.path_resolver.is_allowed_workspace(resolved):
+                raise ValueError("workspace path is outside configured LKA_WORKSPACE_ROOTS")
+            if target.is_symlink() or (target.exists() and not target.is_dir()):
+                raise ValueError(f"workspace path is not a directory: {target}")
+            target.mkdir(parents=True, exist_ok=True)
+            created = workspace.model_copy(update={"state": "created"})
+            project = self.project_service.register(created.backend_path, target.name[:120] or "Project")
+            self.session_service.set_workspace(session_id=session_id, workspace=created, project_id=project["project_id"])
+            return created
+
+    def materialize_workspace_for_write(self, context: ToolContext) -> None:
+        """Executor hook: a write is about to land inside the run's workspace root."""
+        if not context.workspace_root:
+            return
+        session = self.session_service.get_session_or_none(session_id=context.session_id)
+        workspace = session.workspace if session is not None else None
+        if workspace is None or workspace.state != "reserved" or workspace.backend_path != context.workspace_root:
+            return
+        self.materialize_session_workspace(session_id=context.session_id)
+
+    def _resolve_session_workspace(self, *, path: str, platform: str, reserve: bool = False) -> SessionWorkspace:
         """Validate directories identically for projects and session workspace updates."""
         if not isinstance(path, str) or not isinstance(platform, str):
             raise ValueError("workspace path and platform must be strings")  # noqa: TRY004 - API validation contract
@@ -2562,7 +2612,10 @@ class LocalKnowledgeAgentRuntime:
             resolved_workspace = self.path_resolver.resolve_workspace(
                 str(resolved), source_frontend=f"{normalized_platform}-native"
             )
-        if not resolved_workspace.exists or not resolved_workspace.resolved_path.is_dir():
+        exists = resolved_workspace.exists
+        if exists and not resolved_workspace.resolved_path.is_dir():
+            raise ValueError(f"workspace path is not a directory: {resolved_workspace.resolved_path}")
+        if not exists and not reserve:
             raise ValueError(f"workspace directory does not exist: {resolved_workspace.resolved_path}")
         if not self.path_resolver.is_allowed_workspace(resolved_workspace):
             raise ValueError("workspace path is outside configured LKA_WORKSPACE_ROOTS")
@@ -2570,6 +2623,7 @@ class LocalKnowledgeAgentRuntime:
             path=_normalized_workspace_path(path, normalized_platform),
             platform=normalized_platform,
             backend_path=resolved_workspace.normalized_path,
+            state="created" if exists else "reserved",
         )
         return workspace
 

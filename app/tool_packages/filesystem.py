@@ -43,7 +43,9 @@ FILESYSTEM_PACKAGE = ToolPackageSpec(
         "Use edit_file for targeted old_text to new_text replacements only.",
         "If old_text is not unique, read more context and retry with a longer unique snippet.",
         "Do not use edit_file to create new files or replace large files wholesale.",
-        "Use create_file to save a new UTF-8 text file or Python script. The parent directory must exist; existing files are never overwritten.",
+        "Use create_file to save a new UTF-8 text file or Python script. Existing files are never overwritten.",
+        "Output location: when the user names a folder, project or output path, write there. When the user asks to modify an existing file, edit that file in place and create nothing else. Only when no location is given and a new result file must be produced, save it under the session default workspace using a relative path.",
+        "The session default workspace may not exist yet. It is created automatically on the first file written into it, together with any missing subdirectories; do not create it beforehand or run mkdir just to prepare it. Listing or reading it before then returns an empty result.",
     ],
 )
 
@@ -220,6 +222,12 @@ class ListDirectoryTool(ReadFileTool):
             if offset < 0 or not 1 <= limit <= 200:
                 raise ValueError("Invalid directory page")
             entries = []
+            if _is_unmaterialized_root(path, policy):
+                return ToolResult(invocation_id=invocation.invocation_id, tool_name=self.spec.name, status="completed",
+                                  output={"path": requested, "resolved_path": str(path), "entries": [], "snapshot_id": "0" * 64,
+                                          "offset": 0, "next_offset": None, "has_more": False, "enumeration_complete": True,
+                                          "enumerated_entries": 0, "truncated": False, "workspace_state": "reserved",
+                                          "evidence_scope": "The session default workspace has not been created yet; it is created on the first file written into it."})
             with os.scandir(path) as iterator:
                 for entry in islice(iterator, 2001):
                     kind = ("symlink" if entry.is_symlink() else "directory" if entry.is_dir(follow_symlinks=False)
@@ -251,13 +259,17 @@ class CreateFileTool:
     def __init__(self, policy: FileAccessPolicy) -> None:
         self.policy = policy
 
+    def workspace_write_targets(self, tool_input: dict[str, Any], context: ToolContext) -> list[str]:
+        return workspace_write_targets(tool_input, context, self.policy)
+
     def workspace_access_request(self, tool_input: dict[str, Any], context: ToolContext) -> list[str]:
         return workspace_access_request(tool_input, context, self.policy)
 
     spec = ToolSpec(
         name="filesystem.create_file", unrestricted_execution=True, package="filesystem",
         type="local_tool", description="Create a new UTF-8 text file exclusively, including reusable .py scripts. "
-        "Requires an existing parent directory; never overwrites a file. Outside-workspace targets need exact-path approval.",
+        "Never overwrites a file. Missing parent directories are created only inside the session workspace; elsewhere the parent must exist. "
+        "Outside-workspace targets need exact-path approval.",
         risk="medium", requires_confirmation=False, read_only=False,
         side_effects=["write_local_file"], scope_path_fields=("path",), scope_uses_workspace=True,
         input_schema={"type": "object", "required": ["path", "content"],
@@ -286,7 +298,11 @@ class CreateFileTool:
             if b"\x00" in raw:
                 raise ValueError("New file must be text without NUL bytes")
             if not path.parent.is_dir():
-                raise FileNotFoundError("Parent directory must already exist")
+                # Only inside the session workspace may missing subdirectories be created;
+                # elsewhere the parent must already exist.
+                if not policy.is_allowed(path.parent):
+                    raise FileNotFoundError("Parent directory must already exist")
+                path.parent.mkdir(parents=True, exist_ok=True)
             # O_EXCL rejects a competing creator and avoids truncating user files.
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "wb") as stream:
@@ -303,6 +319,9 @@ class CreateFileTool:
 class EditFileTool:
     def __init__(self, policy: FileAccessPolicy) -> None:
         self.policy = policy
+
+    def workspace_write_targets(self, tool_input: dict[str, Any], context: ToolContext) -> list[str]:
+        return workspace_write_targets(tool_input, context, self.policy)
 
     def workspace_access_request(self, tool_input: dict[str, Any], context: ToolContext) -> list[str]:
         return workspace_access_request(tool_input, context, self.policy)
@@ -398,6 +417,20 @@ def workspace_access_request(tool_input: dict[str, Any], context: ToolContext, p
     except (OSError, ValueError, PermissionError):
         return []
     return [] if active.is_allowed(target) else [str(target)]
+
+
+def workspace_write_targets(tool_input: dict[str, Any], context: ToolContext, policy: FileAccessPolicy) -> list[str]:
+    """Resolved write target, used by the executor to decide workspace creation."""
+
+    try:
+        active = policy.for_session_workspace(context.workspace_root)
+        return [str(active.resolve(str(tool_input.get("path") or ""), allow_outside=True))]
+    except (OSError, ValueError, PermissionError):
+        return []
+
+
+def _is_unmaterialized_root(path: Path, policy: FileAccessPolicy) -> bool:
+    return not path.exists() and path == policy.default_root
 
 
 def _require_approved_external_path(path: Path, policy: FileAccessPolicy, context: ToolContext) -> None:

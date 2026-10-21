@@ -51,6 +51,9 @@ class SessionWorkspace(BaseModel):
     path: str
     platform: Literal["linux", "windows", "macos"]
     backend_path: str
+    # "reserved": the default per-session folder is allocated by path only and is
+    # created (and registered as a project) on the first write that lands in it.
+    state: Literal["reserved", "created"] = "created"
 
 
 class AgentSessionMessage(BaseModel):

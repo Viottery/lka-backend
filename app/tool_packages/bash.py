@@ -77,6 +77,7 @@ BASH_PACKAGE = ToolPackageSpec(
         "Use mode=background for long-running or interactive commands, then poll with bash.read_session.",
         "Use bash.write_session to send stdin to a background terminal, bash.interrupt_session for Ctrl-C, and bash.terminate_session to stop it.",
         "The default cwd is the session workspace, otherwise the first configured workspace root. Relative cwd values resolve inside that root.",
+        "The session default workspace may not exist until something is written into it. A non-read-only command run there creates it first; read-only inspection of a not-yet-created workspace reports that it does not exist yet. When the user names an existing folder or file, set cwd or paths to it instead of writing into the default workspace.",
         "Commands receive workspace_root, WORKSPACE_ROOT, LKA_WORKSPACE_ROOT, and LKA_WORKSPACE_ROOTS environment variables.",
         ("Use relative paths from cwd or $env:WORKSPACE_ROOT; do not invent placeholder paths." if IS_WINDOWS else "Use relative paths from cwd or the injected $workspace_root variable; do not invent placeholder paths."),
         "Always inspect command status and output before claiming completion.",
@@ -120,6 +121,11 @@ class BashAccessPolicy:
             allowed = ", ".join(root.as_posix() for root in self.roots)
             raise PermissionError(f"cwd is outside allowed workspace roots: {allowed}")
         if not resolved.exists():
+            if resolved == self.default_root:
+                raise FileNotFoundError(
+                    "The session default workspace has not been created yet; it is created on the first "
+                    "file written into it. Nothing exists there to inspect."
+                )
             raise FileNotFoundError(f"cwd does not exist: {resolved}")
         if not resolved.is_dir():
             raise ValueError(f"cwd is not a directory: {resolved}")
@@ -383,6 +389,20 @@ class BashRunTool:
 
     def manual_review_reason(self, tool_input: dict[str, Any]) -> str | None:
         return command_manual_review_reason(str(tool_input.get("command") or ""))
+
+    def workspace_write_targets(self, tool_input: dict[str, Any], context: ToolContext) -> list[str]:
+        """A non-read-only command may write into its cwd; report it for workspace creation."""
+        try:
+            policy = self.policy.for_session_workspace(context.workspace_root)
+            cwd = tool_input.get("cwd")
+            if cwd and str(cwd).strip():
+                path = Path(policy.expand_workspace_variables(str(cwd))).expanduser()
+                path = path if path.is_absolute() else policy.default_root / path
+            else:
+                path = policy.default_root
+            return [str(path.resolve(strict=False))]
+        except (OSError, ValueError, PermissionError):
+            return []
 
     def workspace_access_request(self, tool_input: dict[str, Any], context: ToolContext) -> list[str]:
         """Return an out-of-root cwd for review; command operands are not fenced."""

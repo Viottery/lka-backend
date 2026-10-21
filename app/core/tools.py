@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 from contextlib import ExitStack
 from datetime import UTC, datetime
 from pathlib import Path
@@ -260,6 +261,8 @@ class ToolExecutor:
         self.registry = registry
         self.run_manager: Any | None = None
         self.constraint_store = ToolConstraintStore()
+        # Runtime hook that creates a reserved session workspace on first write into it.
+        self.workspace_materializer: Callable[[ToolContext], None] | None = None
 
     def _constraint_subjects(self, context: ToolContext) -> list[tuple[str, str]]:
         subjects = [("session", context.session_id)]
@@ -479,6 +482,8 @@ class ToolExecutor:
                     origin_constraints.update(resolved)
                 if origin_constraints:
                     self.constraint_store.add(subjects, origin_constraints)
+                if read_only is not True and self._writes_into_workspace(tool, tool_input, context):
+                    self.workspace_materializer(context)
                 execution_started = True
                 result = tool.invoke(invocation=invocation, context=context)
                 return result.model_copy(update={"execution_started": True})
@@ -490,6 +495,26 @@ class ToolExecutor:
                 error=str(exc),
                 execution_started=execution_started,
             )
+
+    def _writes_into_workspace(self, tool: Tool, tool_input: dict[str, Any], context: ToolContext) -> bool:
+        """Whether a non-read-only invocation targets the run's workspace root.
+
+        Tools may declare ``workspace_write_targets``; writes elsewhere (for example an
+        explicitly named existing file) never allocate the default session folder.
+        """
+        if self.workspace_materializer is None or not context.workspace_root:
+            return False
+        targets_for = getattr(tool, "workspace_write_targets", None)
+        if not callable(targets_for):
+            return False
+        root = Path(context.workspace_root).expanduser().resolve(strict=False)
+        for target in targets_for(tool_input, context):
+            try:
+                Path(target).resolve(strict=False).relative_to(root)
+            except ValueError:
+                continue
+            return True
+        return False
 
     def _run_guard(self, *, context: ToolContext, tool_view: ToolView | None) -> str | None:
         run_id = (tool_view.child_run_id if tool_view else None) or context.run_id

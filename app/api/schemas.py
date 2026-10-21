@@ -504,6 +504,8 @@ class SessionCreateResponse(AgentSessionDetail):
 class SessionWorkspaceUpdateRequest(BaseModel):
     path: str = Field(min_length=1)
     platform: str
+    # Reserve the default per-session folder without creating it on disk.
+    reserve: bool = False
 
 
 class SessionWorkspaceResponse(BaseModel):
