@@ -2708,3 +2708,13 @@ class LocalKnowledgeAgentRuntime:
         """Project persisted local mail evidence into the generic knowledge store."""
 
         return self.mail_knowledge_mirror.sync(account_id=account_id)
+    def delete_matter(self, *, matter_id: str, expected_revision: int | None = None) -> MatterRecord:
+        """Soft-delete an independent local matter."""
+
+        return self.matter_service.delete_matter(matter_id=matter_id, expected_revision=expected_revision)
+
+    def restore_matter(self, *, matter_id: str) -> MatterRecord:
+        """Restore a soft-deleted local matter."""
+
+        return self.matter_service.restore_matter(matter_id=matter_id)
+

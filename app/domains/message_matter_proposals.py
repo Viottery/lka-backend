@@ -384,7 +384,7 @@ class MessageMatterProposalService:
         matches = conn.execute(
             "SELECT m.matter_id,m.title,m.summary,m.revision,m.status,m.priority,m.due_at "
             "FROM matters_fts JOIN matters m ON m.matter_id=matters_fts.matter_id "
-            "WHERE matters_fts MATCH ? ORDER BY rank,m.updated_at DESC,m.matter_id LIMIT 10",
+            "WHERE matters_fts MATCH ? AND m.deleted_at IS NULL ORDER BY rank,m.updated_at DESC,m.matter_id LIMIT 10",
             (self.matters._fts_query(content["title"]),),
         ).fetchall()
         suggestions = [

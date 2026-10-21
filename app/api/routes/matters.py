@@ -10,7 +10,7 @@ from app.api.schemas import (
     MatterSearchResponse,
     MatterUpdateRequest,
 )
-from app.domains.matters import MatterConflictError, MatterSyncPage
+from app.domains.matters import MatterConflictError, MatterPlanNotEmptyError, MatterSyncPage
 
 router = APIRouter(prefix="/matters", tags=["matters"])
 
@@ -124,6 +124,37 @@ def link_matter_source(
             matter_id=matter_id,
             source_link=payload,
         )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="This mutation requires its dedicated human review workflow.") from None
+    return MatterRecordResponse(**result.model_dump())
+
+
+@router.delete("/{matter_id}", response_model=MatterRecordResponse)
+def delete_matter(
+    matter_id: str,
+    request: Request,
+    expected_revision: Annotated[int | None, Query(ge=1)] = None,
+) -> MatterRecordResponse:
+    """Soft delete: the record leaves lists/search; POST .../restore undoes it."""
+    try:
+        result = request.app.state.runtime.delete_matter(matter_id=matter_id, expected_revision=expected_revision)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except MatterConflictError as exc:
+        raise HTTPException(status_code=409, detail="matter_revision_conflict") from exc
+    except MatterPlanNotEmptyError as exc:
+        raise HTTPException(status_code=409, detail="matter_plan_not_empty") from exc
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="This mutation requires its dedicated human review workflow.") from None
+    return MatterRecordResponse(**result.model_dump())
+
+
+@router.post("/{matter_id}/restore", response_model=MatterRecordResponse)
+def restore_matter(matter_id: str, request: Request) -> MatterRecordResponse:
+    try:
+        result = request.app.state.runtime.restore_matter(matter_id=matter_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except PermissionError:

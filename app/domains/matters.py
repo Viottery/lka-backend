@@ -81,6 +81,10 @@ class MatterConflictError(ValueError):
     """A matter changed after the caller read its revision."""
 
 
+class MatterPlanNotEmptyError(ValueError):
+    """A plan cannot be deleted while it still has tasks."""
+
+
 class MatterSourceLinkInput(BaseModel):
     source_type: str
     source_id: str
@@ -172,6 +176,7 @@ class MatterRecord(BaseModel):
     created_at: str
     updated_at: str
     revision: int = 1
+    deleted_at: str | None = None
 
 
 class MatterList(BaseModel):
@@ -255,6 +260,7 @@ class MatterService:
                 ("section", "TEXT NOT NULL DEFAULT ''"),
                 ("sort_order", "REAL NOT NULL DEFAULT 0"),
                 ("sections", "TEXT NOT NULL DEFAULT '[]'"),
+                ("deleted_at", "TEXT"),
             ):
                 if column not in columns:
                     conn.execute(f"ALTER TABLE matters ADD COLUMN {column} {declaration}")
@@ -380,7 +386,7 @@ class MatterService:
 
     def _plan_progress(self, conn, matter_id, *, source_ids=None, account_ids=None, allow_unattributed=True):
         rows = conn.execute(
-            "SELECT matter_id, status FROM matters WHERE parent_matter_id=? AND kind='task' AND visibility='user'", (matter_id,),
+            "SELECT matter_id, status FROM matters WHERE parent_matter_id=? AND kind='task' AND visibility='user' AND deleted_at IS NULL", (matter_id,),
         ).fetchall()
         rows = [row for row in rows if self._matter_in_scope(
             conn, matter_id=row["matter_id"], source_ids=source_ids,
@@ -497,6 +503,7 @@ class MatterService:
         source_ids: tuple[str, ...] | None = None,
         account_ids: tuple[str, ...] | None = None,
         allow_unattributed: bool = True,
+        include_deleted: bool = False,
     ) -> MatterRecord:
         owns = conn is None
         conn = conn or self._conn_factory()
@@ -506,13 +513,13 @@ class MatterService:
             row = conn.execute(
                 """
                 SELECT matter_id, title, summary, status, priority, due_at,
-                       tags, metadata, created_at, updated_at, revision, kind, parent_matter_id, project_id, scheduled_on, scheduled_start, scheduled_end, inbox, section, sort_order, sections, visibility
+                       tags, metadata, created_at, updated_at, revision, kind, parent_matter_id, project_id, scheduled_on, scheduled_start, scheduled_end, inbox, section, sort_order, sections, visibility, deleted_at
                 FROM matters
                 WHERE matter_id = ?
                 """,
                 (matter_id,),
             ).fetchone()
-            if row is None:
+            if row is None or (row["deleted_at"] is not None and not include_deleted):
                 raise KeyError(f"Matter not found: {matter_id}")
             if not self._matter_in_scope(
                 conn, matter_id=matter_id, source_ids=source_ids,
@@ -534,8 +541,8 @@ class MatterService:
     def sync_matters(self, *, after: int = 0, limit: int = 200) -> MatterSyncPage:
         """Read a bounded change page, hydrating current records in one snapshot.
 
-        Sequence entries may repeat a matter. This feed has no deletion contract;
-        cancellation is an ordinary update. Clients derive parent progress from
+        Sequence entries may repeat a matter. Soft-deleted matters stay in the
+        feed with ``deleted_at`` set so caches can drop them; restore clears it. Clients derive parent progress from
         their full task cache because child changes do not journal parent records.
         """
         if after < 0 or not 1 <= limit <= 500:
@@ -554,7 +561,7 @@ class MatterService:
             for row in page:
                 matter_id = row["matter_id"]
                 if matter_id not in records:
-                    records[matter_id] = self.get_matter(matter_id=matter_id, conn=conn)
+                    records[matter_id] = self.get_matter(matter_id=matter_id, conn=conn, include_deleted=True)
                 changes.append(MatterSyncChange(sequence=row["sequence"], matter=records[matter_id]))
             return MatterSyncPage(
                 changes=changes,
@@ -714,7 +721,7 @@ class MatterService:
             raise ValueError("visibility must be user, internal or all")
         page_size = max(1, min(int(limit), 200))
         start = max(0, int(offset))
-        conditions: list[str] = []
+        conditions: list[str] = ["deleted_at IS NULL"]
         params: list[Any] = []
         if visibility != "all":
             conditions.append("visibility = ?")
@@ -764,7 +771,7 @@ class MatterService:
                 conn.execute("BEGIN")
             rows = conn.execute(
                 "SELECT matter_id, title, summary, status, priority, due_at, "
-                "tags, metadata, created_at, updated_at, revision, kind, parent_matter_id, project_id, scheduled_on, scheduled_start, scheduled_end, inbox, section, sort_order, sections, visibility FROM matters" + where +
+                "tags, metadata, created_at, updated_at, revision, kind, parent_matter_id, project_id, scheduled_on, scheduled_start, scheduled_end, inbox, section, sort_order, sections, visibility, deleted_at FROM matters" + where +
                 " ORDER BY sort_order ASC, julianday(due_at) IS NULL, julianday(due_at) ASC, updated_at DESC, matter_id ASC" +
                 ("" if scoped else " LIMIT ? OFFSET ?"),
                 params if scoped else [*params, page_size, start],
@@ -817,7 +824,7 @@ class MatterService:
         try:
             if owns:
                 conn.execute("BEGIN")
-            filters: list[str] = []
+            filters: list[str] = ["deleted_at IS NULL"]
             filter_params: list[Any] = []
             if visibility != "all":
                 filters.append("visibility = ?")
@@ -968,7 +975,7 @@ class MatterService:
             source_ids=source_ids, account_ids=account_ids, allow_unattributed=allow_unattributed,
         )
         if current.kind == "plan" and current.project_id != project_id and conn.execute(
-            "SELECT 1 FROM matters WHERE parent_matter_id=? LIMIT 1", (matter_id,),
+            "SELECT 1 FROM matters WHERE parent_matter_id=? AND deleted_at IS NULL LIMIT 1", (matter_id,),
         ).fetchone():
             raise ValueError("Detach all tasks before changing the plan project")
         planning = {
@@ -1072,6 +1079,58 @@ class MatterService:
                 (now, matter_id),
             )
             return self.get_matter(matter_id=matter_id, conn=transaction, source_ids=source_ids, account_ids=account_ids, allow_unattributed=allow_unattributed)
+
+    def delete_matter(
+        self, *, matter_id: str, expected_revision: int | None = None,
+        conn: sqlite3.Connection | None = None, _receipt: Any = None,
+    ) -> MatterRecord:
+        """Soft-delete a matter; it leaves lists/search but stays restorable.
+
+        Plans with remaining tasks are refused so tasks are never orphaned.
+        """
+        with self._write_connection(conn) as transaction:
+            current = self.get_matter(matter_id=matter_id, conn=transaction)
+            self._check_message_receipt(
+                transaction, action="delete", matter_id=matter_id,
+                payload={"expected_revision": expected_revision}, receipt=_receipt,
+            )
+            if expected_revision is not None and expected_revision != current.revision:
+                raise MatterConflictError(f"Matter revision conflict: {matter_id}")
+            if current.kind == "plan" and transaction.execute(
+                "SELECT 1 FROM matters WHERE parent_matter_id=? AND deleted_at IS NULL LIMIT 1", (matter_id,),
+            ).fetchone():
+                raise MatterPlanNotEmptyError(f"Plan still has tasks: {matter_id}")
+            now = _now_iso()
+            transaction.execute(
+                "UPDATE matters SET deleted_at=?, updated_at=?, revision=revision+1 WHERE matter_id=?",
+                (now, now, matter_id),
+            )
+            transaction.execute("DELETE FROM matters_fts WHERE matter_id = ?", (matter_id,))
+            return self.get_matter(matter_id=matter_id, conn=transaction, include_deleted=True)
+
+    def restore_matter(
+        self, *, matter_id: str, conn: sqlite3.Connection | None = None, _receipt: Any = None,
+    ) -> MatterRecord:
+        """Undo a soft delete. A task whose plan is gone comes back standalone."""
+        with self._write_connection(conn) as transaction:
+            current = self.get_matter(matter_id=matter_id, conn=transaction, include_deleted=True)
+            if current.deleted_at is None:
+                return current
+            self._check_message_receipt(
+                transaction, action="restore", matter_id=matter_id, payload={}, receipt=_receipt,
+            )
+            parent = current.parent_matter_id
+            if parent and not transaction.execute(
+                "SELECT 1 FROM matters WHERE matter_id=? AND deleted_at IS NULL", (parent,),
+            ).fetchone():
+                parent = None
+            now = _now_iso()
+            transaction.execute(
+                "UPDATE matters SET deleted_at=NULL, parent_matter_id=?, updated_at=?, revision=revision+1 WHERE matter_id=?",
+                (parent, now, matter_id),
+            )
+            self._upsert_fts(transaction, matter_id, current.title, current.summary, current.tags)
+            return self.get_matter(matter_id=matter_id, conn=transaction)
 
     def _upsert_fts(
         self,
@@ -1180,6 +1239,7 @@ class MatterService:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             revision=row["revision"],
+            deleted_at=row["deleted_at"] if "deleted_at" in row.keys() else None,  # noqa: SIM118 - sqlite3.Row membership tests values
         )
 
     def _source_link_from_row(self, row: sqlite3.Row) -> MatterSourceLink:
