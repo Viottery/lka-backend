@@ -971,6 +971,24 @@ class SqliteAgentRunStore:
             "summary": summary,
         }
 
+    def prune_graph_runtime_artifacts(self, run_id: str, *, keep_artifact_id: str | None) -> int:
+        """Drop superseded per-step graph snapshots of a finished run.
+
+        Each graph step saves a full runtime snapshot (LLM, tool and progress
+        events). Only the newest one is ever loaded again; the run's result
+        artifact and event log keep the history. Non-terminal runs are untouched.
+        """
+        with connect(self.db_path) as conn:
+            status = conn.execute("SELECT status FROM agent_runs WHERE run_id = ?", (run_id,)).fetchone()
+            if status is None or status["status"] not in TERMINAL_RUN_STATUSES:
+                return 0
+            cursor = conn.execute(
+                "DELETE FROM agent_run_artifacts WHERE run_id = ? AND kind = 'agent_graph_runtime' "
+                "AND artifact_id IS NOT ?",
+                (run_id, keep_artifact_id),
+            )
+            return cursor.rowcount
+
     def load_artifact(self, artifact_id: str) -> dict[str, Any] | None:
         with connect(self.db_path) as conn:
             row = conn.execute(

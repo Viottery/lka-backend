@@ -1951,6 +1951,18 @@ class AgentGraphRunner:
             raise RuntimeError("Graph runtime artifact is missing.")
         return value
 
+    def _prune_runtime_snapshots(self, run_id: str) -> None:
+        """Once a run is terminal, keep only the runtime snapshot its last checkpoint uses."""
+        if self.artifact_store is None or not hasattr(self.artifact_store, "prune_graph_runtime_artifacts"):
+            return
+        try:
+            ref = self.get_state(run_id).values.get("runtime_artifact_ref")
+            keep = ref.get("artifact_id") if isinstance(ref, dict) else None
+            if keep:
+                self.artifact_store.prune_graph_runtime_artifacts(run_id, keep_artifact_id=keep)
+        except Exception:  # noqa: BLE001 - storage hygiene must never fail a finished turn.
+            return
+
     @staticmethod
     def _models(values: list[dict[str, Any]], cls: Any) -> list[Any]:
         return [cls.model_validate(v) for v in values]
@@ -2012,6 +2024,7 @@ class AgentGraphRunner:
             self._errors[run_id] = exc
 
     def _take_result(self, run_id: str) -> AgentTurnResult:
+        self._prune_runtime_snapshots(run_id)
         with self._lock:
             error = self._errors.pop(run_id, None)
             result = self._results.pop(run_id, None)
