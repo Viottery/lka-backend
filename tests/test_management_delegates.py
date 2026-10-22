@@ -1,4 +1,5 @@
 """Offline durable delegation and publication contracts."""
+import json
 from contextlib import closing
 
 import pytest
@@ -254,3 +255,114 @@ def test_parent_instruction_preserves_existing_inherited_allowance(runtime, mana
         delegate = delegates.get_for_session(conn, receipt['session_id'])
         inherited = delegate['kickoff_envelope']['debug_info']['inherited_work_metadata']
         assert inherited['work_budget_scopes'] == [{'scope_id': 'bounded-parent', 'max_tokens': 100}]
+
+
+@pytest.mark.parametrize('kind', ['completed', 'progress', 'blocked', 'needs_decision'])
+@pytest.mark.parametrize('evidence', [None, []])
+def test_task_based_reports_require_explicit_evidence(runtime, manager_context, delegates, kind, evidence):
+    receipt = delegates.delegate_work(manager_context, command_id='line', objective='Inspect state')
+    context = child_context(runtime, receipt['session_id'])
+    task = runtime.managed_tasks.start_task(context, command_id='task', purpose='Inspect source')
+    runtime.agent_run_manager._update_run(task['run_id'], status=AgentRunStatus.COMPLETED)
+    with pytest.raises(ManagementConflictError, match='read_task_result'):
+        delegates.report_delegate(context, command_id='report', kind=kind,
+                                  summary='Verified result from ' + task['run_id'], evidence=evidence)
+    with closing(runtime._conn()) as conn:
+        assert not conn.execute('SELECT 1 FROM manager_delegate_report_proposals').fetchone()
+        assert not conn.execute("SELECT 1 FROM management_commands WHERE action='report_delegate'").fetchone()
+    # Rejected proposals do not consume command IDs; repair with the real structured reference.
+    ref = {'session_id': task['session_id'], 'run_id': task['run_id']}
+    assert delegates.report_delegate(context, command_id='report', kind=kind,
+                                     summary='Verified result from ' + task['run_id'], evidence=[ref])['status'] == 'proposed'
+
+
+@pytest.mark.parametrize('kind', ['progress', 'completed', 'blocked', 'needs_decision'])
+def test_reports_without_execution_tasks_keep_optional_evidence(runtime, manager_context, delegates, kind):
+    receipt = delegates.delegate_work(manager_context, command_id='line', objective='Inspect state')
+    context = child_context(runtime, receipt['session_id'])
+    assert delegates.report_delegate(context, command_id='report', kind=kind,
+                                     summary='Independent work or no-execution blocker')['status'] == 'proposed'
+
+
+def test_blocker_accepts_owned_pending_task_and_session_only_refs(runtime, manager_context, delegates):
+    receipt = delegates.delegate_work(manager_context, command_id='line', objective='Inspect state')
+    context = child_context(runtime, receipt['session_id'])
+    task = runtime.managed_tasks.start_task(context, command_id='task', purpose='Inspect source')
+    for index, ref in enumerate([{'session_id': task['session_id']}, {'run_id': task['run_id']}]):
+        assert delegates.report_delegate(context, command_id='report' + str(index), kind='blocked',
+                                         summary='Awaiting execution', evidence=[ref])['status'] == 'proposed'
+
+
+def test_deleted_tasks_do_not_require_unavailable_evidence(runtime, manager_context, delegates):
+    receipt = delegates.delegate_work(manager_context, command_id='line', objective='Inspect state')
+    context = child_context(runtime, receipt['session_id'])
+    task = runtime.managed_tasks.start_task(context, command_id='task', purpose='Inspect source')
+    runtime.agent_run_manager._update_run(task['run_id'], status=AgentRunStatus.CANCELLED)
+    with closing(runtime._conn()) as conn, conn:
+        conn.execute("UPDATE agent_sessions SET status='deleted' WHERE session_id=?", (task['session_id'],))
+    with pytest.raises(ManagementConflictError, match='ordinary task'):
+        delegates.report_delegate(context, command_id='obsolete', kind='blocked', summary='Source unavailable',
+                                  evidence=[{'run_id': task['run_id']}])
+    args = {'command_id': 'report', 'kind': 'blocked', 'summary': 'All execution sources are unavailable'}
+    report = delegates.report_delegate(context, **args)
+    assert report['status'] == 'proposed'
+    assert delegates.report_delegate(context, **args) == report
+    with closing(runtime._conn()) as conn, conn:
+        delegates.apply_reports(conn, 'execution-child', context.session_id)
+        assert conn.execute('SELECT count(*) FROM manager_delegate_reports').fetchone()[0] == 1
+
+
+def test_report_rejects_foreign_task_and_mismatched_message_provenance(runtime, manager_context, delegates):
+    foreign = runtime.managed_tasks.start_task(manager_context, command_id='foreign', purpose='Other work')
+    receipt = delegates.delegate_work(manager_context, command_id='line', objective='Inspect state')
+    context = child_context(runtime, receipt['session_id'])
+    task = runtime.managed_tasks.start_task(context, command_id='task', purpose='Inspect source')
+    with pytest.raises(ManagementConflictError, match='ordinary task'):
+        delegates.report_delegate(context, command_id='foreign', kind='progress', summary='Result',
+                                  evidence=[{'run_id': foreign['run_id']}])
+    message = runtime.session_service.append_message(session_id=task['session_id'], role='agent',
+                                                     content='Result', payload={'run_id': 'another-run'})
+    with pytest.raises(ManagementConflictError, match='provenance'):
+        delegates.report_delegate(context, command_id='mismatch', kind='progress', summary='Result',
+                                  evidence=[{'run_id': task['run_id'], 'message_id': message.message_id}])
+    valid_message = runtime.session_service.append_message(session_id=task['session_id'], role='agent',
+                                                           content='Result', payload={'run_id': task['run_id']})
+    assert delegates.report_delegate(context, command_id='valid', kind='progress', summary='Result',
+        evidence=[{'run_id': task['run_id'], 'message_id': valid_message.message_id}])['status'] == 'proposed'
+
+
+def test_publication_revalidates_task_evidence_requirement(runtime, manager_context, delegates):
+    receipt = delegates.delegate_work(manager_context, command_id='line', objective='Inspect state')
+    context = child_context(runtime, receipt['session_id'])
+    delegates.report_delegate(context, command_id='report', kind='progress', summary='Before execution')
+    runtime.managed_tasks.start_task(context, command_id='task', purpose='New execution')
+    with closing(runtime._conn()) as conn, conn, pytest.raises(ManagementConflictError, match='nonempty evidence'):
+        delegates.apply_reports(conn, 'execution-child', context.session_id)
+    with closing(runtime._conn()) as conn:
+        assert not conn.execute('SELECT 1 FROM manager_delegate_reports').fetchone()
+
+
+def test_full_delegate_requirements_and_source_are_readable_through_pagination(runtime, manager_context, delegates):
+    objective = 'Required condition. ' * 700 + 'FINAL REQUIRED CONDITION'
+    receipt = delegates.delegate_work(manager_context, command_id='line', objective=objective)
+    context = child_context(runtime, receipt['session_id'])
+    with closing(runtime._conn()) as conn, conn:
+        envelope = delegates.get_for_session(conn, receipt['session_id'])['kickoff_envelope']
+        envelope['original_user_quotes'] = ['Source requirement. ' * 300 + 'FINAL SOURCE REQUIREMENT']
+        envelope['debug_info']['private_marker'] = 'PRIVATE_BUDGET'
+        conn.execute('UPDATE manager_delegates SET kickoff_envelope=? WHERE delegate_id=?',
+                     (json.dumps(envelope), receipt['delegate_id']))
+        purpose = delegates.purpose_for_session(conn, context.session_id, 'Current event')
+    assert 'next_char' in purpose and 'source_envelope' in purpose
+    content, start = '', 0
+    while True:
+        page = delegates.read_delegate(context, delegate_id=receipt['delegate_id'], start_char=start)
+        content += page['content']
+        if page['next_char'] is None:
+            break
+        assert page['next_char'] > start
+        start = page['next_char']
+    decoded = json.loads(content)
+    assert decoded['objective'] == objective
+    assert decoded['source_envelope']['original_user_quotes'] == envelope['original_user_quotes']
+    assert 'PRIVATE_BUDGET' not in content and 'debug_info' not in decoded['source_envelope']

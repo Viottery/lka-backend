@@ -370,6 +370,59 @@ def test_root_react_fork_child_review_resume_and_parent_answer(tmp_path, monkeyp
         runtime.stop()
 
 
+def test_read_only_child_with_review_converges_to_parent_answer(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "calibration.txt").write_text("Calibration: 47\n", encoding="utf-8")
+    config_path = tmp_path / "local.toml"
+    config_path.write_text(
+        '[agent]\norchestrator = "langgraph"\ncheckpoint_backend = "sqlite"\n'
+        'multi_agent_planning_enabled = true\nmax_decision_steps = 8\n'
+        '[safety]\ntool_review_mode = "skip"\n', encoding="utf-8",
+    )
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(config_path))
+    monkeypatch.setenv("LKA_WORKSPACE_ROOTS", str(workspace))
+    get_settings.cache_clear()
+    runtime = create_app().state.runtime
+    loop = runtime.agent_turn_loop
+    loop._route = lambda **_: {"selected_package": "filesystem", "reason": "Read calibration"}
+
+    def decide(**kwargs):
+        if kwargs["user_input"].startswith("Execute only the assigned child task."):
+            if kwargs["observations"]:
+                return {"action": "final_answer", "reason": "Read calibration evidence"}
+            return {"action": "call_tool", "tool_name": "filesystem.read_file",
+                    "tool_input": {"path": "calibration.txt"}, "reason": "Read assigned source"}
+        if kwargs["observations"]:
+            return {"action": "final_answer", "reason": "Child result received"}
+        return {"action": "fork_subtasks", "operation": {
+            "correlation_id": "readonly-review-integration",
+            "operation_id": "calibration-fork", "parent_step_id": "root_coordinator",
+            "subtasks": [{"step_id": "read", "objective": "Read calibration.txt",
+                          "output_contract": "Return the calibration value"}],
+        }, "reason": "Check child execution audit"}
+
+    loop._decide_next_action = decide
+    loop._answer_with_llm = lambda **_: "Calibration is 47."
+    try:
+        result = runtime.run_agent_turn(session_id=None, user_input="Read calibration via a child")
+        manager = runtime.agent_run_manager
+        parent = manager.get_run(result.run_id)
+        children = manager.child_tree(result.run_id)
+        assert parent.status.value == "completed", result.answer
+        assert result.answer == "Calibration is 47."
+        assert len(children) == 1 and children[0].status.value == "completed"
+        reviews = manager.list_safety_reviews(children[0].run_id)
+        assert len(reviews) == 1 and reviews[0].read_only is True
+        assert reviews[0].status.value == "approved"
+        assert parent.metadata["multi_agent_replan_required"] is False
+        assert "actual_side_effects_unknown" not in parent.metadata["multi_agent_verification"]["missing_requirements"]
+    finally:
+        runtime.stop()
+        get_settings.cache_clear()
+
+
 def test_fork_scope_resolver_uses_live_local_source_and_mail_inventory(tmp_path, monkeypatch):
     config_path = tmp_path / "local.toml"
     config_path.write_text(

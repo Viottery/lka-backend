@@ -55,6 +55,31 @@ class ManagementNotificationService:
                 "missing_decision_default_silent" if required else "legacy_default_notify"
             ),
         }
+        delivery = getattr(self, "delivery", None)
+        if delivery is not None and notification["notify_user"]:
+            event_ids = json.loads(execution["event_ids"])
+            events = []
+            for event_id in event_ids:
+                event = conn.execute(
+                    "SELECT * FROM manager_inbox WHERE event_id=? AND session_id=?",
+                    (event_id, record["session_id"]),
+                ).fetchone()
+                if event is not None:
+                    event = dict(event)
+                    event["payload"] = json.loads(event["payload"])
+                    events.append(event)
+            # Central inspection remains independent of delivery preferences.
+            # Existing structured decision events in a mixed batch retain their
+            # allow_decisions exception; a model's prose cannot grant it.
+            central = any(event["payload"].get("attention_sweep") is True for event in events)
+            if central and not any(delivery.can_deliver(conn, record["session_id"], event) for event in events):
+                notification = {
+                    "notify_user": False,
+                    "reason": "Delivery preferences suppress this notification; internal supervision continues.",
+                    "decision_source": "delivery_policy",
+                    "requested_notify_user": notification["notify_user"],
+                    "requested_reason": notification["reason"],
+                }
         return {"notification": notification, "user_visible": notification["notify_user"]}
 
     def for_run(self, run_id):

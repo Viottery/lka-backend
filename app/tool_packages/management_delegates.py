@@ -23,10 +23,14 @@ def management_delegate_tools(service):
           'action': {'type': 'string', 'enum': ['pause', 'cancel']}},
          ['command_id', 'delegate_id', 'expected_revision', 'action']),
         ('list_delegates', 'List owned delegate summaries or this child manager\'s own delegation.', True, PAGE, []),
-        ('read_delegate', 'Read a bounded page of objective and published reports, including evidence references.', True,
+        ('read_delegate', ('Read a bounded page containing objective, source_envelope and published reports with evidence. '
+         'Before acting, delegating or reporting, start at start_char=0 and follow next_char to read the complete requirements.'), True,
          {'delegate_id': TEXT, 'start_char': {'type': 'integer', 'minimum': 0}}, ['delegate_id']),
         ('report_delegate', ('Propose a report to the parent. Only successful autonomous publication delivers it. '
-         'Completion requires all owned ordinary tasks to be terminal. Evidence is owned task references, never source content.'), False,
+         'Completion requires all owned ordinary tasks to be terminal. Once this delegate owns ordinary tasks, every report kind '
+         'requires nonempty evidence with verified owned session_id/run_id/message_id references; pending or failed tasks may '
+         'support blockers. Without ordinary tasks evidence is optional for self-work or blockers. '
+         'References are not inferred from summary text. Evidence is owned task references, never source content.'), False,
          {'command_id': COMMAND, 'kind': {'type': 'string', 'enum': ['progress', 'completed', 'needs_decision', 'blocked']},
           'summary': {'type': 'string', 'minLength': 1, 'maxLength': 4000},
           'evidence': {'type': 'array', 'maxItems': 20, 'items': {'type': 'object', 'minProperties': 1,

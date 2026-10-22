@@ -81,10 +81,15 @@ class ManagementDelegateService:
             "你是持续负责一条事务线的子 agent。主管原轮结束后你仍独立运行。"
             "可自行执行或创建并管理自己的多个执行会话。派发后结束本轮，任务结果会唤醒新轮，禁止轮询空等。"
             "先把本线目标及主管来源原话中适用的要求列为明确验收项，将相关约束完整下发给执行会话。"
+            "保持用户的验收边界，区分必需条件与可选改进；不得自行加严要求。"
+            "额外信息仅在实质影响原要求是否满足时才构成阻塞，否则标为可选核实。"
+            "按原要求合并各来源支持的事实，不要求每份材料各自包含全部条件；可复核的计算与跨来源推导应标明依据。"
             "回读结果时逐项对照验收项，保留结论依赖的实际值、适用条件、时间或版本及来源，不能只转述摘要和来源编号。"
             "缺失或冲突的条件必须补查或明确上报未知／不满足，不得推定通过；需要用户取舍时报告 needs_decision。"
             "先读取返回结果，核验范围、事实与证据，决定补查、继续、重试或报告。"
             "使用 management.report_delegate 向主管报告 completed/needs_decision/blocked/progress；"
+            "本线已有执行任务时，各类报告都须显式提供至少一个已核验归属的 evidence 引用，"
+            "使用实际 session_id/run_id/message_id；阻塞可引用等待或失败的任务，不得用摘要中的编号代替结构化引用。"
             "提交报告后结束本轮，报告仅在本轮最终发布成功后送达主管。"
             "completed 表示整条事务线完成，仍有未终结任务时不得提交。"
             "管理工具仅对自己创建的执行会话生效，不得扩大工具范围。"
@@ -358,6 +363,19 @@ class ManagementDelegateService:
         if any(row['status'] not in TERMINAL for row in rows):
             raise ManagementConflictError('Complete or cancel unfinished ordinary tasks before reporting completion')
 
+    @staticmethod
+    def _require_task_evidence(conn, session_id, evidence):
+        if not evidence and conn.execute(
+            "SELECT 1 FROM managed_session_links l JOIN agent_sessions s ON s.session_id=l.task_session_id "
+            "WHERE l.manager_session_id=? AND s.kind='ordinary' AND s.status!='deleted' LIMIT 1", (session_id,),
+        ).fetchone():
+            raise ManagementConflictError(
+                'Reports from a delegate with ordinary tasks require nonempty evidence. '
+                'Read the relevant owned task with management.read_task_result and pass its '
+                'session_id, run_id and/or message_id in evidence; pending or failed task references '
+                'may support blocked/needs_decision reports. Do not repeat execution or infer references from prose.'
+            )
+
     def report_delegate(self, context, *, command_id, kind, summary, evidence=None):
         if kind not in ('progress', 'completed', 'needs_decision', 'blocked'):
             raise ValueError('Invalid delegate report kind')
@@ -385,6 +403,7 @@ class ManagementDelegateService:
             evidence = self._evidence(conn, context.session_id, evidence)
             if kind == 'completed':
                 self._finished_tasks(conn, context.session_id)
+            self._require_task_evidence(conn, context.session_id, evidence)
             conn.execute('INSERT INTO manager_delegate_report_proposals VALUES(?,?,?,?,?,?,?)',
                          (execution_id, command_id, delegate['delegate_id'], context.run_id, kind, summary, _json(evidence)))
             receipt = {'command_id': command_id, 'action': 'report_delegate', 'status': 'proposed',
@@ -403,9 +422,10 @@ class ManagementDelegateService:
             delegate = self.check_session(conn, session_id)
             if delegate is None or delegate['delegate_id'] != row['delegate_id']:
                 raise ManagementConflictError('Report proposal owner changed')
-            self._evidence(conn, session_id, json.loads(row['evidence']))
+            evidence = self._evidence(conn, session_id, json.loads(row['evidence']))
             if row['kind'] == 'completed':
                 self._finished_tasks(conn, session_id)
+            self._require_task_evidence(conn, session_id, evidence)
             report_id, stamp = 'delegate_report_' + uuid4().hex, datetime.now(UTC).isoformat()
             conn.execute('INSERT INTO manager_delegate_reports VALUES(?,?,?,?,?,?,?,?)',
                          (report_id, row['delegate_id'], row['run_id'], row['command_id'], row['kind'], row['summary'], row['evidence'], stamp))

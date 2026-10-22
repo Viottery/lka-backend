@@ -1706,7 +1706,7 @@ get/list_goal 返回 matter_id/matter_revision/matter_status，拒绝直接改�
 
 - `delegate_work(command_id,objective,title?,workspace_path?,allowed_tools?)`：创建独立持久事务线子 agent，返回 delegate_id、session_id、state、revision。当前主管轮可结束，子 agent 独立推进；默认只授予已注册的非管理只读工具，显式工具清单不能包含管理工具。workspace_path 选择默认执行目录；省略时使用前端默认独立工作区，未配置则无工作目录。已有工作目录不构成文件访问边界，外部访问仍须逐调用审查。子 agent 仅可管理自己创建的普通执行会话，不能递归创建下级主管。
 - `list_delegates(limit?,offset?)`／`read_delegate(delegate_id,start_char?)`：读取本主管名下（或子 agent 自身）归属、最新运行和分页目标／报告／证据。来源原文不进入普通返回字段。
-- `report_delegate(command_id,kind,summary,evidence?)`：子 agent 报告 progress/completed/needs_decision/blocked；evidence 引用自己名下 session_id、run_id、message_id，服务端复验归属。回执 proposed，只在当前轮最终发布事务成功后提交报告、主管事件与本轮终态；失败不发送。completed 要求没有未终结执行任务。
+- `report_delegate(command_id,kind,summary,evidence?)`：子 agent 报告 progress/completed/needs_decision/blocked；evidence 引用自己名下 session_id、run_id、message_id，服务端复验归属。本线有未删除的普通执行任务时，各类报告均须提供至少一个有效引用；等待或失败的任务也可作为阻塞报告的引用，无执行任务的独立工作仍可省略。摘要中的编号不能代替结构化 evidence。提案与最终发布均复验；旧的无引用待发布提案可能被拒绝，需按实际任务引用重新报告，已发布历史不改写。回执 proposed，只在当前轮最终发布事务成功后提交报告、主管事件与本轮终态；失败不发送。completed 要求没有未终结执行任务。
 - `instruct_delegate(command_id,delegate_id,expected_revision,instruction)`：父主管向空闲子 agent 补充指令并唤醒新轮，支持继续已完成事务线。冻结工具清单与该事务线默认目录保持不变；该事务线创建执行会话时可按任务显式选择 workspace_path。忙碌时冲突，不能取代原用户确认或答复。重复命令返回原回执。
 - `control_delegate(command_id,delegate_id,expected_revision,action)`：父主管 pause/cancel 事务线，先持久收回后续执行权限，再取消该线与其执行会话中的未终态运行；重复命令重发原取消信号。pause 是停止推进而非保留运行检查点的暂停；原运行终结后可 instruct_delegate 继续，cancel 不可复活。
 - 智能体创建的事务线及执行会话继承发起轮的 skip/llm/manual 审批偏好并持久保存，排队、重启、恢复、后续运行和下级派发继续沿用。high 风险或 requires_confirmation 标记本身不强制转人工。命中工具危险操作黑名单时强制人工审批；等待确认保留原 review/run 身份，主管与子 agent 不能代批。

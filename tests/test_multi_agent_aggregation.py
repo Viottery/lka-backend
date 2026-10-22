@@ -185,6 +185,63 @@ def test_child_execution_evidence_accepts_complete_read_only_trace() -> None:
     assert confirmation == ConfirmationState.NOT_REQUIRED
 
 
+@pytest.mark.parametrize("mode", ["skip", "llm", "manual"])
+def test_read_only_execution_accepts_approved_per_call_review(mode) -> None:
+    review = {"invocation_id": "inv-1", "read_only": True, "mode": mode,
+              "tool_name": "filesystem.read_file", "run_id": "child:a", "session_id": "session"}
+    events = [
+        _audit_event(1, "run_started", {}),
+        _audit_event(2, "safety_review_required", {"review": {**review, "status": "pending"}}),
+        _audit_event(3, "safety_review_decided", {"review": {**review, "status": "approved"}}),
+        _audit_event(4, "tool_started", {"tool_name": "filesystem.read_file"}),
+        _audit_event(5, "tool_completed", {
+            "tool_name": "filesystem.read_file",
+            "metadata": {"result": {"invocation_id": "inv-1", "status": "completed",
+                                     "execution_started": True}},
+        }),
+        _audit_event(6, "run_completed", {"tool_event_count": 1}),
+    ]
+    audit = {"protocol_version": "child_tool_audit_v1", "complete": True,
+             "invocations": [{"invocation_id": "inv-1", "tool_name": "filesystem.read_file",
+                              "read_only": True, "status": "completed", "execution_started": True}]}
+
+    actual, confirmation = derive_child_execution_evidence(_audit_run(), events, tool_audit=audit)
+
+    assert actual is False
+    assert confirmation == ConfirmationState.NOT_REQUIRED
+
+
+@pytest.mark.parametrize("review", [
+    {"read_only": True, "status": "pending"},
+    {"read_only": True, "status": "rejected"},
+    {"read_only": False, "status": "approved"},
+    {"status": "approved"},
+    {"read_only": True, "status": "approved", "tool_name": "other.tool"},
+    {"read_only": True, "status": "approved", "run_id": "other-run"},
+    {"read_only": True, "status": "approved", "session_id": "other-session"},
+])
+def test_read_only_execution_does_not_accept_unapproved_or_conflicting_review(review) -> None:
+    events = [
+        _audit_event(1, "run_started", {}),
+        _audit_event(2, "safety_review_decided", {"review": {"invocation_id": "inv-1", **review}}),
+        _audit_event(3, "tool_started", {"tool_name": "filesystem.read_file"}),
+        _audit_event(4, "tool_completed", {
+            "tool_name": "filesystem.read_file",
+            "metadata": {"result": {"invocation_id": "inv-1", "status": "completed",
+                                     "execution_started": True}},
+        }),
+        _audit_event(5, "run_completed", {"tool_event_count": 1}),
+    ]
+    audit = {"protocol_version": "child_tool_audit_v1", "complete": True,
+             "invocations": [{"invocation_id": "inv-1", "tool_name": "filesystem.read_file",
+                              "read_only": True, "status": "completed", "execution_started": True}]}
+
+    actual, confirmation = derive_child_execution_evidence(_audit_run(), events, tool_audit=audit)
+
+    assert actual is None
+    assert confirmation == ConfirmationState.MISSING
+
+
 def test_child_execution_evidence_requires_complete_tool_and_safety_audit() -> None:
     incomplete = [
         _audit_event(1, "run_started", {}),

@@ -337,7 +337,21 @@ def derive_child_execution_evidence(
                 return None, ConfirmationState.MISSING
             continue
         if classification["read_only"] is True:
-            if not executed or review is not None:
+            if not executed or (
+                review is not None
+                and (
+                    review.get("read_only") is not True
+                    or review.get("status") != "approved"
+                    or any(
+                        field in review and review[field] != value
+                        for field, value in (
+                            ("tool_name", classification["tool_name"]),
+                            ("run_id", run.run_id),
+                            ("session_id", run.session_id),
+                        )
+                    )
+                )
+            ):
                 return None, ConfirmationState.MISSING
             continue
         if review is None or review.get("read_only") is not False:

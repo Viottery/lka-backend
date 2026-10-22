@@ -636,6 +636,10 @@ reuse `--ledger` across retries, never clear it to obtain a successful result.
 Stored management ledger ceilings cannot be raised. Every run uses fresh data and
 synthetic workspace files, disables unrelated background features and never
 starts/restarts a service or connects to the daily database.
+Runtime reasoning and response protocols are preserved; an explicit 8192-token
+evaluation output ceiling is recorded in the report. The frozen tool ceiling
+includes background notification decisions, so intermediate turns may remain
+silent while a useful final result can be delivered.
 
 `parallel_lines` requires two delegates and four independent execution sessions,
 then checks source content, ownership, completed-run readbacks, report references,
@@ -646,8 +650,42 @@ obsolete approval; its earlier budget-limited attempt remains **unvalidated**, n
 a pass. Missing trace evidence, partial runs, unknown results and budget failures
 never count as passes. Structured gates still require independent semantic review;
 inspect local report and trace artifacts before a production release decision.
+Readback provenance includes durable run events and invocation records for silent
+turns, not only user-visible messages. Complete parent report reads may occur in
+an earlier owned turn; continuation pages must remain ordered within one run and
+read the full envelope. Missing pages or foreign task references still fail.
 
 ### Assistant orchestration regression selection
+
+`evals.lka_evals.attention_supervision --case central_sweep` evaluates
+assistant-organized attention from an ordinary ongoing work mandate. The user
+prompt does not request a goal, timer or reminder. One of two unfinished sources
+changes without another user message. Actual periodic sweep events must wake a
+reconstructed runtime, acquire both current sources, retain unresolved work and
+deliver a material decision. Rule-ranked attention cards must already be in its
+context; complete preloaded objectives must not be fetched again. An unchanged sweep stays quiet; user withdrawal must
+survive reconstruction. Saving a goal or finishing an execution is insufficient.
+This bounded lifecycle does not prove multi-day unattended reliability. Goal
+formation and semantic progress assessment remain model judgments.
+
+```bash
+# Dry planning does not load private configuration or call models.
+.venv/bin/python -m evals.lka_evals.attention_supervision
+# Explicit opt-in; reuse the same fixed ledger across retries.
+.venv/bin/python -m evals.lka_evals.attention_supervision --run --llm-mode real \
+  --case central_sweep --output /tmp/attention-new \
+  --ledger /path/to/attention-budget.sqlite3 --call-limit 80 --usd-limit 1.50
+```
+
+The driver enables autonomy only in its disposable runtime with a disclosed
+one-second central interval, a 300-second real-time bound and 20 driver iterations.
+It preserves configured reasoning and safety review, records an 8192-token output ceiling, disables search
+and forks, and dispatches serially without advancing timer clocks. Failed gates
+remain failures. Inspect source acquisitions, goal revisions and final answers
+alongside structured results for semantic review.
+The older `implicit_followup` and `cancel_followup` selections retain their
+event-driven/per-goal-timer protocol with central sweeps disabled. They remain
+separate diagnostics, not the acceptance protocol for unified supervision.
 
 The management catalog also includes offline `assistant_orchestration`,
 `tool_selection_recovery`, `execution_workspace`, and `result_evidence` groups.

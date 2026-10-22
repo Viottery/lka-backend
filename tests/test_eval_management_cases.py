@@ -245,6 +245,8 @@ def test_all_registered_clients_metered_and_temp_paths(tmp_path, monkeypatch):
     evaluation = Evaluation(
         tmp_path, config, bounded_budget(tmp_path / "ledger", usd_limit=0.1, call_limit=1), ()
     )
+    assert "management.decide_notification" in evaluation.report["allowed_tools"]
+    assert "management.read_task_result" in evaluation.report["allowed_tools"]
     evaluation.current = {"denied_tools": []}
     runtime = evaluation.open_runtime(tmp_path / "case")
     try:
@@ -263,7 +265,7 @@ def test_all_registered_clients_metered_and_temp_paths(tmp_path, monkeypatch):
 def test_async_provider_boundary_shared_between_consumers(tmp_path):
     import asyncio
 
-    from app.core.llm.models import LLMRequest
+    from app.core.llm.models import LLMRequest, LLMResponseMode
     from evals.lka_evals.live_budget import LiveBudgetExceeded
     from evals.lka_evals.management_runtime import RecordedClient, bounded_budget
 
@@ -273,7 +275,10 @@ def test_async_provider_boundary_shared_between_consumers(tmp_path):
 
         async def complete(self, request):
             self.calls += 1
-            assert request.max_output_tokens == 2048
+            assert request.max_output_tokens == 8000
+            assert request.thinking_enabled is True
+            assert request.response_mode is LLMResponseMode.JSON
+            assert request.reasoning_effort == "high"
             raise RuntimeError("synthetic provider failure")
 
     provider = FailingProvider()
@@ -293,6 +298,9 @@ def test_async_provider_boundary_shared_between_consumers(tmp_path):
         prompt_summary="synthetic review",
         model="deepseek-flash",
         max_output_tokens=8000,
+        thinking_enabled=True,
+        response_mode=LLMResponseMode.JSON,
+        reasoning_effort="high",
     )
     with pytest.raises(RuntimeError):
         asyncio.run(wrappers[0].complete(request))
@@ -429,3 +437,221 @@ def test_parent_report_pages_can_span_ordered_messages_of_same_run():
         len(p["result"]["output"]["content"]) for p in pages
     )
     assert not report_read_gate(snapshot, definition)
+
+
+def durable_chain(*, paginated=False):
+    snapshot, definition = paginated_report_chain() if paginated else fixture_chain()
+    run_sessions = {"tr": "task", "cr": "child", "pr": "parent"}
+    for row in snapshot["agent_runs"]:
+        row["record_payload"]["session_id"] = run_sessions[row["run_id"]]
+    snapshot["agent_runs"].append({"run_id": "pr", "record_payload": {"session_id": "parent"}})
+    rows, invocations = [], []
+    sequences = {}
+    for message in snapshot["agent_session_messages"]:
+        run_id = message["payload"]["run_id"]
+        for tool in message["payload"].pop("tool_events", []):
+            sequence = sequences.get(run_id, 0) + 1
+            result = {**tool["result"], "invocation_id": f"{run_id}-{sequence}",
+                      "tool_name": tool["tool_name"]}
+            for index, (kind, metadata) in enumerate([
+                ("tool_started", {"input": tool["input"]}),
+                ("tool_completed", {"result": result}),
+            ]):
+                rows.append({"run_id": run_id, "sequence": sequence + index,
+                             "created_at": message["created_at"],
+                             "event_payload": json.dumps({"run_id": run_id, "type": kind,
+                                 "payload": {"tool_name": tool["tool_name"], "metadata": metadata}})})
+            invocations.append({"run_id": run_id, "invocation_id": result["invocation_id"],
+                                "tool_name": tool["tool_name"], "status": "completed",
+                                "result_payload": json.dumps(result)})
+            sequences[run_id] = sequence + 1
+    snapshot["agent_run_events"] = rows
+    snapshot["agent_tool_invocations"] = invocations
+    # Silent manager rounds have no public message carrying their tools.
+    snapshot["agent_session_messages"] = [
+        message for message in snapshot["agent_session_messages"]
+        if message["session_id"] != "child"
+    ]
+    return snapshot, definition
+
+
+def test_silent_delegate_readback_uses_durable_tool_evidence():
+    snapshot, definition = durable_chain()
+    assert all(trace_checks(snapshot, parent="parent", definition=definition,
+                            initial_run_id="initial").values())
+
+
+@pytest.mark.parametrize("mutation", ["missing_readback", "foreign_run", "foreign_task", "foreign_task_owner", "foreign_delegate_owner", "failed_invocation"])
+def test_silent_readback_requires_matching_owned_completed_evidence(mutation):
+    snapshot, definition = durable_chain()
+    if mutation == "missing_readback":
+        snapshot["agent_run_events"] = [row for row in snapshot["agent_run_events"] if row["run_id"] != "cr"]
+    elif mutation == "foreign_run":
+        snapshot["agent_runs"][1]["record_payload"]["session_id"] = "foreign"
+    elif mutation == "foreign_task":
+        snapshot["manager_delegate_reports"][0]["evidence"][0]["run_id"] = "foreign"
+    elif mutation == "foreign_task_owner":
+        snapshot["agent_runs"][0]["record_payload"]["session_id"] = "foreign"
+    elif mutation == "foreign_delegate_owner":
+        snapshot["manager_delegates"][0]["parent_session_id"] = "foreign"
+    else:
+        next(row for row in snapshot["agent_tool_invocations"] if row["run_id"] == "cr")["status"] = "executing"
+    checks = trace_checks(snapshot, parent="parent", definition=definition, initial_run_id="initial")
+    assert not checks["every_owned_completed_task_read_before_report"]
+
+
+def test_complete_report_read_in_prior_silent_parent_run_counts():
+    snapshot, definition = durable_chain(paginated=True)
+    snapshot["agent_session_messages"][-1]["payload"]["run_id"] = "final-run"
+    assert report_read_gate(snapshot, definition)
+    # Even a complete report body in a prefix does not prove the envelope was read.
+    rows = snapshot["agent_run_events"]
+    parent_rows = [row for row in rows if row["run_id"] == "pr"]
+    first_result = json.loads(parent_rows[1]["event_payload"])
+    first_result["payload"]["metadata"]["result"]["output"].update(
+        content=json.dumps({"reports": snapshot["manager_delegate_reports"]}), next_char=4000)
+    parent_rows[1]["event_payload"] = json.dumps(first_result)
+    invocation = next(row for row in snapshot["agent_tool_invocations"] if row["run_id"] == "pr")
+    invocation["result_payload"] = json.dumps(first_result["payload"]["metadata"]["result"])
+    snapshot["agent_run_events"] = [row for row in rows if row["run_id"] != "pr"] + parent_rows[:2]
+    assert not report_read_gate(snapshot, definition)
+
+
+@pytest.mark.parametrize("mutation", ["missing", "foreign_run", "reversed", "wrong_parent"])
+def test_durable_parent_report_pagination_cannot_cross_gaps_or_ownership(mutation):
+    snapshot, definition = durable_chain(paginated=True)
+    rows = snapshot["agent_run_events"]
+    parent_rows = [row for row in rows if row["run_id"] == "pr"]
+    if mutation == "missing":
+        rows.remove(parent_rows[3])
+    elif mutation == "foreign_run":
+        parent_rows[2]["run_id"] = parent_rows[3]["run_id"] = "foreign"
+    elif mutation == "wrong_parent":
+        snapshot["agent_runs"][-1]["record_payload"]["session_id"] = "foreign"
+    else:
+        # Sequence is authoritative even if exported rows happen to be reordered.
+        parent_rows[0]["sequence"], parent_rows[2]["sequence"] = parent_rows[2]["sequence"], parent_rows[0]["sequence"]
+        parent_rows[1]["sequence"], parent_rows[3]["sequence"] = parent_rows[3]["sequence"], parent_rows[1]["sequence"]
+    assert not report_read_gate(snapshot, definition)
+
+
+@pytest.mark.parametrize("read_tool", ["management.read_session", "management.read_task_result"])
+def test_snapshot_checks_actual_silent_manager_readback(tmp_path, monkeypatch, read_tool):
+    from evals.lka_evals.management_runtime import Evaluation
+    from tests.test_management_api import runtime as runtime_fixture
+    from tests.test_management_delegate_integration import bind_all, dispatch, queued, script
+    from tests.test_management_tasks import manager_context
+    from tests.test_unified_entry_quality import ScriptedClient, operation
+
+    instances = runtime_fixture.__wrapped__(tmp_path, monkeypatch)
+    runtime = next(instances)
+    try:
+        runtime.local_app_config.safety.tool_review_mode = "skip"
+        context = manager_context.__wrapped__(runtime)
+        delegate = runtime.management_delegates.delegate_work(context, command_id="d", objective="Verify task")
+        runtime.agent_run_manager.complete_run(context.run_id)
+        bind_all(runtime)
+        script(runtime, [("management.start_task", {"command_id": "task", "purpose": "Produce evidence"})], "Waiting.")
+        dispatch(runtime)
+        runtime.agent_turn_loop.llm_client = ScriptedClient([
+            operation("final_answer", reason="Evidence complete"), "Verified task result."])
+        dispatch(runtime)
+        bind_all(runtime)
+        child_run = queued(runtime, delegate["session_id"])
+        evaluation = Evaluation.__new__(Evaluation)
+        evaluation.runtime = runtime
+        link = evaluation.snapshot()["managed_session_links"][0]
+        script(runtime, [
+            (read_tool, {"session_id": link["task_session_id"]} if read_tool == "management.read_session"
+             else {"run_id": link["run_id"]}),
+            ("management.report_delegate", {"command_id": "report", "kind": "completed",
+                "summary": "Verified task result.",
+                "evidence": [{"session_id": link["task_session_id"], "run_id": link["run_id"]}]}),
+        ], "Reviewed and reported.")
+        dispatch(runtime)
+        assert runtime.agent_run_manager.get_run(child_run.run_id).result_snapshot["user_visible"] is False
+        snapshot = evaluation.snapshot()
+        assert not any(json.loads(message["payload"]).get("run_id") == child_run.run_id
+                       for message in snapshot["agent_session_messages"])
+        definition = {"files": {}, "task_count": 1, "needs_decision": False}
+        checks = trace_checks(snapshot, parent=context.session_id, definition=definition,
+                              initial_run_id=context.run_id)
+        assert checks["every_owned_completed_task_read_before_report"]
+        snapshot["agent_run_events"] = [row for row in snapshot["agent_run_events"] if row["run_id"] != child_run.run_id]
+        assert not trace_checks(snapshot, parent=context.session_id, definition=definition,
+                                initial_run_id=context.run_id)["every_owned_completed_task_read_before_report"]
+    finally:
+        next(instances, None)
+
+
+def task_answer_chain():
+    snapshot, definition = fixture_chain()
+    answer = "Full execution result. " * 400 + "RANDOM-123 2026-11-13"
+    snapshot["agent_session_messages"][1]["content"] = answer
+    snapshot["agent_runs"][0]["record_payload"].update(
+        session_id="task", result_snapshot={"answer": answer})
+    child = snapshot["agent_session_messages"][2]
+    prototype = child["payload"]["tool_events"][0]
+    pages = []
+    for offset in range(0, len(answer), 4000):
+        page = copy.deepcopy(prototype)
+        page["tool_name"] = "management.read_task_result"
+        page["input"] = {"run_id": "tr", "start_char": offset}
+        page["result"]["output"] = {
+            "run": {"run_id": "tr", "session_id": "task", "status": "completed"},
+            "section": "answer", "content": answer[offset:offset + 4000],
+            "start_char": offset, "total_chars": len(answer),
+            "next_char": offset + 4000 if offset + 4000 < len(answer) else None,
+        }
+        pages.append(page)
+    child["payload"]["tool_events"] = pages
+    return snapshot, definition
+
+
+def test_complete_task_answer_readbacks_preserve_full_chain():
+    snapshot, definition = task_answer_chain()
+    assert all(trace_checks(snapshot, parent="parent", definition=definition,
+                            initial_run_id="initial").values())
+    # Published message fallback has the same exact-answer requirement.
+    snapshot["agent_runs"][0]["record_payload"].pop("result_snapshot")
+    assert all(trace_checks(snapshot, parent="parent", definition=definition,
+                            initial_run_id="initial").values())
+
+
+@pytest.mark.parametrize("mutation", [
+    "partial", "wrong_order", "foreign_input", "foreign_run", "foreign_session",
+    "wrong_section", "different_answer", "mixed_reader_run", "after_report", "prefix_only",
+])
+def test_task_answer_readback_rejects_partial_or_foreign_evidence(mutation):
+    snapshot, definition = task_answer_chain()
+    child = snapshot["agent_session_messages"][2]
+    pages = child["payload"]["tool_events"]
+    output = pages[1]["result"]["output"]
+    if mutation == "partial":
+        pages.pop(1)
+    elif mutation == "wrong_order":
+        pages[0], pages[1] = pages[1], pages[0]
+    elif mutation == "foreign_input":
+        pages[1]["input"]["run_id"] = "foreign"
+    elif mutation == "foreign_run":
+        output["run"]["run_id"] = "foreign"
+    elif mutation == "foreign_session":
+        output["run"]["session_id"] = "foreign"
+    elif mutation == "wrong_section":
+        output["section"] = "evidence"
+    elif mutation == "different_answer":
+        output["content"] = "X" * len(output["content"])
+    elif mutation == "mixed_reader_run":
+        page = pages.pop(1)
+        snapshot["agent_runs"].append({"run_id": "other", "record_payload": {"session_id": "child"}})
+        snapshot["agent_session_messages"].insert(2, {"session_id": "child", "created_at": "2",
+            "payload": {"run_id": "other", "tool_events": [page]}})
+    elif mutation == "after_report":
+        child["created_at"] = "9"
+    else:
+        first = pages[0]["result"]["output"]
+        first.update(next_char=None, total_chars=len(first["content"]))
+        pages[:] = pages[:1]
+    checks = trace_checks(snapshot, parent="parent", definition=definition, initial_run_id="initial")
+    assert not checks["every_owned_completed_task_read_before_report"]
+    assert not checks["source_and_date_facts_survive_task_and_delegate_handoffs"]

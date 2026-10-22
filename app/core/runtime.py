@@ -966,11 +966,23 @@ class LocalKnowledgeAgentRuntime:
         self.management_coordinator.delegates = self.management_delegates
         self.management_coordinator.user_input_pending = self.session_inputs.pending_in_transaction
         self.management_coordinator.ensure_schema()
+        from app.domains.management_supervision import ManagementSupervisionService
+
+        self.management_supervision = ManagementSupervisionService(
+            self._conn, goals=self.management_goals, management=self.management_service,
+            config=self.local_app_config.management,
+        )
+        self.management_supervision.ensure_schema()
+        self.management_coordinator.supervision = self.management_supervision
+        from app.domains.management_attention_context import ManagementAttentionContext
+
+        self.management_coordinator.attention_context = ManagementAttentionContext(self.management_goals)
         self.management_coordinator.work_service = self.management_work
         self.management_coordinator.attention = self.management_attention
         self.management_coordinator.schedules = self.management_schedules
         self.management_coordinator.assignments = self.management_assignments
         self.management_coordinator.delivery = self.management_delivery
+        self.management_coordinator.notifications.delivery = self.management_delivery
         self.management_coordinator.watch_subscriptions = self.management_watch_subscriptions
         self.management_coordinator.work_queue = self.management_queue
         self.agent_turn_loop.execution_guard = self.management_coordinator.check_run
@@ -1159,7 +1171,14 @@ class LocalKnowledgeAgentRuntime:
         from app.domains.management_role import supervisor_instructions
 
         return SessionRunPolicy(
-            role_instructions=supervisor_instructions(active=controller["status"] == "active"),
+            role_instructions=supervisor_instructions(
+                active=controller["status"] == "active",
+                autonomous_enabled=(self.local_app_config.management.enabled
+                                    and self.local_app_config.management.autonomous_enabled),
+                attention_sweep_interval_seconds=(
+                    self.local_app_config.management.attention_sweep_interval_seconds
+                ),
+            ),
             read_only_tools=[tool.name for tool in self.tool_registry.list_tools()
                              if tool.package != "management" and not tool.name.startswith("management.")],
             allow_default_workspace=False, allowed_tools=self.management_service.allowed_tool_names(

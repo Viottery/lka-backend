@@ -95,7 +95,9 @@ def test_two_delegates_manage_four_tasks_then_wake_parent_after_reopen(runtime):
             assert reopened.agent_run_manager.get_run(context_run.run_id).status.value == 'completed'
         bind_all(reopened)
         parent_run = queued(reopened, parent)
-        script(reopened, [('management.read_delegate', {'delegate_id': c['delegate_id']}) for c in children],
+        script(reopened, [('management.read_delegate', {'delegate_id': c['delegate_id']}) for c in children] +
+               [('management.decide_notification', {'command_id': 'notify-final', 'notify_user': True,
+                                                     'reason': 'Both requested work lines are verified.'})],
                'Both independent lines verified.')
         dispatch(reopened)
         assert reopened.agent_run_manager.get_run(parent_run.run_id).status.value == 'completed'

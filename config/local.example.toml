@@ -19,6 +19,9 @@ internal_items_enabled = false
 # Accepted agent tasks dispatch independently; no fixed management worker pool.
 poll_seconds = 5
 min_wake_interval_seconds = 60
+# One unified background sweep of active attention goals; no per-goal timer needed.
+# Zero disables periodic sweeps while retaining task/timer event handling.
+attention_sweep_interval_seconds = 1800
 max_causal_rounds = 6
 failure_limit = 3
 # Optional management-specific limits are unset by default. Existing frozen

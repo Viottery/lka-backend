@@ -15,7 +15,6 @@ from contextlib import closing
 from pathlib import Path
 
 from app.core.config import Settings
-from app.core.llm.models import LLMResponseMode
 from app.core.local_config import LocalAppConfig, _dotenv_value, load_local_config
 from app.core.runtime import LocalKnowledgeAgentRuntime
 from app.core.safety import SafetyReviewMode
@@ -28,6 +27,7 @@ DELEGATE_TOOLS = (
     "management.start_task",
     "management.send_instruction",
     "management.read_session",
+    "management.read_task_result",
     "management.read_events",
     "management.list_sessions",
     "management.list_runs",
@@ -43,6 +43,7 @@ ALLOWED_TOOLS = frozenset(
         "management.list_delegates",
         "management.read_delegate",
         "management.instruct_delegate",
+        "management.decide_notification",
     )
 )
 
@@ -65,9 +66,7 @@ class RecordedClient(MeteredClient):
     def _reserve(self, request):
         request = request.model_copy(
             update={
-                "max_output_tokens": min(request.max_output_tokens or 2048, 2048),
-                "thinking_enabled": False,
-                "response_mode": LLMResponseMode.TEXT,
+                "max_output_tokens": min(request.max_output_tokens or 8192, 8192),
             }
         )
         request, call_id = super()._reserve(request)
@@ -140,6 +139,9 @@ class Evaluation:
             "provider": config.llm.default_client,
             "model": config.llm.model,
             "allowed_tools": sorted(ALLOWED_TOOLS),
+            "max_output_tokens_ceiling": 8192,
+            "tool_review_mode": config.safety.tool_review_mode,
+            "decision_thinking_enabled": config.agent.decision_thinking_enabled,
             "cases": [],
             "semantic_review": "Structured fact/decision assertions plus trace provenance; independent review still required",
             "artifacts": {
@@ -223,7 +225,7 @@ class Evaluation:
                 if re.fullmatch(r"[a-z_]+", n)
                 and (
                     n.startswith(("manager_", "managed_", "agent_run", "agent_session"))
-                    or n == "background_jobs"
+                    or n in {"background_jobs", "agent_tool_invocations"}
                 )
             ]
             return {
@@ -498,7 +500,7 @@ def configured_evaluation(config_path, env_path):
     config.agent.orchestrator = "langgraph"
     config.agent.checkpoint_backend = "sqlite"
     config.agent.unified_entry_enabled = True
-    config.agent.decision_thinking_enabled = False
+    config.agent.decision_thinking_enabled = source.agent.decision_thinking_enabled
     config.agent.multi_agent_planning_enabled = False
     config.management.enabled = True
     config.management.autonomous_enabled = False
@@ -507,7 +509,7 @@ def configured_evaluation(config_path, env_path):
     config.message_history.enabled = False
     config.embedding.enabled = False
     config.reranker.enabled = False
-    config.safety.tool_review_mode = "llm"
+    config.safety.tool_review_mode = source.safety.tool_review_mode
     return config, selected, protected
 
 

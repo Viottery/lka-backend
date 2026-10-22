@@ -60,7 +60,30 @@ def test_conditional_supervisor_reader_does_not_grant_write_commands(runtime, tm
     assert not (tmp_path/'must-not-exist.txt').exists()
 
 
+@pytest.mark.parametrize('enabled,autonomous', [(True, False), (True, True), (False, True)])
+def test_supervisor_sees_effective_followup_capability_without_enabling_it(runtime, enabled, autonomous):
+    runtime.local_app_config.management.enabled = enabled
+    runtime.local_app_config.management.autonomous_enabled = autonomous
+    sid = runtime.management_service.create()['session']['session_id']
+    # Capability information cannot override the paused controller's write restriction.
+    paused = runtime._session_run_policy(sid)
+    assert '当前管理状态为 paused' in paused.role_instructions
+    assert 'management.set_goal' not in paused.allowed_tools
+    expected = '自动跟进已启用' if enabled and autonomous else '自动跟进未启用'
+    assert expected in paused.role_instructions
+    runtime.management_service.update(sid, expected_revision=1, status='active')
+    run = runtime.create_agent_run(session_id=sid, user_input='负责跟进这项工作', resumable=True)
+    policy = run.metadata['session_policy']
+    assert expected in policy['role_instructions']
+    assert 'management.set_goal' in policy['allowed_tools']
+    assert runtime.local_app_config.management.enabled is enabled
+    assert runtime.local_app_config.management.autonomous_enabled is autonomous
+
+
 def test_supervisor_reviews_report_gaps_without_rescanning_sources():
     assert "只针对缺口给出补充指令" in SUPERVISOR_INSTRUCTIONS
     assert "复用返回的证据和结果，不为补齐报告而重扫原资料" in SUPERVISOR_INSTRUCTIONS
     assert "日期精度或来源冲突" in SUPERVISOR_INSTRUCTIONS
+    assert "区分必需条件和可选改进，不自行加严要求" in SUPERVISOR_INSTRUCTIONS
+    assert "实质影响原要求是否满足时才构成阻塞" in SUPERVISOR_INSTRUCTIONS
+    assert "next_char" in SUPERVISOR_INSTRUCTIONS and "source_envelope" in SUPERVISOR_INSTRUCTIONS

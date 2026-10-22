@@ -547,6 +547,7 @@ class ManagementConfig(BaseModel):
 
     enabled: bool = False
     autonomous_enabled: bool = False
+    attention_sweep_interval_seconds: int = Field(default=1800, ge=0, le=86400)
     internal_items_enabled: bool = False
     # Legacy input accepted for old configuration files; dispatch is dynamic.
     dispatch_workers: int = Field(default=1, ge=1, le=8, exclude=True)
