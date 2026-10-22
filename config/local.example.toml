@@ -36,6 +36,10 @@ provider = "mock"
 base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"
 model = "gpt-4.1-mini"
+# Declare controls only after verifying this exact endpoint/default model.
+# supports_reasoning_effort = true
+# reasoning_effort_map = { off = "none", low = "low", high = "high", max = "xhigh" }
+# thinking_control = "deepseek"
 timeout_seconds = 60
 default_client = ""
 fallback_client = ""
@@ -148,7 +152,13 @@ multi_agent_max_retries = 1
 # function_calling_strict = false
 # Set true only for endpoints that accept a reasoning_effort chat-completions field.
 # supports_reasoning_effort = false
+# supports_reasoning_off = false
+# reasoning_effort_map = { off = "none", low = "low", high = "high", max = "xhigh" }
 # thinking_control = "deepseek" # Opt-in only when the endpoint supports thinking.type.
+# Additional models require exact capability declarations; max may alias high.
+# [llm.clients.model_reasoning_overrides."another-model-id"]
+# supports_off = false
+# effort_map = { low = "low", high = "high", max = "high" }
 #
 # [[llm.clients]]
 # name = "openai"

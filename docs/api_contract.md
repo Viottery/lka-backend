@@ -497,7 +497,8 @@ POST /agent/turn
   "llm": {
     "client_name": "packyapi",
     "model": "deepseek-v4-flash",
-    "response_mode": "json"
+    "response_mode": "json",
+    "reasoning_level": "low"
   }
 }
 ```
@@ -505,6 +506,19 @@ POST /agent/turn
 `llm` 是可选字段；不传时使用会话 / 配置默认值。`model` 是运行时可切换选项，不应由
 后端代码写死。`/agent/turn` 返回用户可见结果和脱敏审计摘要；`POST /agent/turn/stream`
 提供用户可见的 SSE token-delta 输出。
+
+`llm.reasoning_level` 接受 `off`、`low`、`high`、`max`，普通请求、SSE 和会话输入队列均支持。
+新运行按当前请求 → 会话／管理控制器偏好 → UI 默认值 → `low` 选择；单次覆盖不修改偏好。
+运行冻结所选档位，排队、恢复及助理派发的执行会话／子代理沿用冻结值，
+旧检查点缺少此字段时保留原配置行为。业务决策、语义修复和用户回答遵循该选择；
+纯路由与已决定静默的内部交付整理尝试关闭推理，工具结果检查、摘要、记忆和安全审查使用内部策略。
+不支持关闭的模型对内部调用回退到声明的低档；没有声明推理控制能力时记录为未控制。
+推理档位不改变工具审批模式或危险操作人工审批。
+
+模型映射按精确 client/model 声明；显式选择不支持的档位会在新请求受理前返回 422，
+不会悄悄忽略 `off`。默认 `low` 可在未声明能力的模型上按其原协议运行，审计标记未控制。
+`max` 可以映射为模型的最高可用档，审计会标明别名和实际生效档位。
+首次调用保存该运行的映射快照，后续恢复不受配置映射变化影响。
 
 ### 会话文件附件
 
@@ -575,7 +589,9 @@ max_matches=20)` 定位正文（大小写敏感的字面搜索，最多 100 个�
 兼容的 `/models`，不可用时退回本地 `available_models` 与默认模型。`?refresh=true` 强制
 刷新，响应不包含 API key。`GET /agent/ui-defaults` 和 `PUT /agent/ui-defaults` 读取及保存
 本机共享的前端默认设置，字段为 `llm_client`、`llm_model`、`safety_mode`、`stream`、
-`workspace_parent`。默认设置只影响前端之后发出的请求或新建工作区，不修改已有会话。
+`workspace_parent`、`reasoning_level`（默认 `low`）。旧客户端保存设置时省略推理字段会保留原值。
+默认设置不修改已有运行的冻结配置。模型目录中的 `reasoning_capabilities` 按模型给出
+`controlled`、`supports_off`、`effort_map`、`source` 和 `protocol`，供前端展示档位支持及别名。
 请求可选带 `safety_review_mode`（`skip`、`llm`、`manual`）。显式选择优先于继承偏好及本地默认配置；省略时使用会话继承偏好，再回退本地配置。
 命中工具的危险操作黑名单时，无论选择 skip 或 llm 均要求人工审批；已有待人工审批记录保持原决策入口。
 Bash 黑名单包括递归删除（`rm -r/-rf`、`Remove-Item -Recurse`、`rd /s`、`find -delete`）、磁盘格式化／擦除、原始设备覆写，以及 `git reset --hard`／`git clean -f`。常见包装命令、命令替换和终端输入也检查；这是显式命令检查，不是 OS 沙箱或任意脚本的语义分析。
@@ -583,6 +599,9 @@ Bash 黑名单包括递归删除（`rm -r/-rf`、`Remove-Item -Recurse`、`rd /s
 response mode、耗时、usage、finish reason、provider request id、rate-limit headers、
 错误分类和 retry 判断等审计字段。完整 prompt / output 仍只写入本地 markdown run log；
 第一版暂不新增 SQLite `llm_calls` 表。
+新运行的调用审计 `metadata.reasoning` 包含 `requested`、`effective`、`alias`、
+`provider_params`、`policy`、`source`、`status` 和能力映射版本；流式与非流式共用解析。
+供应商返回的 reasoning token 计数保留在 usage；没有返回时记为不可用，不推定为零。
 
 响应：
 
@@ -1514,20 +1533,22 @@ limit 1..200，offset 0..1,000,000，q 最长 500 字符，按字面子串搜索
 | 接口 | 行为 |
 | --- | --- |
 | `POST /managers/default` | 并发幂等获取或首次创建主控会话，返回 200；已删除默认会话返回 409，不自动重建 |
-| `POST /managers` | 创建另一管理会话，返回 201；可传 title、make_default、llm_client_name、llm_model |
+| `POST /managers` | 创建另一管理会话，返回 201；可传 title、make_default、llm_client_name、llm_model、reasoning_level |
 | `GET /managers?limit=50&offset=0` | 返回未删除管理会话数组，limit 为 1..200 |
 | `GET /managers/{session_id}` | 返回一个管理会话与 controller，不是管理会话则 404 |
-| `PATCH /managers/{session_id}` | 修改 status 或模型默认值，必须携带 expected_revision；冲突 409 |
+| `PATCH /managers/{session_id}` | 修改 status、模型或推理默认值，必须携带 expected_revision；冲突 409 |
 
 单项响应为 `{session: {...}, controller: {...}}`。controller 包含 session_id、
-status(active/paused)、revision、llm_client_name、llm_model、created_at、updated_at、default_execution_workspace。
+status(active/paused)、revision、llm_client_name、llm_model、reasoning_level、created_at、updated_at、default_execution_workspace。
 默认执行父目录通过创建或 PATCH 的 default_execution_workspace:{path,platform} 配置，后端验证并返回 backend_path；null 清除。PATCH 必须使用 expected_revision。POST /managers/default 的目录仅在首次创建时采用，后续不覆盖已有配置。
 此字段不赋予主管自身 session.workspace，也不是审批授权。
 新建时 paused；模型字段省略保持原值，显式 null 清除。未知 client 返回 422。
+`reasoning_level` 接受 off/low/high/max；省略保留偏好，null 清除并使用共享默认值。
 make_default=true 表示显式切换默认入口，主控会话无需固定 ID。
 
 对话仍通过通用 `/agent/turn` 或 `/agent/turn/stream`。请求模型覆盖优先于会话默认；
 运行冻结其实际会话策略，恢复沿用原设置，替换的新轮读取当前会话设置。
+推理档位在替换时默认保留原运行选择，显式传入新档位才覆盖。
 主管会话开放 `management`、专用 `history` 包、`matter` 读取及轻量主管写入工具，以及当前注册且已授权的只读操作。支持按参数只读的工具可被发现，但每次调用均强制验证只读；其他写入不能通过这一授权执行。主管复杂工作默认下发；简单搜索、单次操作可直接处理。
 主管角色策略在首次路由前装载并冻结，普通执行会话不继承；原有安全审查与审批独立生效。事务线子 agent 的工具能力按委托冻结；默认执行目录与文件访问授权分别处理。
 单条事项可在 `matter` 包使用 `management.create_matter` / `management.update_matter`，无需展开整套管理工具。

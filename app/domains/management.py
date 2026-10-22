@@ -45,6 +45,7 @@ class ManagementService:
                     status TEXT NOT NULL DEFAULT 'paused' CHECK(status IN ('active','paused')),
                     revision INTEGER NOT NULL DEFAULT 1 CHECK(revision >= 1),
                     llm_client_name TEXT, llm_model TEXT,
+                    reasoning_level TEXT CHECK(reasoning_level IN ('off','low','high','max')),
                     created_at TEXT NOT NULL, updated_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS manager_defaults (
@@ -65,6 +66,8 @@ class ManagementService:
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(manager_controllers)")}
             if "default_execution_workspace" not in columns:
                 conn.execute("ALTER TABLE manager_controllers ADD COLUMN default_execution_workspace TEXT")
+            if "reasoning_level" not in columns:
+                conn.execute("ALTER TABLE manager_controllers ADD COLUMN reasoning_level TEXT")
 
     def resolve_execution_workspace(self, value):
         if value is None:
@@ -90,7 +93,13 @@ class ManagementService:
             raise ValueError("Model settings must be non-empty strings or null")
         return value.strip() if value is not None else None
 
-    def _create(self, conn, *, title, make_default, llm_client_name, llm_model, default_execution_workspace=None,
+    @staticmethod
+    def _reasoning_value(value):
+        if value is not None and (not isinstance(value, str) or value not in {"off", "low", "high", "max"}):
+            raise ValueError("reasoning_level must be off, low, high, or max")
+        return value
+
+    def _create(self, conn, *, title, make_default, llm_client_name, llm_model, reasoning_level=None, default_execution_workspace=None,
                 creator_session_id=None):
         session_id = "session_" + uuid4().hex
         now = datetime.now(UTC).isoformat()
@@ -100,8 +109,8 @@ class ManagementService:
             (session_id, title, now, now, "assistant" if creator_session_id else "user", creator_session_id),
         )
         conn.execute(
-            "INSERT INTO manager_controllers(session_id,llm_client_name,llm_model,created_at,updated_at,default_execution_workspace) "
-            "VALUES(?,?,?,?,?,?)", (session_id, llm_client_name, llm_model, now, now,
+            "INSERT INTO manager_controllers(session_id,llm_client_name,llm_model,reasoning_level,created_at,updated_at,default_execution_workspace) "
+            "VALUES(?,?,?,?,?,?,?)", (session_id, llm_client_name, llm_model, reasoning_level, now, now,
                                      json.dumps(default_execution_workspace) if default_execution_workspace else None),
         )
         if make_default:
@@ -109,15 +118,16 @@ class ManagementService:
                          "ON CONFLICT(slot) DO UPDATE SET session_id=excluded.session_id", (session_id,))
         return session_id
 
-    def create(self, title=None, make_default=False, llm_client_name=None, llm_model=None, default_execution_workspace=None):
+    def create(self, title=None, make_default=False, llm_client_name=None, llm_model=None, reasoning_level=None, default_execution_workspace=None):
         workspace = self.resolve_execution_workspace(default_execution_workspace)
         title = self._title(title)
         client = self._model_value(llm_client_name)
         model = self._model_value(llm_model)
+        reasoning = self._reasoning_value(reasoning_level)
         with closing(self._conn()) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
             session_id = self._create(conn, title=title, make_default=make_default,
-                                      llm_client_name=client, llm_model=model, default_execution_workspace=workspace)
+                                      llm_client_name=client, llm_model=model, reasoning_level=reasoning, default_execution_workspace=workspace)
         return self.get(session_id)
 
     def get_default(self, *, default_execution_workspace=None):
@@ -163,7 +173,7 @@ class ManagementService:
                                 "ORDER BY s.updated_at DESC,s.session_id LIMIT ? OFFSET ?", (limit, offset)).fetchall()
         return [self.get(row["session_id"]) for row in rows]
 
-    def update(self, session_id, expected_revision, status=None, llm_client_name=_UNSET, llm_model=_UNSET,
+    def update(self, session_id, expected_revision, status=None, llm_client_name=_UNSET, llm_model=_UNSET, reasoning_level=_UNSET,
                default_execution_workspace=_UNSET):
         if status is not None and status not in {"active", "paused"}:
             raise ValueError("status must be active or paused")
@@ -176,6 +186,8 @@ class ManagementService:
         for field, value in (("llm_client_name", llm_client_name), ("llm_model", llm_model)):
             if value is not _UNSET:
                 values[field] = self._model_value(value)
+        if reasoning_level is not _UNSET:
+            values["reasoning_level"] = self._reasoning_value(reasoning_level)
         with closing(self._conn()) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT c.* FROM manager_controllers c JOIN agent_sessions s "

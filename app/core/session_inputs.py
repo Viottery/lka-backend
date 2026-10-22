@@ -139,8 +139,11 @@ class SessionInputQueue:
             raise ValueError('Input text exceeds 100000 characters')
         if replace_run_id is not None and (not 1 <= len(replace_run_id) <= 128 or not replace_run_id.strip()):
             raise ValueError('replace_run_id must contain 1 to 128 characters')
+        llm_options = dict(llm or {'response_mode': 'text'})
+        if llm_options.get('reasoning_level') is None:
+            llm_options.pop('reasoning_level', None)
         request = {'user_input': user_input, 'attachment_ids': list(attachment_ids),
-                   'safety_review_mode': safety_review_mode, 'llm': llm or {'response_mode': 'text'}}
+                   'safety_review_mode': safety_review_mode, 'llm': llm_options}
         # Keep ordinary request fingerprints compatible with already accepted inputs.
         if replace_run_id is not None:
             request['replace_run_id'] = replace_run_id
@@ -310,10 +313,22 @@ class SessionInputQueue:
             if row is None:
                 return
             request = json.loads(row['request_json'])
+            requested_reasoning = request.get('llm', {}).get('reasoning_level')
+            policy_reasoning = policy.get('llm_reasoning_level')
+            policy_reasoning_source = policy.get('llm_reasoning_source')
+            effective_reasoning = requested_reasoning or policy_reasoning or 'low'
+            effective_reasoning_source = ('request' if requested_reasoning else
+                                          policy_reasoning_source or
+                                          ('session' if policy_reasoning else 'default'))
+            policy['llm_reasoning_level'] = effective_reasoning
+            policy['llm_reasoning_source'] = effective_reasoning_source
             now = datetime.now(UTC).isoformat()
             run = AgentRunRecord(run_id='agent_run_' + uuid4().hex, trace_id='agent_turn_' + uuid4().hex,
                                  session_id=sid, user_input=request['user_input'], created_at=now, status=AgentRunStatus.QUEUED,
-                                 metadata={'entrypoint': 'agent.turn', 'orchestrator': 'langgraph', 'session_policy': policy,
+                                 metadata={'entrypoint': 'agent.turn', 'orchestrator': 'langgraph',
+                                           'llm_reasoning_level': effective_reasoning,
+                                           'llm_reasoning_source': effective_reasoning_source,
+                                           'session_policy': policy,
                                            'session_input_id': row['input_id'], 'session_input_message_id': row['message_id'],
                                            'session_input_options': request})
             self.run_store.save_run_in_transaction(conn, run.model_dump(mode='json'), updated_at=now)

@@ -3,6 +3,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
@@ -71,6 +72,25 @@ def test_acceptance_is_immediate_history_once_without_running_models(runtime):
     with pytest.raises(SessionInputConflict, match='conflict'):
         submit(runtime, session_id, 'a', 'changed')
     assert len(runtime.get_session(session_id=session_id).messages) == 2
+
+
+def test_legacy_retry_ignores_null_reasoning_field(runtime):
+    session_id = sid(runtime)
+    legacy = submit(runtime, session_id, 'legacy')
+    replay = submit(runtime, session_id, 'legacy', llm={'response_mode': 'text', 'reasoning_level': None})
+    assert replay['input'] == legacy['input']
+
+
+def test_queue_batches_require_same_reasoning_level(runtime):
+    session_id = sid(runtime)
+    low = submit(runtime, session_id, 'low', llm={'response_mode': 'text', 'reasoning_level': 'low'})
+    high = submit(runtime, session_id, 'high', llm={'response_mode': 'text', 'reasoning_level': 'high'})
+    runtime.session_inputs.tick()
+    run = input_run(runtime, session_id)
+    run = runtime.session_inputs.freeze_for_dispatch(run, SimpleNamespace(check=lambda **_kwargs: None))
+    batch = run.metadata['session_input_batch']
+    assert [item['input_id'] for item in batch] == [low['input']['input_id']]
+    assert low['input']['run_id'] is None and high['input']['run_id'] is None
 
 
 def test_fifo_uses_root_admission_without_mid_run_injection(runtime):

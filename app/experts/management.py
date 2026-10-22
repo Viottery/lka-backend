@@ -385,6 +385,9 @@ class ManagementCoordinator:
                     run_id="agent_run_" + uuid4().hex, session_id=sid, trace_id="agent_turn_" + uuid4().hex,
                     status=AgentRunStatus.QUEUED, user_input=envelope.render(), created_at=now.isoformat(),
                     metadata={"entrypoint": "agent.turn", "orchestrator": "langgraph", "session_policy": policy,
+                              **({"llm_reasoning_level": policy["llm_reasoning_level"],
+                                  "llm_reasoning_source": policy.get("llm_reasoning_source") or "session"}
+                                 if policy.get("llm_reasoning_level") in {"off", "low", "high", "max"} else {}),
                               "input_envelope": envelope.model_dump(mode="json"),
                               "manager_execution_id": execution_id, "work_budget_scopes": scopes,
                               "manager_notification_required": True,

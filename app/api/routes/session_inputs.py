@@ -17,6 +17,7 @@ router = APIRouter(prefix='/sessions/{session_id}/inputs', tags=['session inputs
 class InputLLMOptions(BaseModel):
     model_config = ConfigDict(extra='forbid')
     response_mode: Literal['stream', 'text'] = 'text'
+    reasoning_level: Literal['off', 'low', 'high', 'max'] | None = None
 
 
 class SubmitSessionInput(BaseModel):
@@ -44,6 +45,18 @@ def _call(request, operation, session_id, **kwargs):
 
 @router.post('', status_code=202)
 def submit_input(session_id: str, payload: SubmitSessionInput, request: Request):
+    runtime = request.app.state.runtime
+    with runtime._conn() as conn:
+        prior = conn.execute("SELECT 1 FROM session_inputs WHERE session_id=? AND client_message_id=?",
+                             (session_id, payload.client_message_id)).fetchone()
+    validator = getattr(runtime, "validate_agent_reasoning_selection", None)
+    if prior is None and callable(validator):
+        try:
+            validator(session_id=session_id,
+                      requested=payload.llm.reasoning_level if payload.llm else None,
+                      attachment_ids=payload.attachment_ids)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
     return _call(request, 'submit', session_id, **payload.model_dump())
 
 

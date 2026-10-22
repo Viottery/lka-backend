@@ -414,8 +414,10 @@ def test_session_workspace_controls_file_and_bash_tool_roots(tmp_path, monkeypat
         tool_input={"path": str(outside)},
         context=context,
     )
-    assert outside_result.status == "failed"
-    assert "outside allowed workspace roots" in (outside_result.error or "")
+    # An out-of-root target never reaches the tool without an approved review.
+    assert outside_result.status == "rejected"
+    assert outside_result.output["safety_review_required"] is True
+    assert outside_result.execution_started is False
 
 
 def test_session_workspace_maps_windows_path_through_wsl_mount(tmp_path, monkeypatch):

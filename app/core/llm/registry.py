@@ -83,5 +83,13 @@ def _build_openai_compatible_client(config: LLMClientConfig) -> AsyncLLMClient:
         supports_required_tool_choice=config.supports_required_tool_choice,
         function_calling_strict=config.function_calling_strict,
         supports_reasoning_effort=config.supports_reasoning_effort,
+        reasoning_effort_models={
+            *([config.default_model] if config.reasoning_effort_map or config.supports_reasoning_off or config.thinking_control == "deepseek" else []),
+            *(
+                model
+                for model, reasoning in config.model_reasoning_overrides.items()
+                if reasoning.effort_map or reasoning.supports_off
+            ),
+        },
         thinking_control=config.thinking_control,
     )

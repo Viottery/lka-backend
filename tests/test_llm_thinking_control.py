@@ -53,6 +53,40 @@ def test_legacy_config_carries_capability_and_service_passes_override(monkeypatc
     assert captured[0].thinking_enabled is False
 
 
+def test_background_reasoning_is_internal_low_and_recovery_override_is_audited(monkeypatch):
+    from types import SimpleNamespace
+
+    from app.core.background_llm import SelectedBackgroundClient, recover_generation
+
+    monkeypatch.setenv("TEST_THINKING_KEY", "test")
+    service = build_llm_service(LLMProviderConfig(
+        provider="openai_compatible", api_key_env="TEST_THINKING_KEY", thinking_control="deepseek",
+    ))
+    captured = []
+
+    async def complete(request):
+        captured.append(request)
+        if len(captured) == 1:
+            return SimpleNamespace(content="", finish_reason="length", partial=False,
+                                   status="completed", usage={}, metadata={})
+        return SimpleNamespace(content="complete", finish_reason="stop", partial=False,
+                               status="completed", usage={}, metadata={})
+
+    monkeypatch.setattr(service, "complete", complete)
+    wrapped = SelectedBackgroundClient(service, initial_output_tokens=8, recovery_output_tokens=32)
+    result = recover_generation(
+        wrapped, system_prompt="s", user_prompt="u", prompt_summary="background",
+    )
+
+    assert result.content == "complete"
+    assert len(captured) == 2
+    assert captured[0].reasoning_level == "low"
+    assert captured[0].metadata["reasoning_policy"] == "internal"
+    assert captured[1].reasoning_level == "low"
+    assert captured[1].thinking_enabled is False
+    assert captured[1].metadata["reasoning_source"] == "recovery"
+
+
 def test_named_clients_do_not_inherit_legacy_capability(monkeypatch):
     monkeypatch.setenv("TEST_THINKING_KEY", "test")
     service = build_llm_service(LLMProviderConfig(

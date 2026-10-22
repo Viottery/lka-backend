@@ -618,6 +618,31 @@ class MailExpertExecutor:
         # after every attempt, including the incomplete attempt.
         input_estimate = len((system + user).encode("utf-8")) + 128
         thinking_enabled = None
+        snapshot_level = getattr(snapshot, "inference_reasoning_level", None)
+        legacy_effort = getattr(snapshot, "inference_reasoning_effort", None)
+        if stage == "route":
+            reasoning_level = "off"
+            reasoning_effort = None
+            reasoning_policy = "utility"
+            reasoning_source = "mail_route_utility"
+        elif snapshot_level is not None:
+            reasoning_level = snapshot_level
+            reasoning_effort = None
+            reasoning_policy = "user"
+            reasoning_source = "snapshot"
+        elif legacy_effort is not None:
+            reasoning_level = None
+            reasoning_effort = legacy_effort
+            reasoning_policy = "user"
+            reasoning_source = "legacy_profile"
+        else:
+            # Older frozen snapshots did not carry the semantic preference;
+            # preserve their provider-default behavior on resume. This also
+            # survives serialization, which writes the new field as null.
+            reasoning_level = None
+            reasoning_effort = None
+            reasoning_policy = "user"
+            reasoning_source = "legacy_snapshot"
         for attempt in range(2):
             if snapshot.budget.max_llm_calls is not None and usage.llm_calls >= snapshot.budget.max_llm_calls:
                 raise RuntimeError("Mail expert LLM-call budget exhausted.")
@@ -633,7 +658,10 @@ class MailExpertExecutor:
                 messages=[LLMMessage(role="system", content=system), LLMMessage(role="user", content=user)],
                 prompt_summary=f"mail_expert_{stage}", require_json=json_mode,
                 max_output_tokens=max_output_tokens, thinking_enabled=thinking_enabled,
-                metadata={"run_id": snapshot.child_run_id, "stage": stage},
+                reasoning_level=reasoning_level, reasoning_effort=reasoning_effort,
+                metadata={"run_id": snapshot.child_run_id, "stage": stage,
+                          "reasoning_policy": reasoning_policy,
+                          "reasoning_source": "recovery" if thinking_enabled is False else reasoning_source},
             )
             response = await self.llm_service.complete(request)
             tokens = response.usage if isinstance(response.usage, dict) else {}

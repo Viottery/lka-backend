@@ -121,13 +121,36 @@ M4A 在本地由锁定依赖 `imageio-ffmpeg` 提供的 FFmpeg 转换；小文�
 本步使用有界内联传输，单个原文件最多 256 MiB；实际模型输入和混合输入限制见
 [会话附件合同](api_contract.md#会话文件附件)。大文件不自动使用供应商 Files API。
 
-## 可选动作阶段推理设置
+## 推理深度与模型映射
 
-`[agent]` 的 `decision_thinking_enabled` 默认不设置，沿用模型默认行为。
-设置为 `false` 时，仅在所选客户端明确支持思考控制的情况下关闭动作决策阶段思考，
-不改变独立路由、最终回答或安全审查，也不改变冻结的子 Agent 推理设置。
-此项应先在隔离任务中验证；关闭思考可能影响工具选择和任务完成质量，不建议直接全局启用。
-现有不完整输出恢复策略仍优先，不会因设置为 `true` 而失去原有恢复能力。
+用户请求通过 `llm.reasoning_level` 选择 `off`、`low`、`high`、`max`，新运行默认 `low`。
+业务决策与回答跟随用户选择，纯路由尝试关闭推理，工具结果检查、上下文整理、记忆和安全审查
+使用内部低档策略。内部关闭不受支持时使用声明的低档；未声明能力的调用明确记录为未控制。
+这些策略不改变审批权限，也不增加用于选择档位的模型调用。
+
+在 `[llm]` 或对应命名客户端声明能力。已验证支持 DeepSeek Chat 协议的端点可设置
+`thinking_control = "deepseek"`：关闭映射为 `thinking.type = "disabled"`，其他三档发送
+`thinking.type = "enabled"` 与 `reasoning_effort = "low" / "high" / "max"`。
+声明仅适用于该客户端默认模型；其他模型需要精确覆盖，不能根据模型名字猜测支持情况。
+通用兼容端点使用 `supports_reasoning_effort`、`supports_reasoning_off` 和 `reasoning_effort_map`：
+
+```toml
+# 放在对应客户端表内，仅填写该端点实际支持的值。
+supports_reasoning_effort = true
+reasoning_effort_map = { off = "none", low = "low", high = "high", max = "xhigh" }
+
+# 混用模型时，对每个额外模型单独声明。
+[llm.model_reasoning_overrides."another-model-id"]
+supports_off = false
+effort_map = { low = "low", high = "high", max = "high" }
+```
+
+命名客户端使用 `[llm.clients.model_reasoning_overrides."模型ID"]`。
+`max = "high"` 表示最高档别名，审计实际档位为 `high`；不支持的用户显式档位返回错误。
+旧 `supports_reasoning_effort = true` 且未配置映射时保留 low/high，max 明确映射为 high。
+运行冻结档位及首次使用的能力映射；旧检查点未保存档位时保留旧行为。
+`[agent].decision_thinking_enabled` 仅用于没有新档位的旧运行，不覆盖新请求的选择。
+不完整输出恢复可有界调整推理策略，实际参数及回退原因保留在调用审计中。
 
 ## Agent Python 环境
 

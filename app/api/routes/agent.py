@@ -79,12 +79,37 @@ def _prepare_image_payload(payload: AgentTurnRequest, runtime) -> AgentTurnReque
     return payload.model_copy(update=updates)
 
 
+def _preflight_reasoning(payload: AgentTurnRequest, runtime, *, session_id: str | None = None) -> None:
+    validator = getattr(runtime, "validate_agent_reasoning_selection", None)
+    if not callable(validator):
+        return
+    options = payload.llm
+    try:
+        validator(session_id=session_id if session_id is not None else payload.session_id,
+                  requested=options.reasoning_level if options else None,
+                  attachment_ids=payload.attachment_ids,
+                  llm_client_name=options.client_name if options else None,
+                  llm_model=options.model if options else None)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+def _replacement_request_fingerprint(payload: ReplaceAgentRunRequest) -> str:
+    body = payload.model_dump(mode="json")
+    llm = body.get("llm")
+    if isinstance(llm, dict) and llm.get("reasoning_level") is None:
+        # Keep retry hashes compatible with payloads serialized before this option existed.
+        llm.pop("reasoning_level", None)
+    return hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
+
+
 @router.post("/turn", response_model=AgentTurnResponse)
 async def run_agent_turn_endpoint(
     payload: AgentTurnRequest,
     request: Request,
 ) -> AgentTurnResponse | JSONResponse:
     payload = await asyncio.to_thread(_prepare_image_payload, payload, request.app.state.runtime)
+    await asyncio.to_thread(_preflight_reasoning, payload, request.app.state.runtime)
     llm_options = payload.llm
     try:
         result = await request.app.state.runtime.run_agent_turn_async(
@@ -92,6 +117,7 @@ async def run_agent_turn_endpoint(
             user_input=payload.user_input,
             llm_client_name=llm_options.client_name if llm_options else None,
             llm_model=llm_options.model if llm_options else None,
+            llm_reasoning_level=llm_options.reasoning_level if llm_options else None,
             llm_response_mode=llm_options.response_mode if llm_options else LLMResponseMode.TEXT,
             safety_review_mode=payload.safety_review_mode,
             **({"resumable": True} if payload.resumable else {}),
@@ -115,12 +141,14 @@ def run_agent_turn(payload: AgentTurnRequest, request: Request) -> AgentTurnResu
     """Synchronous test helper preserving the old direct-call path."""
 
     payload = _prepare_image_payload(payload, request.app.state.runtime)
+    _preflight_reasoning(payload, request.app.state.runtime)
     llm_options = payload.llm
     result = request.app.state.runtime.run_agent_turn(
         session_id=payload.session_id,
         user_input=payload.user_input,
         llm_client_name=llm_options.client_name if llm_options else None,
         llm_model=llm_options.model if llm_options else None,
+        llm_reasoning_level=llm_options.reasoning_level if llm_options else None,
         llm_response_mode=llm_options.response_mode if llm_options else LLMResponseMode.TEXT,
         safety_review_mode=payload.safety_review_mode,
         **({"resumable": True} if payload.resumable else {}),
@@ -135,9 +163,11 @@ async def stream_agent_turn(
     request: Request,
 ) -> StreamingResponse:
     payload = await asyncio.to_thread(_prepare_image_payload, payload, request.app.state.runtime)
+    await asyncio.to_thread(_preflight_reasoning, payload, request.app.state.runtime)
     run = request.app.state.runtime.create_agent_run(
         session_id=payload.session_id,
         user_input=payload.user_input,
+        llm_reasoning_level=payload.llm.reasoning_level if payload.llm else None,
         **({"resumable": True} if payload.resumable else {}),
     )
     return StreamingResponse(
@@ -393,10 +423,13 @@ async def replace_agent_run(run_id: str, payload: ReplaceAgentRunRequest, reques
         raise HTTPException(409, "Replacement must remain in the original session.")
     payload = payload.model_copy(update={"session_id": previous.session_id})
     payload = await asyncio.to_thread(_prepare_image_payload, payload, runtime)
-    fingerprint = hashlib.sha256(json.dumps(payload.model_dump(mode="json"), sort_keys=True).encode()).hexdigest()
+    if payload.llm and payload.llm.reasoning_level is not None:
+        await asyncio.to_thread(_preflight_reasoning, payload, runtime)
+    fingerprint = _replacement_request_fingerprint(payload)
     try:
         run = await asyncio.to_thread(runtime.replace_agent_run, run_id, user_input=payload.user_input,
-                                      command_id=payload.command_id, request_fingerprint=fingerprint)
+                                      command_id=payload.command_id, request_fingerprint=fingerprint,
+                                      llm_reasoning_level=payload.llm.reasoning_level if payload.llm else None)
     except (ValueError, KeyError) as exc:
         raise HTTPException(409, str(exc)) from exc
     if run.status == AgentRunStatus.QUEUED:
@@ -726,6 +759,7 @@ def _start_agent_turn_task(*, runtime, payload: AgentTurnRequest, run_id: str) -
             user_input=payload.user_input,
             llm_client_name=llm_options.client_name if llm_options else None,
             llm_model=llm_options.model if llm_options else None,
+            llm_reasoning_level=llm_options.reasoning_level if llm_options else None,
             llm_response_mode=_stream_turn_llm_response_mode(payload),
             safety_review_mode=payload.safety_review_mode,
             **({"resumable": True} if payload.resumable else {}),

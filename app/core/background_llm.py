@@ -31,9 +31,21 @@ class SelectedBackgroundClient:
             kwargs.pop("max_output_tokens", None)
         if isinstance(self.client, LLMService):
             kwargs.update(client_name=self.client_name, model=self.model)
+            kwargs.setdefault("reasoning_level", "low")
+            kwargs["metadata"] = {
+                **(kwargs.get("metadata") or {}),
+                "reasoning_policy": "internal",
+                "reasoning_source": (kwargs.get("metadata") or {}).get(
+                    "reasoning_source", "background_internal",
+                ),
+            }
             if self.request_timeout_seconds is not None:
-                kwargs["metadata"] = {**(kwargs.get("metadata") or {}),
-                                      "background_timeout_seconds": self.request_timeout_seconds}
+                kwargs["metadata"]["background_timeout_seconds"] = self.request_timeout_seconds
+        elif not _accepts_keyword(self.client, "metadata"):
+            # Keep the compatibility wrapper transparent to old narrow
+            # complete_text signatures; reasoning metadata belongs to the
+            # shared LLMService boundary.
+            kwargs.pop("metadata", None)
         result = self.client.complete_text(**kwargs)
         if self.request_timeout_seconds is None or not inspect.isawaitable(result):
             return result
@@ -135,6 +147,10 @@ def recover_generation(
             _mark_recovery(response, attempts=attempts, recovered=False, tokens=charged)
             return response
     retry = dict(kwargs)
+    retry["metadata"] = {
+        **(retry.get("metadata") or {}),
+        "reasoning_source": "recovery",
+    }
     supports = getattr(client, "supports_thinking_control", None)
     if callable(supports) and supports():
         retry["thinking_enabled"] = False

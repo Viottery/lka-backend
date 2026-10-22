@@ -35,6 +35,7 @@ from app.core.agent_turn import (
     _turn_input_content,
     _turn_llm_client_name,
     _turn_llm_model,
+    _turn_llm_reasoning_level,
     _turn_llm_response_mode,
     _turn_run_id,
     _turn_run_manager,
@@ -391,6 +392,8 @@ class AgentGraphRunner:
         attachment_ids: list[str] | None = None,
         llm_client_name: str | None = None,
         llm_model: str | None = None,
+        llm_reasoning_level: str | None = None,
+        llm_reasoning_source: str | None = None,
         llm_response_mode: LLMResponseMode = LLMResponseMode.TEXT,
         safety_review_mode: SafetyReviewMode | None = None,
         existing_run_id: str | None = None,
@@ -407,6 +410,8 @@ class AgentGraphRunner:
                 "attachment_ids": attachment_ids or [],
                 "llm_client_name": llm_client_name,
                 "llm_model": llm_model,
+                "llm_reasoning_level": llm_reasoning_level,
+                "llm_reasoning_source": llm_reasoning_source,
                 "llm_response_mode": llm_response_mode.value,
                 "safety_review_mode": safety_review_mode.value if safety_review_mode else None,
             },
@@ -424,6 +429,8 @@ class AgentGraphRunner:
         attachment_ids: list[str] | None = None,
         llm_client_name: str | None = None,
         llm_model: str | None = None,
+        llm_reasoning_level: str | None = None,
+        llm_reasoning_source: str | None = None,
         llm_response_mode: LLMResponseMode = LLMResponseMode.TEXT,
         safety_review_mode: SafetyReviewMode | None = None,
         existing_run_id: str | None = None,
@@ -440,6 +447,8 @@ class AgentGraphRunner:
                 "attachment_ids": attachment_ids or [],
                 "llm_client_name": llm_client_name,
                 "llm_model": llm_model,
+                "llm_reasoning_level": llm_reasoning_level,
+                "llm_reasoning_source": llm_reasoning_source,
                 "llm_response_mode": llm_response_mode.value,
                 "safety_review_mode": safety_review_mode.value if safety_review_mode else None,
             },
@@ -497,6 +506,7 @@ class AgentGraphRunner:
                 else None
             ),
         )
+        reasoning_token = _turn_llm_reasoning_level.set(request.get("llm_reasoning_level"))
         inference_token = None
         content_token = _turn_input_content.set((self._run(run_id).session_id, tuple(request.get("attachment_ids") or ())))
         try:
@@ -523,6 +533,7 @@ class AgentGraphRunner:
             _turn_llm_response_mode.reset(tokens[2])
             _turn_llm_model.reset(tokens[1])
             _turn_llm_client_name.reset(tokens[0])
+            _turn_llm_reasoning_level.reset(reasoning_token)
 
     def _invoke_graph_sync(self, graph: Any, value: Any, run_id: str) -> None:
         self._run(run_id)
@@ -541,6 +552,7 @@ class AgentGraphRunner:
                 else None
             ),
         )
+        reasoning_token = _turn_llm_reasoning_level.set(request.get("llm_reasoning_level"))
         inference_token = None
         content_token = _turn_input_content.set((self._run(run_id).session_id, tuple(request.get("attachment_ids") or ())))
         try:
@@ -576,6 +588,7 @@ class AgentGraphRunner:
             _turn_llm_response_mode.reset(tokens[2])
             _turn_llm_model.reset(tokens[1])
             _turn_llm_client_name.reset(tokens[0])
+            _turn_llm_reasoning_level.reset(reasoning_token)
 
     def _initialize_run(self, s: AgentGraphState) -> AgentGraphState:
         self.turn_loop._raise_if_cancel_requested()
@@ -1972,6 +1985,8 @@ class AgentGraphRunner:
             run_id=ws.run_id,
             llm_client_name=inference_client,
             llm_model=inference_model,
+            llm_reasoning_level=self.turn_loop._reasoning_selection()[0],
+            llm_reasoning_source=self.turn_loop._reasoning_selection()[1],
             safety_review_mode=self.turn_loop._safety_review_preference().value,
         )
 
@@ -2094,11 +2109,15 @@ class AgentGraphRunner:
         session_id: str | None,
         user_input: str,
         existing_run_id: str | None = None,
+        llm_reasoning_level: str | None = None,
+        llm_reasoning_source: str | None = None,
         **_: Any,
     ) -> str:
         return (
             existing_run_id
-            or self.create_run_for_turn(session_id=session_id, user_input=user_input).run_id
+            or self.create_run_for_turn(session_id=session_id, user_input=user_input,
+                                        llm_reasoning_level=llm_reasoning_level,
+                                        llm_reasoning_source=llm_reasoning_source).run_id
         )
 
     @staticmethod

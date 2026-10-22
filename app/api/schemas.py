@@ -117,6 +117,7 @@ class AgentTurnLLMOptions(BaseModel):
     client_name: str | None = None
     model: str | None = None
     response_mode: LLMResponseMode = LLMResponseMode.TEXT
+    reasoning_level: Literal["off", "low", "high", "max"] | None = None
 
 
 class AgentTurnRequest(BaseModel):

@@ -21,7 +21,7 @@ from app.core.runtime import LocalKnowledgeAgentRuntime
 from app.core.tools import ToolExecutor, ToolRegistry, ToolResult, ToolSpec
 from app.domains.mail import MailAccountInput, MailMessageInput, MailService
 from app.domains.mail_knowledge import MailKnowledgeMirror
-from app.experts.mail import MailExpertExecutor, MailIntent
+from app.experts.mail import MailExpertExecutor, MailIntent, _Usage
 from app.storage.db import connect
 from app.tool_packages.mail import MAIL_PACKAGE
 from app.tool_packages.mail_expert_tools import MailBatchLoadTool, MailSnapshotTool
@@ -452,11 +452,79 @@ async def test_router_repairs_wrong_shape_once_without_adopting_final_output_con
     result = await _execute(expert, child, snap, views)
     assert result.status == TaskResultStatus.COMPLETED
     assert len(llm.requests) == 2
+    assert llm.requests[0].reasoning_level == "off"
+    assert llm.requests[0].metadata["reasoning_policy"] == "utility"
     assert llm.requests[1].metadata["stage"] == "route_repair"
+    assert llm.requests[1].reasoning_level == "off"
     first_prompt = json.loads(llm.requests[0].messages[-1].content)
     assert "routing_schema" in first_prompt
     assert "output_contract" not in first_prompt
     assert setup[1].load_artifact(f"mail_expert_{child.run_id}")["coverage"]["enumerated"] == 2
+
+
+@pytest.mark.parametrize(
+    "stage,expected_level,expected_policy,legacy_effort",
+    [("route", "off", "utility", None), ("analyze_batch", "high", "user", None),
+     ("analyze_batch", None, "user", "medium")],
+)
+async def test_mail_stage_reasoning_uses_utility_user_or_legacy_profile(
+    setup, stage, expected_level, expected_policy, legacy_effort,
+):
+    expert, _child, snapshot, _views, _ = _case(setup, 2, "list")
+    update = {"inference_reasoning_level": "high"}
+    if legacy_effort is not None:
+        update.update(inference_reasoning_level=None, inference_reasoning_effort=legacy_effort)
+    snapshot = snapshot.model_copy(update=update)
+
+    class CapturingLLM(FakeLLM):
+        def __init__(self):
+            super().__init__("list")
+            self.requests = []
+
+        async def complete(self, request):
+            self.requests.append(request)
+            return await super().complete(request)
+
+    llm = CapturingLLM()
+    expert.llm_service = llm
+    expert._check_active = lambda _run_id: None
+    user = json.dumps({"messages": []}) if stage == "analyze_batch" else "Route this request."
+    await expert._llm(
+        snapshot, _Usage(), None, None, stage=stage, system="system", user=user,
+        max_output_tokens=128,
+    )
+
+    request = llm.requests[0]
+    assert request.reasoning_level == expected_level
+    assert request.reasoning_effort == legacy_effort
+    assert request.metadata["reasoning_policy"] == expected_policy
+
+
+async def test_legacy_mail_snapshot_without_reasoning_fields_keeps_provider_default(setup):
+    expert, _child, snapshot, _views, _ = _case(setup, 2, "list")
+    round_tripped = ContextSnapshot.model_validate(snapshot.model_dump(mode="json"))
+
+    class CapturingLLM(FakeLLM):
+        def __init__(self):
+            super().__init__("list")
+            self.requests = []
+
+        async def complete(self, request):
+            self.requests.append(request)
+            return await super().complete(request)
+
+    llm = CapturingLLM()
+    expert.llm_service = llm
+    expert._check_active = lambda _run_id: None
+    for legacy_snapshot in (snapshot, round_tripped):
+        await expert._llm(
+            legacy_snapshot, _Usage(), None, None, stage="analyze_batch", system="system",
+            user=json.dumps({"messages": []}), max_output_tokens=128,
+        )
+
+    assert [request.reasoning_level for request in llm.requests] == [None, None]
+    assert llm.requests[0].metadata["reasoning_source"] == "legacy_snapshot"
+    assert llm.requests[1].metadata["reasoning_source"] == "legacy_snapshot"
 
 
 async def test_invalid_router_shape_never_retries_unboundedly_or_runs_tools(setup):

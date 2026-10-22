@@ -75,6 +75,7 @@ from app.core.llm.models import (
     LLMAudioBlock,
     LLMImageBlock,
     LLMTextBlock,
+    ReasoningLevel,
 )
 from app.core.llm_workloads import BackgroundBudgetDeferred, BackgroundTaskBudgetExceeded
 from app.core.multi_agent import (
@@ -561,6 +562,7 @@ _turn_llm_client_name: ContextVar[str | None] = ContextVar(
     default=None,
 )
 _turn_llm_model: ContextVar[str | None] = ContextVar("turn_llm_model", default=None)
+_turn_llm_reasoning_level: ContextVar[str | None] = ContextVar("turn_llm_reasoning_level", default=None)
 _turn_safety_review_mode: ContextVar[SafetyReviewMode | None] = ContextVar(
     "turn_safety_review_mode", default=None
 )
@@ -872,12 +874,15 @@ class AgentTurnLoop:
         attachment_ids: list[str] | None = None,
         llm_client_name: str | None = None,
         llm_model: str | None = None,
+        llm_reasoning_level: str | None = None,
+        llm_reasoning_source: str | None = None,
         llm_response_mode: LLMResponseMode = LLMResponseMode.TEXT,
         safety_review_mode: SafetyReviewMode | None = None,
         existing_run_id: str | None = None,
     ) -> AgentTurnResult:
         client_token = _turn_llm_client_name.set(llm_client_name)
         model_token = _turn_llm_model.set(llm_model)
+        reasoning_token = _turn_llm_reasoning_level.set(llm_reasoning_level)
         mode_token = _turn_llm_response_mode.set(llm_response_mode)
         review_mode_token = _turn_safety_review_mode.set(safety_review_mode)
         inference_token = _turn_inference_snapshot.set(None)
@@ -892,6 +897,7 @@ class AgentTurnLoop:
                     else self.create_run_for_turn(
                         session_id=session_id,
                         user_input=user_input,
+                        llm_reasoning_source=llm_reasoning_source,
                     )
                 )
                 _turn_inference_snapshot.set(self._inference_snapshot_for_run(run))
@@ -951,6 +957,7 @@ class AgentTurnLoop:
                 _turn_run_manager.reset(run_manager_token)
             _turn_llm_client_name.reset(client_token)
             _turn_llm_model.reset(model_token)
+            _turn_llm_reasoning_level.reset(reasoning_token)
             _turn_llm_response_mode.reset(mode_token)
             _turn_safety_review_mode.reset(review_mode_token)
             _turn_inference_snapshot.reset(inference_token)
@@ -964,6 +971,8 @@ class AgentTurnLoop:
         attachment_ids: list[str] | None = None,
         llm_client_name: str | None = None,
         llm_model: str | None = None,
+        llm_reasoning_level: str | None = None,
+        llm_reasoning_source: str | None = None,
         llm_response_mode: LLMResponseMode = LLMResponseMode.TEXT,
         safety_review_mode: SafetyReviewMode | None = None,
         existing_run_id: str | None = None,
@@ -982,6 +991,8 @@ class AgentTurnLoop:
                             user_input=user_input,
                             llm_client_name=llm_client_name,
                             llm_model=llm_model,
+                            llm_reasoning_level=llm_reasoning_level,
+                            llm_reasoning_source=llm_reasoning_source,
                             llm_response_mode=llm_response_mode,
                             safety_review_mode=safety_review_mode,
                             existing_run_id=existing_run_id,
@@ -1010,6 +1021,8 @@ class AgentTurnLoop:
         session_id: str | None,
         user_input: str,
         parent_run_id: str | None = None,
+        llm_reasoning_level: str | None = None,
+        llm_reasoning_source: str | None = None,
     ) -> AgentRunRecord:
         if self.run_manager is None:
             raise RuntimeError("Agent run manager is not configured.")
@@ -1019,6 +1032,16 @@ class AgentTurnLoop:
             metadata={"entrypoint": "agent.turn"},
         )
         trace_id = _stable_id("agent_turn", session.session_id, user_input, _now_iso())
+        policy = self.session_service.run_policy(session.session_id)
+        explicit_level = llm_reasoning_level or _turn_llm_reasoning_level.get()
+        selected_level = ReasoningLevel(explicit_level or policy.llm_reasoning_level or "low").value
+        reasoning_source = llm_reasoning_source or (
+            "request" if explicit_level else policy.llm_reasoning_source
+            or ("session" if policy.llm_reasoning_level else "default")
+        )
+        frozen_policy = policy.model_copy(update={
+            "llm_reasoning_level": selected_level, "llm_reasoning_source": reasoning_source,
+        })
         return self.run_manager.create_run(
             session_id=session.session_id,
             user_input=user_input,
@@ -1026,7 +1049,8 @@ class AgentTurnLoop:
             parent_run_id=parent_run_id,
             metadata={
                 "entrypoint": "agent.turn",
-                **({"session_policy": self.session_service.run_policy(session.session_id).model_dump(mode="json")}
+                **({"session_policy": frozen_policy.model_dump(mode="json"),
+                    "llm_reasoning_level": selected_level, "llm_reasoning_source": reasoning_source}
                    if parent_run_id is None else {}),
             },
         )
@@ -1098,9 +1122,71 @@ class AgentTurnLoop:
             return policy.llm_client_name, policy.llm_model, None, "session", None
         return None, None, None, "default", None
 
+    def _reasoning_selection(self) -> tuple[str | None, str]:
+        """Frozen business preference, independently of client/model overrides."""
+        snapshot = _turn_inference_snapshot.get()
+        if snapshot is not None:
+            if snapshot.inference_reasoning_level is not None:
+                return snapshot.inference_reasoning_level, "parent_snapshot"
+            # Preserve old profiles and old child checkpoints verbatim.
+            return None, "legacy_child_profile" if snapshot.inference_reasoning_effort else "legacy_child"
+        manager, run_id = _turn_run_manager.get(), _turn_run_id.get()
+        run = manager.get_run(run_id) if manager is not None and run_id is not None else None
+        if run is not None:
+            if "llm_reasoning_level" in run.metadata:
+                return run.metadata["llm_reasoning_level"], run.metadata.get("llm_reasoning_source", "run")
+            policy = run.metadata.get("session_policy", {})
+            if policy.get("llm_reasoning_level") is not None:
+                return policy["llm_reasoning_level"], "session"
+            return None, "legacy_run"
+        requested = _turn_llm_reasoning_level.get()
+        if requested is not None:
+            return ReasoningLevel(requested).value, "request"
+        policy = self._session_run_policy()
+        return policy.llm_reasoning_level or "low", "session" if policy.llm_reasoning_level else "default"
+
+    def _reasoning_request_metadata(self, stage: str) -> dict[str, Any]:
+        level, source = self._reasoning_selection()
+        if level is None:
+            return {}  # Keep legacy run/profile controls unchanged.
+        # Repair can reinterpret an ambiguous operation; keep the business
+        # level unless its caller supplies a separate pure-format utility task.
+        policy = ("utility" if stage == "route" else "safety" if stage == "safety_review"
+                  else "internal" if stage in {"tool_result_check", "context_summarize"} else "user")
+        if stage in {"answer", "context_answer"}:
+            publication = self._answer_publication()
+            notification = publication.get("notification") or {}
+            if (publication.get("user_visible") is False
+                    and notification.get("decision_source") == "explicit"):
+                policy = "utility"  # Render the already-decided silent handoff.
+        metadata = {"reasoning_source": source, "reasoning_policy": policy,
+                    "reasoning_level_requested": level}
+        if level is not None and isinstance(self.llm_client, LLMService):
+            client, model, *_ = self._inference_selection()
+            client, model = self.llm_client._resolve_request_identity(LLMRequest(
+                messages=[], prompt_summary="reasoning identity", client_name=client, model=model,
+            ))
+            manager, run_id = _turn_run_manager.get(), _turn_run_id.get()
+            run = manager.get_run(run_id) if manager is not None and run_id is not None else None
+            identity = {"client_name": client, "model": model}
+            saved = run.metadata.get("reasoning_capability_snapshot") if run else None
+            if saved is not None and any(saved.get(key) != value for key, value in identity.items()):
+                raise LLMClientError("The model for this frozen reasoning run changed; start a new run.")
+            if saved is None:
+                saved = {**identity, "version": "reasoning-v1", "capability":
+                         self.llm_client.reasoning_capability(client_name=client, model=model)}
+                if run is not None:
+                    manager._update_run(run.run_id, status=run.status,
+                        metadata_patch={"reasoning_capability_snapshot": saved})
+            metadata["reasoning_capability_snapshot"] = saved
+        return metadata
+
     def _inference_call_metadata(self) -> dict[str, str]:
         client_name, model, effort, source, profile_id = self._inference_selection()
         metadata = {"inference_selection_source": source}
+        level, reasoning_source = self._reasoning_selection()
+        if level is not None:
+            metadata.update(llm_reasoning_level=level, llm_reasoning_source=reasoning_source)
         if client_name is not None:
             metadata["inference_client_name"] = client_name
         if model is not None:
@@ -1142,6 +1228,8 @@ class AgentTurnLoop:
             run_id=run_id,
             llm_client_name=inference_client,
             llm_model=inference_model,
+            llm_reasoning_level=self._reasoning_selection()[0],
+            llm_reasoning_source=self._reasoning_selection()[1],
             safety_review_mode=self._safety_review_preference().value,
         )
         user_input, _input_message = self._persist_turn_input(
@@ -3959,6 +4047,7 @@ class AgentTurnLoop:
         configured_thinking = getattr(self, "decision_thinking_enabled", None)
         # Explicit capability only; frozen child inference and recovery win.
         if (thinking_flag is None and stage == "decision"
+                and self._reasoning_selection()[0] is None
                 and _turn_inference_snapshot.get() is None
                 and configured_thinking is not None and recovery_flag is False):
             thinking_flag = configured_thinking
@@ -7206,6 +7295,7 @@ class AgentTurnLoop:
             metadata = {
                 "stage": stage,
                 "inference_selection_source": selection_source,
+                **self._reasoning_request_metadata(stage),
             }
             remaining = self._remaining_execution_seconds()
             if remaining is not None:
@@ -7225,7 +7315,8 @@ class AgentTurnLoop:
                 ],
                 prompt_summary=prompt_summary,
                 temperature=0.0,
-                reasoning_effort=reasoning_effort,
+                reasoning_effort=reasoning_effort if self._reasoning_selection()[0] is None else None,
+                reasoning_level=self._reasoning_selection()[0],
                 thinking_enabled=thinking_enabled,
                 max_output_tokens=max_output_tokens,
                 require_json=self._llm_stage_requires_json(stage),
@@ -7272,7 +7363,7 @@ class AgentTurnLoop:
                             else {}
                         )
                         provider_request_id = event.metadata.get("provider_request_id")
-                        raise LLMProviderStreamError(
+                        stream_error = LLMProviderStreamError(
                             message=event.error or "LLM provider stream failed.",
                             error_event=error_event,
                             partial_content=event.content_snapshot
@@ -7282,7 +7373,11 @@ class AgentTurnLoop:
                             if isinstance(provider_request_id, str)
                             else None,
                         )
-                    raise LLMClientError(event.error or "LLM stream failed.")
+                        stream_error.metadata = dict(event.metadata)
+                        raise stream_error
+                    stream_error = LLMClientError(event.error or "LLM stream failed.")
+                    stream_error.metadata = dict(event.metadata)
+                    raise stream_error
                 if event.event_type == "llm_completed":
                     completed_event_seen = True
                     stream_metadata["status"] = event.metadata.get("status", "completed")
@@ -7331,7 +7426,8 @@ class AgentTurnLoop:
             partial=bool(stream_metadata["partial"]),
             provider_request_id=stream_metadata.get("provider_request_id"),
             usage=stream_metadata.get("usage") or {},
-            metadata={"streamed": True, "content_role": content_role},
+            metadata={"streamed": True, "content_role": content_role,
+                      **({"reasoning": stream_metadata["reasoning"]} if "reasoning" in stream_metadata else {})},
             tool_calls=self._tool_calls_from_stream_metadata(stream_metadata),
         )
 
@@ -8102,6 +8198,7 @@ class AgentTurnLoop:
         request_metadata: dict[str, Any] = {
             "stage": stage,
             "inference_selection_source": selection_source,
+            **self._reasoning_request_metadata(stage),
         }
         remaining = self._remaining_execution_seconds()
         if remaining is not None:
@@ -8122,10 +8219,12 @@ class AgentTurnLoop:
             "client_name": client_name,
             "model": model,
             "response_mode": response_mode,
-            "reasoning_effort": reasoning_effort,
+            "reasoning_effort": reasoning_effort if self._reasoning_selection()[0] is None else None,
             "require_json": self._llm_stage_requires_json(stage),
             "metadata": request_metadata,
         }
+        if isinstance(self.llm_client, LLMService):
+            request_kwargs["reasoning_level"] = self._reasoning_selection()[0]
         if image_blocks is None:
             image_blocks = self._input_content_for_stage(stage)
         if image_blocks:
@@ -8208,6 +8307,9 @@ class AgentTurnLoop:
             )
             metadata = dict(call_record.metadata)
             metadata.update(prompt_metadata(system_prompt=system_prompt, user_prompt=user_prompt))
+            metadata.update(getattr(exc, "metadata", {}))
+            if isinstance(getattr(exc, "reasoning_metadata", None), dict):
+                metadata["reasoning"] = exc.reasoning_metadata
             call_record = call_record.model_copy(update={"metadata": metadata})
             return AgentTurnLLMEvent(
                 **self._event_fields_from_call_record(call_record),
@@ -8245,6 +8347,7 @@ class AgentTurnLoop:
         else:
             category, retriable = classify_openai_sdk_exception(exc)
             headers = getattr(exc, "headers", {})
+        reasoning_metadata = getattr(exc, "reasoning_metadata", None)
         partial_content = getattr(exc, "partial_content", "")
         usage = getattr(exc, "usage", {})
         input_tokens, output_tokens, total_tokens = usage_token_counts(usage)
@@ -8274,6 +8377,7 @@ class AgentTurnLoop:
             input_token_count=input_tokens, output_token_count=output_tokens, total_token_count=total_tokens,
             content_length=len(partial_content), partial=bool(partial_content or getattr(exc, "stream_output_emitted", False)),
             metadata={**getattr(exc, "metadata", {}), "headers": headers,
+                      **({"reasoning": reasoning_metadata} if isinstance(reasoning_metadata, dict) else {}),
                       "tool_calls": getattr(exc, "tool_calls", [])},
         )
         return AgentTurnLLMEvent(
@@ -8305,6 +8409,9 @@ class AgentTurnLoop:
         response: LLMResponse,
     ) -> AgentTurnLLMEvent:
         input_tokens, output_tokens, total_tokens = usage_token_counts(response.usage)
+        details = response.usage.get("completion_tokens_details") or response.usage.get("output_tokens_details") or {}
+        reasoning_tokens = details.get("reasoning_tokens") if isinstance(details, dict) else None
+        reasoning_known = type(reasoning_tokens) is int and reasoning_tokens >= 0
         call_record = self._llm_call_record(
             llm_call_id=llm_call_id,
             stage=stage,
@@ -8326,7 +8433,8 @@ class AgentTurnLoop:
             total_token_count=total_tokens,
             content_length=len(response.content),
             partial=response.partial,
-            metadata=response.metadata,
+            metadata={**response.metadata, "reasoning_tokens": reasoning_tokens if reasoning_known else None,
+                      "reasoning_tokens_available": reasoning_known},
         )
         return AgentTurnLLMEvent(
             **self._event_fields_from_call_record(call_record),

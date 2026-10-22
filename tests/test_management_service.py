@@ -76,6 +76,18 @@ def test_rename_and_model_settings_persist_with_cas(services):
         management.update("missing", expected_revision=1)
 
 
+def test_controller_reasoning_level_is_additive_and_revisioned(services):
+    _, _, management = services
+    created = management.create(reasoning_level="high")
+    sid = created["session"]["session_id"]
+    assert created["controller"]["reasoning_level"] == "high"
+    updated = management.update(sid, expected_revision=1, reasoning_level="max")
+    assert updated["controller"]["reasoning_level"] == "max"
+    assert ManagementService(services[0], services[1]).get(sid) == updated
+    with pytest.raises(ValueError):
+        management.update(sid, expected_revision=2, reasoning_level="medium")
+
+
 def test_default_tombstone_requires_explicit_switch_and_restore_stays_paused(services):
     factory, _, management = services
     old = management.get_default()["session"]["session_id"]

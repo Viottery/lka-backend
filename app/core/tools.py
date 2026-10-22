@@ -144,6 +144,8 @@ class ToolContext(BaseModel):
     run_id: str | None = None
     llm_client_name: str | None = None
     llm_model: str | None = None
+    llm_reasoning_level: Literal["off", "low", "high", "max"] | None = None
+    llm_reasoning_source: str | None = None
     safety_review_mode: Literal["skip", "llm", "manual"] | None = None
 
 

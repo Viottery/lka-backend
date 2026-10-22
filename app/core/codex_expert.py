@@ -104,6 +104,24 @@ class CodexAppServerExpertExecutor:
             raise ValueError("Codex expert requires an existing Child Run.")
         if child.status != AgentRunStatus.QUEUED:
             return self.from_terminal(child, snapshot)
+        requested_reasoning = getattr(snapshot, "inference_reasoning_level", None)
+        if requested_reasoning == "off":
+            return self._blocked(
+                child, snapshot, code="codex_reasoning_unsupported",
+                message="The configured Codex app-server protocol does not support disabling reasoning.",
+            )
+        if requested_reasoning in {"low", "high", "max"}:
+            # The app-server turn/start contract accepts low/medium/high. No
+            # exact-model capability negotiation is available on this channel.
+            effective_reasoning = "high" if requested_reasoning in {"high", "max"} else "low"
+            reasoning_source = "snapshot"
+            reasoning_mapping = "max_alias_high" if requested_reasoning == "max" else "identity"
+        else:
+            # Preserve frozen legacy snapshots that only carried the old
+            # server-owned static effort setting.
+            effective_reasoning = self.reasoning_effort
+            reasoning_source = "legacy_config"
+            reasoning_mapping = "legacy_static"
         if llm_model is not None and llm_model != self.codex_model:
             return self._blocked(
                 child,
@@ -233,14 +251,17 @@ class CodexAppServerExpertExecutor:
                     )
                 ),
                 model=self.codex_model,
-                effort=self.reasoning_effort,
+                effort=effective_reasoning,
             )
             active.turn_id = _required_id(turn, "id", "turn/start")
             self._record(
                 child,
                 "codex_turn_started",
                 "Codex turn started.",
-                {"thread_id": thread_id, "turn_id": active.turn_id},
+                {"thread_id": thread_id, "turn_id": active.turn_id,
+                 "reasoning": {"requested": requested_reasoning or self.reasoning_effort,
+                               "effective": effective_reasoning, "source": reasoning_source,
+                               "mapping": reasoning_mapping}},
             )
             self._record_native(
                 child.run_id, "turn/start", {"turn": turn},

@@ -27,9 +27,9 @@ def setup(tmp_path):
     return tool, c, image
 
 
-def invoke(tool, image, approved=True, **extra):
+def invoke(tool, image, approved=True, context=None, **extra):
     invocation = ToolInvocation(invocation_id="image", tool=tool.spec, session_id="session", context_id="context", input={"path": str(image), "question": "Read heading", **extra})
-    return tool.invoke(invocation=invocation, context=ToolContext(session_id="session", safety_review_approved=approved))
+    return tool.invoke(invocation=invocation, context=context or ToolContext(session_id="session", safety_review_approved=approved))
 
 
 def test_success_sanitized_provenance_and_usage(setup):
@@ -41,6 +41,8 @@ def test_success_sanitized_provenance_and_usage(setup):
     result = invoke(tool, image, expected_sha256=hashlib.sha256(image.read_bytes()).hexdigest())
     assert result.status == "completed"
     assert result.output["llm_call"]["total_token_count"] == 115
+    assert result.output["llm_call"]["metadata"]["reasoning"]["requested"] == "low"
+    assert result.output["llm_call"]["metadata"]["reasoning"]["source"] == "default"
     assert result.output["provenance"]["width"] == 40
     assert "base64" not in result.model_dump_json()
 
@@ -76,7 +78,27 @@ def test_provider_error_never_echoes_image_data(setup):
     result = invoke(tool, image)
     assert result.status == "failed"
     assert result.output["llm_call"]["error_category"] == "invalid_request"
+    assert result.output["llm_call"]["metadata"]["reasoning"]["requested"] == "low"
+    assert result.output["llm_call"]["metadata"]["reasoning"]["status"] == "uncontrolled"
     assert "SECRET" not in json.dumps(result.model_dump())
+
+
+def test_legacy_run_context_without_reasoning_keeps_provider_default(setup):
+    tool, c, image = setup
+    captured = []
+
+    async def complete(request):
+        captured.append(request)
+        return LLMResponse(provider="test", status="completed", content="Heading", prompt_summary="image")
+
+    c.complete = complete
+    context = ToolContext(session_id="session", safety_review_approved=True,
+                          llm_reasoning_source="legacy_run")
+    result = invoke(tool, image, context=context)
+
+    assert result.status == "completed"
+    assert captured[0].reasoning_level is None
+    assert result.output["llm_call"]["metadata"]["reasoning"]["source"] == "legacy_run"
 
 
 def test_frozen_child_scope_denied_even_with_approval(setup):

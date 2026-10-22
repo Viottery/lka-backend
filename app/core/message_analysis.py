@@ -737,6 +737,10 @@ class MessageAnalysisCoordinator:
             "max_output_tokens": self.config.recovery_output_tokens
             if recovery
             else self.config.generation_output_tokens,
+            "metadata": {
+                "reasoning_policy": "internal",
+                "reasoning_source": "message_analysis",
+            },
         }
         if recovery and client.supports_thinking_control():
             kwargs["thinking_enabled"] = False
@@ -1110,7 +1114,9 @@ class MessageAnalysisCoordinator:
         kwargs = {"system_prompt": system, "user_prompt": prompt,
                   "prompt_summary": "Analyze fixed scoped conversation evidence.", "require_json": True,
                   "temperature": 0.0, "max_output_tokens": output_limits["recovery"]
-                  if recovery else output_limits["generation"]}
+                  if recovery else output_limits["generation"],
+                  "metadata": {"reasoning_policy": "internal",
+                               "reasoning_source": "message_reading_v3"}}
         if client.supports_thinking_control():
             kwargs["thinking_enabled"] = False
         accumulator = checkpoint.get("accumulator") or {

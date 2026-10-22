@@ -34,6 +34,7 @@ class FakeCodexClient:
         self.decisions: list[tuple[int | str, str]] = []
         self.server_responses: list[tuple[int | str, dict]] = []
         self.interrupts: list[tuple[str, str]] = []
+        self.efforts: list[str | None] = []
 
     async def initialize(self, *, name: str, title: str, version: str) -> dict:
         return {"userAgent": "offline-fake"}
@@ -51,6 +52,7 @@ class FakeCodexClient:
         effort: str | None = None,
     ) -> dict:
         self.turn_started.set()
+        self.efforts.append(effort)
         return {"id": "turn-test", "status": "inProgress"}
 
     async def next_event(self) -> ApprovalRequest | ServerNotification:
@@ -168,6 +170,38 @@ def test_fake_codex_notifications_map_to_completed_child_and_task_result(tmp_pat
     ]
     delta_event = manager.list_events(child.run_id)[-3]
     assert delta_event.payload == {"itemId": "message-1", "delta_length": 22}
+
+
+def test_codex_inherits_reasoning_level_and_records_max_alias(tmp_path) -> None:
+    manager, child, snapshot, views = _setup(str(tmp_path))
+    snapshot = snapshot.model_copy(update={"inference_reasoning_level": "max"})
+    client = FakeCodexClient()
+    client.events.put_nowait(ServerNotification(
+        method="turn/completed", params={"turn": {"id": "turn-test", "status": "completed"}},
+    ))
+    executor = CodexAppServerExpertExecutor(manager, client_factory=lambda _run_id: client)
+
+    asyncio.run(executor.execute(child_run_id=child.run_id, snapshot=snapshot, views=views))
+
+    assert client.efforts == ["high"]
+    started = next(event for event in manager.list_events(child.run_id) if event.type == "codex_turn_started")
+    assert started.payload["reasoning"] == {
+        "requested": "max", "effective": "high", "source": "snapshot", "mapping": "max_alias_high",
+    }
+
+
+def test_codex_rejects_explicit_off_before_starting_protocol(tmp_path) -> None:
+    manager, child, snapshot, views = _setup(str(tmp_path))
+    snapshot = snapshot.model_copy(update={"inference_reasoning_level": "off"})
+    created = []
+    executor = CodexAppServerExpertExecutor(
+        manager, client_factory=lambda _run_id: created.append(True),
+    )
+
+    result = asyncio.run(executor.execute(child_run_id=child.run_id, snapshot=snapshot, views=views))
+
+    assert result.failure.code == "codex_reasoning_unsupported"
+    assert created == []
 
 
 def test_unenforceable_read_scope_is_blocked_before_client_creation(tmp_path) -> None:

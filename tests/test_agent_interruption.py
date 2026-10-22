@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import json
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier, Event
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ from httpx import ASGITransport, AsyncClient
 
 from app.api.routes.agent import (
     _agent_turn_event_stream,
+    _replacement_request_fingerprint,
     interrupt_agent_run,
     replace_agent_run,
     resume_agent_run,
@@ -31,6 +33,16 @@ def request_for(runtime):
         return False
     return SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(runtime=runtime)),
                            is_disconnected=connected)
+
+
+def test_replacement_fingerprint_keeps_legacy_null_reasoning_retry_stable():
+    payload = ReplaceAgentRunRequest(command_id="replace", user_input="New task",
+                                     llm={"response_mode": "text", "reasoning_level": None})
+    current_fingerprint = _replacement_request_fingerprint(payload)
+    legacy_body = payload.model_dump(mode="json")
+    legacy_body["llm"].pop("reasoning_level")
+    legacy_fingerprint = hashlib.sha256(json.dumps(legacy_body, sort_keys=True).encode()).hexdigest()
+    assert current_fingerprint == legacy_fingerprint
 
 
 def run_existing(runtime, run):

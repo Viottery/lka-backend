@@ -58,7 +58,7 @@ class ManagementDelegateService:
         delegate = self.get_for_session(conn, session_id)
         if delegate is None:
             return None
-        controller = conn.execute('SELECT llm_client_name,llm_model FROM manager_controllers WHERE session_id=?',
+        controller = conn.execute('SELECT llm_client_name,llm_model,reasoning_level FROM manager_controllers WHERE session_id=?',
                                   (session_id,)).fetchone()
         control = ['management.list_sessions', 'management.read_session', 'management.list_runs',
                    'management.inspect_run', 'management.read_task_result', 'management.start_task', 'management.send_instruction',
@@ -69,7 +69,9 @@ class ManagementDelegateService:
                 'allowed_tools': list(dict.fromkeys([*delegate['allowed_tools'], *control])),
                 'allowed_paths': None if workspace else [],
                 'safety_review_mode': delegate['safety_review_mode'],
-                'llm_client_name': controller['llm_client_name'], 'llm_model': controller['llm_model']}
+                'llm_client_name': controller['llm_client_name'], 'llm_model': controller['llm_model'],
+                'llm_reasoning_level': controller['reasoning_level'],
+                'llm_reasoning_source': 'inherited' if controller['reasoning_level'] else None}
 
     def purpose_for_session(self, conn, session_id, base_purpose):
         delegate = self.get_for_session(conn, session_id)
@@ -149,10 +151,13 @@ class ManagementDelegateService:
             if prior:
                 return prior
             tools = self._tools(allowed_tools)
-            model = conn.execute('SELECT llm_client_name,llm_model FROM manager_controllers WHERE session_id=?',
+            model = conn.execute('SELECT llm_client_name,llm_model,reasoning_level FROM manager_controllers WHERE session_id=?',
                                  (context.session_id,)).fetchone()
+            caller_reasoning = (getattr(context, 'llm_reasoning_level', None)
+                                or caller.metadata.get('llm_reasoning_level') or model['reasoning_level'])
             sid = self.management._create(conn, title=prepared['title'], make_default=False,
                                            llm_client_name=model['llm_client_name'], llm_model=model['llm_model'],
+                                           reasoning_level=caller_reasoning,
                                            creator_session_id=context.session_id)
             conn.execute("UPDATE manager_controllers SET status='active' WHERE session_id=?", (sid,))
             if prepared['workspace'] is not None:

@@ -62,6 +62,7 @@ class OpenAICompatibleLLMClient:
         supports_required_tool_choice: bool = False,
         function_calling_strict: bool = False,
         supports_reasoning_effort: bool = False,
+        reasoning_effort_models: set[str] | None = None,
         thinking_control: str | None = None,
     ) -> None:
         if not api_key:
@@ -83,6 +84,7 @@ class OpenAICompatibleLLMClient:
         self.supports_required_tool_choice = supports_required_tool_choice
         self.function_calling_strict = function_calling_strict
         self.supports_reasoning_effort = supports_reasoning_effort
+        self.reasoning_effort_models = reasoning_effort_models or set()
         self.thinking_control = thinking_control
 
     def supports_image_input(self, model: str) -> bool:
@@ -294,7 +296,9 @@ class OpenAICompatibleLLMClient:
             raise LLMClientError(f"LLM client {self.name} does not support audio input.")
         if any(message.has_images for message in request.messages) and not self.supports_image_input(self._model_for(request)):
             raise LLMClientError(f"LLM client {self.name} does not support image input.")
-        if request.reasoning_effort is not None and not self.supports_reasoning_effort:
+        if request.reasoning_effort is not None and not (
+            self.supports_reasoning_effort or self._model_for(request) in self.reasoning_effort_models
+        ):
             raise LLMClientError(
                 f"LLM client {self.name} does not support reasoning_effort."
             )
@@ -305,7 +309,11 @@ class OpenAICompatibleLLMClient:
             "stream": stream,
         }
         if request.reasoning_effort is not None:
-            payload["reasoning_effort"] = LLMReasoningEffort(request.reasoning_effort).value
+            payload["reasoning_effort"] = (
+                request.reasoning_effort.value
+                if isinstance(request.reasoning_effort, LLMReasoningEffort)
+                else str(request.reasoning_effort)
+            )
         if request.thinking_enabled is not None:
             if self.thinking_control != "deepseek":
                 raise LLMClientError(f"LLM client {self.name} does not support thinking control.")

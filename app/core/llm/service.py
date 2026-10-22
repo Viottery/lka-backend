@@ -22,6 +22,11 @@ from app.core.llm.models import (
     LLMTextBlock,
     LLMToolDefinition,
 )
+from app.core.llm.reasoning import (
+    reasoning_capability,
+    resolve_reasoning_request,
+    validate_reasoning_level,
+)
 from app.core.llm.registry import LLMClientRegistry
 from app.core.local_config import LLMProviderConfig
 from app.core.prompt_tokens import PromptTokenCounter
@@ -62,6 +67,7 @@ class LLMService:
                 "model": model,
             }
         )
+        request, reasoning = resolve_reasoning_request(self.config, request)
         request = self._bounded_background_request(request)
         await self._preflight_multimodal_capacity(request)
         async with self._admission(request) as ticket:
@@ -72,6 +78,10 @@ class LLMService:
                 ticket.dispatched = True
             try:
                 response = await client.complete(request)
+                if reasoning is not None:
+                    response = response.model_copy(update={
+                        "metadata": {**response.metadata, "reasoning": reasoning},
+                    })
                 if ticket is not None:
                     ticket.usage = response.usage
                 if any(message.has_images or message.has_audio for message in request.messages):
@@ -81,6 +91,8 @@ class LLMService:
                     })
                 return response
             except Exception as exc:
+                if reasoning is not None:
+                    self._record_reasoning_error(exc, reasoning)
                 self._sanitize_image_error(exc, request)
                 self._record_workload_error(ticket, exc)
                 raise
@@ -102,6 +114,7 @@ class LLMService:
         tools: list[LLMToolDefinition] | None = None,
         tool_choice: str | dict | None = None,
         metadata: dict | None = None,
+        reasoning_level=None,
         image_blocks: list[LLMImageBlock] | None = None,
         audio_blocks: list[LLMAudioBlock] | None = None,
     ) -> LLMResponse:
@@ -117,6 +130,7 @@ class LLMService:
                 prompt_summary=prompt_summary,
                 temperature=temperature,
                 reasoning_effort=reasoning_effort,
+                reasoning_level=reasoning_level,
                 thinking_enabled=thinking_enabled,
                 max_output_tokens=max_output_tokens,
                 require_json=require_json,
@@ -139,6 +153,7 @@ class LLMService:
                 "model": model,
             }
         )
+        request, reasoning = resolve_reasoning_request(self.config, request)
         request = self._bounded_background_request(request)
         await self._preflight_multimodal_capacity(request)
         async with self._admission(request) as ticket:
@@ -149,6 +164,10 @@ class LLMService:
                 ticket.dispatched = True
             try:
                 async for event in client.stream(request):
+                    if reasoning is not None:
+                        event = event.model_copy(update={
+                            "metadata": {**event.metadata, "reasoning": reasoning},
+                        })
                     if any(message.has_images or message.has_audio for message in request.messages):
                         event = event.model_copy(update={
                             "error": self._redact_image_diagnostics(event.error, request),
@@ -161,6 +180,8 @@ class LLMService:
                             ticket.failed = True
                     yield event
             except Exception as exc:
+                if reasoning is not None:
+                    self._record_reasoning_error(exc, reasoning)
                 self._sanitize_image_error(exc, request)
                 self._record_workload_error(ticket, exc)
                 raise
@@ -203,6 +224,14 @@ class LLMService:
             ticket.failed = True
         if self.workloads is not None and getattr(exc, "status_code", None) == 429:
             self.workloads.provider_limited()
+
+    @staticmethod
+    def _record_reasoning_error(exc: Exception, reasoning: dict) -> None:
+        metadata = getattr(exc, "metadata", None)
+        if not isinstance(metadata, dict):
+            metadata = {}
+            exc.metadata = metadata
+        metadata["reasoning"] = reasoning
 
     def _bounded_background_request(self, request: LLMRequest) -> LLMRequest:
         from app.core.llm_workloads import current_workload
@@ -346,6 +375,20 @@ class LLMService:
             clients = self.registry.list_clients()
             client = clients[0] if clients else None
         return bool(client and getattr(client, "supports_reasoning_effort", False))
+
+    def reasoning_capability(self, *, client_name: str | None = None, model: str | None = None) -> dict:
+        name = client_name or self.config.default_client
+        client = self.registry.get(name) if name else next(iter(self.registry.list_clients()), None)
+        resolved_model = model or (client.default_model if client is not None else "")
+        return reasoning_capability(self.config, name or (client.name if client else None), resolved_model)
+
+    def validate_reasoning_level(self, *, client_name: str | None = None, model: str | None = None, level) -> dict:
+        name = client_name or self.config.default_client
+        client = self.registry.get(name) if name else next(iter(self.registry.list_clients()), None)
+        resolved_model = model or (client.default_model if client is not None else "")
+        return validate_reasoning_level(
+            self.config, name or (client.name if client else None), resolved_model, level,
+        )
 
     def supports_thinking_control(self, *, client_name: str | None = None) -> bool:
         """Only explicitly configured providers receive vendor thinking fields."""

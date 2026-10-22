@@ -6,6 +6,7 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -163,6 +164,7 @@ class ContextRequest(BaseModel):
     inference_profile: AgentInferenceProfile | None = None
     request_llm_client_name: str | None = None
     request_llm_model: str | None = None
+    request_reasoning_level: Literal["off", "low", "high", "max"] | None = None
     dependency_results: tuple[TaskResult, ...] = ()
     parent_effective_scope: ScopeGrant
     session_scope: ScopeGrant
@@ -511,6 +513,7 @@ class ContextDriver:
             inference_client_name=inference_client_name,
             inference_model=inference_model,
             inference_reasoning_effort=inference_reasoning_effort,
+            inference_reasoning_level=request.request_reasoning_level,
             inference_selection_source=inference_selection_source,
             objective=request.plan_step.objective,
             output_contract=request.plan_step.output_contract,

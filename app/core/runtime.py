@@ -1089,6 +1089,7 @@ class LocalKnowledgeAgentRuntime:
                     safety_review_mode=(SafetyReviewMode(run.metadata['session_input_options']['safety_review_mode'])
                                         if run.metadata.get('session_input_options', {}).get('safety_review_mode') else None),
                     llm_response_mode=LLMResponseMode(run.metadata.get('session_input_options', {}).get('llm', {}).get('response_mode', 'text')),
+                    llm_reasoning_level=run.metadata.get('session_input_options', {}).get('llm', {}).get('reasoning_level'),
                     existing_run_id=run.run_id, resumable=True,
                 )
         except AgentRunCancelled as exc:
@@ -1116,6 +1117,18 @@ class LocalKnowledgeAgentRuntime:
         return media_bytes <= 12 * 1024 * 1024
 
     def _session_run_policy(self, session_id: str) -> SessionRunPolicy:
+        ui_reasoning_level = "low"
+        ui_reasoning_source = "default"
+        try:
+            with closing(self._conn()) as conn:
+                preference = conn.execute("SELECT preferences FROM agent_ui_preferences WHERE id=1").fetchone()
+            if preference:
+                value = json.loads(preference[0]).get("reasoning_level")
+                if value in {"off", "low", "high", "max"}:
+                    ui_reasoning_level = value
+                    ui_reasoning_source = "ui_default"
+        except (sqlite3.Error, ValueError, TypeError, AttributeError):
+            pass
         session = self.session_service.get_session_or_none(session_id=session_id)
         if session is None or session.kind != "manager":
             delegates = getattr(self, "management_delegates", None)
@@ -1128,9 +1141,12 @@ class LocalKnowledgeAgentRuntime:
                     if row:
                         frozen = json.loads(row[0])["metadata"]["session_policy"]
                         return SessionRunPolicy.model_validate(frozen)
-            return SessionRunPolicy(allowed_tools=self.management_service.allowed_tool_names(
+            return SessionRunPolicy(llm_reasoning_level=ui_reasoning_level,
+                                    llm_reasoning_source=ui_reasoning_source,
+                                    allowed_tools=self.management_service.allowed_tool_names(
                 self.tool_registry.list_tools(), manager=False,
-            )) if self.local_app_config.management.enabled else SessionRunPolicy()
+            )) if self.local_app_config.management.enabled else SessionRunPolicy(
+                llm_reasoning_level=ui_reasoning_level, llm_reasoning_source=ui_reasoning_source)
         controller = self.management_service.get(session_id)["controller"]
         delegates = getattr(self, "management_delegates", None)
         if delegates is not None:
@@ -1150,6 +1166,8 @@ class LocalKnowledgeAgentRuntime:
                 self.tool_registry.list_tools(), manager=True, active=controller["status"] == "active",
             ), allow_fork=False,
             llm_client_name=controller["llm_client_name"], llm_model=controller["llm_model"],
+            llm_reasoning_level=controller.get("reasoning_level") or ui_reasoning_level,
+            llm_reasoning_source="controller" if controller.get("reasoning_level") else ui_reasoning_source,
         )
 
     def _backfill_session_projects(self) -> None:
@@ -1601,6 +1619,7 @@ class LocalKnowledgeAgentRuntime:
         attachment_ids: list[str] | None = None,
         llm_client_name: str | None = None,
         llm_model: str | None = None,
+        llm_reasoning_level: str | None = None,
         llm_response_mode: LLMResponseMode = LLMResponseMode.TEXT,
         safety_review_mode: SafetyReviewMode | None = None,
         existing_run_id: str | None = None,
@@ -1610,6 +1629,13 @@ class LocalKnowledgeAgentRuntime:
 
         attachment_ids = self.prepare_agent_attachment_input(session_id=session_id, attachment_ids=attachment_ids, llm_client_name=llm_client_name, llm_model=llm_model)
         llm_client_name, llm_model = self.resolve_agent_input_model(session_id=session_id, attachment_ids=attachment_ids, llm_client_name=llm_client_name, llm_model=llm_model)
+        if existing_run_id is None:
+            self.validate_agent_reasoning_selection(session_id=session_id, requested=llm_reasoning_level,
+                                                    attachment_ids=attachment_ids,
+                                                    llm_client_name=llm_client_name, llm_model=llm_model)
+        llm_reasoning_level, llm_reasoning_source = self.resolve_agent_reasoning_level(
+            session_id=session_id, requested=llm_reasoning_level, existing_run_id=existing_run_id,
+        )
         runner = self._runner_for_turn(existing_run_id=existing_run_id, resumable=resumable)
         with self._management_workload_for_run(existing_run_id):
             return runner.run(
@@ -1618,6 +1644,8 @@ class LocalKnowledgeAgentRuntime:
                 user_input=user_input,
                 llm_client_name=llm_client_name,
                 llm_model=llm_model,
+                llm_reasoning_level=llm_reasoning_level,
+                llm_reasoning_source=llm_reasoning_source,
                 llm_response_mode=llm_response_mode,
                 safety_review_mode=safety_review_mode,
                 existing_run_id=existing_run_id,
@@ -1631,6 +1659,7 @@ class LocalKnowledgeAgentRuntime:
         attachment_ids: list[str] | None = None,
         llm_client_name: str | None = None,
         llm_model: str | None = None,
+        llm_reasoning_level: str | None = None,
         llm_response_mode: LLMResponseMode = LLMResponseMode.TEXT,
         safety_review_mode: SafetyReviewMode | None = None,
         existing_run_id: str | None = None,
@@ -1640,6 +1669,14 @@ class LocalKnowledgeAgentRuntime:
 
         attachment_ids = await asyncio.to_thread(self.prepare_agent_attachment_input, session_id=session_id, attachment_ids=attachment_ids, llm_client_name=llm_client_name, llm_model=llm_model)
         llm_client_name, llm_model = await asyncio.to_thread(self.resolve_agent_input_model, session_id=session_id, attachment_ids=attachment_ids, llm_client_name=llm_client_name, llm_model=llm_model)
+        if existing_run_id is None:
+            await asyncio.to_thread(self.validate_agent_reasoning_selection, session_id=session_id,
+                                    requested=llm_reasoning_level, attachment_ids=attachment_ids,
+                                    llm_client_name=llm_client_name, llm_model=llm_model)
+        llm_reasoning_level, llm_reasoning_source = await asyncio.to_thread(
+            self.resolve_agent_reasoning_level, session_id=session_id, requested=llm_reasoning_level,
+            existing_run_id=existing_run_id,
+        )
         runner = await asyncio.to_thread(self._runner_for_turn, existing_run_id=existing_run_id, resumable=resumable)
         with self._management_workload_for_run(existing_run_id):
             return await runner.run_async(
@@ -1648,6 +1685,8 @@ class LocalKnowledgeAgentRuntime:
                 user_input=user_input,
                 llm_client_name=llm_client_name,
                 llm_model=llm_model,
+                llm_reasoning_level=llm_reasoning_level,
+                llm_reasoning_source=llm_reasoning_source,
                 llm_response_mode=llm_response_mode,
                 safety_review_mode=safety_review_mode,
                 existing_run_id=existing_run_id,
@@ -2198,7 +2237,8 @@ class LocalKnowledgeAgentRuntime:
 
     def replace_agent_run(self, run_id: str, *, user_input: str, command_id: str,
                           request_fingerprint: str, on_created=None,
-                          metadata_updates: dict[str, Any] | None = None) -> AgentRunRecord:
+                          metadata_updates: dict[str, Any] | None = None,
+                          llm_reasoning_level: str | None = None) -> AgentRunRecord:
         runner = self._runner_for_turn(existing_run_id=run_id)
         if not isinstance(runner, AgentGraphRunner):
             raise ValueError("Run replacement requires the LangGraph orchestrator.")  # noqa: TRY004
@@ -2213,8 +2253,16 @@ class LocalKnowledgeAgentRuntime:
         metadata_updates = {**(metadata_updates or {}), **self.managed_tasks.budget_metadata(
             current.metadata, metadata_updates or {},
         )}
+        if llm_reasoning_level is None:
+            queued_options = metadata_updates.get("session_input_options", {})
+            llm_options = queued_options.get("llm", {}) if isinstance(queued_options, dict) else {}
+            candidate = llm_options.get("reasoning_level") if isinstance(llm_options, dict) else None
+            if candidate is not None:
+                llm_reasoning_level = candidate
         if current.status.value != "paused" and not current.metadata.get("replacement_command_id"):
             raise ValueError("Wait for run_paused before replacing the run.")
+        if llm_reasoning_level is not None and llm_reasoning_level not in {"off", "low", "high", "max"}:
+            raise ValueError("reasoning_level must be off, low, high, or max")
         lease = runner._execution_lease(run_id)
         # The pause event can reach SSE just before the old worker releases its
         # lease. Allow only that brief teardown, never a full model/tool wait.
@@ -2222,6 +2270,18 @@ class LocalKnowledgeAgentRuntime:
             raise ValueError("Agent run is still executing; retry after its pause is acknowledged.")
         try:
             replacement_policy = self.session_service.run_policy(current.session_id).model_dump(mode="json")
+            frozen_reasoning = current.metadata.get("llm_reasoning_level")
+            replacement_reasoning = llm_reasoning_level if llm_reasoning_level is not None else frozen_reasoning
+            replacement_policy["llm_reasoning_level"] = replacement_reasoning
+            metadata_updates = {**(metadata_updates or {})}
+            if replacement_reasoning is not None:
+                reasoning_source = ("request" if llm_reasoning_level is not None
+                                    else current.metadata.get("llm_reasoning_source", "frozen"))
+                replacement_policy["llm_reasoning_source"] = reasoning_source
+                metadata_updates["llm_reasoning_level"] = replacement_reasoning
+                metadata_updates["llm_reasoning_source"] = reasoning_source
+            else:
+                replacement_policy.pop("llm_reasoning_source", None)
             if current.metadata.get("session_policy", {}).get("require_high_risk_approval"):
                 replacement_policy["require_high_risk_approval"] = True
             return self.agent_run_manager.replace_paused(
@@ -2262,16 +2322,88 @@ class LocalKnowledgeAgentRuntime:
         *,
         session_id: str | None,
         user_input: str,
+        llm_reasoning_level: str | None = None,
         parent_run_id: str | None = None,
         resumable: bool = False,
     ) -> AgentRunRecord:
         """Create a queued run before an HTTP stream starts consuming events."""
 
-        return self._runner_for_turn(resumable=resumable).create_run_for_turn(
+        level, source = self.resolve_agent_reasoning_level(session_id=session_id, requested=llm_reasoning_level)
+        run = self._runner_for_turn(resumable=resumable).create_run_for_turn(
             session_id=session_id,
             user_input=user_input,
             parent_run_id=parent_run_id,
         )
+        run.metadata.update(llm_reasoning_level=level, llm_reasoning_source=source)
+        run.metadata.setdefault("session_policy", {}).update(
+            llm_reasoning_level=level, llm_reasoning_source=source,
+        )
+        self.agent_run_manager._update_run(run.run_id, status=run.status, metadata_patch={
+            "llm_reasoning_level": level, "llm_reasoning_source": source,
+            "session_policy": {**run.metadata.get("session_policy", {}),
+                               "llm_reasoning_level": level, "llm_reasoning_source": source},
+        })
+        return self.agent_run_manager.get_run(run.run_id)
+
+    def resolve_agent_reasoning_level(self, *, session_id: str | None, requested: str | None,
+                                     existing_run_id: str | None = None) -> tuple[str | None, str]:
+        """Resolve a new turn's reasoning preference; existing runs keep their frozen value."""
+        if requested is not None and requested not in {"off", "low", "high", "max"}:
+            raise ValueError("reasoning_level must be off, low, high, or max")
+        if existing_run_id:
+            run = self.agent_run_manager.get_run(existing_run_id)
+            if run is not None:
+                level = run.metadata.get("llm_reasoning_level")
+                if level in {"off", "low", "high", "max"}:
+                    return level, str(run.metadata.get("llm_reasoning_source") or "frozen")
+                # Legacy checkpoints retain provider behavior.
+                return None, "legacy"
+        if requested is not None:
+            return requested, "request"
+        if session_id:
+            policy = self.session_service.run_policy(session_id)
+            if policy.llm_reasoning_level is not None:
+                return policy.llm_reasoning_level, policy.llm_reasoning_source or "session"
+        with self._conn() as conn:
+            row = conn.execute("SELECT preferences FROM agent_ui_preferences WHERE id=1").fetchone()
+        if row:
+            try:
+                value = json.loads(row[0]).get("reasoning_level")
+                if value in {"off", "low", "high", "max"}:
+                    return value, "ui_default"
+            except (ValueError, TypeError, AttributeError):
+                pass
+        return "low", "default"
+
+    def validate_agent_reasoning_selection(self, *, session_id: str | None, requested: str | None,
+                                           attachment_ids: list[str] | None = None,
+                                           llm_client_name: str | None = None,
+                                           llm_model: str | None = None) -> None:
+        """Reject a user-selected level before creating or dispatching a run."""
+        if requested is not None and requested not in {"off", "low", "high", "max"}:
+            raise ValueError("reasoning_level must be off, low, high, or max")
+        level, _source = self.resolve_agent_reasoning_level(session_id=session_id, requested=requested)
+        capability_fn = getattr(self.agent_llm_client, "reasoning_capability", None)
+        if level is None or not callable(capability_fn):
+            return
+        client_name, model = self.resolve_agent_input_model(
+            session_id=session_id, attachment_ids=attachment_ids or [],
+            llm_client_name=llm_client_name, llm_model=llm_model,
+        )
+        level_validator = getattr(self.agent_llm_client, "validate_reasoning_level", None)
+        if callable(level_validator):
+            try:
+                level_validator(client_name=client_name, model=model, level=level)
+            except LLMClientError as exc:
+                raise ValueError(str(exc)) from exc
+        capability = capability_fn(client_name=client_name, model=model)
+        if level == "off" and not capability.get("supports_off"):
+            raise ValueError(f"Reasoning level 'off' is unsupported for client {client_name} and model {model}.")
+        if (level == "low" and capability.get("controlled")
+                and "low" not in capability.get("effort_map", {})):
+            raise ValueError(f"Reasoning level 'low' is unsupported for client {client_name} and model {model}.")
+        if level in {"high", "max"} and level not in capability.get("effort_map", {}):
+            raise ValueError(f"Reasoning level '{level}' is unsupported for client {client_name} and model {model}.")
 
     def import_mail(
         self,
@@ -2706,6 +2838,16 @@ class LocalKnowledgeAgentRuntime:
 
         return self.matter_service.update_matter(matter_id=matter_id, payload=payload)
 
+    def delete_matter(self, *, matter_id: str, expected_revision: int | None = None) -> MatterRecord:
+        """Soft-delete an independent local matter."""
+
+        return self.matter_service.delete_matter(matter_id=matter_id, expected_revision=expected_revision)
+
+    def restore_matter(self, *, matter_id: str) -> MatterRecord:
+        """Restore a soft-deleted local matter."""
+
+        return self.matter_service.restore_matter(matter_id=matter_id)
+
     def link_matter_source(
         self,
         *,
@@ -2762,13 +2904,3 @@ class LocalKnowledgeAgentRuntime:
         """Project persisted local mail evidence into the generic knowledge store."""
 
         return self.mail_knowledge_mirror.sync(account_id=account_id)
-    def delete_matter(self, *, matter_id: str, expected_revision: int | None = None) -> MatterRecord:
-        """Soft-delete an independent local matter."""
-
-        return self.matter_service.delete_matter(matter_id=matter_id, expected_revision=expected_revision)
-
-    def restore_matter(self, *, matter_id: str) -> MatterRecord:
-        """Restore a soft-deleted local matter."""
-
-        return self.matter_service.restore_matter(matter_id=matter_id)
-

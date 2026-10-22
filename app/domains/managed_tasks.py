@@ -301,18 +301,27 @@ class ManagedTaskService:
                         "original_refs_truncated": len(originals) > 16},
         )
 
-    def _new_run(self, session_id, envelope, source=None, *, workspace=None, safety_review_mode=None):
+    def _new_run(self, session_id, envelope, source=None, *, workspace=None, safety_review_mode=None,
+                 reasoning_level=None, reasoning_source=None):
         policy = self.policy(session_id).model_dump(mode="json")
         if policy.get("safety_review_mode") is None:
             policy["safety_review_mode"] = safety_review_mode or (
                 source.metadata.get("session_policy", {}).get("safety_review_mode") if source else None
             )
+        inherited_reasoning = (reasoning_level if reasoning_level in {"off", "low", "high", "max"}
+                               else source.metadata.get("llm_reasoning_level") if source else None)
+        if inherited_reasoning in {"off", "low", "high", "max"}:
+            policy["llm_reasoning_level"] = inherited_reasoning
+            policy["llm_reasoning_source"] = reasoning_source or "inherited"
         metadata = {"entrypoint": "agent.turn", "orchestrator": "langgraph",
                     "input_envelope": envelope.model_dump(mode="json"),
                     "session_policy": {**policy,
                                        "allow_default_workspace": False,
                                        "allowed_paths": None if workspace else []},
                     "execution_workspace": workspace}
+        if policy.get("llm_reasoning_level") in {"off", "low", "high", "max"}:
+            metadata["llm_reasoning_level"] = policy["llm_reasoning_level"]
+            metadata["llm_reasoning_source"] = policy.get("llm_reasoning_source") or ("inherited" if source else "session")
         metadata.update(self.budget_metadata(source.metadata) if source else {})
         return AgentRunRecord(
             run_id="agent_run_" + uuid4().hex, session_id=session_id, trace_id="agent_turn_" + uuid4().hex,
@@ -325,7 +334,7 @@ class ManagedTaskService:
         delegate = delegates.get_for_session(conn, context.session_id) if delegates is not None else None
         if delegate is None:
             return
-        controller = conn.execute("SELECT llm_client_name,llm_model FROM manager_controllers WHERE session_id=?",
+        controller = conn.execute("SELECT llm_client_name,llm_model,reasoning_level FROM manager_controllers WHERE session_id=?",
                                   (context.session_id,)).fetchone()
         run.metadata["delegate_session_id"] = context.session_id
         run.metadata["session_policy"] = {
@@ -333,8 +342,14 @@ class ManagedTaskService:
             "allowed_tools": delegate["allowed_tools"],
             "allowed_paths": None if run.metadata.get("execution_workspace") else [],
             "llm_client_name": controller[0], "llm_model": controller[1],
+            "llm_reasoning_level": run.metadata.get("llm_reasoning_level") or controller[2] or run.metadata.get("session_policy", {}).get("llm_reasoning_level"),
+            "llm_reasoning_source": run.metadata.get("llm_reasoning_source") or ("inherited" if controller[2] else run.metadata.get("session_policy", {}).get("llm_reasoning_source")),
             "safety_review_mode": run.metadata["session_policy"].get("safety_review_mode"),
         }
+        frozen_level = run.metadata["session_policy"].get("llm_reasoning_level")
+        if frozen_level in {"off", "low", "high", "max"}:
+            run.metadata["llm_reasoning_level"] = frozen_level
+            run.metadata["llm_reasoning_source"] = run.metadata["session_policy"].get("llm_reasoning_source") or "inherited"
 
     @staticmethod
     def budget_metadata(*metadata):
@@ -525,7 +540,9 @@ class ManagedTaskService:
                      "creation_source,creator_session_id) VALUES(?,?,'active',?,'ordinary',?,?,'assistant',?)",
                      (sid, title, _json({"workspace": workspace} if workspace else {}), now, now, context.session_id))
         run = self._new_run(sid, envelope, caller, workspace=workspace,
-                            safety_review_mode=context.safety_review_mode)
+                            safety_review_mode=context.safety_review_mode,
+                            reasoning_level=getattr(context, "llm_reasoning_level", None),
+                            reasoning_source=getattr(context, "llm_reasoning_source", None))
         self._freeze_delegate_policy(conn, context, run)
         self.run_store.save_run_in_transaction(conn, run.model_dump(mode="json"), updated_at=now)
         if not defer_dispatch:
@@ -560,7 +577,9 @@ class ManagedTaskService:
                 workspace = (old or {}).get("metadata", {}).get("execution_workspace",
                     json.loads(target["metadata"]).get("workspace"))
                 run = self._new_run(session_id, envelope, caller, workspace=workspace,
-                                    safety_review_mode=context.safety_review_mode)
+                                    safety_review_mode=context.safety_review_mode,
+                                    reasoning_level=getattr(context, "llm_reasoning_level", None),
+                                    reasoning_source=getattr(context, "llm_reasoning_source", None))
                 self._freeze_delegate_policy(conn, context, run)
                 # Later user/model configuration cannot widen accepted tools.
                 if old and old.get("metadata", {}).get("delegate_session_id"):

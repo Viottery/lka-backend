@@ -15,7 +15,7 @@ def test_list_and_dry_run_never_import_runtime(capsys):
     try:
         assert main(["--list", "--json", "--local-config", "/missing/private.toml"]) == 0
         listing = json.loads(capsys.readouterr().out)
-        assert len(listing["cases"]) == 16
+        assert len(listing["cases"]) == 17
         indexed = {case["case_id"]: case for case in listing["cases"]}
         for name in ("session_progress_cache", "management_notifications", "management_result_recovery"):
             assert indexed[name]["kind"] == "offline_contract"

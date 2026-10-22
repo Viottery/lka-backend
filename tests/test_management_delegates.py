@@ -41,10 +41,13 @@ def child_context(runtime, sid):
 
 
 def test_creation_is_durable_bounded_independent_and_idempotent(runtime, manager_context, delegates):
-    receipt = delegates.delegate_work(manager_context, command_id='one', objective='Inspect state')
-    assert delegates.delegate_work(manager_context, command_id='one', objective='Inspect state') == receipt
+    caller = manager_context.model_copy(update={"llm_reasoning_level": "high", "llm_reasoning_source": "request"})
+    receipt = delegates.delegate_work(caller, command_id='one', objective='Inspect state')
+    assert delegates.delegate_work(caller, command_id='one', objective='Inspect state') == receipt
     with closing(runtime._conn()) as conn:
         item = delegates.get_for_session(conn, receipt['session_id'])
+        assert conn.execute("SELECT reasoning_level FROM manager_controllers WHERE session_id=?",
+                            (receipt['session_id'],)).fetchone()[0] == "high"
         assert item['parent_session_id'] == manager_context.session_id
         assert all(runtime.tool_registry.get_tool(name).spec.read_only for name in item['allowed_tools'])
         assert not conn.execute('SELECT 1 FROM agent_runs WHERE session_id=?', (receipt['session_id'],)).fetchone()

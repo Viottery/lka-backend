@@ -177,6 +177,12 @@
     ],
     "management_result_recovery": [
       "tests/test_management_result_recovery.py"
+    ],
+    "reasoning_controls": [
+      "tests/test_llm_reasoning_levels.py",
+      "tests/test_reasoning_turn_integration.py",
+      "tests/test_management_tasks.py::test_task_freezes_callers_effective_reasoning_over_controller_default",
+      "tests/test_management_delegates.py::test_creation_is_durable_bounded_independent_and_idempotent"
     ]
   }
 }

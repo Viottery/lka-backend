@@ -829,6 +829,14 @@ class MultiAgentScheduler:
                 inference_profile=inference_profile,
                 request_llm_client_name=request_llm_client_name,
                 request_llm_model=request_llm_model,
+                request_reasoning_level=(
+                    (parent.metadata.get("llm_reasoning_level")
+                     or parent.metadata.get("context_snapshot", {}).get("inference_reasoning_level")
+                     or parent.metadata.get("session_policy", {}).get("llm_reasoning_level"))
+                    if not (inference_profile is not None and inference_profile.reasoning_effort is not None
+                            and parent.metadata.get("llm_reasoning_source", "default") == "default")
+                    else None
+                ),
                 dependency_results=dependencies,
                 parent_effective_scope=context.parent_effective_scope,
                 session_scope=context.session_scope,

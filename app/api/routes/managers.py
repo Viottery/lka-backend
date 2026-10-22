@@ -32,6 +32,7 @@ class ManagerController(BaseModel):
     default_execution_workspace: SessionWorkspace | None = None
     llm_client_name: str | None
     llm_model: str | None
+    reasoning_level: Literal["off", "low", "high", "max"] | None = None
     created_at: str
     updated_at: str
 
@@ -48,6 +49,7 @@ class CreateManagerRequest(BaseModel):
     default_execution_workspace: ExecutionWorkspaceInput | None = None
     llm_client_name: str | None = Field(default=None, min_length=1, max_length=200)
     llm_model: str | None = Field(default=None, min_length=1, max_length=200)
+    reasoning_level: Literal["off", "low", "high", "max"] | None = None
 
     @field_validator("title", "llm_client_name", "llm_model")
     @classmethod
@@ -64,6 +66,7 @@ class UpdateManagerRequest(BaseModel):
     status: Literal["active", "paused"] | None = None
     llm_client_name: str | None = Field(default=None, min_length=1, max_length=200)
     llm_model: str | None = Field(default=None, min_length=1, max_length=200)
+    reasoning_level: Literal["off", "low", "high", "max"] | None = None
 
     _trim_nonblank = field_validator("llm_client_name", "llm_model")(CreateManagerRequest.trim_nonblank.__func__)
 

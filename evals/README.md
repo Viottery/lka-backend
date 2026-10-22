@@ -587,6 +587,12 @@ No benchmark case should depend on or mutate the user's real mailbox.
 
 ## Persistent management delegate evaluations
 
+The offline `reasoning_controls` selection covers per-request four-level reasoning,
+provider mappings and failures, streaming/non-streaming trace, frozen runs and
+management inheritance. It uses synthetic requests and mocked transport; passing
+does not measure real-model task quality or latency. Run it with
+`--case reasoning_controls --run` using the management driver below.
+
 `evals.lka_evals.management_cases` is a dedicated driver for persistent manager
 sessions and event-driven follow-up turns. It does not use the generic one-turn
 runner to approximate this lifecycle. The public synthetic catalog is

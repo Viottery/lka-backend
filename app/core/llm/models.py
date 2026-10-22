@@ -22,6 +22,19 @@ class LLMReasoningEffort(str, Enum):
     LOW = "low"
     MEDIUM = "medium"
     HIGH = "high"
+    MAX = "max"
+    XHIGH = "xhigh"
+    NONE = "none"
+    MINIMAL = "minimal"
+
+
+class ReasoningLevel(str, Enum):
+    """Stable user-facing reasoning preference, independent of provider values."""
+
+    OFF = "off"
+    LOW = "low"
+    HIGH = "high"
+    MAX = "max"
 
 
 class LLMTextBlock(BaseModel):
@@ -101,7 +114,8 @@ class LLMRequest(BaseModel):
     client_name: str | None = None
     model: str | None = None
     temperature: float = 0.0
-    reasoning_effort: LLMReasoningEffort | None = None
+    reasoning_effort: LLMReasoningEffort | str | None = None
+    reasoning_level: ReasoningLevel | None = None
     thinking_enabled: bool | None = None
     max_output_tokens: int | None = None
     require_json: bool = False

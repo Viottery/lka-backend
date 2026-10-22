@@ -19,6 +19,7 @@ class UIDefaults(BaseModel):
 
     llm_client: str = Field(default="", max_length=100)
     llm_model: str = Field(default="", max_length=200)
+    reasoning_level: Literal["off", "low", "high", "max"] = "low"
     safety_mode: Literal["backend", "skip", "llm", "manual"] = "backend"
     stream: bool = True
     workspace_parent: str = Field(default="", max_length=1000)
@@ -35,6 +36,13 @@ def get_ui_defaults(request: Request) -> dict:
 
 @router.put("/ui-defaults")
 def put_ui_defaults(payload: UIDefaults, request: Request) -> dict:
+    # Older desktop clients omit this field. Preserve an existing preference.
+    if "reasoning_level" not in payload.model_fields_set:
+        with request.app.state.runtime._conn() as conn:
+            row = conn.execute("SELECT preferences FROM agent_ui_preferences WHERE id = 1").fetchone()
+        if row is not None:
+            previous = UIDefaults.model_validate_json(row["preferences"])
+            payload = payload.model_copy(update={"reasoning_level": previous.reasoning_level})
     timestamp = datetime.now(UTC).isoformat()
     with request.app.state.runtime._conn() as conn:
         conn.execute(
@@ -79,5 +87,9 @@ async def list_agent_models(request: Request, refresh: bool = False) -> dict:
             if cached and time.monotonic() - cached[0] <= 300:
                 models = list(dict.fromkeys([*configured, *cached[1]]))
                 source = "provider"
-        clients.append({"name": client.name, "default_model": client.default_model, "models": models, "source": source})
+        reasoning = getattr(service, "reasoning_capability", None)
+        capabilities = ({model: reasoning(client_name=client.name, model=model) for model in models}
+                        if callable(reasoning) else {})
+        clients.append({"name": client.name, "default_model": client.default_model, "models": models,
+                        "reasoning_capabilities": capabilities, "source": source})
     return {"default_client": service.config.default_client or (clients[0]["name"] if clients else None), "clients": clients}

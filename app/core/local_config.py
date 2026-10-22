@@ -36,6 +36,15 @@ def _resolved_env_value(name: str) -> str | None:
     return os.getenv(name) or _dotenv_value(name)
 
 
+class LLMReasoningConfig(BaseModel):
+    """Reasoning controls for one exact client/model pair."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    effort_map: dict[Literal["off", "low", "high", "max"], str] = Field(default_factory=dict)
+    supports_off: bool = False
+
+
 class LLMClientConfig(BaseModel):
     name: str
     provider: str = "openai_compatible"
@@ -54,6 +63,9 @@ class LLMClientConfig(BaseModel):
     supports_required_tool_choice: bool = False
     function_calling_strict: bool = False
     supports_reasoning_effort: bool = False
+    reasoning_effort_map: dict[str, str] = Field(default_factory=dict)
+    supports_reasoning_off: bool = False
+    model_reasoning_overrides: dict[str, LLMReasoningConfig] = Field(default_factory=dict)
     thinking_control: Literal["deepseek"] | None = None
     context_window_tokens: int | None = Field(default=None, gt=0)
     output_reserve_tokens: int = Field(default=8192, gt=0)
@@ -71,6 +83,10 @@ class LLMProviderConfig(BaseModel):
     model: str = "gpt-4.1-mini"
     timeout_seconds: int = 180
     thinking_control: Literal["deepseek"] | None = None
+    supports_reasoning_effort: bool = False
+    reasoning_effort_map: dict[str, str] = Field(default_factory=dict)
+    supports_reasoning_off: bool = False
+    model_reasoning_overrides: dict[str, LLMReasoningConfig] = Field(default_factory=dict)
     supports_json_mode: bool = False
     supports_vision: bool = False
     vision_model_overrides: dict[str, bool] = Field(default_factory=dict)
@@ -197,6 +213,10 @@ class LLMProviderConfig(BaseModel):
                 available_models=[self.model],
                 timeout_seconds=self.timeout_seconds,
                 thinking_control=self.thinking_control,
+                supports_reasoning_effort=self.supports_reasoning_effort,
+                reasoning_effort_map=self.reasoning_effort_map,
+                supports_reasoning_off=self.supports_reasoning_off,
+                model_reasoning_overrides=self.model_reasoning_overrides,
                 supports_json_mode=self.supports_json_mode,
                 supports_vision=self.supports_vision,
                 vision_model_overrides=self.vision_model_overrides,

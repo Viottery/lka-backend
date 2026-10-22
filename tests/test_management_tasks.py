@@ -66,6 +66,18 @@ def test_start_is_independent_root_with_server_quote_and_idempotent_receipt(runt
         service.start_task(manager_context, command_id="start-1", purpose="Different purpose")
 
 
+def test_task_freezes_callers_effective_reasoning_over_controller_default(runtime, manager_context):
+    with closing(runtime._conn()) as conn, conn:
+        conn.execute("UPDATE manager_controllers SET reasoning_level='low' WHERE session_id=?",
+                     (manager_context.session_id,))
+    caller = manager_context.model_copy(update={"llm_reasoning_level": "high", "llm_reasoning_source": "request"})
+    receipt = runtime.managed_tasks.start_task(caller, command_id="reasoning", purpose="Inspect under caller policy")
+    frozen = runtime.agent_run_manager.get_run(receipt["run_id"]).metadata
+    assert frozen["llm_reasoning_level"] == "high"
+    assert frozen["llm_reasoning_source"] == "request"
+    assert frozen["session_policy"]["llm_reasoning_level"] == "high"
+
+
 def test_start_receipt_deduplicates_after_runtime_reopen(runtime, manager_context):
     first = runtime.managed_tasks.start_task(manager_context, command_id="restart", purpose="Read current state")
     baseline = counts(runtime)

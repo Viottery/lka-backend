@@ -1031,6 +1031,7 @@ class ContextSnapshot(MultiAgentModel):
     inference_client_name: str | None = Field(default=None, max_length=100)
     inference_model: str | None = Field(default=None, max_length=200)
     inference_reasoning_effort: Literal["low", "medium", "high"] | None = None
+    inference_reasoning_level: Literal["off", "low", "high", "max"] | None = None
     inference_selection_source: Literal["request", "server_profile", "default"] = "default"
     objective: str = Field(min_length=1)
     output_contract: str = Field(min_length=1)
