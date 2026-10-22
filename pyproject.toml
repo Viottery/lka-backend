@@ -40,6 +40,11 @@ lka = "debug_frontend.cli:main"
 [tool.hatch.build.targets.wheel]
 packages = ["app", "debug_frontend"]
 
+[tool.pytest.ini_options]
+# data/ holds benchmark checkouts with their own test suites; never collect them.
+testpaths = ["tests"]
+norecursedirs = ["data", ".venv", ".uv-cache", "node_modules", ".git"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py312"
