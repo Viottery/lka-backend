@@ -564,3 +564,23 @@ def test_opt_in_stream_binding_and_replacement_keep_legacy_default(tmp_path, mon
         asyncio.run(scenario())
     finally:
         runtime.stop()
+
+
+def test_rate_limit_backoff_stops_when_the_run_is_cancelled(monkeypatch):
+    """Retry waits poll cancellation instead of sleeping the whole Retry-After."""
+    from app.core.agent_runs import AgentRunCancelled
+    from app.core.agent_turn import AgentTurnLoop
+
+    loop = AgentTurnLoop.__new__(AgentTurnLoop)
+    checks = []
+
+    def cancel_on_third_check():
+        checks.append(1)
+        if len(checks) >= 3:
+            raise AgentRunCancelled("cancelled")
+
+    loop._raise_if_cancel_requested = cancel_on_third_check
+    started = __import__("time").monotonic()
+    with pytest.raises(AgentRunCancelled):
+        loop._cancellable_wait(30.0)
+    assert __import__("time").monotonic() - started < 2.0

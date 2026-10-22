@@ -7845,7 +7845,7 @@ class AgentTurnLoop:
                 llm_events.append(llm_event)
                 if attempt >= attempt_limit:
                     return None
-                time.sleep(self._retry_after_seconds(exc.retry_after))
+                self._cancellable_wait(self._retry_after_seconds(exc.retry_after))
                 continue
             except LLMClientError as exc:
                 resource_refusal = isinstance(exc, (LLMResourceError, BackgroundBudgetDeferred, BackgroundTaskBudgetExceeded))
@@ -8446,6 +8446,16 @@ class AgentTurnLoop:
         if isinstance(exc, LLMProviderHTTPError):
             return "http_failed"
         return "failed"
+
+    def _cancellable_wait(self, seconds: float) -> None:
+        """Rate-limit backoff that still honours run cancellation within ~0.25 s."""
+        deadline = time.monotonic() + max(seconds, 0.0)
+        while True:
+            self._raise_if_cancel_requested()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(remaining, 0.25))
 
     def _retry_after_seconds(self, retry_after: str | None) -> float:
         if not retry_after:
