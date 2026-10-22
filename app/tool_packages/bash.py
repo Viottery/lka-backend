@@ -15,6 +15,7 @@ from typing import Any
 from app.core.tools import ToolContext, ToolInvocation, ToolPackageSpec, ToolResult, ToolSpec
 from app.platform.commands import IS_WINDOWS, SHELL_NAME, run_sync, start_terminal
 from app.platform.python_environment import ManagedPythonEnvironment
+from app.platform.sensitive_paths import scrub_secret_env, sensitive_path_reason
 from app.platform.workspace_access import approved_path, require_child_path_scope
 from app.tool_packages.bash_manual_review import command_manual_review_reason
 
@@ -388,7 +389,8 @@ class BashRunTool:
         return is_read_only_command(str(tool_input.get("command") or ""))
 
     def manual_review_reason(self, tool_input: dict[str, Any]) -> str | None:
-        return command_manual_review_reason(str(tool_input.get("command") or ""))
+        command = str(tool_input.get("command") or "")
+        return command_manual_review_reason(command) or _secret_access_reason(command)
 
     def workspace_write_targets(self, tool_input: dict[str, Any], context: ToolContext) -> list[str]:
         """A non-read-only command may write into its cwd; report it for workspace creation."""
@@ -562,10 +564,9 @@ class BashRunTool:
         }
 
     def _env(self, policy: BashAccessPolicy, *, read_only: bool = False) -> dict[str, str]:
-        # Human control credentials must never reach an Agent-owned process.
-        env = {key: value for key, value in os.environ.items() if key not in {
-            "LKA_MESSAGES_CONTROL_TOKEN", "LKA_MESSAGES_API_TOKEN", "LKA_MESSAGES_IMPORT_TOKEN"
-        }}
+        # Credentials (provider API keys, control tokens, agent sockets) must never
+        # reach an Agent-owned process; it gets the rest of the backend environment.
+        env = scrub_secret_env(dict(os.environ))
         if read_only:
             # Startup files, exported functions and rg --pre can run code even
             # when argv is read-only. Reviewed commands retain those semantics.
@@ -843,6 +844,30 @@ class BashTerminateSessionTool:
             status="completed",
             output={"session_id": session_id, "status": "terminated"},
         )
+
+
+def _secret_access_reason(command: str) -> str | None:
+    """Reading credential files or dumping the environment always needs a human."""
+    try:
+        tokens = shlex.split(command, comments=False, posix=not IS_WINDOWS)
+    except ValueError:
+        tokens = command.split()
+    names = [_name_of(token) for token in tokens]
+    if "printenv" in names or names == ["env"] or names == ["set"]:
+        return "Listing environment variables can expose credentials; it needs your confirmation."
+    if any(token.lower().rstrip(":\\/") in {"env", "env:"} for token in tokens[1:]) and names and names[0] in {
+        "get-childitem", "gci", "dir", "ls",
+    }:
+        return "Listing environment variables can expose credentials; it needs your confirmation."
+    for token in tokens:
+        reason = sensitive_path_reason(token)
+        if reason:
+            return "Credential access needs your confirmation: " + reason
+    return None
+
+
+def _name_of(token: str) -> str:
+    return token.replace("\\", "/").rsplit("/", 1)[-1].lower().removesuffix(".exe")
 
 
 def is_read_only_command(command: str) -> bool:

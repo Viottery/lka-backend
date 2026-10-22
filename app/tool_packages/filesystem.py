@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from app.core.tools import ToolContext, ToolInvocation, ToolPackageSpec, ToolResult, ToolSpec
+from app.platform.sensitive_paths import sensitive_path_reason
 from app.platform.workspace_access import approved_path, is_path_within, require_child_path_scope
 
 DEFAULT_READ_MAX_LINES = 200
@@ -116,6 +117,11 @@ class ReadFileTool:
     def __init__(self, policy: FileAccessPolicy) -> None:
         self.policy = policy
 
+    def manual_review_reason(self, tool_input: dict[str, Any]) -> str | None:
+        """Credential files need a human even in skip/llm review mode."""
+        reason = sensitive_path_reason(str(tool_input.get("path") or ""))
+        return "Credential access needs your confirmation: " + reason if reason else None
+
     def workspace_access_request(self, tool_input: dict[str, Any], context: ToolContext) -> list[str]:
         return workspace_access_request(tool_input, context, self.policy)
 
@@ -195,6 +201,9 @@ class ReadFileTool:
 
 class ListDirectoryTool(ReadFileTool):
     """Shallow, bounded discovery; no symlink traversal or implied text coverage."""
+
+    def manual_review_reason(self, tool_input: dict[str, Any]) -> str | None:
+        return None  # Listing names does not read file contents.
 
     spec = ToolSpec(
         name="filesystem.list_directory", package="filesystem", type="local_tool",
