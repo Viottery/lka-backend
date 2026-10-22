@@ -389,4 +389,38 @@ class ManagementGoalService:
 
     def list_deliveries(self, session_id, *, after=0, limit=50):
         rows, cursor = self._records("manager_deliveries", session_id, after, limit)
+        with closing(self._conn()) as conn:
+            for row in rows:
+                row["topic"] = self._delivery_topic(conn, row)
         return {"deliveries": rows, "next_after": cursor}
+
+    @staticmethod
+    def _delivery_topic(conn, delivery):
+        """A short subject: the finished task's session title, else the reply's first line."""
+        execution = conn.execute("SELECT event_ids FROM manager_executions WHERE execution_id=?",
+                                 (delivery.get("execution_id"),)).fetchone()
+        try:
+            event_ids = json.loads(execution["event_ids"]) if execution is not None else []
+        except (TypeError, ValueError):
+            event_ids = []
+        for event_id in event_ids if isinstance(event_ids, list) else []:
+            event = conn.execute("SELECT kind,payload FROM manager_inbox WHERE event_id=?", (event_id,)).fetchone()
+            if event is None or event["kind"] != "task_terminal":
+                continue
+            try:
+                run_id = json.loads(event["payload"]).get("run_id")
+            except (TypeError, ValueError, AttributeError):
+                continue
+            title = conn.execute(
+                "SELECT s.title FROM agent_runs r JOIN agent_sessions s ON s.session_id=r.session_id "
+                "WHERE r.run_id=? AND s.kind!='manager'", (run_id,),
+            ).fetchone()
+            if title is not None and str(title["title"] or "").strip() not in {"", "New Session", "新会话"}:
+                return str(title["title"]).strip()[:60]
+        message = conn.execute("SELECT content FROM agent_session_messages WHERE message_id=?",
+                               (delivery.get("message_id"),)).fetchone()
+        if message is not None:
+            first = next((line.strip(" #*>-") for line in str(message["content"]).splitlines() if line.strip()), "")
+            if first:
+                return first[:40]
+        return None
