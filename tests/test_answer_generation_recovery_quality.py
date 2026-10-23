@@ -113,6 +113,7 @@ def test_complete_answer_needs_no_recovery(tmp_path):
 @pytest.mark.parametrize("context_only", [False, True])
 def test_answer_timeout_before_output_retries_once(tmp_path, stream, context_only):
     loop, provider, manager = make_loop(tmp_path, [LLMTimeoutError("read timed out"), response()])
+    loop.answer_timeout_fallback_enabled = False
     events = []
     with scope(manager, stream=stream) as run:
         result = (
@@ -133,6 +134,7 @@ def test_repeated_answer_timeout_keeps_timeout_classification(tmp_path):
     loop, provider, manager = make_loop(tmp_path, [LLMTimeoutError("first"),
                                                 LLMTimeoutError("second"), response()])
     loop.llm_max_attempts = 5
+    loop.answer_timeout_fallback_enabled = False
     with scope(manager), pytest.raises(LLMTimeoutError, match="second"):
         answer(loop, [])
     assert len(provider.requests) == 2
@@ -258,6 +260,7 @@ def test_recovery_uses_frozen_child_selection_for_thinking_capability(tmp_path):
     snapshot = SimpleNamespace(
         inference_selection_source="server_profile", inference_client_name="selected",
         inference_model="test-model", inference_reasoning_effort=None,
+        inference_reasoning_level=None,
         inference_profile_id="test-profile", output_contract=None,
     )
     with scope(manager):

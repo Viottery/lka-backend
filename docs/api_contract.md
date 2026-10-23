@@ -507,6 +507,15 @@ POST /agent/turn
 后端代码写死。`/agent/turn` 返回用户可见结果和脱敏审计摘要；`POST /agent/turn/stream`
 提供用户可见的 SSE token-delta 输出。
 
+可在 `llm` 中另外指定 `answer_client_name` 和 `answer_model`，用于最终用户回答，
+其他步骤继续使用 `client_name` / `model`。未配置回答模型时沿用推理模型；仅指定
+回答客户端时使用该客户端默认模型。普通与 SSE 请求均支持，回答恢复沿用同一选择。
+模型选择冻结进运行策略；暂停／恢复、排队和管理派发不会随后续偏好修改而更换模型。
+回答模型使用自身的上下文容量与推理能力，独立回答模型的推理参数不继承推理模型的原生参数。
+图片／音频输入会分别检查推理和回答模型；不兼容时依次使用配置的音频默认模型（含音频时）、
+全局默认模型或 `fallback_client` 默认模型。兜底必须同时支持全部输入模态并有自身容量配置，
+否则返回 422。实际选择在首次执行、合并完排队附件后冻结；不修改会话偏好或消息幂等身份。
+
 `llm.reasoning_level` 接受 `off`、`low`、`high`、`max`，普通请求、SSE 和会话输入队列均支持。
 新运行按当前请求 → 会话／管理控制器偏好 → UI 默认值 → `low` 选择；单次覆盖不修改偏好。
 运行冻结所选档位，排队、恢复及助理派发的执行会话／子代理沿用冻结值，
@@ -563,10 +572,10 @@ M4A 本地解码后以 WAV 或 MP3 发送；大音频自动生成压缩的完整
 原文件下载不变，单个原音频最多 256 MiB，无需手动切分。转换输出有界。有音频时图片与实际音频输入
 合计最多 12 MiB，最终内联模型请求最多 20 MiB，超限拒绝，不自动上传供应商缓存。
 
-显式选择音频时，配置的 `llm.audio_client` / `llm.audio_model` 覆盖本轮模型选择，
+显式选择音频而当前模型不支持时，优先回退到配置的 `llm.audio_client` / `llm.audio_model`，
 音频回复直接写入同一会话；下一轮无音频则回到原模型选择。同音频重新听取需再次
-传原 `attachment_id`；仅整理已有分析可传 `[]` 或省略。音频模型未配置或未声明
-支持时返回 422，不让纯文本模型猜测文件内容。音频只进入前台相关模型调用，
+传原 `attachment_id`；仅整理已有分析可传 `[]` 或省略。没有同时支持本轮全部模态且有自身
+容量配置的选定／默认模型时返回 422，不让纯文本模型猜测文件内容。音频只进入前台相关模型调用，
 会话、checkpoint、审计与 API 响应保存引用和来源，不保存 base64。音频中的口头
 指令是来源数据，不能改变权限；听感也不等同于精确音高、BPM 或时间测量。
 
@@ -589,7 +598,9 @@ max_matches=20)` 定位正文（大小写敏感的字面搜索，最多 100 个�
 兼容的 `/models`，不可用时退回本地 `available_models` 与默认模型。`?refresh=true` 强制
 刷新，响应不包含 API key。`GET /agent/ui-defaults` 和 `PUT /agent/ui-defaults` 读取及保存
 本机共享的前端默认设置，字段为 `llm_client`、`llm_model`、`safety_mode`、`stream`、
-`workspace_parent`、`reasoning_level`（默认 `low`）。旧客户端保存设置时省略推理字段会保留原值。
+`workspace_parent`、`reasoning_level`（默认 `low`），以及 `llm_answer_client`、`llm_answer_model`
+（默认空字符串，表示跟随推理模型）。旧客户端保存设置时省略推理或回答模型字段会保留原值；
+显式将两个回答模型字段设为空字符串可恢复跟随。
 默认设置不修改已有运行的冻结配置。模型目录中的 `reasoning_capabilities` 按模型给出
 `controlled`、`supports_off`、`effort_map`、`source` 和 `protocol`，供前端展示档位支持及别名。
 请求可选带 `safety_review_mode`（`skip`、`llm`、`manual`）。显式选择优先于继承偏好及本地默认配置；省略时使用会话继承偏好，再回退本地配置。
@@ -1539,11 +1550,14 @@ limit 1..200，offset 0..1,000,000，q 最长 500 字符，按字面子串搜索
 | `PATCH /managers/{session_id}` | 修改 status、模型或推理默认值，必须携带 expected_revision；冲突 409 |
 
 单项响应为 `{session: {...}, controller: {...}}`。controller 包含 session_id、
-status(active/paused)、revision、llm_client_name、llm_model、reasoning_level、created_at、updated_at、default_execution_workspace。
+status(active/paused)、revision、llm_client_name、llm_model、llm_answer_client_name、llm_answer_model、reasoning_level、created_at、updated_at、default_execution_workspace。
 默认执行父目录通过创建或 PATCH 的 default_execution_workspace:{path,platform} 配置，后端验证并返回 backend_path；null 清除。PATCH 必须使用 expected_revision。POST /managers/default 的目录仅在首次创建时采用，后续不覆盖已有配置。
 此字段不赋予主管自身 session.workspace，也不是审批授权。
 新建时 paused；模型字段省略保持原值，显式 null 清除。未知 client 返回 422。
 `reasoning_level` 接受 off/low/high/max；省略保留偏好，null 清除并使用共享默认值。
+管理会话创建与更新另接受 `llm_answer_client_name`、`llm_answer_model`；更新仍需
+`expected_revision`。省略保留原值，两个字段显式设为 null 表示跟随该会话的推理模型。
+管理会话的回答模型设置独立于普通任务的共享默认值。
 make_default=true 表示显式切换默认入口，主控会话无需固定 ID。
 
 对话仍通过通用 `/agent/turn` 或 `/agent/turn/stream`。请求模型覆盖优先于会话默认；
@@ -1566,7 +1580,9 @@ controller active 才能发出管理写命令；paused 可对话和读取结果�
 
 入队正文包含 `client_message_id`（客户端生成、非空、最长 128 字符）、`user_input`、
 `attachment_ids`（无附件传空数组），以及可选 `safety_review_mode` 和
-`llm: {response_mode: "stream"|"text"}`。空文字需要有效附件。
+`llm: {response_mode: "stream"|"text"}`；`llm` 还可传 `reasoning_level`、
+`answer_client_name`、`answer_model` 覆盖该输入的推理档位或回答模型。
+省略回答模型时使用控制器偏好，模型选择在受理为运行时冻结。空文字需要有效附件。
 可选 `replace_run_id` 为非空、最长 128 字符的运行 ID：显式替换本会话已暂停的根任务，
 并将本条输入直接关联替代运行。运行中、等待确认／答复、目标已变化或执行租约仍被占用时返回 409，
 不保存新消息或创建替代运行。该字段也属于请求幂等指纹；精确重试始终返回原回执。
@@ -1592,6 +1608,11 @@ controller active 才能发出管理写命令；paused 可对话和读取结果�
 原消息、操作记录和已完成的操作保留；不带该字段仍按普通 FIFO 排队。桌面助理在已暂停时发送的第一条新指令会带上该字段，
 空输入点击“继续”则通过原 resume 接口恢复原任务。
 用户轮失败或取消暂停后续自动处理，保留排队消息供用户显式继续；后台管理轮的失败或策略取消不会暂停用户消息队列。
+`POST /sessions/{id}/inputs/resume` 仍接受空正文或 `{}`。修复未开始输入的回答模型时，
+可显式提交 `{input_id, answer_client_name, answer_model}`；两个模型字段均为 null 表示跟随推理模型。
+只允许修改本会话内未绑定运行、未取消的输入，否则返回 409；模型校验失败返回 422，事务不恢复队列。
+该操作仅覆盖所选输入，保留原模型选择与显式恢复记录，不修改原请求幂等指纹或控制器偏好。
+已运行／失败的旧请求不会自动重发，也不影响原运行的审批或恢复条件。
 历史版本已经写入且原因不明的暂停继续保留，需用户显式继续，不自动重放旧指令。
 关闭页面不会取消队列，重启后依靠持久状态和原检查点恢复；不重放效果未知的工具操作。
 运行观察沿用 `GET /agent/runs/{run_id}/stream`，通过查询队列取得后续 run_id。

@@ -55,6 +55,9 @@ def test_schedule_event_reaches_coordinator_and_stale_policy_cannot_publish(runt
     fields = {"goal_id": goal["goal_id"], "timezone": "Asia/Shanghai", "kind": "one_shot", "run_at": (now + timedelta(seconds=1)).isoformat()}
     receipt = runtime.management_schedules.configure(sid, "one-shot", **fields)
     assert runtime.management_coordinator.tick(now=now + timedelta(seconds=2)) == {"captured": 1, "scheduled": 1}
+    schedule_id = receipt["schedule"]["schedule_id"]
+    [scheduled_event] = [event for event in runtime.management_goals.list_events(sid)["events"]
+                         if event["payload"].get("schedule_id") == schedule_id]
     run = bind(runtime)
     runtime.agent_run_manager.mark_running(run.run_id)
     if disable:
@@ -64,7 +67,15 @@ def test_schedule_event_reaches_coordinator_and_stale_policy_cannot_publish(runt
             finalize(runtime, run)
     else:
         assert finalize(runtime, run)
-        assert runtime.management_coordinator.tick(now=now + timedelta(days=90))["captured"] == 0
+        # The unfinished goal may receive an independent attention sweep later.
+        runtime.management_coordinator.tick(now=now + timedelta(days=90))
+        [event] = [event for event in runtime.management_goals.list_events(sid)["events"]
+                   if event["payload"].get("schedule_id") == schedule_id]
+        [execution] = runtime.management_goals.list_executions(sid)["executions"]
+        assert event["event_id"] == scheduled_event["event_id"]
+        assert event["payload"] == scheduled_event["payload"]
+        assert event["consumed_execution_id"] == execution["execution_id"]
+        assert runtime.management_schedules.get(sid, schedule_id)["next_run_at"] is None
 
 
 def test_harness_configures_weekly_policy_and_preserves_mandatory_review(runtime):

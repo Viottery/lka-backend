@@ -38,7 +38,7 @@ from app.core.config import Settings
 from app.core.context import ContextAssembler
 from app.core.context_driver import ContextViews, EvidenceCandidate
 from app.core.instruction_files import InstructionFiles
-from app.core.llm import LLMResponseMode, MockLLMClient, build_text_llm_client
+from app.core.llm import LLMRequest, LLMResponseMode, MockLLMClient, build_text_llm_client
 from app.core.llm.errors import LLMClientError
 from app.core.llm.models import LLMAudioBlock, LLMAudioInput, LLMImageBlock, LLMImageURL
 from app.core.llm.service import LLMService
@@ -665,6 +665,8 @@ class LocalKnowledgeAgentRuntime:
             log_dir=self.settings.data_dir / "agent_logs",
             max_decision_steps=self.local_app_config.agent.max_decision_steps,
             llm_max_attempts=self.local_app_config.llm.max_attempts,
+            answer_timeout_seconds=self.local_app_config.agent.answer_timeout_seconds,
+            answer_timeout_fallback_enabled=self.local_app_config.agent.answer_timeout_fallback_enabled,
             run_manager=self.agent_run_manager,
             safety_review_mode=self.local_app_config.safety.tool_review_mode,
             safety_manual_wait_poll_seconds=(
@@ -891,6 +893,7 @@ class LocalKnowledgeAgentRuntime:
             self._conn, sessions=self.session_service, run_store=self.agent_run_store,
             dispatcher=self.agent_dispatch, authorize=self._authorize_session_input,
             policy=self._session_run_policy, validate_attachments=self.prepare_agent_attachment_input,
+            validate_answer_selection=self.validate_agent_answer_selection,
             replace=self.replace_agent_run,
             batch_attachments_fit=self._session_input_batch_attachments_fit,
         )
@@ -1131,14 +1134,19 @@ class LocalKnowledgeAgentRuntime:
     def _session_run_policy(self, session_id: str) -> SessionRunPolicy:
         ui_reasoning_level = "low"
         ui_reasoning_source = "default"
+        ui_answer_client_name = None
+        ui_answer_model = None
         try:
             with closing(self._conn()) as conn:
                 preference = conn.execute("SELECT preferences FROM agent_ui_preferences WHERE id=1").fetchone()
             if preference:
-                value = json.loads(preference[0]).get("reasoning_level")
+                preferences = json.loads(preference[0])
+                value = preferences.get("reasoning_level")
                 if value in {"off", "low", "high", "max"}:
                     ui_reasoning_level = value
                     ui_reasoning_source = "ui_default"
+                ui_answer_client_name = preferences.get("llm_answer_client") or None
+                ui_answer_model = preferences.get("llm_answer_model") or None
         except (sqlite3.Error, ValueError, TypeError, AttributeError):
             pass
         session = self.session_service.get_session_or_none(session_id=session_id)
@@ -1155,10 +1163,13 @@ class LocalKnowledgeAgentRuntime:
                         return SessionRunPolicy.model_validate(frozen)
             return SessionRunPolicy(llm_reasoning_level=ui_reasoning_level,
                                     llm_reasoning_source=ui_reasoning_source,
+                                    llm_answer_client_name=ui_answer_client_name,
+                                    llm_answer_model=ui_answer_model,
                                     allowed_tools=self.management_service.allowed_tool_names(
                 self.tool_registry.list_tools(), manager=False,
             )) if self.local_app_config.management.enabled else SessionRunPolicy(
-                llm_reasoning_level=ui_reasoning_level, llm_reasoning_source=ui_reasoning_source)
+                llm_reasoning_level=ui_reasoning_level, llm_reasoning_source=ui_reasoning_source,
+                llm_answer_client_name=ui_answer_client_name, llm_answer_model=ui_answer_model)
         controller = self.management_service.get(session_id)["controller"]
         delegates = getattr(self, "management_delegates", None)
         if delegates is not None:
@@ -1180,11 +1191,14 @@ class LocalKnowledgeAgentRuntime:
                 ),
             ),
             read_only_tools=[tool.name for tool in self.tool_registry.list_tools()
-                             if tool.package != "management" and not tool.name.startswith("management.")],
+                             if tool.package != "management" and not tool.name.startswith("management.")
+                             and tool.name not in self.management_service.DIRECT_WRITE_TOOLS],
             allow_default_workspace=False, allowed_tools=self.management_service.allowed_tool_names(
                 self.tool_registry.list_tools(), manager=True, active=controller["status"] == "active",
             ), allow_fork=False,
             llm_client_name=controller["llm_client_name"], llm_model=controller["llm_model"],
+            llm_answer_client_name=controller.get("llm_answer_client_name"),
+            llm_answer_model=controller.get("llm_answer_model"),
             llm_reasoning_level=controller.get("reasoning_level") or ui_reasoning_level,
             llm_reasoning_source="controller" if controller.get("reasoning_level") else ui_reasoning_source,
         )
@@ -1553,21 +1567,107 @@ class LocalKnowledgeAgentRuntime:
         self, *, session_id: str | None, attachment_ids: list[str],
         llm_client_name: str | None = None, llm_model: str | None = None,
     ) -> tuple[str | None, str | None]:
-        if session_id and any(
-            self.session_attachment_service.get(session_id=session_id, attachment_id=item).get("kind") == "audio"
-            for item in attachment_ids
-        ):
-            if not isinstance(self.agent_llm_client, LLMService):
+        has_images, has_audio = self._agent_input_modalities(session_id, attachment_ids)
+        if not (has_images or has_audio):
+            return llm_client_name, llm_model
+        if not isinstance(self.agent_llm_client, LLMService):
+            if has_audio:
                 raise SessionAttachmentError("Audio model is unavailable.")
-            try:
-                identity = self.agent_llm_client.audio_identity()
-                capacity = self.agent_llm_client.config.resolve_context_capacity(*identity)
-                if capacity is None:
-                    raise SessionAttachmentError("Audio model requires its own context_window_tokens configuration.")
-                return identity
-            except LLMClientError as exc:
-                raise SessionAttachmentError(str(exc)) from exc
-        return llm_client_name, llm_model
+            return llm_client_name, llm_model
+        if llm_client_name is None and llm_model is None and session_id:
+            policy = self.session_service.run_policy(session_id)
+            llm_client_name, llm_model = policy.llm_client_name, policy.llm_model
+        try:
+            identity = self.agent_llm_client.resolve_input_identity(
+                client_name=llm_client_name, model=llm_model,
+                has_images=has_images, has_audio=has_audio,
+            )
+            if has_audio and self.agent_llm_client.config.resolve_context_capacity(*identity) is None:
+                raise SessionAttachmentError("Audio model requires its own context_window_tokens configuration.")
+            return identity
+        except LLMClientError as exc:
+            raise SessionAttachmentError(str(exc)) from exc
+
+    def _agent_input_modalities(self, session_id, attachment_ids):
+        kinds = {self.session_attachment_service.get(session_id=session_id, attachment_id=item).get("kind", "image")
+                 for item in attachment_ids or []} if session_id else set()
+        return "image" in kinds, "audio" in kinds
+
+    def _resolve_answer_input_model(self, *, session_id, attachment_ids,
+                                    client_name, model, primary_client_name=None):
+        if (client_name is None and model is None) or not isinstance(self.agent_llm_client, LLMService):
+            return client_name, model
+        has_images, has_audio = self._agent_input_modalities(session_id, attachment_ids)
+        if not (has_images or has_audio):
+            return client_name, model
+        if client_name is None:
+            client_name = primary_client_name
+            if client_name is None and session_id:
+                client_name = self.session_service.run_policy(session_id).llm_client_name
+        try:
+            return self.agent_llm_client.resolve_input_identity(
+                client_name=client_name, model=model, has_images=has_images, has_audio=has_audio,
+            )
+        except LLMClientError as exc:
+            raise ValueError(str(exc)) from exc
+
+    def _prepare_agent_turn_input(self, *, session_id, attachment_ids, llm_client_name, llm_model,
+                                  llm_answer_client_name, llm_answer_model, existing_run_id):
+        """Resolve final input before graph entry, including a newly frozen queue batch."""
+        run = self.agent_run_manager.get_run(existing_run_id) if existing_run_id else None
+        if run is not None and llm_client_name is None and llm_model is None:
+            policy = run.metadata.get("session_policy", {})
+            llm_client_name, llm_model = policy.get("llm_client_name"), policy.get("llm_model")
+            if llm_client_name is None and llm_model is None and isinstance(self.agent_llm_client, LLMService):
+                inherited_ids = attachment_ids
+                if inherited_ids is None:
+                    inherited_ids = [item for item in self.session_service.get_latest_turn_attachment_ids(session_id=session_id)
+                                     if self.session_attachment_service.get(session_id=session_id, attachment_id=item).get("kind") != "audio"]
+                if any(self._agent_input_modalities(session_id, inherited_ids)):
+                    # A frozen unspecified pair means the configured default,
+                    # not a session preference changed after this run was queued.
+                    llm_client_name, llm_model = self.agent_llm_client._resolve_request_identity(LLMRequest(
+                        messages=[], prompt_summary="frozen input default",
+                    ))
+        attachment_ids = self.prepare_agent_attachment_input(
+            session_id=session_id, attachment_ids=attachment_ids,
+            llm_client_name=llm_client_name, llm_model=llm_model,
+        )
+        llm_client_name, llm_model = self.resolve_agent_input_model(
+            session_id=session_id, attachment_ids=attachment_ids,
+            llm_client_name=llm_client_name, llm_model=llm_model,
+        )
+        llm_answer_client_name, llm_answer_model = self.resolve_agent_answer_model(
+            session_id=session_id, requested_client=llm_answer_client_name,
+            requested_model=llm_answer_model, existing_run_id=existing_run_id,
+        )
+        if run is None or run.status == AgentRunStatus.QUEUED:
+            llm_answer_client_name, llm_answer_model = self._resolve_answer_input_model(
+                session_id=session_id, attachment_ids=attachment_ids,
+                client_name=llm_answer_client_name, model=llm_answer_model,
+                primary_client_name=llm_client_name,
+            )
+        self.validate_agent_answer_selection(
+            session_id=session_id, llm_answer_client_name=llm_answer_client_name,
+            llm_answer_model=llm_answer_model, primary_client_name=llm_client_name,
+            attachment_ids=attachment_ids,
+        )
+        if run is not None and run.status == AgentRunStatus.QUEUED and any(self._agent_input_modalities(session_id, attachment_ids)):
+            # Final answer routing reads durable metadata before ContextVars. Update
+            # the first-run snapshot, never a checkpoint's already running selection.
+            manager = self.agent_run_manager
+            with manager._lock:
+                current = manager.get_run(run.run_id)
+                if current.status != AgentRunStatus.QUEUED:
+                    raise ValueError("Agent run is no longer queued for input model selection.")
+                policy = {**current.metadata.get("session_policy", {}),
+                          "llm_client_name": llm_client_name, "llm_model": llm_model,
+                          "llm_answer_client_name": llm_answer_client_name, "llm_answer_model": llm_answer_model}
+                manager._update_run(current.run_id, status=current.status, metadata_patch={
+                    "session_policy": policy, "llm_answer_client_name": llm_answer_client_name,
+                    "llm_answer_model": llm_answer_model,
+                })
+        return attachment_ids, llm_client_name, llm_model, llm_answer_client_name, llm_answer_model
 
     def prepare_agent_image_input(self, **kwargs) -> list[str]:
         """Compatibility entry point for existing image API integrations."""
@@ -1638,6 +1738,8 @@ class LocalKnowledgeAgentRuntime:
         attachment_ids: list[str] | None = None,
         llm_client_name: str | None = None,
         llm_model: str | None = None,
+        llm_answer_client_name: str | None = None,
+        llm_answer_model: str | None = None,
         llm_reasoning_level: str | None = None,
         llm_response_mode: LLMResponseMode = LLMResponseMode.TEXT,
         safety_review_mode: SafetyReviewMode | None = None,
@@ -1646,8 +1748,13 @@ class LocalKnowledgeAgentRuntime:
     ) -> AgentTurnResult:
         """Run the minimal general agent turn loop."""
 
-        attachment_ids = self.prepare_agent_attachment_input(session_id=session_id, attachment_ids=attachment_ids, llm_client_name=llm_client_name, llm_model=llm_model)
-        llm_client_name, llm_model = self.resolve_agent_input_model(session_id=session_id, attachment_ids=attachment_ids, llm_client_name=llm_client_name, llm_model=llm_model)
+        (attachment_ids, llm_client_name, llm_model,
+         llm_answer_client_name, llm_answer_model) = self._prepare_agent_turn_input(
+            session_id=session_id, attachment_ids=attachment_ids,
+            llm_client_name=llm_client_name, llm_model=llm_model,
+            llm_answer_client_name=llm_answer_client_name, llm_answer_model=llm_answer_model,
+            existing_run_id=existing_run_id,
+        )
         if existing_run_id is None:
             self.validate_agent_reasoning_selection(session_id=session_id, requested=llm_reasoning_level,
                                                     attachment_ids=attachment_ids,
@@ -1663,6 +1770,8 @@ class LocalKnowledgeAgentRuntime:
                 user_input=user_input,
                 llm_client_name=llm_client_name,
                 llm_model=llm_model,
+                llm_answer_client_name=llm_answer_client_name,
+                llm_answer_model=llm_answer_model,
                 llm_reasoning_level=llm_reasoning_level,
                 llm_reasoning_source=llm_reasoning_source,
                 llm_response_mode=llm_response_mode,
@@ -1678,6 +1787,8 @@ class LocalKnowledgeAgentRuntime:
         attachment_ids: list[str] | None = None,
         llm_client_name: str | None = None,
         llm_model: str | None = None,
+        llm_answer_client_name: str | None = None,
+        llm_answer_model: str | None = None,
         llm_reasoning_level: str | None = None,
         llm_response_mode: LLMResponseMode = LLMResponseMode.TEXT,
         safety_review_mode: SafetyReviewMode | None = None,
@@ -1686,8 +1797,14 @@ class LocalKnowledgeAgentRuntime:
     ) -> AgentTurnResult:
         """Run one agent turn without blocking the event loop."""
 
-        attachment_ids = await asyncio.to_thread(self.prepare_agent_attachment_input, session_id=session_id, attachment_ids=attachment_ids, llm_client_name=llm_client_name, llm_model=llm_model)
-        llm_client_name, llm_model = await asyncio.to_thread(self.resolve_agent_input_model, session_id=session_id, attachment_ids=attachment_ids, llm_client_name=llm_client_name, llm_model=llm_model)
+        (attachment_ids, llm_client_name, llm_model,
+         llm_answer_client_name, llm_answer_model) = await asyncio.to_thread(
+            self._prepare_agent_turn_input,
+            session_id=session_id, attachment_ids=attachment_ids,
+            llm_client_name=llm_client_name, llm_model=llm_model,
+            llm_answer_client_name=llm_answer_client_name, llm_answer_model=llm_answer_model,
+            existing_run_id=existing_run_id,
+        )
         if existing_run_id is None:
             await asyncio.to_thread(self.validate_agent_reasoning_selection, session_id=session_id,
                                     requested=llm_reasoning_level, attachment_ids=attachment_ids,
@@ -1704,6 +1821,8 @@ class LocalKnowledgeAgentRuntime:
                 user_input=user_input,
                 llm_client_name=llm_client_name,
                 llm_model=llm_model,
+                llm_answer_client_name=llm_answer_client_name,
+                llm_answer_model=llm_answer_model,
                 llm_reasoning_level=llm_reasoning_level,
                 llm_reasoning_source=llm_reasoning_source,
                 llm_response_mode=llm_response_mode,
@@ -2257,7 +2376,9 @@ class LocalKnowledgeAgentRuntime:
     def replace_agent_run(self, run_id: str, *, user_input: str, command_id: str,
                           request_fingerprint: str, on_created=None,
                           metadata_updates: dict[str, Any] | None = None,
-                          llm_reasoning_level: str | None = None) -> AgentRunRecord:
+                          llm_reasoning_level: str | None = None,
+                          llm_answer_client_name: str | None = None,
+                          llm_answer_model: str | None = None) -> AgentRunRecord:
         runner = self._runner_for_turn(existing_run_id=run_id)
         if not isinstance(runner, AgentGraphRunner):
             raise ValueError("Run replacement requires the LangGraph orchestrator.")  # noqa: TRY004
@@ -2278,6 +2399,11 @@ class LocalKnowledgeAgentRuntime:
             candidate = llm_options.get("reasoning_level") if isinstance(llm_options, dict) else None
             if candidate is not None:
                 llm_reasoning_level = candidate
+        if llm_answer_client_name is None and llm_answer_model is None:
+            queued_llm = metadata_updates.get("session_input_options", {}).get("llm", {})
+            if isinstance(queued_llm, dict):
+                llm_answer_client_name = queued_llm.get("answer_client_name")
+                llm_answer_model = queued_llm.get("answer_model")
         if current.status.value != "paused" and not current.metadata.get("replacement_command_id"):
             raise ValueError("Wait for run_paused before replacing the run.")
         if llm_reasoning_level is not None and llm_reasoning_level not in {"off", "low", "high", "max"}:
@@ -2289,6 +2415,19 @@ class LocalKnowledgeAgentRuntime:
             raise ValueError("Agent run is still executing; retry after its pause is acknowledged.")
         try:
             replacement_policy = self.session_service.run_policy(current.session_id).model_dump(mode="json")
+            if llm_answer_client_name is not None or llm_answer_model is not None:
+                frozen_answer_client, frozen_answer_model = llm_answer_client_name, llm_answer_model
+            else:
+                frozen_answer_client, frozen_answer_model = self.resolve_agent_answer_model(
+                    session_id=current.session_id, existing_run_id=run_id,
+                )
+            self.validate_agent_answer_selection(session_id=current.session_id,
+                                                 llm_answer_client_name=frozen_answer_client,
+                                                 llm_answer_model=frozen_answer_model)
+            replacement_policy["llm_answer_client_name"] = frozen_answer_client
+            replacement_policy["llm_answer_model"] = frozen_answer_model
+            metadata_updates["llm_answer_client_name"] = frozen_answer_client
+            metadata_updates["llm_answer_model"] = frozen_answer_model
             frozen_reasoning = current.metadata.get("llm_reasoning_level")
             replacement_reasoning = llm_reasoning_level if llm_reasoning_level is not None else frozen_reasoning
             replacement_policy["llm_reasoning_level"] = replacement_reasoning
@@ -2341,31 +2480,147 @@ class LocalKnowledgeAgentRuntime:
         *,
         session_id: str | None,
         user_input: str,
+        attachment_ids: list[str] | None = None,
+        llm_client_name: str | None = None,
+        llm_answer_client_name: str | None = None,
+        llm_answer_model: str | None = None,
         llm_reasoning_level: str | None = None,
         parent_run_id: str | None = None,
         resumable: bool = False,
     ) -> AgentRunRecord:
         """Create a queued run before an HTTP stream starts consuming events."""
 
-        level, source = self.resolve_agent_reasoning_level(session_id=session_id, requested=llm_reasoning_level)
-        run = self._runner_for_turn(resumable=resumable).create_run_for_turn(
-            session_id=session_id,
-            user_input=user_input,
-            parent_run_id=parent_run_id,
+        policy = (self.session_service.run_policy(session_id) if session_id
+                  else self._session_run_policy("__new_ordinary_session__"))
+        level, source = self.resolve_agent_reasoning_level(
+            session_id=session_id, requested=llm_reasoning_level, frozen_policy=policy,
         )
-        run.metadata.update(llm_reasoning_level=level, llm_reasoning_source=source)
+        answer_client, answer_model = (
+            (llm_answer_client_name, llm_answer_model)
+            if llm_answer_client_name is not None or llm_answer_model is not None
+            else (policy.llm_answer_client_name, policy.llm_answer_model)
+        )
+        answer_client, answer_model = self._resolve_answer_input_model(
+            session_id=session_id, attachment_ids=attachment_ids,
+            client_name=answer_client, model=answer_model, primary_client_name=llm_client_name,
+        )
+        self.validate_agent_answer_selection(session_id=session_id,
+                                             llm_answer_client_name=answer_client,
+                                             llm_answer_model=answer_model,
+                                             attachment_ids=attachment_ids,
+                                             primary_client_name=llm_client_name)
+        try:
+            run = self._runner_for_turn(resumable=resumable).create_run_for_turn(
+                session_id=session_id,
+                user_input=user_input,
+                parent_run_id=parent_run_id,
+            )
+        except KeyError as exc:
+            if "Session is deleted" in str(exc):
+                raise ValueError("Cannot create a run for a deleted session.") from exc
+            raise
+        run.metadata.update(llm_reasoning_level=level, llm_reasoning_source=source,
+                            llm_answer_client_name=answer_client,
+                            llm_answer_model=answer_model)
         run.metadata.setdefault("session_policy", {}).update(
             llm_reasoning_level=level, llm_reasoning_source=source,
+            llm_answer_client_name=answer_client, llm_answer_model=answer_model,
         )
         self.agent_run_manager._update_run(run.run_id, status=run.status, metadata_patch={
             "llm_reasoning_level": level, "llm_reasoning_source": source,
+            "llm_answer_client_name": answer_client, "llm_answer_model": answer_model,
             "session_policy": {**run.metadata.get("session_policy", {}),
                                "llm_reasoning_level": level, "llm_reasoning_source": source},
         })
         return self.agent_run_manager.get_run(run.run_id)
 
+    def resolve_agent_answer_model(self, *, session_id: str | None,
+                                   requested_client: str | None = None,
+                                   requested_model: str | None = None,
+                                   existing_run_id: str | None = None) -> tuple[str | None, str | None]:
+        """Freeze an answer pair independently from the turn's primary inference pair."""
+        if existing_run_id is not None:
+            run = self.agent_run_manager.get_run(existing_run_id)
+            if run is not None:
+                if "llm_answer_client_name" in run.metadata or "llm_answer_model" in run.metadata:
+                    return run.metadata.get("llm_answer_client_name"), run.metadata.get("llm_answer_model")
+                frozen = run.metadata.get("session_policy")
+                if isinstance(frozen, dict) and (
+                    "llm_answer_client_name" in frozen or "llm_answer_model" in frozen
+                ):
+                    return frozen.get("llm_answer_client_name"), frozen.get("llm_answer_model")
+                # Pre-dual-model runs remain on their original primary inference pair.
+                return None, None
+        if requested_client is not None or requested_model is not None:
+            return requested_client, requested_model
+        policy = (self.session_service.run_policy(session_id) if session_id
+                  else self._session_run_policy("__new_ordinary_session__"))
+        return (getattr(policy, "llm_answer_client_name", None),
+                getattr(policy, "llm_answer_model", None))
+
+    def validate_agent_answer_selection(self, *, session_id: str | None,
+                                        llm_answer_client_name: str | None = None,
+                                        llm_answer_model: str | None = None,
+                                        attachment_ids: list[str] | None = None,
+                                        resolve_preference: bool = False,
+                                        primary_client_name: str | None = None,
+                                        **_optional: Any) -> None:
+        """Validate configured answer identity and its capacity before run admission."""
+        if resolve_preference:
+            llm_answer_client_name, llm_answer_model = self.resolve_agent_answer_model(
+                session_id=session_id, requested_client=llm_answer_client_name,
+                requested_model=llm_answer_model,
+            )
+        if llm_answer_client_name is None and llm_answer_model is None:
+            return
+        if not isinstance(self.agent_llm_client, LLMService):
+            return
+        llm_answer_client_name, llm_answer_model = self._resolve_answer_input_model(
+            session_id=session_id, attachment_ids=attachment_ids,
+            client_name=llm_answer_client_name, model=llm_answer_model,
+            primary_client_name=primary_client_name,
+        )
+        registry = self.agent_llm_client.registry
+        request_client = llm_answer_client_name
+        if request_client is None and llm_answer_model is not None:
+            request_client = primary_client_name
+            if request_client is None and session_id:
+                request_client = self.session_service.run_policy(session_id).llm_client_name
+        try:
+            identity_client, identity_model = self.agent_llm_client._resolve_request_identity(LLMRequest(
+                client_name=request_client, model=llm_answer_model,
+                messages=[], prompt_summary="answer model preflight",
+            ))
+        except LLMClientError as exc:
+            raise ValueError(str(exc)) from exc
+        client_name = llm_answer_client_name or identity_client
+        client = registry.get(client_name)
+        if llm_answer_client_name is not None and client is None:
+            raise ValueError(f"Unknown answer LLM client: {llm_answer_client_name}")
+        model = llm_answer_model or identity_model or (client.default_model if client else None)
+        if model is None:
+            raise ValueError("The selected answer LLM client has no default model.")
+        try:
+            resolved = self.agent_llm_client.config.resolve_model_config(client_name, model)
+        except LLMClientError as exc:
+            raise ValueError(str(exc)) from exc
+        if resolved is None or resolved.context_window_tokens is None:
+            raise ValueError("The answer model requires its own context_window_tokens configuration.")
+        if session_id and attachment_ids:
+            has_images = any(self.session_attachment_service.get(
+                session_id=session_id, attachment_id=item,
+            ).get("kind", "image") == "image" for item in attachment_ids)
+            if has_images and not self.agent_llm_client.supports_vision(client_name=client_name, model=model):
+                raise ValueError(f"Answer LLM client {client_name} does not support image input.")
+            has_audio = any(self.session_attachment_service.get(
+                session_id=session_id, attachment_id=item,
+            ).get("kind") == "audio" for item in attachment_ids)
+            if has_audio and not self.agent_llm_client.supports_audio(client_name=client_name, model=model):
+                raise ValueError(f"Answer LLM client {client_name} does not support audio input.")
+
     def resolve_agent_reasoning_level(self, *, session_id: str | None, requested: str | None,
-                                     existing_run_id: str | None = None) -> tuple[str | None, str]:
+                                     existing_run_id: str | None = None,
+                                     frozen_policy: SessionRunPolicy | None = None) -> tuple[str | None, str]:
         """Resolve a new turn's reasoning preference; existing runs keep their frozen value."""
         if requested is not None and requested not in {"off", "low", "high", "max"}:
             raise ValueError("reasoning_level must be off, low, high, or max")
@@ -2379,8 +2634,8 @@ class LocalKnowledgeAgentRuntime:
                 return None, "legacy"
         if requested is not None:
             return requested, "request"
-        if session_id:
-            policy = self.session_service.run_policy(session_id)
+        if frozen_policy is not None or session_id:
+            policy = frozen_policy or self.session_service.run_policy(session_id)
             if policy.llm_reasoning_level is not None:
                 return policy.llm_reasoning_level, policy.llm_reasoning_source or "session"
         with self._conn() as conn:

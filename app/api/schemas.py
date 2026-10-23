@@ -116,6 +116,8 @@ class RuntimeDebugResponse(BaseModel):
 class AgentTurnLLMOptions(BaseModel):
     client_name: str | None = None
     model: str | None = None
+    answer_client_name: str | None = Field(default=None, min_length=1, max_length=200)
+    answer_model: str | None = Field(default=None, min_length=1, max_length=200)
     response_mode: LLMResponseMode = LLMResponseMode.TEXT
     reasoning_level: Literal["off", "low", "high", "max"] | None = None
 

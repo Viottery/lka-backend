@@ -39,6 +39,11 @@ provider = "mock"
 base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"
 model = "gpt-4.1-mini"
+# Models served by the same endpoint may require different wire protocols.
+# available_models = ["gpt-4.1-mini", "another-model-id"]
+# api_protocol = "chat_completions" # Or "responses" for the entire client.
+# model_api_protocol_overrides = { "another-model-id" = "responses" }
+# These protocol fields also apply within each [[llm.clients]] table.
 # Declare controls only after verifying this exact endpoint/default model.
 # supports_reasoning_effort = true
 # reasoning_effort_map = { off = "none", low = "low", high = "high", max = "xhigh" }
@@ -76,6 +81,10 @@ tool_review_mode = "skip"
 manual_wait_poll_seconds = 0.5
 
 [agent]
+# Final-answer network waiting limit; other model stages retain their provider limits.
+answer_timeout_seconds = 60
+# Before any stream output, a timeout may switch once to a compatible configured model.
+answer_timeout_fallback_enabled = true
 # Orchestration backend. Keep legacy during migration; langgraph enables the
 # checkpointed graph runner while preserving the existing Agent semantics.
 orchestrator = "legacy"

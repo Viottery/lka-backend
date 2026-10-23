@@ -32,6 +32,8 @@ class ManagerController(BaseModel):
     default_execution_workspace: SessionWorkspace | None = None
     llm_client_name: str | None
     llm_model: str | None
+    llm_answer_client_name: str | None = None
+    llm_answer_model: str | None = None
     reasoning_level: Literal["off", "low", "high", "max"] | None = None
     created_at: str
     updated_at: str
@@ -49,9 +51,11 @@ class CreateManagerRequest(BaseModel):
     default_execution_workspace: ExecutionWorkspaceInput | None = None
     llm_client_name: str | None = Field(default=None, min_length=1, max_length=200)
     llm_model: str | None = Field(default=None, min_length=1, max_length=200)
+    llm_answer_client_name: str | None = Field(default=None, min_length=1, max_length=200)
+    llm_answer_model: str | None = Field(default=None, min_length=1, max_length=200)
     reasoning_level: Literal["off", "low", "high", "max"] | None = None
 
-    @field_validator("title", "llm_client_name", "llm_model")
+    @field_validator("title", "llm_client_name", "llm_model", "llm_answer_client_name", "llm_answer_model")
     @classmethod
     def trim_nonblank(cls, value):
         if value is not None and not value.strip():
@@ -66,9 +70,11 @@ class UpdateManagerRequest(BaseModel):
     status: Literal["active", "paused"] | None = None
     llm_client_name: str | None = Field(default=None, min_length=1, max_length=200)
     llm_model: str | None = Field(default=None, min_length=1, max_length=200)
+    llm_answer_client_name: str | None = Field(default=None, min_length=1, max_length=200)
+    llm_answer_model: str | None = Field(default=None, min_length=1, max_length=200)
     reasoning_level: Literal["off", "low", "high", "max"] | None = None
 
-    _trim_nonblank = field_validator("llm_client_name", "llm_model")(CreateManagerRequest.trim_nonblank.__func__)
+    _trim_nonblank = field_validator("llm_client_name", "llm_model", "llm_answer_client_name", "llm_answer_model")(CreateManagerRequest.trim_nonblank.__func__)
 
 
 def _service(request: Request):
@@ -99,6 +105,7 @@ def default_manager(request: Request, payload: DefaultManagerRequest | None = No
 def create_manager(payload: CreateManagerRequest, request: Request):
     service = _service(request)
     _validate_client(request, payload.llm_client_name)
+    _validate_client(request, payload.llm_answer_client_name)
     try:
         return service.create(**payload.model_dump())
     except ValueError as exc:
@@ -123,6 +130,7 @@ def get_manager(session_id: str, request: Request):
 def update_manager(session_id: str, payload: UpdateManagerRequest, request: Request):
     service = _service(request)
     _validate_client(request, payload.llm_client_name)
+    _validate_client(request, payload.llm_answer_client_name)
     try:
         return service.update(session_id, **payload.model_dump(exclude_unset=True))
     except KeyError as exc:

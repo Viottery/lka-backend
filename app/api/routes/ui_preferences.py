@@ -19,6 +19,8 @@ class UIDefaults(BaseModel):
 
     llm_client: str = Field(default="", max_length=100)
     llm_model: str = Field(default="", max_length=200)
+    llm_answer_client: str = Field(default="", max_length=100)
+    llm_answer_model: str = Field(default="", max_length=200)
     reasoning_level: Literal["off", "low", "high", "max"] = "low"
     safety_mode: Literal["backend", "skip", "llm", "manual"] = "backend"
     stream: bool = True
@@ -37,12 +39,13 @@ def get_ui_defaults(request: Request) -> dict:
 @router.put("/ui-defaults")
 def put_ui_defaults(payload: UIDefaults, request: Request) -> dict:
     # Older desktop clients omit this field. Preserve an existing preference.
-    if "reasoning_level" not in payload.model_fields_set:
+    preserved_fields = {"reasoning_level", "llm_answer_client", "llm_answer_model"} - payload.model_fields_set
+    if preserved_fields:
         with request.app.state.runtime._conn() as conn:
             row = conn.execute("SELECT preferences FROM agent_ui_preferences WHERE id = 1").fetchone()
         if row is not None:
             previous = UIDefaults.model_validate_json(row["preferences"])
-            payload = payload.model_copy(update={"reasoning_level": previous.reasoning_level})
+            payload = payload.model_copy(update={name: getattr(previous, name) for name in preserved_fields})
     timestamp = datetime.now(UTC).isoformat()
     with request.app.state.runtime._conn() as conn:
         conn.execute(

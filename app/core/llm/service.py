@@ -331,6 +331,53 @@ class LLMService:
             raise LLMClientError("Configured audio model has not enabled audio input (supports_audio).")
         return name, model
 
+    def resolve_input_identity(
+        self, *, client_name: str | None = None, model: str | None = None,
+        has_images: bool = False, has_audio: bool = False,
+        excluded_identities: set[tuple[str, str]] | None = None,
+        preferred_identity: tuple[str | None, str | None] | None = None,
+    ) -> tuple[str, str]:
+        """Keep a compatible selection, otherwise use a configured default.
+
+        Never infer capabilities from model names or enumerate remote models.
+        A fallback must support every supplied modality and have its own capacity.
+        """
+        selected = self._resolve_request_identity(LLMRequest(
+            client_name=client_name, model=model, messages=[], prompt_summary="input modality route",
+        ))
+
+        def compatible(identity):
+            name, candidate = identity
+            return ((not has_images or self.supports_vision(client_name=name, model=candidate))
+                    and (not has_audio or self.supports_audio(client_name=name, model=candidate)))
+
+        excluded = excluded_identities or set()
+        if selected not in excluded and compatible(selected):
+            return selected
+        candidates = [preferred_identity] if preferred_identity is not None else []
+        if has_audio and self.config.audio_model:
+            candidates.append((self.config.audio_client, self.config.audio_model))
+        candidates.append((None, None))
+        if self.config.fallback_client:
+            candidates.append((self.config.fallback_client, None))
+        seen = {selected, *excluded}
+        for name, candidate in candidates:
+            try:
+                identity = self._resolve_request_identity(LLMRequest(
+                    client_name=name, model=candidate, messages=[], prompt_summary="input modality fallback",
+                ))
+            except LLMClientError:
+                continue
+            if identity in seen:
+                continue
+            seen.add(identity)
+            if compatible(identity) and self.config.resolve_context_capacity(*identity) is not None:
+                return identity
+        modalities = "/".join(kind for kind, required in (("image", has_images), ("audio", has_audio)) if required)
+        raise LLMClientError(
+            f"No configured default model supports {modalities} input with its own context_window_tokens."
+        )
+
     def supports_audio(self, *, client_name: str | None = None, model: str | None = None) -> bool:
         name = client_name or self.config.default_client
         client = self.registry.get(name) if name else next(iter(self.registry.list_clients()), None)

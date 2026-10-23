@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.api.routes.memories import require_local_memory_control
 from app.core.session_inputs import SessionInputConflict
@@ -18,6 +18,8 @@ class InputLLMOptions(BaseModel):
     model_config = ConfigDict(extra='forbid')
     response_mode: Literal['stream', 'text'] = 'text'
     reasoning_level: Literal['off', 'low', 'high', 'max'] | None = None
+    answer_client_name: str | None = Field(default=None, min_length=1, max_length=200)
+    answer_model: str | None = Field(default=None, min_length=1, max_length=200)
 
 
 class SubmitSessionInput(BaseModel):
@@ -28,6 +30,19 @@ class SubmitSessionInput(BaseModel):
     replace_run_id: str | None = Field(default=None, min_length=1, max_length=128)
     safety_review_mode: Literal['skip', 'llm', 'manual'] | None = None
     llm: InputLLMOptions | None = None
+
+
+class ResumeSessionInputs(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    input_id: str | None = Field(default=None, min_length=1, max_length=128)
+    answer_client_name: str | None = Field(default=None, min_length=1, max_length=200)
+    answer_model: str | None = Field(default=None, min_length=1, max_length=200)
+
+    @model_validator(mode='after')
+    def require_recovery_target(self):
+        if self.input_id is None and self.model_fields_set & {'answer_client_name', 'answer_model'}:
+            raise ValueError('Answer model recovery requires input_id')
+        return self
 
 
 def _call(request, operation, session_id, **kwargs):
@@ -50,6 +65,17 @@ def submit_input(session_id: str, payload: SubmitSessionInput, request: Request)
         prior = conn.execute("SELECT 1 FROM session_inputs WHERE session_id=? AND client_message_id=?",
                              (session_id, payload.client_message_id)).fetchone()
     validator = getattr(runtime, "validate_agent_reasoning_selection", None)
+    answer_validator = getattr(runtime, "validate_agent_answer_selection", None)
+    if prior is None and callable(answer_validator):
+        try:
+            answer_validator(
+                session_id=session_id, attachment_ids=payload.attachment_ids,
+                llm_answer_client_name=payload.llm.answer_client_name if payload.llm else None,
+                llm_answer_model=payload.llm.answer_model if payload.llm else None,
+                resolve_preference=True,
+            )
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
     if prior is None and callable(validator):
         try:
             validator(session_id=session_id,
@@ -66,5 +92,5 @@ def list_inputs(session_id: str, request: Request):
 
 
 @router.post('/resume')
-def resume_inputs(session_id: str, request: Request):
-    return _call(request, 'resume', session_id)
+def resume_inputs(session_id: str, request: Request, payload: ResumeSessionInputs | None = None):
+    return _call(request, 'resume', session_id, **(payload.model_dump() if payload else {}))

@@ -25,6 +25,7 @@ class SessionInputQueue:
 
     def __init__(self, conn_factory, *, sessions, run_store, dispatcher,
                  authorize, policy, validate_attachments, replace=None, batch_attachments_fit=None,
+                 validate_answer_selection=None,
                  capacity=100, poll_seconds=0.25):
         self._conn = conn_factory
         self.sessions, self.run_store, self.dispatcher = sessions, run_store, dispatcher
@@ -32,6 +33,7 @@ class SessionInputQueue:
         self.validate_attachments = validate_attachments
         self.replace = replace
         self.batch_attachments_fit = batch_attachments_fit
+        self.validate_answer_selection = validate_answer_selection
         self.capacity, self.poll_seconds = capacity, poll_seconds
         self._stop = threading.Event()
         self._thread = None
@@ -140,8 +142,9 @@ class SessionInputQueue:
         if replace_run_id is not None and (not 1 <= len(replace_run_id) <= 128 or not replace_run_id.strip()):
             raise ValueError('replace_run_id must contain 1 to 128 characters')
         llm_options = dict(llm or {'response_mode': 'text'})
-        if llm_options.get('reasoning_level') is None:
-            llm_options.pop('reasoning_level', None)
+        for name in ('reasoning_level', 'answer_client_name', 'answer_model'):
+            if llm_options.get(name) is None:
+                llm_options.pop(name, None)
         request = {'user_input': user_input, 'attachment_ids': list(attachment_ids),
                    'safety_review_mode': safety_review_mode, 'llm': llm_options}
         # Keep ordinary request fingerprints compatible with already accepted inputs.
@@ -164,6 +167,16 @@ class SessionInputQueue:
                                     (session_id, client_message_id)).fetchone()
             if previous is None:
                 self.authorize(conn, session_id, accepting=True)
+                # The write reservation also serializes this read-only policy
+                # snapshot with controller preference updates.
+                accepted_policy = self.policy(session_id)
+                answer_selection = {
+                    'llm_answer_client_name': accepted_policy.llm_answer_client_name,
+                    'llm_answer_model': accepted_policy.llm_answer_model,
+                }
+                if llm_options.get('answer_client_name') is not None or llm_options.get('answer_model') is not None:
+                    answer_selection = {'llm_answer_client_name': llm_options.get('answer_client_name'),
+                                        'llm_answer_model': llm_options.get('answer_model')}
             if previous is not None:
                 if previous['request_json'] != encoded:
                     raise SessionInputConflict('client_message_id_conflict')
@@ -189,7 +202,7 @@ class SessionInputQueue:
                 self.sessions.append_message_in_transaction(
                     conn, session_id=session_id, role='user', content=user_input, message_id=item['message_id'],
                     payload={'entrypoint': 'agent.turn', 'input_id': input_id, 'client_message_id': client_message_id,
-                             'attachment_ids': list(attachment_ids)},
+                             'attachment_ids': list(attachment_ids), 'answer_model_selection': answer_selection},
                 )
                 receipt = self._snapshot(conn, session_id)
             return {'input': item, 'queue': {key: receipt[key] for key in ('paused', 'pending_count', 'active_run_id')}}
@@ -235,7 +248,9 @@ class SessionInputQueue:
             self.sessions.append_message_in_transaction(
                 conn, session_id=session_id, role='user', content=request['user_input'], message_id=message_id,
                 payload={'entrypoint': 'agent.turn', 'input_id': input_id, 'client_message_id': client_message_id,
-                         'attachment_ids': request['attachment_ids'], 'trace_id': replacement.trace_id},
+                         'attachment_ids': request['attachment_ids'], 'trace_id': replacement.trace_id,
+                         'answer_model_selection': {name: replacement.metadata.get('session_policy', {}).get(name)
+                                                    for name in ('llm_answer_client_name', 'llm_answer_model')}},
             )
             # Explicit replacement clears a failure pause and watches the new run;
             # later FIFO inputs retain their identities and place after this turn.
@@ -261,10 +276,36 @@ class SessionInputQueue:
                 raise SessionInputConflict('replacement_receipt_unavailable')
             return self._receipt(conn, session_id, row)
 
-    def resume(self, session_id):
+    def resume(self, session_id, *, input_id=None, answer_client_name=None, answer_model=None):
+        if input_id is None and (answer_client_name is not None or answer_model is not None):
+            raise ValueError('Answer model recovery requires input_id')
         with closing(self._conn()) as conn, conn:
             conn.execute('BEGIN IMMEDIATE')
             self.authorize(conn, session_id)
+            if input_id is not None:
+                item = conn.execute('SELECT * FROM session_inputs WHERE session_id=? AND input_id=? '
+                                    'AND run_id IS NULL AND cancelled=0', (session_id, input_id)).fetchone()
+                if item is None:
+                    raise SessionInputConflict('session_input_not_pending')
+                request = json.loads(item['request_json'])
+                if self.validate_answer_selection is not None:
+                    self.validate_answer_selection(
+                        session_id=session_id, attachment_ids=request['attachment_ids'],
+                        llm_answer_client_name=answer_client_name, llm_answer_model=answer_model,
+                    )
+                message = conn.execute('SELECT payload FROM agent_session_messages WHERE session_id=? AND message_id=?',
+                                       (session_id, item['message_id'])).fetchone()
+                if message is None:
+                    raise SessionInputConflict('session_input_history_unavailable')
+                payload = json.loads(message[0])
+                selection = {'llm_answer_client_name': answer_client_name, 'llm_answer_model': answer_model}
+                if payload.get('answer_model_selection') != selection:
+                    payload.setdefault('original_answer_model_selection', payload.get('answer_model_selection'))
+                    payload['answer_model_selection'] = selection
+                    payload['answer_model_recovery'] = {'source': 'explicit_resume',
+                                                        'updated_at': datetime.now(UTC).isoformat()}
+                    conn.execute('UPDATE agent_session_messages SET payload=? WHERE session_id=? AND message_id=?',
+                                 (json.dumps(payload, ensure_ascii=False), session_id, item['message_id']))
             active = self._active(conn, session_id)
             conn.execute('UPDATE session_input_queues SET paused=0,watched_run_id=? WHERE session_id=?',
                          (self._watched_user_run(conn, active), session_id))
@@ -291,6 +332,15 @@ class SessionInputQueue:
                 # Disabled, deleted, or no longer eligible sessions stay inert.
                 continue
 
+    @staticmethod
+    def _accepted_answer_selection(conn, item):
+        row = conn.execute('SELECT payload FROM agent_session_messages WHERE session_id=? AND message_id=?',
+                           (item['session_id'], item['message_id'])).fetchone()
+        selection = json.loads(row[0]).get('answer_model_selection') if row else None
+        if not isinstance(selection, dict):
+            return None  # Inputs accepted before dual-model support keep their legacy policy behavior.
+        return {name: selection.get(name) for name in ('llm_answer_client_name', 'llm_answer_model')}
+
     def _bind(self, sid):
         policy = self.policy(sid).model_dump(mode='json')
         with closing(self._conn()) as conn, conn:
@@ -313,6 +363,13 @@ class SessionInputQueue:
             if row is None:
                 return
             request = json.loads(row['request_json'])
+            accepted_answer = self._accepted_answer_selection(conn, row)
+            answer_options = request.get('llm', {})
+            if accepted_answer is not None:
+                policy.update(accepted_answer)
+            elif answer_options.get('answer_client_name') is not None or answer_options.get('answer_model') is not None:
+                policy['llm_answer_client_name'] = answer_options.get('answer_client_name')
+                policy['llm_answer_model'] = answer_options.get('answer_model')
             requested_reasoning = request.get('llm', {}).get('reasoning_level')
             policy_reasoning = policy.get('llm_reasoning_level')
             policy_reasoning_source = policy.get('llm_reasoning_source')
@@ -380,7 +437,8 @@ class SessionInputQueue:
                 if first is None:
                     raise ValueError('Accepted session input binding is unavailable')
                 first_request = json.loads(first['request_json'])
-                options = (first_request.get('safety_review_mode'), first_request.get('llm'))
+                options = (first_request.get('safety_review_mode'), first_request.get('llm'),
+                           self._accepted_answer_selection(conn, first))
                 selected, rendered, attachment_ids = [], [], []
                 rows = conn.execute('SELECT * FROM session_inputs WHERE session_id=? AND sequence>=? ORDER BY sequence',
                                     (current.session_id, first['sequence'])).fetchall()
@@ -392,7 +450,8 @@ class SessionInputQueue:
                     if item['input_id'] != first['input_id'] and item['run_id'] is not None:
                         break
                     request = json.loads(item['request_json'])
-                    if (request.get('safety_review_mode'), request.get('llm')) != options:
+                    if (request.get('safety_review_mode'), request.get('llm'),
+                        self._accepted_answer_selection(conn, item)) != options:
                         break
                     if selected and request.get('replace_run_id'):
                         break
@@ -402,13 +461,14 @@ class SessionInputQueue:
                     if selected:
                         if len(combined) > 4 or len(self.render_batch(rendered + [candidate])) > 100000:
                             break
-                        if self.batch_attachments_fit is not None and combined != attachment_ids:
+                        # Recheck the prefix even when later text adds no files.
+                        if self.batch_attachments_fit is not None and combined:
                             try:
                                 if not self.batch_attachments_fit(current.session_id, combined):
                                     break
                             except (KeyError, OSError, ValueError):
-                                # A revoked later attachment must not poison the
-                                # valid prefix; its own turn will fail preflight.
+                                # A revoked attachment must not bind additional
+                                # messages; its own turn will fail preflight.
                                 break
                     selected.append(item)
                     rendered.append(candidate)

@@ -25,6 +25,7 @@ from app.core.llm.errors import (
     LLMClientError,
     LLMNetworkError,
     LLMProviderHTTPError,
+    LLMProviderStreamError,
     LLMRateLimitError,
     LLMResponseParseError,
     LLMTimeoutError,
@@ -37,6 +38,7 @@ from app.core.llm.models import (
     LLMStreamEvent,
     LLMToolCall,
 )
+from app.core.llm.responses import ResponsesStreamDecoder, parse_response, responses_payload
 
 
 class OpenAICompatibleLLMClient:
@@ -50,6 +52,8 @@ class OpenAICompatibleLLMClient:
         base_url: str,
         api_key: str | None,
         default_model: str,
+        api_protocol: str = "chat_completions",
+        model_api_protocol_overrides: dict[str, str] | None = None,
         available_models: list[str] | None = None,
         timeout_seconds: int = 60,
         supports_stream: bool = True,
@@ -70,6 +74,8 @@ class OpenAICompatibleLLMClient:
         self.name = name
         self.provider_name = provider_name
         self.base_url = base_url.rstrip("/")
+        self.api_protocol = api_protocol
+        self.model_api_protocol_overrides = model_api_protocol_overrides or {}
         self.api_key = api_key
         self.default_model = default_model
         self.available_models = available_models or [default_model]
@@ -99,13 +105,24 @@ class OpenAICompatibleLLMClient:
             request,
             False,
         )
-        content, tool_calls, usage, finish_reason = self._message_content(response_payload)
         headers = audit_headers(response_headers)
+        try:
+            content, tool_calls, usage, finish_reason = (
+                parse_response(response_payload)
+                if self._uses_responses(request)
+                else self._message_content(response_payload)
+            )
+        except LLMProviderStreamError as exc:
+            exc.headers = headers
+            exc.provider_request_id = provider_request_id_from_headers(headers)
+            exc.usage = response_payload.get("usage") or {}
+            raise
         return LLMResponse(
             provider=self.provider_name,
             client_name=self.name,
             model=self._model_for(request),
-            status="completed",
+            status="incomplete" if response_payload.get("status") == "incomplete" else "completed",
+            partial=response_payload.get("status") == "incomplete",
             content=content,
             prompt_summary=request.prompt_summary,
             response_mode=request.response_mode,
@@ -133,6 +150,7 @@ class OpenAICompatibleLLMClient:
         snapshot = ""
         tool_call_parts: dict[int, dict[str, str]] = {}
         completion_seen = False
+        responses_decoder = ResponsesStreamDecoder() if self._uses_responses(request) else None
         headers = audit_headers(getattr(response, "headers", {}))
         stream_metadata: dict[str, Any] = {"headers": headers}
         provider_request_id = provider_request_id_from_headers(headers)
@@ -159,10 +177,13 @@ class OpenAICompatibleLLMClient:
                     continue
                 data = text.removeprefix("data:").strip()
                 if data == "[DONE]":
-                    completion_seen = True
+                    if responses_decoder is None:
+                        completion_seen = True
                     break
                 try:
                     payload = self._stream_payload(data)
+                    if responses_decoder is not None:
+                        payload = responses_decoder.decode(payload)
                 except LLMResponseParseError as exc:
                     yield self._stream_event(
                         "llm_failed",
@@ -190,7 +211,14 @@ class OpenAICompatibleLLMClient:
                         },
                     )
                     return
-                delta, tool_call_deltas, chunk_metadata = self._stream_delta_and_metadata(payload)
+                try:
+                    delta, tool_call_deltas, chunk_metadata = self._stream_delta_and_metadata(payload)
+                except LLMResponseParseError as exc:
+                    yield self._stream_event(
+                        "llm_failed", request, snapshot, error=str(exc),
+                        metadata={**stream_metadata, "partial_content": snapshot},
+                    )
+                    return
                 stream_metadata.update(chunk_metadata)
                 if chunk_metadata.get("finish_reason"):
                     completion_seen = True
@@ -203,6 +231,8 @@ class OpenAICompatibleLLMClient:
                         if tool_call_delta[key]:
                             part[key] += tool_call_delta[key]
                 if not delta and not tool_call_deltas:
+                    if responses_decoder is not None and completion_seen:
+                        break
                     continue
                 snapshot += delta
                 yield self._stream_event(
@@ -215,6 +245,8 @@ class OpenAICompatibleLLMClient:
                         "tool_calls": self._tool_calls_from_parts(tool_call_parts),
                     },
                 )
+                if responses_decoder is not None and completion_seen:
+                    break
         finally:
             response.close()
 
@@ -224,8 +256,8 @@ class OpenAICompatibleLLMClient:
             snapshot,
             metadata={
                 **stream_metadata,
-                "status": "completed" if completion_seen else "incomplete",
-                "partial": not completion_seen,
+                "status": stream_metadata.get("status", "completed") if completion_seen else "incomplete",
+                "partial": not completion_seen or stream_metadata.get("status") == "incomplete",
                 "finish_reason": stream_metadata.get("finish_reason")
                 or ("stream_completed" if completion_seen else "stream_incomplete"),
                 "tool_calls": self._tool_calls_from_parts(tool_call_parts),
@@ -337,11 +369,14 @@ class OpenAICompatibleLLMClient:
             ]
             payload["tool_choice"] = request.tool_choice or "auto"
 
+        use_responses = self._uses_responses(request)
+        if use_responses:
+            payload = responses_payload(payload)
         encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         if any(message.has_audio for message in request.messages) and len(encoded) > 20 * 1024 * 1024:
             raise LLMClientError("Inline audio request exceeds 20 MiB; provide smaller attachments.")
         return urllib.request.Request(
-            f"{self.base_url}/chat/completions",
+            f"{self.base_url}/{'responses' if use_responses else 'chat/completions'}",
             data=encoded,
             headers={
                 "Authorization": f"Bearer {self.api_key}",
@@ -352,6 +387,9 @@ class OpenAICompatibleLLMClient:
 
     def _model_for(self, request: LLMRequest) -> str:
         return request.model or self.default_model
+
+    def _uses_responses(self, request: LLMRequest) -> bool:
+        return self.model_api_protocol_overrides.get(self._model_for(request), self.api_protocol) == "responses"
 
     def _message_content(
         self,
@@ -418,8 +456,10 @@ class OpenAICompatibleLLMClient:
         usage = payload.get("usage")
         if isinstance(usage, dict):
             metadata["usage"] = usage
+        if payload.get("status") in {"completed", "incomplete"}:
+            metadata["status"] = payload["status"]
         choices = payload.get("choices")
-        if choices == [] and metadata:
+        if choices == []:
             return "", [], metadata
         if not isinstance(choices, list) or not choices:
             raise LLMResponseParseError("LLM provider stream chunk did not include choices.")
@@ -520,6 +560,8 @@ class OpenAICompatibleLLMClient:
             metadata["finish_reason"] = response.finish_reason
         if response.usage:
             metadata["usage"] = response.usage
+        if response.tool_calls:
+            metadata["tool_calls"] = [call.model_dump(mode="json") for call in response.tool_calls]
         return metadata
 
     def _raise_http_error(self, exc: urllib.error.HTTPError) -> None:
@@ -575,7 +617,7 @@ async def _run_blocking(func, *args):
     def target() -> None:
         try:
             result_queue.put((True, func(*args)))
-        except BaseException as exc:
+        except BaseException as exc:  # noqa: BLE001 - propagate thread failures to the caller.
             result_queue.put((False, exc))
 
     threading.Thread(target=target, name="lka-llm-http", daemon=True).start()

@@ -26,6 +26,7 @@ from app.core import tool_result_gate
 from app.core.agent_runs import (
     AgentRunCancelled,
     AgentRunRecord,
+    AgentRunStatus,
     InMemoryAgentRunManager,
 )
 from app.core.agent_storage import SqliteAgentRunStore
@@ -571,6 +572,8 @@ _turn_llm_client_name: ContextVar[str | None] = ContextVar(
     default=None,
 )
 _turn_llm_model: ContextVar[str | None] = ContextVar("turn_llm_model", default=None)
+_turn_llm_answer_client_name: ContextVar[str | None] = ContextVar("turn_llm_answer_client_name", default=None)
+_turn_llm_answer_model: ContextVar[str | None] = ContextVar("turn_llm_answer_model", default=None)
 _turn_llm_reasoning_level: ContextVar[str | None] = ContextVar("turn_llm_reasoning_level", default=None)
 _turn_safety_review_mode: ContextVar[SafetyReviewMode | None] = ContextVar(
     "turn_safety_review_mode", default=None
@@ -610,6 +613,8 @@ class AgentTurnLoop:
         log_dir: Path,
         max_decision_steps: int = DEFAULT_MAX_DECISION_STEPS,
         llm_max_attempts: int = 2,
+        answer_timeout_seconds: float = 60,
+        answer_timeout_fallback_enabled: bool = True,
         run_manager: InMemoryAgentRunManager | None = None,
         safety_review_mode: SafetyReviewMode | str = SafetyReviewMode.SKIP,
         safety_manual_wait_poll_seconds: float = 0.5,
@@ -645,6 +650,8 @@ class AgentTurnLoop:
         if type(llm_max_attempts) is not int or llm_max_attempts < 1:
             raise ValueError("llm_max_attempts must be a positive integer")
         self.llm_max_attempts = llm_max_attempts
+        self.answer_timeout_seconds = answer_timeout_seconds
+        self.answer_timeout_fallback_enabled = answer_timeout_fallback_enabled
         self.default_rate_limit_wait_seconds = 1.0
         self.max_decision_steps = max(1, int(max_decision_steps))
         self.decision_format_max_attempts = 2
@@ -729,6 +736,8 @@ class AgentTurnLoop:
         attachment_ids: list[str] | None = None,
         llm_client_name: str | None = None,
         llm_model: str | None = None,
+        llm_answer_client_name: str | None = None,
+        llm_answer_model: str | None = None,
         llm_reasoning_level: str | None = None,
         llm_reasoning_source: str | None = None,
         llm_response_mode: LLMResponseMode = LLMResponseMode.TEXT,
@@ -737,6 +746,8 @@ class AgentTurnLoop:
     ) -> AgentTurnResult:
         client_token = _turn_llm_client_name.set(llm_client_name)
         model_token = _turn_llm_model.set(llm_model)
+        answer_client_token = _turn_llm_answer_client_name.set(llm_answer_client_name)
+        answer_model_token = _turn_llm_answer_model.set(llm_answer_model)
         reasoning_token = _turn_llm_reasoning_level.set(llm_reasoning_level)
         mode_token = _turn_llm_response_mode.set(llm_response_mode)
         review_mode_token = _turn_safety_review_mode.set(safety_review_mode)
@@ -812,6 +823,8 @@ class AgentTurnLoop:
                 _turn_run_manager.reset(run_manager_token)
             _turn_llm_client_name.reset(client_token)
             _turn_llm_model.reset(model_token)
+            _turn_llm_answer_client_name.reset(answer_client_token)
+            _turn_llm_answer_model.reset(answer_model_token)
             _turn_llm_reasoning_level.reset(reasoning_token)
             _turn_llm_response_mode.reset(mode_token)
             _turn_safety_review_mode.reset(review_mode_token)
@@ -826,6 +839,8 @@ class AgentTurnLoop:
         attachment_ids: list[str] | None = None,
         llm_client_name: str | None = None,
         llm_model: str | None = None,
+        llm_answer_client_name: str | None = None,
+        llm_answer_model: str | None = None,
         llm_reasoning_level: str | None = None,
         llm_reasoning_source: str | None = None,
         llm_response_mode: LLMResponseMode = LLMResponseMode.TEXT,
@@ -846,6 +861,8 @@ class AgentTurnLoop:
                             user_input=user_input,
                             llm_client_name=llm_client_name,
                             llm_model=llm_model,
+                            llm_answer_client_name=llm_answer_client_name,
+                            llm_answer_model=llm_answer_model,
                             llm_reasoning_level=llm_reasoning_level,
                             llm_reasoning_source=llm_reasoning_source,
                             llm_response_mode=llm_response_mode,
@@ -876,6 +893,8 @@ class AgentTurnLoop:
         session_id: str | None,
         user_input: str,
         parent_run_id: str | None = None,
+        llm_answer_client_name: str | None = None,
+        llm_answer_model: str | None = None,
         llm_reasoning_level: str | None = None,
         llm_reasoning_source: str | None = None,
     ) -> AgentRunRecord:
@@ -894,8 +913,13 @@ class AgentTurnLoop:
             "request" if explicit_level else policy.llm_reasoning_source
             or ("session" if policy.llm_reasoning_level else "default")
         )
+        answer_client = llm_answer_client_name or _turn_llm_answer_client_name.get()
+        answer_model = llm_answer_model or _turn_llm_answer_model.get()
+        if answer_client is None and answer_model is None:
+            answer_client, answer_model = policy.llm_answer_client_name, policy.llm_answer_model
         frozen_policy = policy.model_copy(update={
             "llm_reasoning_level": selected_level, "llm_reasoning_source": reasoning_source,
+            "llm_answer_client_name": answer_client, "llm_answer_model": answer_model,
         })
         return self.run_manager.create_run(
             session_id=session.session_id,
@@ -905,6 +929,7 @@ class AgentTurnLoop:
             metadata={
                 "entrypoint": "agent.turn",
                 **({"session_policy": frozen_policy.model_dump(mode="json"),
+                    "llm_answer_client_name": answer_client, "llm_answer_model": answer_model,
                     "llm_reasoning_level": selected_level, "llm_reasoning_source": reasoning_source}
                    if parent_run_id is None else {}),
             },
@@ -977,6 +1002,119 @@ class AgentTurnLoop:
             return policy.llm_client_name, policy.llm_model, None, "session", None
         return None, None, None, "default", None
 
+    def _stage_inference_selection(self, stage: str) -> tuple[str | None, str | None, LLMReasoningEffort | None, str, str | None]:
+        selected = self._inference_selection()
+        if stage not in {"answer", "context_answer"} or _turn_inference_snapshot.get() is not None:
+            return selected
+        manager, run_id = _turn_run_manager.get(), _turn_run_id.get()
+        run = manager.get_run(run_id) if manager is not None and run_id is not None else None
+        if run is not None:
+            if run.parent_run_id is not None or self._answer_publication().get("user_visible") is False:
+                return selected
+            fallback = run.metadata.get("answer_timeout_fallback")
+            if isinstance(fallback, dict) and fallback.get("client_name") and fallback.get("model"):
+                return fallback["client_name"], fallback["model"], None, "timeout_fallback", None
+            fields = ("llm_answer_client_name", "llm_answer_model")
+            frozen = run.metadata
+            if not any(name in frozen for name in fields):
+                frozen = run.metadata.get("session_policy", {})
+            if not isinstance(frozen, dict) or not any(name in frozen for name in fields):
+                return selected  # Old checkpoints retain their primary model.
+            client, model = (frozen.get(name) for name in fields)
+            source = "frozen_answer"
+        else:
+            client, model = _turn_llm_answer_client_name.get(), _turn_llm_answer_model.get()
+            source = "answer_selection"
+        if client is None and model is None:
+            return selected
+        client = client or selected[0]
+        if isinstance(self.llm_client, LLMService):
+            client, model = self.llm_client._resolve_request_identity(LLMRequest(
+                client_name=client, model=model, messages=[], prompt_summary="answer identity",
+            ))
+        return client, model, None, source, None
+
+    def _activate_answer_timeout_fallback(
+        self, stage: str, failed_identity: tuple[str, str], input_content: AgentInputContent,
+    ) -> bool:
+        if (not self.answer_timeout_fallback_enabled or stage not in {"answer", "context_answer"}
+                or not isinstance(self.llm_client, LLMService) or _turn_inference_snapshot.get() is not None
+                or self._answer_publication().get("user_visible") is False):
+            return False
+        manager, run_id = _turn_run_manager.get(), _turn_run_id.get()
+        run = manager.get_run(run_id) if manager is not None and run_id is not None else None
+        if run is None or run.parent_run_id is not None or run.metadata.get("answer_timeout_fallback"):
+            return False
+        try:
+            identity = self.llm_client.resolve_input_identity(
+                client_name=failed_identity[0], model=failed_identity[1],
+                excluded_identities={failed_identity}, preferred_identity=self._inference_selection()[:2],
+                has_images=bool(input_content.images), has_audio=bool(input_content.audio),
+            )
+        except LLMClientError:
+            return False
+        self._check_execution_allowed()
+        fallback = {"client_name": identity[0], "model": identity[1],
+                    "from_client_name": failed_identity[0], "from_model": failed_identity[1],
+                    "selected_at": llm_audit_now_iso(), "reason": "timeout_before_output"}
+        with manager._lock:
+            current = manager.get_run(run_id)
+            if current.status not in {AgentRunStatus.QUEUED, AgentRunStatus.RUNNING}:
+                self._check_execution_allowed()
+                return False
+            if current.metadata.get("answer_timeout_fallback"):
+                return False
+            manager._update_run(run_id, status=current.status, metadata_patch={"answer_timeout_fallback": fallback})
+        self._append_run_event(
+            type="answer_model_fallback_started", stage=stage,
+            message="Answer timed out before output; using a compatible model without replaying tools.",
+            payload=fallback,
+        )
+        return True
+
+    def _model_network_timeout(self, stage: str) -> float | None:
+        remaining = self._remaining_execution_seconds()
+        if stage in {"answer", "context_answer"}:
+            return min(self.answer_timeout_seconds, remaining) if remaining is not None else self.answer_timeout_seconds
+        return remaining
+
+    def _stage_reasoning_selection(self, stage: str) -> tuple[str | None, str]:
+        level, source = self._reasoning_selection()
+        if stage not in {"answer", "context_answer"}:
+            return level, source
+        client, model = _turn_llm_answer_client_name.get(), _turn_llm_answer_model.get()
+        selection = self._stage_inference_selection(stage)
+        primary = self._inference_selection()
+        if isinstance(self.llm_client, LLMService):
+            client, model = self.llm_client._resolve_request_identity(LLMRequest(
+                client_name=selection[0], model=selection[1], messages=[], prompt_summary="answer identity",
+            ))
+            primary_client, primary_model = self.llm_client._resolve_request_identity(LLMRequest(
+                client_name=primary[0], model=primary[1], messages=[], prompt_summary="primary identity",
+            ))
+            if (client, model) == (primary_client, primary_model):
+                return level, source
+        elif selection[:2] == primary[:2]:
+            return level, source
+        if client is None and model is None and selection[0] == primary[0] and selection[1] == primary[1]:
+            return level, source
+        if isinstance(self.llm_client, LLMService):
+            capability = self.llm_client.reasoning_capability(client_name=client, model=model)
+            if level == "low" and not capability.get("controlled"):
+                return None, "answer_model_uncontrolled"
+            valid = (capability.get("supports_off") if level == "off" else
+                     level in capability.get("effort_map", {}) if level in {"high", "max"} else
+                     not capability.get("controlled") or "low" in capability.get("effort_map", {}))
+            if not valid:
+                if capability.get("supports_off"):
+                    return "off", "answer_rendering_fallback"
+                if capability.get("controlled") and "low" in capability.get("effort_map", {}):
+                    return "low", "answer_rendering_fallback"
+                return None, "answer_rendering_fallback"
+        else:
+            return None, "answer_rendering_fallback"
+        return level, source
+
     def _reasoning_selection(self) -> tuple[str | None, str]:
         """Frozen business preference, independently of client/model overrides."""
         snapshot = _turn_inference_snapshot.get()
@@ -1001,8 +1139,16 @@ class AgentTurnLoop:
         return policy.llm_reasoning_level or "low", "session" if policy.llm_reasoning_level else "default"
 
     def _reasoning_request_metadata(self, stage: str) -> dict[str, Any]:
-        level, source = self._reasoning_selection()
+        level, source = self._stage_reasoning_selection(stage)
         if level is None:
+            if stage in {"answer", "context_answer"} and (
+                _turn_llm_answer_client_name.get() is not None or _turn_llm_answer_model.get() is not None
+            ):
+                requested, requested_source = self._reasoning_selection()
+                return {"reasoning_source": source, "reasoning_policy": "internal",
+                        "reasoning_level_requested": requested,
+                        "reasoning_level_applied": None,
+                        "reasoning_selection_source": requested_source}
             return {}  # Keep legacy run/profile controls unchanged.
         # Repair can reinterpret an ambiguous operation; keep the business
         # level unless its caller supplies a separate pure-format utility task.
@@ -1015,25 +1161,32 @@ class AgentTurnLoop:
                     and notification.get("decision_source") == "explicit"):
                 policy = "utility"  # Render the already-decided silent handoff.
         metadata = {"reasoning_source": source, "reasoning_policy": policy,
-                    "reasoning_level_requested": level}
+                    "reasoning_level_requested": self._reasoning_selection()[0],
+                    "reasoning_level_applied": level}
         if level is not None and isinstance(self.llm_client, LLMService):
-            client, model, *_ = self._inference_selection()
+            client, model, *_ = self._stage_inference_selection(stage)
             client, model = self.llm_client._resolve_request_identity(LLMRequest(
                 messages=[], prompt_summary="reasoning identity", client_name=client, model=model,
             ))
             manager, run_id = _turn_run_manager.get(), _turn_run_id.get()
             run = manager.get_run(run_id) if manager is not None and run_id is not None else None
             identity = {"client_name": client, "model": model}
-            saved = run.metadata.get("reasoning_capability_snapshot") if run else None
+            primary_client, primary_model, *_ = self._inference_selection()
+            primary_identity = self.llm_client._resolve_request_identity(LLMRequest(
+                messages=[], prompt_summary="primary identity", client_name=primary_client, model=primary_model,
+            ))
+            separate_answer = stage in {"answer", "context_answer"} and (client, model) != primary_identity
+            saved = run.metadata.get("reasoning_capability_snapshot") if run and not separate_answer else None
             if saved is not None and any(saved.get(key) != value for key, value in identity.items()):
                 raise LLMClientError("The model for this frozen reasoning run changed; start a new run.")
-            if saved is None:
+            if saved is None and not separate_answer:
                 saved = {**identity, "version": "reasoning-v1", "capability":
                          self.llm_client.reasoning_capability(client_name=client, model=model)}
                 if run is not None:
                     manager._update_run(run.run_id, status=run.status,
                         metadata_patch={"reasoning_capability_snapshot": saved})
-            metadata["reasoning_capability_snapshot"] = saved
+            if saved is not None:
+                metadata["reasoning_capability_snapshot"] = saved
         return metadata
 
     def _inference_call_metadata(self) -> dict[str, str]:
@@ -6947,13 +7100,17 @@ class AgentTurnLoop:
             system_prompt=system_prompt, user_prompt=recovery_prompt,
             max_output_tokens=None, tools=None,
             image_token_reservation=recovery_content.token_reservation,
+            stage=stage,
         )
         call["max_output_tokens"] = budgeted.output_reserve_tokens
-        client_name, *_ = self._inference_selection()
+        client_name, model, *_ = self._stage_inference_selection(stage)
         supports = getattr(self.llm_client, "supports_thinking_control", None)
         thinking_enabled = None
         if callable(supports):
-            if isinstance(self.llm_client, LLMService) or "client_name" in inspect.signature(supports).parameters:
+            if isinstance(self.llm_client, LLMService):
+                capability = self.llm_client.reasoning_capability(client_name=client_name, model=model)
+                supported = capability.get("protocol") == "deepseek_chat" and capability.get("controlled")
+            elif "client_name" in inspect.signature(supports).parameters:
                 supported = supports(client_name=client_name)
             else:
                 supported = client_name is None and supports()
@@ -7143,7 +7300,7 @@ class AgentTurnLoop:
         async def collect() -> tuple[str, dict[str, Any]]:
             self._check_execution_allowed()
             client_name, model, reasoning_effort, selection_source, profile_id = (
-                self._inference_selection()
+                self._stage_inference_selection(stage)
             )
             if dispatch_identity is not None:
                 client_name, model = dispatch_identity
@@ -7152,7 +7309,7 @@ class AgentTurnLoop:
                 "inference_selection_source": selection_source,
                 **self._reasoning_request_metadata(stage),
             }
-            remaining = self._remaining_execution_seconds()
+            remaining = self._model_network_timeout(stage)
             if remaining is not None:
                 metadata["network_timeout_seconds"] = max(0.001, remaining)
             if profile_id is not None:
@@ -7170,8 +7327,8 @@ class AgentTurnLoop:
                 ],
                 prompt_summary=prompt_summary,
                 temperature=0.0,
-                reasoning_effort=reasoning_effort if self._reasoning_selection()[0] is None else None,
-                reasoning_level=self._reasoning_selection()[0],
+                reasoning_effort=reasoning_effort if self._stage_reasoning_selection(stage)[0] is None else None,
+                reasoning_level=self._stage_reasoning_selection(stage)[0],
                 thinking_enabled=thinking_enabled,
                 max_output_tokens=max_output_tokens,
                 require_json=self._llm_stage_requires_json(stage),
@@ -7377,6 +7534,7 @@ class AgentTurnLoop:
         max_output_tokens: int | None,
         tools: list[LLMToolDefinition] | None,
         image_token_reservation: int = 0,
+        stage: str = "",
     ) -> BudgetedPrompt:
         """Apply the whole-prompt cap for the exact selected client/model.
 
@@ -7392,7 +7550,7 @@ class AgentTurnLoop:
         output_reserve = 8_192
         tokenizer_path: Path | None = None
         if isinstance(self.llm_client, LLMService):
-            requested_client, requested_model, *_ = self._inference_selection()
+            requested_client, requested_model, *_ = self._stage_inference_selection(stage)
             config = self.llm_client.config
             client_name = requested_client or config.default_client
             if client_name is None:
@@ -7540,6 +7698,7 @@ class AgentTurnLoop:
                 current = self._budget_llm_prompt(
                     system_prompt=system_prompt, user_prompt=serialize_prompt_payload(payload),
                     max_output_tokens=max_output_tokens, tools=tools, image_token_reservation=image_token_reservation,
+                    stage="answer",
                 )
                 self._raise_if_cancel_requested()
                 omitted.update(current.omitted)
@@ -7592,6 +7751,7 @@ class AgentTurnLoop:
             fitted = self._budget_llm_prompt(
                 system_prompt=system_prompt, user_prompt=serialize_prompt_payload(payload),
                 max_output_tokens=max_output_tokens, tools=tools, image_token_reservation=image_token_reservation,
+                stage="answer",
             )
             self._raise_if_cancel_requested()
             final_payload = json.loads(fitted.user_prompt)
@@ -7638,6 +7798,8 @@ class AgentTurnLoop:
     ) -> LLMResponse | None:
         if self.llm_client is None:
             return None
+        original_system_prompt, original_user_prompt = system_prompt, user_prompt
+        requested_max_output_tokens = max_output_tokens
 
         # Server-owned role policy is frozen per run, before routing or repairs.
         # Ordinary/child policies never infer instructions from user metadata.
@@ -7662,6 +7824,7 @@ class AgentTurnLoop:
                 max_output_tokens=max_output_tokens,
                 tools=tools,
                 image_token_reservation=image_reservation,
+                stage=stage,
             )
             if stage == "answer":
                 budgeted = self._answer_delivery_prompt(
@@ -7715,6 +7878,8 @@ class AgentTurnLoop:
         )
         content_role = self._llm_content_role_for_stage(stage)
         attempt_limit = self.llm_max_attempts if max_attempts is None else max_attempts
+        if stage in {"answer", "context_answer"} and self._stage_inference_selection(stage)[3] == "timeout_fallback":
+            attempt_limit = min(attempt_limit, 1)
         timeout_retried = False
         for attempt in range(1, attempt_limit + 1):
             self._raise_if_cancel_requested()
@@ -7776,6 +7941,11 @@ class AgentTurnLoop:
             )
             try:
                 with self._admit_llm(provider), self._provider_dispatch_guard():
+                    if isinstance(self.llm_client, LLMService) and dispatch_identity is None:
+                        client_name, model, *_ = self._stage_inference_selection(stage)
+                        dispatch_identity = self.llm_client._resolve_request_identity(LLMRequest(
+                            client_name=client_name, model=model, messages=[], prompt_summary="audited dispatch identity",
+                        ))
                     if use_stream:
                         response = self._stream_text_once(
                             system_prompt=system_prompt,
@@ -7906,6 +8076,14 @@ class AgentTurnLoop:
                 ):
                     timeout_retried = True
                     self._raise_if_cancel_requested()
+                    if isinstance(exc, LLMTimeoutError) and dispatch_identity is not None and self._activate_answer_timeout_fallback(
+                        stage, dispatch_identity, input_content,
+                    ):
+                        return self._complete_text_with_retry(
+                            stage=stage, system_prompt=original_system_prompt, user_prompt=original_user_prompt,
+                            prompt_summary=prompt_summary, max_output_tokens=requested_max_output_tokens,
+                            llm_events=llm_events, tools=tools, tool_choice=tool_choice, max_attempts=1,
+                        )
                     self._append_run_event(
                         type="llm_retry_scheduled",
                         message="Retrying model transport failure before any stream output; tools are not replayed.",
@@ -8046,7 +8224,7 @@ class AgentTurnLoop:
             raise LLMClientError("No LLM client is configured.")
         self._check_execution_allowed()
         client_name, model, reasoning_effort, selection_source, profile_id = (
-            self._inference_selection()
+            self._stage_inference_selection(stage)
         )
         if dispatch_identity is not None:
             client_name, model = dispatch_identity
@@ -8055,7 +8233,7 @@ class AgentTurnLoop:
             "inference_selection_source": selection_source,
             **self._reasoning_request_metadata(stage),
         }
-        remaining = self._remaining_execution_seconds()
+        remaining = self._model_network_timeout(stage)
         if remaining is not None:
             request_metadata["network_timeout_seconds"] = max(0.001, remaining)
         output_schema = (
@@ -8074,12 +8252,12 @@ class AgentTurnLoop:
             "client_name": client_name,
             "model": model,
             "response_mode": response_mode,
-            "reasoning_effort": reasoning_effort if self._reasoning_selection()[0] is None else None,
+            "reasoning_effort": reasoning_effort if self._stage_reasoning_selection(stage)[0] is None else None,
             "require_json": self._llm_stage_requires_json(stage),
             "metadata": request_metadata,
         }
         if isinstance(self.llm_client, LLMService):
-            request_kwargs["reasoning_level"] = self._reasoning_selection()[0]
+            request_kwargs["reasoning_level"] = self._stage_reasoning_selection(stage)[0]
         if image_blocks is None:
             image_blocks = self._input_content_for_stage(stage)
         if image_blocks:
@@ -8104,7 +8282,7 @@ class AgentTurnLoop:
                 or reasoning_effort is not None
                 or profile_id is not None
                 or (stage == "answer" and self._llm_stage_requires_json(stage))
-                or remaining is not None
+                or self._remaining_execution_seconds() is not None
             ):
                 message = (
                     "The configured LLM client cannot honor the structured output contract."

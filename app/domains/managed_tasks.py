@@ -304,6 +304,11 @@ class ManagedTaskService:
     def _new_run(self, session_id, envelope, source=None, *, workspace=None, safety_review_mode=None,
                  reasoning_level=None, reasoning_source=None):
         policy = self.policy(session_id).model_dump(mode="json")
+        if source is not None:
+            inherited = source.metadata.get("session_policy", {})
+            for name in ("llm_answer_client_name", "llm_answer_model"):
+                if name in inherited:
+                    policy[name] = inherited[name]
         if policy.get("safety_review_mode") is None:
             policy["safety_review_mode"] = safety_review_mode or (
                 source.metadata.get("session_policy", {}).get("safety_review_mode") if source else None
@@ -334,7 +339,7 @@ class ManagedTaskService:
         delegate = delegates.get_for_session(conn, context.session_id) if delegates is not None else None
         if delegate is None:
             return
-        controller = conn.execute("SELECT llm_client_name,llm_model,reasoning_level FROM manager_controllers WHERE session_id=?",
+        controller = conn.execute("SELECT llm_client_name,llm_model,reasoning_level,llm_answer_client_name,llm_answer_model FROM manager_controllers WHERE session_id=?",
                                   (context.session_id,)).fetchone()
         run.metadata["delegate_session_id"] = context.session_id
         run.metadata["session_policy"] = {
@@ -342,6 +347,8 @@ class ManagedTaskService:
             "allowed_tools": delegate["allowed_tools"],
             "allowed_paths": None if run.metadata.get("execution_workspace") else [],
             "llm_client_name": controller[0], "llm_model": controller[1],
+            "llm_answer_client_name": run.metadata.get("session_policy", {}).get("llm_answer_client_name", controller[3]),
+            "llm_answer_model": run.metadata.get("session_policy", {}).get("llm_answer_model", controller[4]),
             "llm_reasoning_level": run.metadata.get("llm_reasoning_level") or controller[2] or run.metadata.get("session_policy", {}).get("llm_reasoning_level"),
             "llm_reasoning_source": run.metadata.get("llm_reasoning_source") or ("inherited" if controller[2] else run.metadata.get("session_policy", {}).get("llm_reasoning_source")),
             "safety_review_mode": run.metadata["session_policy"].get("safety_review_mode"),

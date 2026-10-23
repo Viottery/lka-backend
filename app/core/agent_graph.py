@@ -33,6 +33,8 @@ from app.core.agent_turn import (
     _stable_id,
     _turn_inference_snapshot,
     _turn_input_content,
+    _turn_llm_answer_client_name,
+    _turn_llm_answer_model,
     _turn_llm_client_name,
     _turn_llm_model,
     _turn_llm_reasoning_level,
@@ -392,6 +394,8 @@ class AgentGraphRunner:
         attachment_ids: list[str] | None = None,
         llm_client_name: str | None = None,
         llm_model: str | None = None,
+        llm_answer_client_name: str | None = None,
+        llm_answer_model: str | None = None,
         llm_reasoning_level: str | None = None,
         llm_reasoning_source: str | None = None,
         llm_response_mode: LLMResponseMode = LLMResponseMode.TEXT,
@@ -410,6 +414,8 @@ class AgentGraphRunner:
                 "attachment_ids": attachment_ids or [],
                 "llm_client_name": llm_client_name,
                 "llm_model": llm_model,
+                "llm_answer_client_name": llm_answer_client_name,
+                "llm_answer_model": llm_answer_model,
                 "llm_reasoning_level": llm_reasoning_level,
                 "llm_reasoning_source": llm_reasoning_source,
                 "llm_response_mode": llm_response_mode.value,
@@ -429,6 +435,8 @@ class AgentGraphRunner:
         attachment_ids: list[str] | None = None,
         llm_client_name: str | None = None,
         llm_model: str | None = None,
+        llm_answer_client_name: str | None = None,
+        llm_answer_model: str | None = None,
         llm_reasoning_level: str | None = None,
         llm_reasoning_source: str | None = None,
         llm_response_mode: LLMResponseMode = LLMResponseMode.TEXT,
@@ -447,6 +455,8 @@ class AgentGraphRunner:
                 "attachment_ids": attachment_ids or [],
                 "llm_client_name": llm_client_name,
                 "llm_model": llm_model,
+                "llm_answer_client_name": llm_answer_client_name,
+                "llm_answer_model": llm_answer_model,
                 "llm_reasoning_level": llm_reasoning_level,
                 "llm_reasoning_source": llm_reasoning_source,
                 "llm_response_mode": llm_response_mode.value,
@@ -495,6 +505,8 @@ class AgentGraphRunner:
         tokens = (
             _turn_llm_client_name.set(request.get("llm_client_name")),
             _turn_llm_model.set(request.get("llm_model")),
+            _turn_llm_answer_client_name.set(request.get("llm_answer_client_name")),
+            _turn_llm_answer_model.set(request.get("llm_answer_model")),
             _turn_llm_response_mode.set(
                 LLMResponseMode(str(request.get("llm_response_mode", LLMResponseMode.TEXT.value)))
             ),
@@ -527,10 +539,12 @@ class AgentGraphRunner:
             if inference_token is not None:
                 _turn_inference_snapshot.reset(inference_token)
             _turn_input_content.reset(content_token)
-            _turn_safety_review_mode.reset(tokens[5])
-            _turn_run_id.reset(tokens[4])
-            _turn_run_manager.reset(tokens[3])
-            _turn_llm_response_mode.reset(tokens[2])
+            _turn_safety_review_mode.reset(tokens[7])
+            _turn_run_id.reset(tokens[6])
+            _turn_run_manager.reset(tokens[5])
+            _turn_llm_response_mode.reset(tokens[4])
+            _turn_llm_answer_model.reset(tokens[3])
+            _turn_llm_answer_client_name.reset(tokens[2])
             _turn_llm_model.reset(tokens[1])
             _turn_llm_client_name.reset(tokens[0])
             _turn_llm_reasoning_level.reset(reasoning_token)
@@ -541,6 +555,8 @@ class AgentGraphRunner:
         tokens = (
             _turn_llm_client_name.set(request.get("llm_client_name")),
             _turn_llm_model.set(request.get("llm_model")),
+            _turn_llm_answer_client_name.set(request.get("llm_answer_client_name")),
+            _turn_llm_answer_model.set(request.get("llm_answer_model")),
             _turn_llm_response_mode.set(
                 LLMResponseMode(str(request.get("llm_response_mode", LLMResponseMode.TEXT.value)))
             ),
@@ -582,10 +598,12 @@ class AgentGraphRunner:
             if inference_token is not None:
                 _turn_inference_snapshot.reset(inference_token)
             _turn_input_content.reset(content_token)
-            _turn_safety_review_mode.reset(tokens[5])
-            _turn_run_id.reset(tokens[4])
-            _turn_run_manager.reset(tokens[3])
-            _turn_llm_response_mode.reset(tokens[2])
+            _turn_safety_review_mode.reset(tokens[7])
+            _turn_run_id.reset(tokens[6])
+            _turn_run_manager.reset(tokens[5])
+            _turn_llm_response_mode.reset(tokens[4])
+            _turn_llm_answer_model.reset(tokens[3])
+            _turn_llm_answer_client_name.reset(tokens[2])
             _turn_llm_model.reset(tokens[1])
             _turn_llm_client_name.reset(tokens[0])
             _turn_llm_reasoning_level.reset(reasoning_token)
@@ -2122,6 +2140,8 @@ class AgentGraphRunner:
         session_id: str | None,
         user_input: str,
         existing_run_id: str | None = None,
+        llm_answer_client_name: str | None = None,
+        llm_answer_model: str | None = None,
         llm_reasoning_level: str | None = None,
         llm_reasoning_source: str | None = None,
         **_: Any,
@@ -2129,6 +2149,8 @@ class AgentGraphRunner:
         return (
             existing_run_id
             or self.create_run_for_turn(session_id=session_id, user_input=user_input,
+                                        llm_answer_client_name=llm_answer_client_name,
+                                        llm_answer_model=llm_answer_model,
                                         llm_reasoning_level=llm_reasoning_level,
                                         llm_reasoning_source=llm_reasoning_source).run_id
         )

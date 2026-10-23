@@ -482,6 +482,15 @@ class InMemoryAgentRunManager:
             existing = self._runs.get(record.run_id)
             if existing is not None:
                 return existing
+            if self.durable_store is not None:
+                persisted = self.durable_store.load_run(record.run_id)
+                fallback = (persisted or {}).get("metadata", {}).get("answer_timeout_fallback")
+                if fallback:
+                    # A transport fallback can be newer than the graph checkpoint.
+                    # Keep its identity so resume cannot dispatch the failed model again.
+                    record = record.model_copy(update={"metadata": {
+                        **record.metadata, "answer_timeout_fallback": fallback,
+                    }})
             self._persist_run(record)
             self._runs[record.run_id] = record
             self._events[record.run_id] = self._load_events(record.run_id)

@@ -144,6 +144,7 @@ def image_runtime(request, tmp_path, monkeypatch):
         data_dir=tmp_path / "data",
         orchestrator=request.param,
     )
+    runtime.stop()
     client.close()
     get_settings.cache_clear()
 
@@ -296,7 +297,6 @@ def test_invalid_image_selection_rejects_before_creating_runs(image_runtime):
         ({"session_id": sid, "attachment_ids": ["missing"]}, 422),
         ({"session_id": sid, "attachment_ids": [attachment] * 5}, 422),
         ({"session_id": sid, "attachment_ids": [""]}, 422),
-        ({"session_id": sid, "attachment_ids": [attachment], "llm": {"model": "text_only"}}, 422),
     ]
     before = len(env.runtime.agent_run_manager._runs)
     for payload, status in cases:

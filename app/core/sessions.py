@@ -93,6 +93,8 @@ class SessionRunPolicy(BaseModel):
     role_instructions: str | None = Field(default=None, max_length=16000)
     llm_client_name: str | None = None
     llm_model: str | None = None
+    llm_answer_client_name: str | None = None
+    llm_answer_model: str | None = None
     llm_reasoning_level: Literal["off", "low", "high", "max"] | None = None
     llm_reasoning_source: Literal["request", "session", "controller", "ui_default", "default", "inherited"] | None = None
     safety_review_mode: Literal["skip", "llm", "manual"] | None = None

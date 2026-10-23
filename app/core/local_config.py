@@ -49,6 +49,8 @@ class LLMClientConfig(BaseModel):
     name: str
     provider: str = "openai_compatible"
     base_url: str = "https://api.openai.com/v1"
+    api_protocol: Literal["chat_completions", "responses"] = "chat_completions"
+    model_api_protocol_overrides: dict[str, Literal["chat_completions", "responses"]] = Field(default_factory=dict)
     api_key_env: str = "OPENAI_API_KEY"
     default_model: str = "gpt-4.1-mini"
     available_models: list[str] = Field(default_factory=list)
@@ -79,8 +81,11 @@ class LLMClientConfig(BaseModel):
 class LLMProviderConfig(BaseModel):
     provider: str = "mock"
     base_url: str = "https://api.openai.com/v1"
+    api_protocol: Literal["chat_completions", "responses"] = "chat_completions"
+    model_api_protocol_overrides: dict[str, Literal["chat_completions", "responses"]] = Field(default_factory=dict)
     api_key_env: str = "OPENAI_API_KEY"
     model: str = "gpt-4.1-mini"
+    available_models: list[str] = Field(default_factory=list)
     timeout_seconds: int = 180
     thinking_control: Literal["deepseek"] | None = None
     supports_reasoning_effort: bool = False
@@ -208,9 +213,11 @@ class LLMProviderConfig(BaseModel):
                 name=client_name,
                 provider=provider_type,
                 base_url=self.base_url,
+                api_protocol=self.api_protocol,
+                model_api_protocol_overrides=self.model_api_protocol_overrides,
                 api_key_env=self.api_key_env,
                 default_model=self.model,
-                available_models=[self.model],
+                available_models=self.available_models or [self.model],
                 timeout_seconds=self.timeout_seconds,
                 thinking_control=self.thinking_control,
                 supports_reasoning_effort=self.supports_reasoning_effort,
@@ -259,6 +266,8 @@ class AgentInferenceProfile(BaseModel):
 
 class AgentConfig(BaseModel):
     max_decision_steps: int = 32
+    answer_timeout_seconds: float = Field(default=60, gt=0, le=600)
+    answer_timeout_fallback_enabled: bool = True
     # Opt-in rollout: choose the first operation in ReAct, without a separate route call.
     unified_entry_enabled: bool = False
     # Optional decision-stage override; route/answer/review remain unchanged.

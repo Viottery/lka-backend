@@ -69,6 +69,8 @@ def _build_openai_compatible_client(config: LLMClientConfig) -> AsyncLLMClient:
         name=config.name,
         provider_name=config.name,
         base_url=config.base_url,
+        api_protocol=config.api_protocol,
+        model_api_protocol_overrides=config.model_api_protocol_overrides,
         api_key=config.resolved_api_key(),
         default_model=config.default_model,
         available_models=config.available_models,
