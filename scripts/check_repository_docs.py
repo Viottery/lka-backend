@@ -12,7 +12,7 @@ from xml.etree import ElementTree
 
 PUBLIC_DOCS = frozenset({
     "README.md", "getting_started.md", "configuration.md", "usage.md",
-    "architecture.md", "maintenance.md", "api_contract.md",
+    "architecture.md", "maintenance.md", "api_contract.md", "distributed_client_handoff.md",
 })
 LOCAL_PREFIXES = ("docs/_engineering/", "evals/baselines/", "tmp_")
 
@@ -89,7 +89,7 @@ def main() -> int:
     for error in errors:
         print(error)
     if not errors:
-        print("Documentation checked: 7 public guides, local links and SVG assets.")
+        print(f"Documentation checked: {len(PUBLIC_DOCS)} public guides, local links and SVG assets.")
     return int(bool(errors))
 
 

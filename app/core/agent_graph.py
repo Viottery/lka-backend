@@ -656,7 +656,7 @@ class AgentGraphRunner:
         window["current_time"] = current_time_payload()
         if session.workspace is not None:
             window["workspace"] = session.workspace.model_dump(mode="json")
-        if self.turn_loop.instruction_files is not None:
+        if self.turn_loop.instruction_files is not None and self.turn_loop._session_run_policy().use_local_context:
             workspace_path = (
                 self.turn_loop._workspace_for_run(session, run.run_id)
             )

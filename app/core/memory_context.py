@@ -92,7 +92,7 @@ class MemoryContextProvider:
                 "updated_at": item.updated_at,
                 "version": item.version,
             })
-        return {
+        result = {
             "session_id": session_id,
             "project_id": project_id,
             "items": selected,
@@ -100,6 +100,10 @@ class MemoryContextProvider:
             "withheld_conflict_count": withheld_conflicts,
             "policy": "Derived user memory; lower priority than current user request and AGENTS.md.",
         }
+        cache_status = getattr(self.service, "cache_status", None)
+        if callable(cache_status):
+            result["shared_memory_cache"] = cache_status()
+        return result
 
 
 _FORGET_ID = re.compile(

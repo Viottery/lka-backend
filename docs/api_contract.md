@@ -1539,7 +1539,8 @@ limit 1..200，offset 0..1,000,000，q 最长 500 字符，按字面子串搜索
 普通创建接口或 metadata 中的类型标记不会把会话转换为 manager。
 
 以下接口需启用 `[management].enabled=true`，否则返回 409 `management_disabled`；
-沿用现有 loopback／`LKA_MEMORY_API_TOKEN` 校验。未引入账号或设备身份体系。
+未启用账号时沿用现有 loopback／`LKA_MEMORY_API_TOKEN` 校验；
+启用账号后，已认证的受信任管理员可管理同一套个人助理数据，见[账号接口](#账号设备与共享同步)。
 
 | 接口 | 行为 |
 | --- | --- |
@@ -2786,3 +2787,293 @@ IMPORT 上报必须绑定现有白名单和 capture_epoch，不能自授权。
 
 新增 Agent messages 工具全部只读，并按配置进行逐调用 safety review。消息来源标记不产生
 session 级工具禁用；事项候选仍须通过专用人工决定流程。没有 NapCat 原始客户端或 QQ 写操作。
+
+## 账号、设备与共享同步
+
+桌宠、手机及原生桥的接入顺序、请求路由和验收清单见 [多终端客户端接口交付](distributed_client_handoff.md)。
+
+以下能力默认关闭，配置及范围见[配置说明](configuration.md#可选云端账号设备与共享同步)。
+启用账号后，除最小 `GET /health`、固定 `/client` 登录资源与信息、受 Origin 限制的 `POST /auth/login`，普通 API、文档、
+文件和事件流均需登录；`/node/*` 单独要求有效设备令牌，不能用账号令牌代替。
+所有账号共享同一套个人数据，当前没有租户隔离或普通成员角色。
+
+### 登录与账号管理
+
+首个管理员在服务器本机交互创建：`python scripts/manage_accounts.py create-admin owner`。
+用户名规范化为小写 ASCII，长度 3..64；新密码长度 12..256，无匿名注册接口。
+
+| 接口 | 请求与行为 |
+| --- | --- |
+| `POST /auth/login` | `{username,password}`；返回 account、session_id、csrf_token、expires_at（Unix 秒），浏览器另收 HttpOnly cookie |
+| `GET /auth/me` | 返回当前账号和会话的安全字段 |
+| `POST /auth/logout` | 撤销当前会话，204 |
+| `POST /auth/password` | `{current_password,new_password}`；撤销该账号全部会话，204 |
+| `GET /auth/sessions` | 当前账号的有效会话，`{items:[...]}` |
+| `DELETE /auth/sessions/{session_id}` | 撤销自己的指定会话，204 |
+| `GET /auth/accounts` | 受信任管理员列表及 `data_scope: shared_personal_instance` |
+| `POST /auth/accounts` | `{username,password}` 创建另一受信任管理员，201 |
+| `PATCH /auth/accounts/{user_id}` | `{disabled:true|false}`；不能禁用最后一个有效管理员，204 |
+| `POST /auth/accounts/{user_id}/password` | `{new_password}` 重置密码并撤销其全部会话，204 |
+
+浏览器登录必须提供配置中精确匹配的 Origin；cookie 写请求还要带 `X-CSRF-Token`。
+前端跨源请求需 `credentials: include`；cookie 为 SameSite=Strict，跨站部署应使用同站 HTTPS 入口。
+原生/API 客户端必须显式启用 `auth.allow_bearer_sessions`，登录时发送 `X-LKA-Client: native`
+且不带 Origin，才在响应中获得 token。后续优先以 `X-LKA-Account-Token: <token>` 提供账号身份，
+让 `Authorization` 留给消息 IMPORT/API/CONTROL 等独立凭据；没有其他凭据时也支持
+`Authorization: Bearer <account-token>`。原生令牌路径不接受 Origin。
+浏览器 cookie 与其他 Authorization 凭据并用时仍须满足 CSRF，其他领域凭据仍独立校验。
+
+登录失败统一返回 401；持久限流触发 429。HTTPS/Origin/CSRF 不满足返回 403，账号关闭时
+`/auth/*` 返回 404。SSE 发送及 WebSocket 收发会复验会话，改密/撤销后终止连接；
+cookie WebSocket 握手需要 Origin 与 CSRF header。会话到期或撤销不回滚已经受理的领域事务。
+
+### 设备登记与连接选择
+
+设备管理接口需要账号认证。登记示例：
+
+```json
+{
+  "device_id": "desktop-a",
+  "name": "书房电脑",
+  "platform": "windows",
+  "systems": [{"environment_id":"wsl","platform":"linux","workspace_ids":["work"]}],
+  "workspace_ids": ["work"],
+  "capabilities": ["files.read"],
+  "scopes": ["heartbeat","sync.read","sync.propose"]
+}
+```
+
+scopes 默认只有 heartbeat。`sync.read` 授予整套共享个人投影，不按 workspace_ids 分片授权；
+`sync.propose` 仅可投递候选。可选 advertised_url 只接受 Tailscale 的 HTTPS `*.ts.net` origin，
+不能带凭据、路径或查询参数；它是管理员登记的地址，不代表已核验 Tailscale 用户身份。
+工作区 ID 是登记标识，不是远程文件路径或挂载点。
+
+| 接口 | 行为 |
+| --- | --- |
+| `POST /devices` | 登记，201；响应含仅此次返回的 token，后续查询不返回令牌 |
+| `GET /devices?limit=100&offset=0` | `{items:[...]}`，含 revision、online、last_seen；limit 为 1..500 |
+| `GET /devices/{device_id}` | 单台设备档案 |
+| `PATCH /devices/{device_id}` | 完整登记结构加 expected_revision，身份不可改变 |
+| `POST /devices/{device_id}/revoke` | `{expected_revision}`，立即撤销设备授权 |
+| `POST /devices/{device_id}/rotate` | `{expected_revision}`，轮换令牌，旧令牌立即失效 |
+| `POST /node/heartbeat` | 设备 Bearer 凭据；`{status,environment_id?}`，status 默认为 online，可为 busy/idle/degraded；不能自行修改 scopes 或工作区 |
+| `GET /devices/selection?selection_key=default` | 读取当前账号指定用途的策略 |
+| `PUT /devices/selection?selection_key=default` | 保存策略，新建 expected_revision=0；后续更新必须带当前 revision |
+| `POST /devices/selection/resolve?selection_key=default` | 在当前已授权、在线且匹配的系统中解析目标 |
+
+策略示例：
+
+```json
+{
+  "mode": "fixed",
+  "device_id": "desktop-a",
+  "allowed_device_ids": ["desktop-a"],
+  "environment_id": "wsl",
+  "workspace_id": "work",
+  "capabilities": ["files.read"],
+  "expected_revision": 0
+}
+```
+
+`mode:auto` 可不提供 device_id，但必须显式提供非空 allowed_device_ids；
+系统、能力及工作区约束仍生效。selection_key 可区分手机连接、助理等用途。
+解析返回 node_id、device_id、environment_id、system 和 remote_execution_available
+（取决于云端执行配置及节点 scopes，不是任务成功保证）。
+固定设备离线、没有合格目标或修订冲突返回 409；不会悄悄换到别的电脑。
+此接口仅解析连接策略。助理派发使用下面的 execution_target；不会把某个客户端的连接切换隐式应用到全部助理任务。
+
+### 共享投影、分页与节点提案
+
+hub 接口需要开启 sync.role=hub。账号可调用 `GET /sync/status` 和
+`GET /sync/changes?after=0&limit=100`；授权设备使用 `/node/sync/status`、`/node/sync/changes`。
+状态返回 `{hub_id,cursor}`；变化页格式如下（limit 为 1..500，响应至多 1 MiB）：
+
+```json
+{
+  "hub_id": "hub_example",
+  "after": 0,
+  "cursor": 1,
+  "high_watermark": 1,
+  "has_more": false,
+  "changes": [{"sequence":1,"kind":"memory_projects","key":["project-a"],"version":1,
+               "deleted":false,"record":{"project_id":"project-a","created_at":"2026-10-24"}}]
+}
+```
+
+从 after=0 初始化，用 cursor 继续；保留 hub_id 并拒绝连接另一身份。变化日志引用当前投影，
+不是历史事件正文；删除/来源失效可能返回 deleted=true、record=null。
+同页的实体版本可高于当前日志引用；相同版本只允许进一步隐藏字段，不能复活已删除内容。
+单条投影超过上限返回 422，客户端应明确报告，不能跳过该游标。
+
+kind 清单：memory_entries、memory_sources、memory_entry_sources、memory_projects、
+agent_sessions（仅 manager 的少量身份字段）、manager_controllers、manager_defaults、
+manager_goals、matters、matter_source_links、matter_management、manager_work_relations、
+manager_goal_matter_links、manager_delegates、manager_deliveries。投影使用固定字段清单，
+排除密码、token、工作区路径、来源原文、普通会话消息、助理对话正文、调度租约和模型配置。
+
+节点 `POST /node/sync/proposals` 需要 sync.propose，返回 201；严格结构为：
+
+```json
+{"proposal_id":"note-1","kind":"memory_candidate","text":"待核对内容","base_revision":1}
+```
+
+kind 还可为 assistant_note；text 最长 8000 字，可选 target_ref 最长 256 字。
+同 node_id/proposal_id 的同内容重试返回原回执，不同内容返回 409；禁止额外权限、审批或执行字段。
+账号可 `GET /sync/proposals?limit=100` 查看，或
+`POST /sync/proposals/{node_id}/{proposal_id}/resolve` 提交 `{status:"reviewed"}` / `{status:"rejected"}`。
+reviewed 仅表示已查看，不将候选发布为记忆，也不授予 Agent 行动权限。
+
+replica 本机接口：`GET /sync/replica/status` 查看游标、错误类别和 outbox 计数，
+`POST /sync/replica/proposals` 持久排队上述结构（202）；沿用本机记忆控制保护，或使用已认证账号。
+`GET /sync/replica/records?kind=memory_entries&limit=100&offset=0` 查询只读副本，需要账号登录，
+返回 `{items:[...]}`；limit 为 1..500。不修改本机原生领域表，不能从副本恢复活动调度器。
+同步先拉取再提交提案，失败保留游标及待发队列；网络恢复后重试，不做多主覆盖合并。
+
+### 设备直连授权与节点普通会话
+
+| 接口 | 身份与行为 |
+| --- | --- |
+| `GET /client` | 手机/电脑连接入口；静态资源 `/client/client.js`、`client.css`，不包含秘密 |
+| `GET /client/info` | 公开最小角色/节点/功能开关；不返回路径或凭据 |
+| `POST /devices/{device_id}/connections` | 云端账号；可选 `{workspace_ids:[...]}`，201 返回一次性 grant、origin、expires_at，等待节点轮询接收 |
+| `GET /node/connection-grants` | 节点令牌及 connections.poll；返回该节点未过期授权哈希和范围，重复投递幂等 |
+| `POST /connections/redeem` | 节点 HTTPS；`{grant}`，精确 Origin 或原生 X-LKA-Client；一次兑换建立本地 cookie/CSRF |
+| `GET /connections/me` | 本地连接会话、workspace_ids、有效期与可恢复的 csrf_token；不需要云端在线 |
+| `POST /connections/logout` | 本地撤销连接，204 |
+| `GET /connections/sessions` | 当前用户在此节点的有效连接，不返回 token；标识 current |
+| `DELETE /connections/sessions/{session_id}` | 本地撤销自己的指定连接，204 |
+| `POST /devices/{device_id}/connections/revoke` | 云端撤销本人在此节点的旧授权；节点下次同步生效 |
+
+原生兑换带 `X-LKA-Client:native` 且无 Origin，响应另含 token；后续使用
+`X-LKA-Connection-Token` 与 `X-LKA-Client:native`。浏览器使用独立 HttpOnly/Secure/Strict cookie，
+写请求带 X-CSRF-Token 和已配置 Origin。一次性 grant 只放导航 fragment，页面立即清除，不写查询参数。
+授权默认 120 秒，节点连接会话默认 30 天，可配置。已经兑换的会话由节点本地撤销或到期，
+云端改密/禁用账号及连接撤销通过单调授权代次传播，节点重新成功同步后旧会话失效；
+云端不能瞬时撤销离线节点既有客户端会话，网络错误不撤销本地身份。
+
+节点直连沿用 `/sessions`、`/agent/turn[/stream]`、运行状态及附件接口，
+但只允许普通根会话及其已核验的运行；manager、助理派生会话、远程任务、历史/审批绕过均拒绝。
+已有宽权限运行不能借新连接直接恢复；新运行冻结本地批准路径、禁止默认目录回退并强制人工审查。
+文件路径约束沿用现有工具审查，不构成操作系统级沙箱。
+
+| 节点直连工作区接口 | 行为 |
+| --- | --- |
+| `GET /local/workspaces` | 已授权并配置的 workspace_id，不返回其他节点路径 |
+| `GET /local/workspaces/{id}/status` | local/mounted、available、只读状态；挂载身份与有界健康探测，无私有路径 |
+| `GET /local/cache` | 本地镜像水位、同步年龄和 stale 标记，只读本机，不调用云端 |
+| `GET /local/workspaces/{id}/entries?path=` | 列目录，最多 200 项；拒绝链接/越界 |
+| `GET /local/workspaces/{id}/file?path=relative` | 附件下载，最多 32 MiB |
+| `PUT /local/workspaces/{id}/file?path=relative` | 请求体为文件字节，最多 32 MiB；仅新建，已有文件 409，不覆盖 |
+| `POST /local/workspaces/{id}/directories` | `{path:"relative"}` 新建目录，不递归穿越链接 |
+| `POST /sessions/{session_id}/workspace-id` | `{workspace_id:"work"}` 按本机映射绑定普通会话 |
+
+### 助理跨设备任务与会话中转
+
+开启 remote_execution 后，management.list_execution_targets 提供已授权在线设备/环境/工作区。
+management.start_task 新增可选 execution_target：省略沿用云端本机，`{}` 自动选择获授权在线节点，
+或用 `{device_id,environment_id,workspace_id,capabilities}` 指定要求。
+与本机 workspace_path 不能混用。命令 ID 去重、目标、来源/工具范围、节点凭据代次及租约持久冻结。
+返回原任务 session_id/run_id 及 remote_execution.task_id；云端 shadow 不运行第二次执行。
+
+| 接口 | 行为 |
+| --- | --- |
+| `GET /remote-execution/tasks?owner_session_id=&limit=100&offset=0` | 云端账号，分页摘要，next_offset；不返回任务输入快照 |
+| `GET /remote-execution/targets` | 云端账号，获授权的设备及各系统 execution_online；要求实际 worker 近期轮询 |
+| `GET /remote-execution/tasks/{task_id}?limit=20&offset=0` | 云端账号，状态及分页回报/会话内容，next_offset |
+| `POST /remote-execution/tasks/{task_id}/cancel` | 云端取消；节点后续执行/发布检查失效 |
+| `POST /remote-execution/tasks/{task_id}/pause`、`/resume` | `{command_id}`，持久命令，节点原检查点暂停/继续 |
+| `POST /remote-execution/tasks/{task_id}/answer` | `{command_id,question_id,answer}`，回答当前待用户问题 |
+| `POST /remote-execution/tasks/{task_id}/instruction` | `{command_id,expected_run_id,purpose}`，已核验终态后在原会话继续，冻结原设备/系统/工作区 |
+| `POST /remote-execution/tasks/{task_id}/reviews/{review_id}` | 云端账号 `{decision:"approve"或"reject",reason?}`；节点复验原审批指纹，再走原检查点恢复 |
+| `POST /node/execution/claim` | execution.poll，`{environment_id}` 领取已冻结目标任务 |
+| `POST /node/execution/start`、`/check` | execution.run，task_id/lease_epoch/lease_token/environment_id，执行点校验 |
+| `POST /node/execution/report` | execution.result，同租约身份、report_id、状态、messages/reviews/result；同 ID 相同内容幂等 |
+
+远程任务仍通过注册工具及安全门执行，不提供远程裸命令接口。
+节点保存独立任务回执和待回报内容；响应丢失重试不重复执行。永久失效的回报保留在节点，
+不能阻塞后续任务。租约过期、断云或授权失效时停止后续步骤，云端标记 unknown，
+不宣称已经撤销在途外部副作用，也不自动换设备重放。
+助理任务正文及审批经云端中转；节点普通连接不能直读或控制这些会话。
+
+暂停是协作式检查点操作，不撤回已经开始的副作用。`resuming` 表示恢复命令已入队但节点尚未报告恢复；
+不要重复创建命令。命令 ID 与原内容重试幂等；未知结果、失效来源或原目录映射变化均不能继续。
+原生 shell 还须节点显式 host_user 信任、工具白名单、冻结授权、逐次人工审批与活租约；
+工作目录不构成操作系统沙箱。
+
+### 共享记忆正式编辑与离线队列
+
+双方启用 sync.memory_write_enabled；节点另需 sync.memory.write。节点 HTTP 入口要求云端授权后
+在该节点兑换的连接会话，独立本机账号不授予共享写入身份。写请求检查 Origin/CSRF；
+模型工具不会获得这些接口的身份授权。
+
+| 接口 | 行为 |
+| --- | --- |
+| `GET /local/shared-memory/status` | 本用户队列计数、开关及缓存状态 |
+| `GET /local/shared-memory/records?scope=global` | 本地有效共享镜像；project 范围另带已批准 workspace_id |
+| `GET /local/shared-memory/mutations`、`/mutations/{id}` | 本用户编辑状态及 accepted/conflict 回执 |
+| `POST /local/shared-memory/mutations` | 人工确认编辑持久入队，201；未发布编辑不参与检索 |
+| `POST /node/sync/memory-mutations` | 受信任节点提交版本化正式修订，事务内核验设备及活跃云端账号 |
+
+本地提交字段为 mutation_id、operation=create/update/delete、expected_version、scope、
+可选 workspace_id、memory_id、content、memory_type、sensitivity、confidence、expires_at 和 confirmed=true。
+create 使用版本 0；update/delete 使用缓存 cloud_ 命名空间 ID 与正版本。禁止客户端自报用户/来源身份。
+节点将已验证会话转换为人工操作证明；hub 信任被显式授予该 scope 的节点作此证明，不是端到端用户签名。
+同 mutation_id 不同内容返回 409；冲突返回终态 receipt.status=conflict 并保留 proposal/current，
+不覆盖、不自动复活撤回内容。用户需基于最新缓存显式创建新 mutation。
+personal 敏感记忆不进入共享镜像；人工输入的提案仍保存在提交节点的离线队列/提交记录中。
+
+### 自动记忆数据库同步与去重
+
+云端及节点显式启用 `sync.memory_aggregation_enabled`，设备另需 `sync.memory.aggregate`。
+该 scope 授权受信任后端复制本地领域服务已经发布的 active/candidate 状态；
+它不等于人工确认，也不允许模型通过请求正文为自己增加权限。
+节点本地数据库中的条目、来源和关联变更在原事务中记录同步修订；普通请求不访问云端。
+后台有界收集当前快照并通过节点 HTTPS 传输，初次启用也会收集现有可共享记录。
+
+`POST /node/sync/memory-records` 仅接受设备凭据，请求结构为：
+
+```json
+{
+  "hub_id":"registered-hub",
+  "mutation_id":"stable-immutable-operation-id",
+  "origin_id":"node-local-memory-id",
+  "revision":3,
+  "operation":"upsert",
+  "record":{
+    "content":"用户已生效的普通偏好",
+    "memory_type":"preference",
+    "scope":"global",
+    "project_id":null,
+    "status":"active",
+    "sensitivity":"normal",
+    "origin_version":2
+  },
+  "sources":[{"source_id":"node-local-source-id","source_type":"user_message","checksum":null,"status":"active"}]
+}
+```
+
+record 还可包含 confidence、expires_at、supersedes_id、extraction_model、conflict_hints 和 needs_review；
+source 可含 expires_at。时间须带时区并规范化为 UTC。withdraw 请求使用相同身份/修订字段，
+record=null、sources=[]，不附带撤回内容。未知字段、人工确认身份或 trusted 标记不被接受。
+来源只传标识、类型、摘要、状态和期限，不传原会话、source_ref、文件路径、原文或模型配置。
+敏感记忆、未绑定项目和过期/失效来源不会作为有效记忆导出。
+
+200 回执含 hub_id、node_id、mutation_id、origin_id、revision、status 和 result；
+status 为 accepted、withdrawn、conflict 或 stale，result 提供云端条目 ID/版本/状态和 needs_review。
+同 ID 同内容读取原回执，不同内容 409；旧修订不能覆盖新状态。领域写入、来源关联和回执原子提交。
+网络/401 错误保留重试；403 标为 blocked，每轮有界重试，不挤占后续新快照。
+409/422 保留拒绝记录。新修订或隐私变化会替代旧的待提交/受阻快照，不能重试旧内容来绕过撤回。
+
+跨节点精确去重使用规范化内容、类型、scope/project、敏感级别与期限，
+同一事实保留各节点独立可撤回来源；重复候选不会因此变为 active。
+语义近似不作自动合并，现有矛盾提示或云端人工新修订保留为待核对记录。
+人工云端更正/撤回、过期和来源失效不能被晚到的节点快照覆盖或复活。
+只有仍有效的 active 发布来源支持召回，candidate 来源不会延长已过期 active 来源的有效性。
+
+节点 `GET /local/cache` 另含 memory_aggregation.enabled、ownership_tracking 和有界队列计数。
+已安装正式镜像后抑制同源本地重复；即使后续关闭自动发布，也保留接管状态，
+防止中央撤回后回退到本地旧 active。各节点仍保存独立普通会话和本地 SQLite。
+
+云端 `GET /sync/memory-records/conflicts?limit=100&offset=0` 使用账号身份，
+返回待核对的自动同步来源提案和当前状态及 next_offset；来源后续撤回后不再展示旧提案。
+该接口只读，核对后通过现有记忆领域接口明确更正；不会自动替用户选择矛盾内容。

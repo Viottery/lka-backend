@@ -24,6 +24,12 @@ from app.domains.memory_feedback import MemoryFeedbackInput, MemoryFeedbackReaso
 def require_local_memory_control(request: Request) -> None:
     """Do not expose private memory or job metadata on an unauthenticated LAN bind."""
 
+    connection = getattr(getattr(request, "state", None), "device_connection", None)
+    if connection and request.url.path.startswith("/projects"):
+        return  # Ordinary project access is scoped by the direct connection boundary.
+    account = getattr(getattr(request, "state", None), "account", None)
+    if isinstance(account, dict) and account.get("is_admin") is True:
+        return
     expected = os.getenv("LKA_MEMORY_API_TOKEN")
     if expected:
         authorization = request.headers.get("authorization", "")

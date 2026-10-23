@@ -242,9 +242,16 @@ class LocalKnowledgeAgentRuntime:
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self.local_app_config = settings.load_local_config()
+        # SQLite and durable checkpoints must remain local even when a node
+        # maps remote file workspaces. Validate before creating any data files.
+        local_data = settings.data_dir.expanduser().resolve(strict=False)
+        for identity in self.local_app_config.connections.workspace_mounts:
+            mount_root = Path(self.local_app_config.connections.workspace_roots[identity]).expanduser().resolve(strict=False)
+            if local_data.is_relative_to(mount_root) or mount_root.is_relative_to(local_data):
+                raise ValueError("Mounted workspaces must not overlap the local data directory")
         self.db_path = get_db_path(settings.data_dir)
         init_db(self.db_path)
-        self.local_app_config = settings.load_local_config()
         self.memory_settings_base = self.local_app_config.model_copy(deep=True)
         self.memory_settings_store = MemorySettingsStore(self._conn)
         self.memory_settings_error: str | None = None
@@ -1049,8 +1056,227 @@ class LocalKnowledgeAgentRuntime:
             ):
                 self.tool_registry.register_tool(tool)
 
+        # Optional cloud services initialize after domain schemas and before any workers.
+        from app.domains.accounts import AccountService
+        from app.domains.device_connections import DeviceConnectionService
+        from app.domains.devices import DeviceService
+        from app.domains.shared_sync import SharedSyncService
+
+        self.account_service = (
+            AccountService(self._conn, self.local_app_config.auth)
+            if self.local_app_config.auth.enabled else None
+        )
+        self.device_service = (
+            DeviceService(self._conn, self.local_app_config.devices)
+            if self.local_app_config.devices.enabled else None
+        )
+        if self.device_service is not None:
+            self.device_service.remote_execution_enabled = self.local_app_config.remote_execution.enabled
+        self.sync_service = None
+        self.shared_replica = None
+        self.cloud_replica_sync = None
+        self.shared_memory_cache = None
+        self.shared_memory_writes = None
+        self.shared_memory_write_outbox = None
+        self.memory_replication_service = None
+        self.memory_replication_journal = None
+        self.memory_replication_sync = None
+        self.remote_execution_service = None
+        self.remote_execution_worker = None
+        self.node_workspaces = None
+        self.memory_background.session_eligible = self._memory_session_eligible
+        self.device_connection_service = (
+            DeviceConnectionService(self._conn, self.local_app_config.connections,
+                                    device_service=self.device_service)
+            if self.local_app_config.connections.enabled else None
+        )
+        if (self.device_connection_service is not None
+                and self.local_app_config.connections.node_id):
+            from app.domains.node_workspaces import NodeWorkspaceService
+
+            self.node_workspaces = NodeWorkspaceService(
+                self.local_app_config.connections.workspace_roots,
+                self.local_app_config.connections.workspace_mounts,
+            )
+            self.tool_executor.workspace_access_guard = self._check_node_tool_workspace
+        sync_config = self.local_app_config.sync
+        if (self.account_service is not None and self.device_connection_service is not None
+                and sync_config.role == "hub"):
+            self.account_service.on_security_change = self.device_connection_service.bump_account_epoch
+        if sync_config.enabled:
+            if sync_config.role == "hub":
+                self.sync_service = SharedSyncService(self._conn, sync_config, self.device_service)
+                if sync_config.memory_aggregation_enabled and memory_config.enabled:
+                    from app.domains.memory_replication import MemoryReplicationService
+
+                    self.memory_replication_service = MemoryReplicationService(self.memory_service, self.sync_service)
+                if sync_config.memory_write_enabled and memory_config.enabled:
+                    from app.domains.shared_memory_writes import SharedMemoryWriteService
+
+                    self.shared_memory_writes = SharedMemoryWriteService(self.memory_service, self.sync_service)
+            else:
+                from app.domains.node_outbox import NodeProposalOutbox
+                from app.integrations.cloud_sync import CloudReplicaSynchronizer
+                from app.storage.shared_replica import SharedReplicaStore
+
+                replica_path = self.settings.data_dir / "shared-replica.sqlite3"
+                self.shared_replica = SharedReplicaStore(replica_path, sync_config.hub_id)
+                self.cloud_replica_sync = CloudReplicaSynchronizer(
+                    sync_config, self.shared_replica, NodeProposalOutbox(replica_path),
+                    connections=self.device_connection_service,
+                )
+                if memory_config.enabled:
+                    from app.domains.shared_memory_cache import SharedMemoryCache
+
+                    self.shared_memory_cache = SharedMemoryCache(
+                        self.memory_service, self.shared_replica,
+                        project_bindings=sync_config.memory_project_bindings,
+                        stale_after_seconds=sync_config.memory_cache_stale_seconds,
+                    )
+                    with closing(self._conn()) as conn:
+                        retained_replication_ownership = conn.execute(
+                            "SELECT 1 FROM sqlite_master WHERE type='table' "
+                            "AND name='node_memory_replication_ownership'",
+                        ).fetchone() is not None
+                    if sync_config.memory_aggregation_enabled or retained_replication_ownership:
+                        from app.domains.memory_replication import NodeMemoryReplicationJournal
+                        from app.integrations.memory_replication import (
+                            MemoryReplicationSynchronizer,
+                        )
+
+                        self.memory_replication_journal = NodeMemoryReplicationJournal(
+                            self._conn, hub_id=sync_config.hub_id,
+                            node_id=self.local_app_config.connections.node_id,
+                            project_bindings=sync_config.memory_project_bindings, cache=self.shared_memory_cache,
+                        )
+                        self.shared_memory_cache.replication_filter = self.memory_replication_journal.local_visible
+                        if sync_config.memory_aggregation_enabled:
+                            self.memory_replication_sync = MemoryReplicationSynchronizer(
+                                sync_config, self.memory_replication_journal,
+                                transport=lambda *args: self.cloud_replica_sync._transport(*args),
+                            )
+                            self.cloud_replica_sync.memory_replication = self.memory_replication_sync
+                    self.agent_turn_loop.memory_context_provider.service = self.shared_memory_cache
+                    for name in ("memory.search", "memory.read"):
+                        tool = self.tool_registry.get_tool_or_none(name)
+                        if tool is not None:
+                            tool.service = self.shared_memory_cache
+                    from app.domains.shared_memory_writes import SharedMemoryMutationOutbox
+                    from app.integrations.shared_memory_writes import SharedMemoryWriteSynchronizer
+
+                    self.shared_memory_write_outbox = SharedMemoryMutationOutbox(
+                        replica_path, hub_id=sync_config.hub_id,
+                        node_id=self.local_app_config.connections.node_id, cache=self.shared_memory_cache,
+                    ) if self.local_app_config.connections.node_id else None
+                    if self.shared_memory_write_outbox is not None:
+                        self.cloud_replica_sync.memory_writes = SharedMemoryWriteSynchronizer(
+                            sync_config, self.shared_memory_write_outbox,
+                            transport=lambda *args: self.cloud_replica_sync._transport(*args),
+                        )
+        execution_config = self.local_app_config.remote_execution
+        if execution_config.enabled:
+            if sync_config.role == "hub":
+                from app.domains.remote_execution import RemoteExecutionService
+
+                self.remote_execution_service = RemoteExecutionService(
+                    self._conn, self.device_service, hub_id=self.sync_service.status()["hub_id"],
+                    managed_tasks=self.managed_tasks, sessions=self.session_service,
+                    run_store=self.agent_run_store, run_manager=self.agent_run_manager,
+                    tool_executor=self.tool_executor, lease_seconds=execution_config.lease_seconds,
+                )
+                self.remote_execution_service.ensure_schema()
+                self.managed_tasks.remote_execution = self.remote_execution_service
+            else:
+                from app.integrations.remote_execution import RemoteExecutionNode
+
+                self.remote_execution_worker = RemoteExecutionNode(self, execution_config, sync_config)
+                self.tool_executor.host_execution_guard = self._check_remote_host_execution
+            self._local_execution_guard = self.agent_turn_loop.execution_guard
+            self.agent_turn_loop.execution_guard = self._check_distributed_execution
+
+    def _check_remote_host_execution(self, context):
+        """Revalidate the node operator's live grant and original task lease."""
+        worker = self.remote_execution_worker
+        config = self.local_app_config.remote_execution
+        if (worker is None or not config.enabled or config.shell_trust != "host_user"
+                or "bash.run" not in config.allowed_tools or not context.run_id):
+            return "Native host execution is not authorized by this node."
+        run = self.agent_run_manager.get_run(context.run_id)
+        if run is None or not run.metadata.get("remote_execution"):
+            return "Native host execution requires a delegated node task."
+        frozen = run.metadata.get("context_views", {}).get("tool", {})
+        if not frozen.get("host_execution_authority"):
+            return "This task has no frozen native host execution grant."
+        if self.tool_executor.constraint_store.get(self.tool_executor._constraint_subjects(context)):
+            return "Native host execution cannot bypass newly acquired source constraints."
+        workspace_id = run.metadata["remote_execution"].get("workspace_id")
+        workspace = run.metadata.get("execution_workspace")
+        if workspace_id and (
+                self.node_workspaces and self.node_workspaces.is_mounted(workspace_id)
+                or not workspace
+                or config.workspace_mappings.get(workspace_id) != workspace.get("backend_path")):
+            return "Native host execution workspace authority changed."
+        try:
+            worker.check_run(context.run_id)
+        except Exception:  # noqa: BLE001 - deny without exposing transport details.
+            return "Native host execution lease is unavailable."
+        return None
+
+    def _check_node_tool_workspace(self, spec, tool_input, context, read_only):
+        """Mounted files need live identity; unpinned tool writes stay closed."""
+        service = self.node_workspaces
+        if service is None or not service.mount_guard.mounts:
+            return None
+        paths = [context.workspace_root] if context.workspace_root else []
+        for field in spec.scope_path_fields:
+            value = tool_input.get(field)
+            values = value if isinstance(value, (list, tuple)) else [value]
+            for item in values:
+                if not isinstance(item, str):
+                    continue
+                if context.workspace_root:
+                    for variable in ("workspace_root", "WORKSPACE_ROOT", "LKA_WORKSPACE_ROOT"):
+                        item = item.replace("${" + variable + "}", context.workspace_root)
+                        item = item.replace("$" + variable, context.workspace_root)
+                target = Path(item).expanduser()
+                if not target.is_absolute():
+                    if not context.workspace_root:
+                        continue
+                    target = Path(context.workspace_root) / target
+                paths.append(str(target))
+        try:
+            for path in paths:
+                for candidate in {str(path), str(Path(path).expanduser().resolve(strict=False))}:
+                    service.check_path(candidate, write=not read_only)
+                    if not read_only and service.mounted_workspace_for_path(candidate) is not None:
+                        return "Mounted workspace writes require the pinned direct workspace interface."
+        except (OSError, PermissionError, ValueError):
+            return "Mounted workspace is unavailable or its identity changed."
+        return None
+
+    def _check_distributed_execution(self, run_id, conn=None):
+        self._local_execution_guard(run_id, conn=conn)
+        if self.remote_execution_service is not None:
+            if conn is not None:
+                row = conn.execute("SELECT record_payload FROM agent_runs WHERE run_id=?", (run_id,)).fetchone()
+                remote = bool(row and json.loads(row[0]).get("metadata", {}).get("remote_execution"))
+            else:
+                run = self.agent_run_manager.get_run(run_id)
+                remote = bool(run is not None and run.metadata.get("remote_execution"))
+            if remote:
+                from app.core.agent_runs import AgentRunCancelled
+
+                raise AgentRunCancelled("remote_execution_requires_node")
+        if self.remote_execution_worker is not None:
+            self.remote_execution_worker.check_run(run_id, conn=conn)
+
     def _conn(self) -> sqlite3.Connection:
         return connect(self.db_path)
+
+    @staticmethod
+    def _memory_session_eligible(conn, session_id):
+        row = conn.execute("SELECT metadata FROM agent_sessions WHERE session_id=?", (session_id,)).fetchone()
+        return bool(row and not json.loads(row[0]).get("remote_execution"))
 
     def _authorize_session_input(self, conn, session_id, *, accepting=False):
         from app.core.session_inputs import SessionInputConflict
@@ -1150,6 +1376,19 @@ class LocalKnowledgeAgentRuntime:
         except (sqlite3.Error, ValueError, TypeError, AttributeError):
             pass
         session = self.session_service.get_session_or_none(session_id=session_id)
+        connections = getattr(self, "device_connection_service", None)
+        if connections is not None and (session is None or session.kind != "manager"):
+            direct_policy = connections.session_policy(session_id)
+            if direct_policy is not None:
+                return SessionRunPolicy(
+                    **direct_policy, llm_reasoning_level=ui_reasoning_level,
+                    llm_reasoning_source=ui_reasoning_source,
+                    llm_answer_client_name=ui_answer_client_name,
+                    llm_answer_model=ui_answer_model,
+                    allowed_tools=self.management_service.allowed_tool_names(
+                        self.tool_registry.list_tools(), manager=False,
+                    ),
+                )
         if session is None or session.kind != "manager":
             delegates = getattr(self, "management_delegates", None)
             if delegates is not None:
@@ -1237,6 +1476,8 @@ class LocalKnowledgeAgentRuntime:
                 conn.close()
 
     def _enqueue_memory_answer(self, conn: sqlite3.Connection, message: AgentSessionMessage) -> None:
+        if not self._memory_session_eligible(conn, message.session_id):
+            return
         try:
             self.memory_background.enqueue_answer(conn, message)
         except Exception as exc:  # noqa: BLE001 - optional outbox must not discard a committed answer
@@ -1271,6 +1512,12 @@ class LocalKnowledgeAgentRuntime:
     def start(self) -> None:
         """Start runtime services that should run while the API process is alive."""
 
+        if self.cloud_replica_sync is not None:
+            self.cloud_replica_sync.start()
+        if self.remote_execution_service is not None:
+            self.remote_execution_service.start()
+        if self.remote_execution_worker is not None:
+            self.remote_execution_worker.start()
         self._run_startup_mail_sync()
         self._start_background_mail_sync()
         self.watch_scheduler.start()
@@ -1282,13 +1529,23 @@ class LocalKnowledgeAgentRuntime:
             self.session_inputs.start()
             self.agent_dispatch.start()
             self.management_coordinator.start()
+        elif self.remote_execution_worker is not None:
+            self.agent_dispatch.start()
 
     def stop(self) -> None:
         """Stop runtime background services."""
 
         self.session_inputs.stop()
         self.management_coordinator.stop()
+        # Keep the outbound authority checker alive while graphs drain into
+        # their native checkpoints; stop must not destroy paused remote work.
         self.agent_dispatch.stop()
+        if self.remote_execution_worker is not None:
+            self.remote_execution_worker.stop()
+        if self.remote_execution_service is not None:
+            self.remote_execution_service.stop()
+        if self.cloud_replica_sync is not None:
+            self.cloud_replica_sync.stop()
         self.watch_scheduler.stop()
         self.memory_background.stop()
         self.message_analysis.stop()
@@ -2015,6 +2272,7 @@ class LocalKnowledgeAgentRuntime:
         """Resolve explicitly requested versions in the parent's authorized scope."""
         if not self.local_app_config.memory.enabled:
             return ()
+        memory_reader = getattr(self, "shared_memory_cache", None) or self.memory_service
         parent = self.agent_run_manager.get_run(run_id)
         if parent is None:
             return ()
@@ -2028,14 +2286,14 @@ class LocalKnowledgeAgentRuntime:
             inherited = ContextSnapshot.model_validate(raw_snapshot).memory_refs
             return tuple(ref for ref in inherited
                          if (ref.memory_id in requested or f"{ref.memory_id}@{ref.version}" in requested)
-                         and self.memory_service.get_active(ref.memory_id) is not None)
+                         and memory_reader.get_active(ref.memory_id) is not None)
         session = self.session_service.get_session_or_none(session_id=parent.session_id)
         workspace = session.workspace.backend_path if session and session.workspace else None
-        project_id = self.memory_service.resolve_project(workspace, create=False) if workspace else None
+        project_id = memory_reader.resolve_project(workspace, create=False) if workspace else None
         references = []
         for value in sorted(requested):
             memory_id, _, expected = value.partition("@")
-            record = self.memory_service.get_active(memory_id)
+            record = memory_reader.get_active(memory_id)
             if record is None or record.sensitivity not in {"normal", "public"}:
                 continue
             if record.scope == "project" and (project_id is None or record.project_id != project_id):
@@ -2839,24 +3097,28 @@ class LocalKnowledgeAgentRuntime:
         project_id: str | None = None,
         creation_source: SessionCreationSource | None = None,
         creator_session_id: str | None = None,
+        ordinary_only: bool = False,
     ) -> AgentSessionList:
         """Return recent agent sessions for frontend session switching."""
 
         return self.session_service.list_sessions(
             limit=limit, offset=offset, q=q, project_id=project_id,
             creation_source=creation_source, creator_session_id=creator_session_id,
+            ordinary_only=ordinary_only,
         )
 
     def list_deleted_sessions(
         self, *, limit: int = 50, offset: int = 0, q: str | None = None,
         creation_source: SessionCreationSource | None = None,
         creator_session_id: str | None = None,
+        ordinary_only: bool = False,
     ) -> AgentSessionList:
         """Return soft-deleted sessions for the frontend recycle bin."""
 
         return self.session_service.list_deleted_sessions(
             limit=limit, offset=offset, q=q,
             creation_source=creation_source, creator_session_id=creator_session_id,
+            ordinary_only=ordinary_only,
         )
 
     def get_session(self, *, session_id: str) -> AgentSessionDetail:
@@ -2971,6 +3233,11 @@ class LocalKnowledgeAgentRuntime:
             if workspace.state == "created":
                 return workspace
             target = Path(workspace.backend_path)
+            service = getattr(self, "node_workspaces", None)
+            if service is not None:
+                service.check_path(target, write=True)
+                if service.mounted_workspace_for_path(target) is not None:
+                    raise PermissionError("Mounted workspace directories require the pinned direct interface")
             resolved = self.path_resolver.resolve_workspace(str(target))
             if not self.path_resolver.is_allowed_workspace(resolved):
                 raise ValueError("workspace path is outside configured LKA_WORKSPACE_ROOTS")
@@ -2997,6 +3264,9 @@ class LocalKnowledgeAgentRuntime:
         if not isinstance(path, str) or not isinstance(platform, str):
             raise ValueError("workspace path and platform must be strings")  # noqa: TRY004 - API validation contract
 
+        service = getattr(self, "node_workspaces", None)
+        if service is not None and platform.strip().lower() == self.platform.name:
+            service.check_path(path)
         normalized_platform = platform.strip().lower()
         if normalized_platform not in {"linux", "windows", "macos"}:
             raise ValueError("platform must be one of: linux, windows, macos")
@@ -3018,6 +3288,8 @@ class LocalKnowledgeAgentRuntime:
             resolved_workspace = self.path_resolver.resolve_workspace(
                 str(resolved), source_frontend=f"{normalized_platform}-native"
             )
+        if service is not None:
+            service.check_path(resolved_workspace.normalized_path)
         exists = resolved_workspace.exists
         if exists and not resolved_workspace.resolved_path.is_dir():
             raise ValueError(f"workspace path is not a directory: {resolved_workspace.resolved_path}")

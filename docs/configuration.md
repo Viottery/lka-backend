@@ -17,6 +17,146 @@
 `LKA_DB_TIMING_SLOW_MS=50` 指定慢操作／请求阈值（毫秒），慢记录和数据库错误不受采样限制。
 修改这些变量后需在任务空闲时重启后端。记录说明见[数据库耗时排查](maintenance.md#数据库耗时排查)。
 
+## 可选云端账号、设备与共享同步
+
+这些能力默认关闭。个人云端实例可启用：
+
+```toml
+[auth]
+enabled = true
+allowed_origins = ["https://host.example-tailnet.ts.net"]
+# 非浏览器客户端需要时另设 allow_bearer_sessions = true。
+
+[devices]
+enabled = true
+
+[sync]
+enabled = true
+role = "hub"
+```
+
+应用账号使用密码登录，首个账号由 `scripts/manage_accounts.py create-admin owner` 在服务器终端创建。
+所有账号都是共享同一套个人数据的受信任管理员，不提供不同用户之间的数据隔离，也不开放匿名注册。
+密码使用带随机盐的 PBKDF2-SHA256（600000 次）；改密/重置会撤销目标账号全部会话。
+浏览器使用 HttpOnly/Secure/SameSite=Strict cookie；写请求需要已配置的完整 Origin 和登录返回的 CSRF token。
+`require_https`、`secure_cookie` 默认 true；反向代理只信任明确的本机入口，不能通过外部任意转发头绕过。
+认证保护普通 API、附件、文件、文档和 SSE；公开健康接口只返回最小服务状态，
+`/client` 及其固定静态资源提供不含凭据的登录入口。
+消息 IMPORT/API/CONTROL 凭据继续单独校验，应用登录不代替这些凭据。
+
+设备登记时分别批准系统环境、能力、工作区 ID 和 scopes。`heartbeat` 允许报告状态，
+`sync.read` 明确授予读取整套共享投影，`sync.propose` 只允许提交待核对提案；后两者默认不授予。
+设备令牌仅在登记/轮换时返回一次，服务器只保存哈希。固定选择在目标离线时返回冲突，不自动换电脑；
+自动选择只在批准的候选设备、环境、能力及工作区中解析目标。当前选择接口不执行远程命令。
+
+另一台电脑的本地副本配置如下，密钥放本机环境变量，不写入 TOML：
+
+```toml
+[sync]
+enabled = true
+role = "replica"
+hub_url = "https://host.example-tailnet.ts.net"
+hub_id = "从已认证的云端同步状态读取的hub_id"
+token_env = "LKA_NODE_TOKEN"
+poll_seconds = 15
+page_size = 100
+request_timeout_seconds = 10
+
+[management]
+enabled = false
+```
+
+replica 模式将读取副本保存在自己的 `data_dir/shared-replica.sqlite3`，不覆盖本机 `lka.sqlite3`。
+后台线程主动心跳和拉取有界分页，固定 hub 身份，拒绝重定向和环境代理；设备需授予 heartbeat 与 sync.read。
+可用 `scripts/cloud_sync.py status` 或 `run --max-pages 8` 检查/执行单次同步。
+`queue --file proposal.json` 将形如 `{"kind":"memory_candidate","text":"..."}` 的 JSON 提案持久排队，
+kind 也可为 `assistant_note`；
+可另给稳定 `proposal_id`、`target_ref` 和 `base_revision`；重试同 ID 不得改变内容。提交还需要 sync.propose。
+提案不会自动成为有效记忆或执行指令；云端只支持标为 reviewed/rejected，正式记忆修改仍走原领域接口。
+
+同步包括有效记忆及来源状态、助理身份/目标、事项、委派和交付索引；普通会话消息、运行租约、
+模型配置、私有路径、凭据、附件及文件内容均不复制。副本读取会检查源有效性、期限和删除状态。
+普通 Agent 的上下文与 memory.search/read 会读取本地镜像，允许脏读，不因云端断线阻塞。
+本地与云端记忆 ID 分开，不覆盖本地记忆表；项目记忆用 sync.memory_project_bindings
+显式映射本地记忆 project_id 到云端 project_id。sync.memory_cache_stale_seconds 默认 60，
+只影响新鲜度显示，不是过期授权；已知删除、来源失效及记忆本身的 expires_at 仍过滤。
+云端与节点可显式打开 `sync.memory_write_enabled=true`，并给受信任节点授予 `sync.memory.write`。
+节点 `/client` 的共享记忆面板支持人工确认的新增、更正和撤回；离线编辑持久排队，
+直到云端接受并重新拉取前不影响本地检索。更新携带预期版本，冲突保留提案和当前版本，
+由用户重新选择提交，不采用最后写入覆盖。仅启用人工编辑时，自动学习的记忆仍保留本机；
+自动同步需另启用下述数据库同步开关。
+这个 scope 信任节点为已登录用户证明人工操作；它不是端到端用户签名，不能授予不受信任节点。
+
+自动学习记忆的数据库同步使用独立开关 `sync.memory_aggregation_enabled=true`，
+云端与节点均须启用，节点另需 `sync.memory.aggregate`。
+该 scope 明确授权受信任节点后台复制已发布记忆的 active/candidate 状态，
+不要求每条重新人工确认，也不向模型开放伪造确认身份的参数。
+各节点独立保存记忆数据库，以事务变更记录和持久队列上传；云端按规范化内容、类型、
+全局/项目范围、敏感级别和期限核对重复，合并来源关联，保留冲突待核对。
+正常记忆可共享，敏感记录及未绑定项目不自动导出；不会复制完整会话或 SQLite 文件。
+撤回、来源失效和隐私变化要传播，已被云端接管的本地条目不能在共享删除后作为旧副本复活。
+此开关与原手工共享编辑开关独立，默认关闭；启用代表批准该节点参与记忆数据库汇总。
+`scripts/cloud_sync.py run` 用于镜像拉取和普通提案检查，不代替记忆归集或人工编辑队列的后台 worker。
+记忆发布由正常运行时统一执行，可从节点 `/local/cache` 的 memory_aggregation 查看状态。
+
+### 设备直连与远程任务
+
+云端另启用 `[connections].enabled=true`、`[remote_execution].enabled=true` 和管理助理。
+账号登录后可在 `/client` 查看设备、获取单节点连接授权和访问助理。
+登记设备时，按用途授予 connections.poll、execution.poll、execution.run、execution.result；
+不授予这些 scope 的设备不能领取对应授权/任务。advertised_url 填节点自身的 Tailscale HTTPS origin。
+
+节点在上面的 replica 配置基础上增加：
+
+```toml
+[connections]
+enabled = true
+node_id = "desktop-a"
+allowed_origins = ["https://desktop-a.example-tailnet.ts.net"]
+workspace_roots = { work = "/home/me/work" }
+
+[remote_execution]
+enabled = true
+environment_id = "linux"
+workspace_mappings = { work = "/home/me/work" }
+allowed_tools = ["filesystem.read_file"]
+poll_seconds = 3
+```
+
+同一 workspace_id 在两个映射中必须指向相同本机路径，并包含于该节点的 LKA_WORKSPACE_ROOTS；
+Linux 路径不能直接复制到 Windows。节点已登记的环境必须批准该 workspace_id。
+allowed_tools 是节点操作者明确授予远程任务的工具；空列表不提供工具，不因云端任务要求扩大。
+远程任务使用原安全审查并强制 manual，权限、租约和审批不用脏缓存判断。
+跨机累计后台预算尚不能转移，带该类预算的委派明确拒绝；不重置额度。
+
+节点轮询接收一次性连接授权的哈希，客户端在节点 `/connections/redeem` 兑换本地会话，
+浏览器不持有设备 token。已有节点会话、普通任务和缓存读取可在云端离线时继续，
+模型仍需该节点自己的可用配置；这不承诺云端下线时外部模型供应商也可离线使用。
+本地 cookie 有效时新标签页可以从 `/connections/me` 恢复 CSRF；本机账户也可独立配置，
+不复制云端账户/密码数据库。新云端授权及助理任务派发仍需云端在线。
+
+助理派发时 execution_target 可包含 device_id、environment_id、workspace_id、capabilities，
+workspace_path 仅用于原本机执行，不能与远程 target 混用。远程任务会话从云端查看，
+普通会话及文件管理从节点 `/client` 访问。远程任务支持取消、审批、检查点暂停/继续和用户问答。
+已确认终态后可在原会话补充指令，执行目标和工作区保持绑定；未知副作用不自动恢复。
+Linux 节点可使用操作者已建立的原生挂载：在 workspace_roots 登记挂载根目录，
+再以 `connections.workspace_mounts.<ID>` 配置 expected_filesystem、expected_source、read_only
+及 health_probe_timeout_seconds（默认 2 秒）。根目录必须与 Linux mountinfo 中挂载点精确匹配。
+未挂载、来源变化或探测失败时不可使用，直连文件接口使用挂载身份与目录描述符，
+不会向卸载后露出的本机目录回退写入。数据库和检查点目录不得与挂载工作区重叠。
+当前不安装或自动建立挂载，也不支持 Windows 挂载身份验证；通用 Agent 工具向挂载目录写入
+暂时拒绝，创建文件/目录须经直连工作区接口。探测不能证明提供程序缓存的新鲜度，
+也不能瞬时停止已提交给内核的 I/O；需要写回缓存的挂载不能当作严格断线拒写方案。
+通用工具的路径读取仍有卸载竞态；需要固定挂载身份的读取应使用直连文件接口。
+
+`remote_execution.shell_trust` 默认 `disabled`。明确设置 `host_user` 且批准 `bash.run` 后，
+没有继承来源/副作用限制的任务可获得冻结的原生执行授权，每次调用都须人工审批并重验活租约。
+这允许以节点操作系统用户身份访问文件和网络，工作目录不构成沙箱。配置撤销后后续调用被拒绝；
+挂载工作区和受限来源任务不会因此获得原生执行权。
+
+节点 `/client` 可列出并撤销自己的连接。云端撤销既有连接、修改密码或禁用账号后，
+节点下一次成功拉取授权代次时撤销旧会话；断网本身不清除本地连接，也不保证离线即时撤销。
+
 ## 接入模型
 
 管理特殊会话的后端试用入口默认关闭。仅在需要时设置：

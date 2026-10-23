@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>理事所 · 工作台</title>
+  <link rel="stylesheet" href="/client/client.css">
+  <script defer src="/client/client.js"></script>
+</head>
+<body>
+  <header class="masthead">
+    <a class="brand" href="/client">理事所<span>随处接续手边的事</span></a>
+    <div class="location"><span class="signal" id="signal"></span><strong id="place">正在连接</strong><span id="identity"></span></div>
+    <button id="logout" class="quiet" hidden>退出</button>
+  </header>
+  <div id="notice" role="status" aria-live="polite" hidden></div>
+  <section id="login-panel" class="login-panel" hidden aria-labelledby="login-title">
+    <form id="login-form">
+      <h1 id="login-title">登录工作台</h1>
+      <p id="login-help">使用此服务的账号登录。</p>
+      <label>账号<input id="username" name="username" autocomplete="username" maxlength="64" required></label>
+      <label>密码<input id="password" name="password" type="password" autocomplete="current-password" maxlength="256" required></label>
+      <button class="primary" type="submit">登录</button>
+      <p id="login-error" class="error" role="alert"></p>
+    </form>
+  </section>
+  <div id="workbench" class="workbench" hidden>
+    <nav class="mobile-nav" aria-label="工作区面板">
+      <button data-panel="conversation" aria-pressed="true">对话</button>
+      <button data-panel="sessions" aria-pressed="false">会话</button>
+      <button data-panel="resources" aria-pressed="false">终端与文件</button>
+    </nav>
+    <aside class="sessions" id="sessions-panel">
+      <div class="section-heading"><h2 id="sessions-heading">本机会话</h2><button id="refresh-sessions" class="quiet" aria-label="刷新会话">刷新</button></div>
+      <button id="new-session" class="new-session">＋ 新建普通会话</button>
+      <div id="session-list" class="session-list"></div>
+      <p class="sidebar-note" id="scope-note"></p>
+    </aside>
+    <main class="conversation" id="conversation-panel">
+      <div class="conversation-heading"><div><p id="conversation-kind" class="context-label"></p><h1 id="conversation-title">选择一个会话</h1></div><button id="refresh-chat" class="quiet">刷新记录</button></div>
+      <div id="messages" class="messages" aria-label="会话记录"><p class="empty">在这里接着说。</p></div>
+      <div id="run-status" class="run-status" role="status" aria-live="polite"></div>
+      <div id="reviews" class="reviews"></div>
+      <form id="composer" class="composer">
+        <label class="sr-only" for="message">消息</label>
+        <textarea id="message" rows="3" maxlength="100000" placeholder="说说接下来要做什么…" required></textarea>
+        <div class="composer-actions"><span id="composer-hint">Enter 换行，Ctrl / ⌘ + Enter 发送</span><button id="disconnect" type="button" class="quiet" hidden>断开显示</button><button id="send" type="submit" class="primary">发送</button></div>
+      </form>
+    </main>
+    <aside class="resources" id="resources-panel">
+      <section id="devices-panel" hidden><div class="section-heading"><h2>已批准的终端</h2><button id="refresh-devices" class="quiet">刷新</button></div><p class="help">进入电脑后，对话与文件直接连接该终端。</p><div id="device-list"></div></section>
+      <section id="files-panel" hidden>
+        <h2>当前终端的工作区</h2>
+        <label>工作区<select id="workspace"><option value="">选择工作区</option></select></label>
+        <button id="bind-workspace" class="subtle">将会话绑定到此工作区</button>
+        <div class="section-heading file-heading"><span id="file-path">/</span><button id="file-up" class="quiet">上一级</button><button id="refresh-files" class="quiet">刷新</button></div>
+        <div id="file-list" class="file-list"></div>
+        <form id="upload-form" class="upload-form"><label>上传新文件<input id="upload-file" type="file" required></label><label>文件名<input id="upload-name" maxlength="200" placeholder="留空使用原文件名"></label><button type="submit" class="subtle">上传到当前目录</button><p class="help">每个文件最多 32 MiB，已有同名文件保留。</p></form>
+      </section>
+      <section id="remote-panel" hidden><div class="section-heading"><h2>终端任务</h2><button id="refresh-tasks" class="quiet">刷新</button></div><p class="help">查看助理派出的任务、结果与待确认操作。</p><form id="task-form" class="inline-form"><label class="sr-only" for="task-id">任务 ID</label><input id="task-id" placeholder="输入任务 ID 查看" maxlength="200" required><button type="submit" class="subtle">查看</button></form><div id="task-list"></div></section>
+      <section id="shared-memory-panel" hidden aria-labelledby="shared-memory-heading">
+        <div class="section-heading"><h2 id="shared-memory-heading">共享记忆</h2><button id="refresh-shared-memory" class="quiet">刷新</button></div>
+        <p class="help">读取当前终端的镜像。编辑先在本机排队，由云端核对版本；待提交或冲突内容不会进入记忆召回。</p>
+        <p id="shared-memory-status" class="help" role="status" aria-live="polite"></p>
+        <label>查看范围<select id="shared-memory-scope"><option value="global">全局记忆</option><option value="project">所选工作区的项目记忆</option></select></label>
+        <div id="shared-memory-records"></div>
+        <button id="new-shared-memory" type="button" class="subtle">新增共享记忆</button>
+        <form id="shared-memory-form" class="shared-memory-form">
+          <h3 id="shared-memory-edit-title">新增共享记忆</h3>
+          <p id="shared-memory-target" class="help"></p>
+          <label>内容<textarea id="shared-memory-content" rows="3" maxlength="500" required></textarea></label>
+          <label>记忆类型<select id="shared-memory-type"><option value="preference">偏好</option><option value="project_decision">项目决定</option><option value="user_fact">个人事实</option></select></label>
+          <label>保存范围<select id="shared-memory-sensitivity"><option value="normal">普通，可同步到已批准终端</option><option value="personal">敏感，不进入终端镜像；提交记录保留本机</option></select></label>
+          <label class="memory-consent"><input id="shared-memory-confirm" type="checkbox" required><span id="shared-memory-confirm-label">我确认这是我本人要保存的记忆，并授权正式提交。</span></label>
+          <button id="submit-shared-memory" type="submit" class="subtle">确认并排队提交</button>
+          <button id="cancel-shared-memory" type="button" class="quiet">取消编辑</button>
+        </form>
+        <h3 class="memory-outbox-heading">提交记录</h3><div id="shared-memory-outbox"></div>
+      </section>
+      <section id="connections-panel" hidden><div class="section-heading"><h2>我的终端连接</h2><button id="refresh-connections" class="quiet">刷新</button></div><div id="connection-list"></div></section>
+      <section class="connection-note"><h2>连接说明</h2><p id="connection-help"></p><p id="cache-status" hidden aria-live="polite"></p><button id="refresh-cache" class="quiet" hidden>刷新记忆状态</button></section>
+    </aside>
+  </div>
+</body>
+</html>

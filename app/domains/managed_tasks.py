@@ -505,7 +505,16 @@ class ManagedTaskService:
         return {"title": self.management._title(title),
                 "envelope": self._envelope(context, caller, command_id, purpose), "workspace": workspace}
 
-    def start_task(self, context, *, command_id, purpose, title="管理任务", workspace_path=None):
+    def start_task(self, context, *, command_id, purpose, title="管理任务", workspace_path=None,
+                   execution_target=None):
+        if execution_target is not None:
+            if workspace_path is not None:
+                raise ValueError("Remote workspaces require an approved workspace_id, not workspace_path")
+            remote = getattr(self, "remote_execution", None)
+            if remote is None:
+                raise ManagementConflictError("Remote execution is disabled; target was not changed")
+            return remote.start_managed_task(context, command_id=command_id, purpose=purpose,
+                                             title=title, execution_target=execution_target)
         prepared = self.prepare_task(context, command_id=command_id, purpose=purpose, title=title, workspace_path=workspace_path)
         with closing(self._conn()) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -557,8 +566,22 @@ class ManagedTaskService:
         result = self._receipt(conn, context, command_id, command_action, fingerprint, run)
         return result, run
 
+    def list_execution_targets(self, context):
+        self.caller(context)
+        remote = getattr(self, "remote_execution", None)
+        if remote is None:
+            return {"items": [], "enabled": False}
+        return {"enabled": True, **remote.execution_targets()}
+
     def send_instruction(self, context, *, command_id, session_id, expected_run_id, purpose):
         caller = self.caller(context, mutate=True)
+        target_session = self.sessions.get_session_or_none(session_id=session_id)
+        if target_session is not None and target_session.metadata.get("remote_execution"):
+            remote = getattr(self, "remote_execution", None)
+            if remote is None:
+                raise ManagementConflictError("Remote task authority is unavailable")
+            return remote.send_instruction(context, command_id=command_id, session_id=session_id,
+                                           expected_run_id=expected_run_id, purpose=purpose)
         envelope = self._envelope(context, caller, command_id, purpose)
         args = {"session_id": session_id, "expected_run_id": expected_run_id, "purpose": purpose}
         with closing(self._conn()) as conn, conn:
@@ -641,6 +664,26 @@ class ManagedTaskService:
             self._target(conn, record["session_id"], manager_session_id=context.session_id)
             if record.get("parent_run_id"):
                 raise ManagementConflictError("Control the task root, not its child")
+            remote_marker = record.get("metadata", {}).get("remote_execution")
+            if remote_marker and action != "cancel":
+                remote = getattr(self, "remote_execution", None)
+                if remote is None:
+                    raise ManagementConflictError("Remote task authority is unavailable")
+                if action == "resume" and context.run_id:
+                    caller_row = conn.execute("SELECT record_payload FROM agent_runs WHERE run_id=?", (context.run_id,)).fetchone()
+                    if caller_row and self.budget_metadata(json.loads(caller_row[0]).get("metadata", {})):
+                        raise ManagementConflictError("Remote resume cannot transfer cumulative background budgets")
+                # Exit the local write transaction before the remote command service
+                # performs its own durable admission. Never dispatch a hub shadow.
+                conn.commit()
+                remote.control(remote_marker["task_id"], command_id=context.session_id + ":" + command_id, action=action)
+                conn.execute("BEGIN IMMEDIATE")
+                self.caller(context, mutate=True, conn=conn)
+                _, prior = self._command(conn, context, command_id, action, {"run_id": run_id})
+                if prior:
+                    return prior
+                run = AgentRunRecord.model_validate(record)
+                return self._receipt(conn, context, command_id, action, fingerprint, run)
             if action == "resume":
                 self.require_durable_execution()
                 if record["status"] != "paused":
@@ -658,7 +701,14 @@ class ManagedTaskService:
         # These controls are idempotent against the explicit run ID. They never
         # retarget a later user run, and do not execute a model in this service.
         self.caller(context, mutate=True)
-        if action == "pause":
+        remote_marker = record.get("metadata", {}).get("remote_execution")
+        if remote_marker:
+            remote = getattr(self, "remote_execution", None)
+            if remote is None:
+                raise ManagementConflictError("Remote task authority is unavailable")
+            remote.cancel(remote_marker["task_id"])
+            run = self.run_manager.get_run(run_id)
+        elif action == "pause":
             run = self.interrupt(run_id)
         else:
             run = self.run_manager.cancel_run(run_id, reason="Management command")

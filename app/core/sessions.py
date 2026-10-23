@@ -90,6 +90,9 @@ class SessionRunPolicy(BaseModel):
     """Server-owned defaults frozen into a run, never inferred from metadata."""
 
     allow_default_workspace: bool = True
+    # Isolated delegated roots consume their bounded snapshot instead of local
+    # automatic recall, preference extraction and ambient guidance files.
+    use_local_context: bool = True
     role_instructions: str | None = Field(default=None, max_length=16000)
     llm_client_name: str | None = None
     llm_model: str | None = None
@@ -279,20 +282,24 @@ class SessionService:
         project_id: str | None = None,
         creation_source: SessionCreationSource | None = None,
         creator_session_id: str | None = None,
+        ordinary_only: bool = False,
     ) -> AgentSessionList:
         return self._list_sessions(
             status_clause="status != 'deleted'", limit=limit, offset=offset, q=q,
             project_id=project_id, creation_source=creation_source, creator_session_id=creator_session_id,
+            ordinary_only=ordinary_only,
         )
 
     def list_deleted_sessions(
         self, *, limit: int = 50, offset: int = 0, q: str | None = None,
         creation_source: SessionCreationSource | None = None,
         creator_session_id: str | None = None,
+        ordinary_only: bool = False,
     ) -> AgentSessionList:
         return self._list_sessions(
             status_clause="status = 'deleted'", limit=limit, offset=offset, q=q,
             creation_source=creation_source, creator_session_id=creator_session_id,
+            ordinary_only=ordinary_only,
         )
 
     def _list_sessions(
@@ -300,9 +307,14 @@ class SessionService:
         project_id: str | None = None,
         creation_source: SessionCreationSource | None = None,
         creator_session_id: str | None = None,
+        ordinary_only: bool = False,
     ) -> AgentSessionList:
         query = q.strip() if q else ""
         search_clause = ""
+        if ordinary_only:
+            search_clause += " AND kind='ordinary' AND creator_session_id IS NULL " \
+                             "AND creation_source IN ('user','unknown') " \
+                             "AND json_extract(metadata,'$.remote_execution') IS NULL"
         params: list[Any] = []
         if creation_source is not None:
             self._validate_creation_source(creation_source, None)
@@ -339,6 +351,12 @@ class SessionService:
         params.extend((limit, offset))
         conn = self._conn_factory()
         try:
+            if ordinary_only and conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='managed_session_links'"
+            ).fetchone():
+                search_clause += " AND NOT EXISTS (SELECT 1 FROM managed_session_links l " \
+                                 "WHERE l.task_session_id=agent_sessions.session_id " \
+                                 "OR l.manager_session_id=agent_sessions.session_id)"
             rows = conn.execute(
                 f"""
                 SELECT session_id, title, status, kind, creation_source, creator_session_id,

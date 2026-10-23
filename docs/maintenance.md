@@ -135,6 +135,119 @@ Windows CurrentUser DPAPI 凭据需重新配对，邮箱或外部模型服务也
 按随包的检查工具校验。它可能含真实凭据，不作为公开下载包上传。
 软件更新不会自动同步两台电脑的会话、记忆或资料。
 
+## Ubuntu 22.04 云端共享核心
+
+云端沿用原生 Python、SQLite 和 systemd，不使用 Docker。此节描述部署操作，
+更新源码本身不会自动迁移数据、发布网络入口或重启已有服务。
+
+1. 使用专用非 root 用户 `lka`，准备源码目录 `/opt/lka-backend`、私有配置目录 `/etc/lka`
+   和数据目录 `/var/lib/lka`。仅该用户和管理员可读私有配置与运行数据。
+   项目要求 Python 3.12 及以上；在该用户下安装 uv，按
+   [uv 的 Python 管理说明](https://docs.astral.sh/uv/guides/install-python/)准备独立解释器，
+   不替换 Ubuntu 系统 Python。在源码目录执行：
+
+```bash
+uv python install 3.12
+uv sync --locked --python 3.12
+```
+
+2. 从模板创建新的 `/etc/lka/local.toml`（已有文件只做定点修改），配置真实模型，
+   启用 `[auth]`、`[devices]`、`[sync] role="hub"`，并把 auth.allowed_origins 设为实际前端 HTTPS origin。
+   需要云端长期助理时启用 `[management].enabled=true`；其自主唤醒仍按原配置独立控制。
+   embedding/reranker 的 cache_dir 可设为 `/var/lib/lka/models`，不要沿用 Windows 路径。
+   模型下载及远程模型调用不包含在启动验证中，按用途单独配置和验证。
+
+3. 创建权限受限的 `/etc/lka/backend.env`，至少包含：
+
+```dotenv
+LKA_DATA_DIR=/var/lib/lka
+LKA_LOCAL_CONFIG=/etc/lka/local.toml
+# 在这里按配置填写模型密钥等；设备令牌用于各自节点，不共用账号密码。
+```
+
+在交互终端以相同数据/配置路径创建首个管理员，密码由 getpass 输入，不写在命令行：
+
+```bash
+LKA_DATA_DIR=/var/lib/lka LKA_LOCAL_CONFIG=/etc/lka/local.toml .venv/bin/python scripts/manage_accounts.py create-admin owner
+```
+
+4. 按服务器路径检查 [systemd 单元示例](../scripts/deploy/lka-cloud.service.example)，
+   安装为系统服务 `lka-cloud.service`。其 `--require-auth` 要求现存配置明确启用账号、HTTPS 和
+   secure cookie，缺文件或关闭认证直接拒绝启动；不可省略该参数来消除云端启动错误。
+   代理转发头只信任 127.0.0.1，监听也保持 127.0.0.1:8765，单实例运行，不能另加多个 worker。
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now lka-cloud.service
+sudo systemctl status lka-cloud.service
+```
+
+5. 云端加入 tailnet 后，通过 [Tailscale Serve](https://tailscale.com/docs/reference/tailscale-cli/serve)
+   将 HTTPS 入口反向代理到本机服务。例如在确认该服务器现有 Serve 配置后：
+
+```bash
+sudo tailscale serve --bg http://127.0.0.1:8765
+tailscale serve status
+```
+
+使用 tailnet 内的 HTTPS 入口，不开启公网 Funnel。后端明文端口不直接对外放行。
+Tailscale 负责网络准入，应用仍要求账号或设备凭据；不能把转发的用户头当成账号登录。
+同站前端入口、Origin、cookie、CSRF、SSE 和代理头需要在真实手机/电脑逐项验证，
+不能只依靠本机健康检查。健康检查公开最小状态，未登录 `/sessions` 应为 401，
+直接 HTTP 请求登录接口应为 403；错误转发头配置应修复代理，不关闭 require_https。
+
+6. 登录后登记电脑及其系统/工作区，显式授予 heartbeat、sync.read（需要候选上报时另授 sync.propose）。
+   妥善保存一次性返回的设备 token，在该电脑环境中设置 LKA_NODE_TOKEN。
+   从已认证的 `/sync/status` 获取 hub_id，配置电脑为 replica；先运行
+   `python scripts/cloud_sync.py run --max-pages 8`，核对游标，再启用本地后台轮询。
+   大量初始数据可能需要多次分页。提案提交失败不阻止下一轮拉取，状态会保留错误及 pending 计数。
+
+### 多电脑节点与手机入口
+
+启用多机工作前，按[配置说明](configuration.md#设备直连与远程任务)增加 connections 和 remote_execution。
+节点的每个对外后端入口使用稳定独立的 node_id、自己的数据目录与 HTTPS origin；
+若同一物理电脑分别运行 Windows/WSL 后端，直连时应分别登记为可辨认的节点入口，
+不能让两个进程共用 SQLite 或用相同地址假装可以互换。
+执行目录只在节点本地配置，云端记录 workspace_id。登记的 execution scopes 和节点 allowed_tools
+均需明确批准。原生 shell 默认关闭；仅在理解操作系统用户权限后设置 shell_trust=host_user，
+另授 bash.run，并逐次人工审批。cwd 不限制进程访问范围，受限来源或挂载工作区不授予此权限。
+
+Linux 节点可按 [节点 systemd 示例](../scripts/deploy/lka-node.service.example)安装独立服务，
+其环境文件包含本机 LKA_DATA_DIR、LKA_LOCAL_CONFIG、LKA_NODE_TOKEN 与本机模型凭据。
+示例使用 `--require-node`，缺失配置或缺少节点认证边界时拒绝启动；代理仍只信任 127.0.0.1。
+其他 Windows 电脑使用原生环境时，可运行
+`python scripts/start_backend.py personal --require-node`，不要在当前以 WSL 为日常主后端的电脑另启第二套日常实例。
+本轮不自动安装开机任务、覆盖凭据或调整 tailnet 策略。
+
+云端和节点都可由自己的 HTTPS origin 打开 `/client`，不需要在手机安装后端。
+云端入口登录后使用统一助理，或选择设备进入节点入口。连接授权由节点轮询接收，默认最长 120 秒有效，
+页面等待期间应保持节点服务在线；地址中一次性授权仅用 fragment，页面读取后立即移除。
+已连接节点的普通会话、文件及记忆缓存全部通过该节点处理；关闭云端不会使普通请求改走云端。
+节点连接 cookie 默认有效 30 天，本地退出、撤销或到期后需重新建立连接；
+独立本机账户须提前在本机配置，不能把“断云可工作”解释为离线接受新的云端账户认证。
+云端改密、禁用账号或撤销连接会增加授权代次，节点重新成功同步后撤销旧连接。
+断网期间保留已有连接；如需当场撤销，应在目标节点本地撤销或停止对外入口。
+共享记忆正式编辑需双方启用 memory_write_enabled 和节点 sync.memory.write scope；
+升级前备份各自数据库，保留节点待提交队列，不将它当作已发布记忆。
+自动学习记忆同步需云端和节点均启用 sync.memory_aggregation_enabled，并授予节点
+sync.memory.aggregate；默认关闭，与人工编辑开关独立。它由正常运行时的后台 worker
+上传和拉取，沿用 active/candidate 状态并做精确去重，不用复制 SQLite 文件。
+启用范围、项目映射及删除传播见[账号与同步配置](configuration.md#可选云端账号设备与共享同步)。
+
+节点执行 worker 会分别报告环境在线状态，不能只看设备心跳推断某个系统能执行任务。
+从云端查看任务摘要、回报与审批；禁止直接在节点普通入口打开助理派生会话。
+断云时远程任务在后续执行/发布检查停止，未知结果不重放；普通节点任务继续使用本机模型配置。
+远程任务支持检查点恢复和同会话续作，续作保留原设备与工作区；
+在途任务、未知外部效果或无法安全继承的累计预算会阻止相应操作。
+跨机器累计预算迁移、真正远程挂载及完整安装更新器仍不提供。
+内置连接入口覆盖基本对话、文件和任务回报；现有桌宠工作台的全部高级界面尚未接入多机身份体系。
+
+云端数据库放服务器本地磁盘，电脑数据库各自独立，不通过 SMB/NFS/SSHFS 共享 SQLite 文件。
+普通会话保留本地；共享副本不能直接当成云端全量备份或热备调度器。
+如需把现有日常助理迁往云端，另行确定权威数据、等待任务空闲、备份两边，
+一致迁移数据库及所需本地资料，核对路径、凭据、用量和发布水位后再切换唯一协调器。
+不要把空云端库自动覆盖本机数据，不同时运行两套同身份的自主助理。
+
 ## 数据库耗时排查
 
 后端启动时默认向实际数据目录的 `logs/database_timing.jsonl` 写入 JSONL。

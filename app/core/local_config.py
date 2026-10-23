@@ -9,6 +9,12 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from app.domains.accounts import AccountConfig
+from app.domains.device_connections import DeviceConnectionConfig
+from app.domains.devices import DeviceConfig
+from app.domains.remote_execution import RemoteExecutionConfig
+from app.domains.shared_sync import SharedSyncConfig
+
 
 def _is_env_var_name(value: str) -> bool:
     return (
@@ -574,6 +580,11 @@ class ManagementConfig(BaseModel):
 
 
 class LocalAppConfig(BaseModel):
+    auth: AccountConfig = Field(default_factory=AccountConfig)
+    devices: DeviceConfig = Field(default_factory=DeviceConfig)
+    sync: SharedSyncConfig = Field(default_factory=SharedSyncConfig)
+    connections: DeviceConnectionConfig = Field(default_factory=DeviceConnectionConfig)
+    remote_execution: RemoteExecutionConfig = Field(default_factory=RemoteExecutionConfig)
     llm: LLMProviderConfig = Field(default_factory=LLMProviderConfig)
     safety: SafetyReviewConfig = Field(default_factory=SafetyReviewConfig)
     agent: AgentConfig = Field(default_factory=AgentConfig)
@@ -586,6 +597,47 @@ class LocalAppConfig(BaseModel):
     message_history: MessageHistoryConfig = Field(default_factory=MessageHistoryConfig)
     background: BackgroundConfig = Field(default_factory=BackgroundConfig)
     management: ManagementConfig = Field(default_factory=ManagementConfig)
+
+    @model_validator(mode="after")
+    def cloud_boundaries(self) -> LocalAppConfig:
+        if self.devices.enabled and not self.auth.enabled:
+            raise ValueError("Device registration requires auth.enabled")
+        if self.sync.enabled:
+            if self.sync.role == "hub" and not self.auth.enabled:
+                raise ValueError("The shared sync hub requires auth.enabled")
+            if self.sync.role == "replica":
+                if not self.sync.hub_url or not self.sync.hub_id:
+                    raise ValueError("A replica requires an HTTPS hub_url and pinned hub_id")
+                if self.management.enabled:
+                    raise ValueError("A cloud replica cannot run a second management coordinator")
+            if self.sync.memory_write_enabled or self.sync.memory_aggregation_enabled:
+                if not self.memory.enabled:
+                    raise ValueError("Shared memory publication requires memory.enabled")
+                if self.sync.role == "hub" and not self.devices.enabled:
+                    raise ValueError("Shared memory publication requires registered devices")
+                if self.sync.role == "replica" and not self.connections.enabled:
+                    raise ValueError("Shared memory publication requires authenticated node connections")
+        if self.connections.enabled or self.remote_execution.enabled:
+            if not self.sync.enabled:
+                raise ValueError("Distributed connections and execution require explicit sync role")
+            if self.sync.role == "hub" and not (self.auth.enabled and self.devices.enabled):
+                raise ValueError("Distributed hub requires accounts and device registration")
+            if self.sync.role == "replica":
+                if self.connections.enabled and not self.connections.node_id:
+                    raise ValueError("Direct node connections require connections.node_id")
+                if self.remote_execution.enabled and not self.remote_execution.environment_id:
+                    raise ValueError("Remote execution requires the local environment_id")
+                if self.remote_execution.enabled and not self.connections.enabled:
+                    raise ValueError("Execution replicas require the direct-node session boundary")
+                for identity, path in self.remote_execution.workspace_mappings.items():
+                    from pathlib import Path
+
+                    if not Path(path).expanduser().is_absolute():
+                        raise ValueError("Execution workspace mappings require absolute local paths")
+                    shared = self.connections.workspace_roots.get(identity)
+                    if shared is not None and Path(shared) != Path(path):
+                        raise ValueError("Workspace ID must map to one local path")
+        return self
 
     @model_validator(mode="after")
     def inference_profiles_match_llm_clients(self) -> LocalAppConfig:

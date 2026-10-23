@@ -944,10 +944,12 @@ class AgentTurnLoop:
         return run
 
     def _inference_snapshot_for_run(self, run: AgentRunRecord) -> ContextSnapshot | None:
-        if run.parent_run_id is None:
+        if run.parent_run_id is None and run.metadata.get("session_policy", {}).get("use_local_context", True):
             return None
         raw_snapshot = run.metadata.get("context_snapshot")
         if not isinstance(raw_snapshot, dict):
+            if run.parent_run_id is None:
+                raise ValueError("Isolated root execution requires a bounded context snapshot")
             return None
         snapshot = ContextSnapshot.model_validate(raw_snapshot)
         if (
@@ -1209,7 +1211,7 @@ class AgentTurnLoop:
         self, workspace_path: str | None, user_input: str, source_message_id: str,
     ) -> None:
         callback = self.memory_pre_turn_callback
-        if callback is None or _turn_inference_snapshot.get() is not None:
+        if callback is None or _turn_inference_snapshot.get() is not None or not self._session_run_policy().use_local_context:
             return
         source_callback = getattr(callback, "on_persisted_user_message", None)
         if callable(source_callback):
@@ -1251,7 +1253,7 @@ class AgentTurnLoop:
         context_window_payload["current_time"] = current_time_payload()
         if session.workspace is not None:
             context_window_payload["workspace"] = session.workspace.model_dump(mode="json")
-        if self.instruction_files is not None:
+        if self.instruction_files is not None and self._session_run_policy().use_local_context:
             context_window_payload["agent_instructions"] = self.instruction_files.for_workspace(
                 self._workspace_for_run(session, run_id)
             )
@@ -6124,7 +6126,10 @@ class AgentTurnLoop:
 
         sanitized = dict(context_window)
         sanitized.pop("cached_tool_observations", None)
-        if self.instruction_files is not None:
+        if not self._session_run_policy().use_local_context:
+            sanitized.pop("agent_instructions", None)
+            sanitized.pop("recalled_memories", None)
+        elif self.instruction_files is not None:
             workspace = sanitized.get("workspace")
             default_root = self.default_workspace_root if self._session_run_policy().allow_default_workspace else None
             workspace_path = workspace.get("backend_path") if isinstance(workspace, dict) else None
@@ -6138,7 +6143,8 @@ class AgentTurnLoop:
         workspace_path: str | None,
         user_input: str,
     ) -> dict[str, Any] | None:
-        if self.memory_context_provider is None or _turn_inference_snapshot.get() is not None:
+        if (self.memory_context_provider is None or _turn_inference_snapshot.get() is not None
+                or not self._session_run_policy().use_local_context):
             return None
         try:
             return self.memory_context_provider(session_id, workspace_path, user_input)

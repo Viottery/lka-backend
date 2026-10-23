@@ -41,6 +41,8 @@ RAW_PREVIEW_TYPES = {
 
 
 def _require_loopback(request: Request) -> None:
+    if getattr(getattr(request, "state", None), "device_connection", None):
+        return  # Outer middleware has checked purpose, session ancestry and workspace.
     client = request.client
     try:
         address = ipaddress.ip_address(client.host if client else "")
@@ -66,6 +68,12 @@ def _get_workspace(request: Request, session_id: str) -> Path:
     if getattr(workspace, "state", "created") == "reserved":
         raise HTTPException(status_code=409, detail="session_workspace_reserved")
     bound_root = Path(workspace.backend_path)
+    service = getattr(request.app.state.runtime, "node_workspaces", None)
+    if service is not None:
+        try:
+            service.check_path(bound_root)
+        except (PermissionError, OSError, ValueError) as exc:
+            raise HTTPException(status_code=403, detail="Session workspace mount is unavailable.") from exc
     try:
         root = bound_root.resolve(strict=True)
     except (OSError, RuntimeError) as exc:

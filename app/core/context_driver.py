@@ -93,6 +93,9 @@ class ToolView(BaseModel):
     allowed_account_ids: tuple[str, ...] = ()
     memory_refs: tuple[MemoryReference, ...] = ()
     full_workspace_authority: bool = False
+    # Operator-issued host-user process authority, not a filesystem sandbox.
+    # Applies only to registered tools declaring unrestricted_execution.
+    host_execution_authority: bool = Field(default=False, strict=True)
     full_data_authority: bool = False
     side_effect_level: SideEffectLevel
     expires_at: datetime | None = None

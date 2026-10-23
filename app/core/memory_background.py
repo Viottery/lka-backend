@@ -181,6 +181,9 @@ class MemoryBackgroundCoordinator:
     def enqueue_answer(self, conn: sqlite3.Connection, message: Any) -> None:
         """Called inside SessionService.append_message transaction."""
 
+        eligible = getattr(self, "session_eligible", None)
+        if eligible is not None and not eligible(conn, message.session_id):
+            return
         trace_id = message.payload.get("trace_id")
         run_id = message.payload.get("run_id")
         if (not isinstance(trace_id, str) or not trace_id
@@ -945,6 +948,9 @@ class MemoryBackgroundCoordinator:
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 for row in rows:
+                    eligible = getattr(self, "session_eligible", None)
+                    if eligible is not None and not eligible(conn, row["session_id"]):
+                        continue
                     try:
                         answer_payload = json.loads(row["payload"] or "{}")
                     except (TypeError, ValueError):

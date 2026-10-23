@@ -24,6 +24,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=None)
     parser.add_argument(
+        "--require-auth", action="store_true",
+        help="Fail closed unless an existing personal config enables HTTPS account authentication.",
+    )
+    parser.add_argument(
+        "--require-node", action="store_true",
+        help="Require an existing replica config with local device connection authentication.",
+    )
+    parser.add_argument(
         "--test-data-dir",
         type=Path,
         default=None,
@@ -74,6 +82,10 @@ def main(argv: list[str] | None = None) -> int:
     profile: ProfileName = args.profile
     if profile == "test" and args.reload:
         raise SystemExit("--reload is unavailable in test mode; use a fresh isolated server instead.")
+    if args.require_auth and (profile != "personal" or args.reload):
+        raise SystemExit("--require-auth requires personal mode without --reload.")
+    if args.require_node and (profile != "personal" or args.reload):
+        raise SystemExit("--require-node requires personal mode without --reload.")
 
     temporary_context = (
         tempfile.TemporaryDirectory(prefix="lka_test_backend_")
@@ -85,14 +97,29 @@ def main(argv: list[str] | None = None) -> int:
             profile,
             test_data_dir=Path(temp_dir) if temp_dir is not None else args.test_data_dir,
         )
+        if str(REPO_ROOT) not in sys.path:
+            sys.path.insert(0, str(REPO_ROOT))
+        if args.require_auth or args.require_node:
+            from app.core.config import Settings
+
+            settings = Settings()
+            if not settings.local_config_path.expanduser().is_file():
+                raise SystemExit("--require-auth/--require-node requires an existing configuration file.")
+            config = settings.load_local_config()
+            auth = config.auth
+            if args.require_auth and not (auth.enabled and auth.require_https and auth.secure_cookie):
+                raise SystemExit("--require-auth requires auth.enabled, require_https and secure_cookie.")
+            if args.require_node and not (
+                config.sync.enabled and config.sync.role == "replica"
+                and config.connections.enabled and config.connections.node_id
+            ):
+                raise SystemExit("--require-node requires an authenticated replica node configuration.")
         port = args.port if args.port is not None else (8765 if profile == "personal" else 8766)
         print(f"Starting {profile} backend on http://{args.host}:{port}", flush=True)
         print(f"LKA_DATA_DIR={data_dir}", flush=True)
         if profile == "test":
             print("LKA_LOCAL_CONFIG=<isolated mock configuration>", flush=True)
 
-        if str(REPO_ROOT) not in sys.path:
-            sys.path.insert(0, str(REPO_ROOT))
         import uvicorn
 
         uvicorn.run(
@@ -100,6 +127,7 @@ def main(argv: list[str] | None = None) -> int:
             host=args.host,
             port=port,
             reload=args.reload,
+            **({"forwarded_allow_ips": "127.0.0.1"} if args.require_auth or args.require_node else {}),
         )
     return 0
 

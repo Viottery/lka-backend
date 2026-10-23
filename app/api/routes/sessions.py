@@ -66,6 +66,7 @@ def list_sessions(
     result = request.app.state.runtime.list_sessions(
         limit=limit, offset=offset, q=q, project_id=project_id,
         creation_source=creation_source, creator_session_id=creator_session_id,
+        **({"ordinary_only": True} if getattr(getattr(request, "state", None), "ordinary_sessions_only", False) else {}),
     )
     return SessionListResponse(**result.model_dump())
 
@@ -86,6 +87,7 @@ def list_deleted_sessions(
     result = request.app.state.runtime.list_deleted_sessions(
         limit=limit, offset=offset, q=q,
         creation_source=creation_source, creator_session_id=creator_session_id,
+        **({"ordinary_only": True} if getattr(getattr(request, "state", None), "ordinary_sessions_only", False) else {}),
     )
     return SessionListResponse(**result.model_dump())
 

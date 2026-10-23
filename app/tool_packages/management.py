@@ -58,6 +58,7 @@ PAGE = {"limit": {"type": "integer", "minimum": 1, "maximum": 100},
         "offset": {"type": "integer", "minimum": 0}}
 
 DEFINITIONS = [
+    ("list_execution_targets", "List approved devices, environments, workspace IDs, capabilities and current online status before choosing an execution_target. These grants do not expose node-local absolute paths.", True, {}, []),
     ("list_goals", "Read this manager's durable goals, revisions, timers and task waiting conditions.", True,
      {**PAGE}, []),
     ("read_goal", "Read the full goal objective in pages after a truncated list preview.", True,
@@ -80,6 +81,10 @@ DEFINITIONS = [
      {"run_id": TEXT}, ["run_id"]),
     ("start_task", "Create an independent ordinary session and durable resumable task. Original user quotes are attached by the server. workspace_path selects an existing default working directory, not a filesystem access boundary; outside access uses normal per-call review. Omit it or pass null to use the frontend default independent workspace.", False,
      {"command_id": COMMAND, "purpose": PURPOSE, "title": {"type": "string", "minLength": 1, "maxLength": 40},
+      "execution_target": {"type": "object", "additionalProperties": False,
+          "description": "Choose an approved execution node. Device, environment and workspace are optional constraints; {} chooses an eligible node. Explicit targets never fall back locally. Use workspace_id for a node-local approved mapping.",
+          "properties": {"device_id": TEXT, "environment_id": TEXT, "workspace_id": TEXT,
+                         "capabilities": {"type": "array", "maxItems": 100, "items": TEXT}}},
       "workspace_path": {"type": ["string", "null"], "minLength": 1, "maxLength": 4096,
                          "description": "Existing task/project directory, or existing parent of a project to create. Omit or use null for the frontend default independent workspace. Explicit locations must be nonempty existing paths; Windows drive paths are supported."}}, ["command_id", "purpose"]),
     ("send_instruction", "Start the next turn, or replace a checkpoint-paused run. Receipt run_snapshot describes the NEW queued run; replaced_run_snapshot is the retired old run, not current paused state. Running tasks must acknowledge pause first. expected_run_id binds the latest observed root; null requires an empty run history.", False,

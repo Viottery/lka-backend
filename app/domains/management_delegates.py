@@ -60,7 +60,7 @@ class ManagementDelegateService:
             return None
         controller = conn.execute('SELECT llm_client_name,llm_model,llm_answer_client_name,llm_answer_model,reasoning_level FROM manager_controllers WHERE session_id=?',
                                   (session_id,)).fetchone()
-        control = ['management.list_sessions', 'management.read_session', 'management.list_runs',
+        control = ['management.list_execution_targets', 'management.list_sessions', 'management.read_session', 'management.list_runs',
                    'management.inspect_run', 'management.read_task_result', 'management.start_task', 'management.send_instruction',
                    'management.control_run', 'management.read_events', 'management.report_delegate',
                    'management.read_delegate']

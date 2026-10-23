@@ -230,6 +230,61 @@ auto_index_on_import = false
 # be requested explicitly through semantic-index sync.
 local_files_only = true
 
+# Optional personal cloud instance. Accounts are trusted coadministrators of ONE
+# shared dataset; this is not multi-tenant isolation. Bootstrap through the CLI.
+[auth]
+enabled = false
+require_https = true
+secure_cookie = true
+allowed_origins = [] # Exact frontend origins, e.g. https://host.example-tailnet.ts.net
+session_ttl_seconds = 43200
+allow_bearer_sessions = false # Explicit opt-in for native/API clients.
+login_max_attempts = 5
+login_window_seconds = 900
+
+[devices]
+enabled = false # Requires auth.enabled. Registration grants scopes explicitly.
+online_threshold_seconds = 90
+
+[sync]
+enabled = false
+role = "hub" # Or "replica" for an independent, read-only materialization.
+# Replica mode requires both values and management.enabled=false.
+# hub_url = "https://host.example-tailnet.ts.net"
+# hub_id = "hub_id_read_from_the_authenticated_hub"
+token_env = "LKA_NODE_TOKEN"
+poll_seconds = 15
+page_size = 100
+request_timeout_seconds = 10
+max_page_bytes = 1048576
+memory_cache_stale_seconds = 60 # Informational; stale reads remain available offline.
+memory_project_bindings = {} # Explicit local memory project ID -> hub project ID.
+memory_write_enabled = false # Human-confirmed versioned writes; devices need sync.memory.write.
+memory_aggregation_enabled = false # Trusted backend memory replication + dedup; sync.memory.aggregate required.
+
+[connections]
+enabled = false
+# Hub: enable with auth/devices/sync hub; no node_id required.
+# Replica: set node_id, HTTPS origin and locally approved workspace mappings.
+node_id = ""
+allowed_origins = []
+workspace_roots = {} # Example: { work = "/home/me/work" }; never copy another node's paths.
+workspace_mounts = {} # Linux native mounts: ID -> expected_filesystem/expected_source/read_only.
+grant_ttl_seconds = 120
+session_ttl_seconds = 2592000
+allow_native = true
+
+[remote_execution]
+enabled = false
+# Replica requires connections.enabled and a registered environment_id.
+# environment_id = "linux"
+workspace_mappings = {} # Same workspace ID must match connections.workspace_roots.
+allowed_tools = [] # Explicit node-local execution grant. Empty grants no tools.
+shell_trust = "disabled" # "host_user" acknowledges native OS-user access; bash.run + manual approval required.
+poll_seconds = 3
+lease_seconds = 90
+max_task_bytes = 1048576
+
 [query_rewrite]
 # Per knowledge.search call: original query plus at most max_rewrites alternatives.
 # Retrieval fans out with bounded parallelism, then fuses and reranks once.

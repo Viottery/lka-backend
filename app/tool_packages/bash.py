@@ -420,6 +420,7 @@ class BashRunTool:
         if (
             context.tool_view is not None
             and not context.tool_view.full_workspace_authority
+            and not context.tool_view.host_execution_authority
         ):
             return ToolResult(
                 invocation_id=invocation.invocation_id,

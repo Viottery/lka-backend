@@ -117,6 +117,7 @@ def tool_scope_discovery_denial(spec: ToolSpec, tool_view: ToolView | None) -> s
     uses_sources = spec.scope_uses_sources or bool(spec.scope_source_fields)
     uses_accounts = spec.scope_uses_accounts or bool(spec.scope_account_fields)
     uses_workspace = spec.scope_uses_workspace or bool(spec.scope_path_fields)
+    host_execution = spec.unrestricted_execution and tool_view.host_execution_authority
     if child_scope and uses_sources and not source_ids and not tool_view.full_data_authority:
         return "Child run has no authorized source scope for this tool."
     if child_scope and uses_accounts and not account_ids and not tool_view.full_data_authority:
@@ -125,9 +126,9 @@ def tool_scope_discovery_denial(spec: ToolSpec, tool_view: ToolView | None) -> s
         return "Tool does not enforce this child run's source scope."
     if child_scope and uses_accounts and account_ids and not spec.scope_account_fields and not spec.scope_filtering_required:
         return "Tool does not enforce this child run's account scope."
-    if uses_workspace and not tool_view.allowed_paths and not tool_view.full_workspace_authority:
+    if uses_workspace and not tool_view.allowed_paths and not tool_view.full_workspace_authority and not host_execution:
         return "Child run has no authorized workspace scope for this tool."
-    if uses_workspace and not spec.scope_path_fields and not spec.scope_filtering_required and not tool_view.full_workspace_authority:
+    if uses_workspace and not spec.scope_path_fields and not spec.scope_filtering_required and not tool_view.full_workspace_authority and not host_execution:
         return "Tool does not enforce this child run's workspace scope."
     return None
 
@@ -265,6 +266,9 @@ class ToolExecutor:
         self.constraint_store = ToolConstraintStore()
         # Runtime hook that creates a reserved session workspace on first write into it.
         self.workspace_materializer: Callable[[ToolContext], None] | None = None
+        # Revalidate live operator trust before every host-authorized operation.
+        self.host_execution_guard: Callable[[ToolContext], str | None] | None = None
+        self.workspace_access_guard: Callable[[ToolSpec, dict, ToolContext, bool], str | None] | None = None
 
     def _constraint_subjects(self, context: ToolContext) -> list[tuple[str, str]]:
         subjects = [("session", context.session_id)]
@@ -334,6 +338,18 @@ class ToolExecutor:
                 execution_started=False,
             )
         read_only = effective_tool_read_only(tool, tool_input)
+        host_execution = bool(tool_view and tool_view.host_execution_authority and tool.spec.unrestricted_execution)
+        if host_execution:
+            denial = None
+            if not context.run_id or context.safety_review_mode != "manual":
+                denial = "Host execution requires a run and manual safety review."
+            elif self.host_execution_guard is None:
+                denial = "Host execution trust revalidation is unavailable."
+            else:
+                denial = self.host_execution_guard(context)
+            if denial:
+                return ToolResult(invocation_id=invocation_id, tool_name=tool_name,
+                                  status="rejected", error=denial, execution_started=False)
         denial_reason = (
             tool_view.denial_reason(
                 tool_name=tool_name, package=tool.spec.package, read_only=read_only,
@@ -412,6 +428,9 @@ class ToolExecutor:
                     or review.run_id != context.run_id or review.workspace_root != context.workspace_root):
                 return ToolResult(invocation_id=invocation_id, tool_name=tool_name, status="rejected",
                                   error="Safety approval does not match this invocation.", execution_started=False)
+            if host_execution and getattr(review.mode, "value", review.mode) != "manual":
+                return ToolResult(invocation_id=invocation_id, tool_name=tool_name, status="rejected",
+                                  error="Host execution requires a manual approval record.", execution_started=False)
             context = context.model_copy(update={"approved_paths": list(review.workspace_access)})
         guard_failure = self._run_guard(context=context, tool_view=tool_view)
         if guard_failure is not None:
@@ -436,6 +455,11 @@ class ToolExecutor:
                 error="Tool input failed schema validation.",
                 execution_started=False,
             )
+        if self.workspace_access_guard is not None:
+            denial = self.workspace_access_guard(tool.spec, tool_input, context, read_only)
+            if denial:
+                return ToolResult(invocation_id=invocation_id, tool_name=tool_name,
+                                  status="rejected", error=denial, execution_started=False)
         invocation = ToolInvocation(
             invocation_id=invocation_id,
             tool=tool.spec,
@@ -452,6 +476,17 @@ class ToolExecutor:
                 read_only=read_only,
                 tool_view=tool_view,
             ):
+                if self.workspace_access_guard is not None:
+                    denial = self.workspace_access_guard(tool.spec, tool_input, context, read_only)
+                    if denial:
+                        return ToolResult(invocation_id=invocation_id, tool_name=tool_name,
+                                          status="rejected", error=denial, execution_started=False)
+                if host_execution:
+                    denial = (self.host_execution_guard(context) if self.host_execution_guard is not None
+                              else "Host execution trust revalidation is unavailable.")
+                    if denial:
+                        return ToolResult(invocation_id=invocation_id, tool_name=tool_name,
+                                          status="rejected", error=denial, execution_started=False)
                 failure = self._run_guard(context=context, tool_view=tool_view)
                 if failure is not None:
                     return ToolResult(

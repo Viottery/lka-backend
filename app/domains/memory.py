@@ -563,6 +563,23 @@ class MemoryService:
         *,
         publication_lease: tuple[str, str, int] | None = None,
     ) -> MemoryRecord:
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            record = self.create_in_transaction(conn, payload, publication_lease=publication_lease)
+            conn.commit()
+            return record
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def create_in_transaction(
+        self, conn: sqlite3.Connection, payload: MemoryInput, *,
+        publication_lease: tuple[str, str, int] | None = None,
+    ) -> MemoryRecord:
+        """Apply domain validation and provenance in a caller-owned transaction."""
         content = payload.content.strip()
         if not content:
             raise ValueError("Memory content cannot be blank")
@@ -572,133 +589,183 @@ class MemoryService:
             raise ValueError("Global memory cannot have project_id")
         dedupe_key = payload.dedupe_key or hashlib.sha256(content.casefold().encode()).hexdigest()
         memory_id = _stable_id("mem", _json([payload.scope,payload.project_id,dedupe_key]))
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            if publication_lease is not None:
-                self._validate_publication_lease(conn, publication_lease)
-            now = _now()
-            source = conn.execute("SELECT * FROM memory_sources WHERE source_id=?", (payload.source_id,)).fetchone()
-            if source is None:
-                raise KeyError(f"Unknown source: {payload.source_id}")
-            if not self._source_valid(source, now):
-                raise ValueError("Source is revoked or expired")
-            self._check_correction_fences(conn, source, payload)
-            alias = self._publication_alias(conn, payload, source) if publication_lease is not None else None
-            if alias is not None:
-                memory_id = alias["memory_id"]
-            status: MemoryStatus = "active" if payload.user_confirmed or source["trusted_source"] else "candidate"
-            existing = conn.execute("SELECT * FROM memory_entries WHERE memory_id=?", (memory_id,)).fetchone()
-            if existing:
-                prior_source = conn.execute(
-                    "SELECT 1 FROM memory_entry_sources WHERE memory_id=? AND source_id=?",
-                    (memory_id, payload.source_id),
-                ).fetchone() is not None
-                # Retried publication from one source is idempotent. The only
-                # same-source state change permitted is a new explicit confirmation.
-                if prior_source and not (existing["status"] == "candidate" and status == "active"):
-                    if publication_lease is not None:
-                        self._validate_publication_lease(conn, publication_lease)
-                    conn.commit()
-                    return self.get(memory_id)
-                if existing["status"] in {"retracted", "superseded"}:
-                    if publication_lease is not None:
-                        self._validate_publication_lease(conn, publication_lease)
-                    conn.commit()
-                    return self.get(memory_id)
-                if not prior_source:
-                    conn.execute("INSERT INTO memory_entry_sources VALUES(?,?)", (memory_id,payload.source_id))
-                self._snapshot(conn, existing)
-                independent_user_evidence = conn.execute(
-                    "SELECT COUNT(DISTINCT s.source_ref) FROM memory_entry_sources es "
-                    "JOIN memory_sources s USING(source_id) WHERE es.memory_id=? "
-                    "AND s.status='active' AND (s.expires_at IS NULL OR s.expires_at>?) "
-                    "AND s.source_type IN ('user_message','conversation')",
-                    (memory_id, now),
-                ).fetchone()[0]
-                promote_by_repeat = (
-                    existing["status"] == "candidate"
-                    and existing["memory_type"] == "preference"
-                    and float(existing["confidence"] or 0) >= 0.75
-                    and payload.confidence is not None and payload.confidence >= 0.75
-                    and independent_user_evidence >= 2
-                    and not prior_source
-                    and not json.loads(existing["metadata"]).get("needs_review")
-                )
-                promote = (
-                    existing["status"] == "candidate"
-                    and not json.loads(existing["metadata"]).get("needs_review")
-                    and (status == "active" or promote_by_repeat)
-                )
-                old_expiry = existing["expires_at"]
-                expiry_extended = bool(
-                    payload.user_confirmed and payload.expires_at and old_expiry
-                    and _is_later_expiry(payload.expires_at, old_expiry)
-                )
-                effective_expiry = payload.expires_at if expiry_extended else old_expiry
-                duplicate_version = max(int(existing["version"]), int(conn.execute(
-                    "SELECT COALESCE(MAX(version),0) FROM memory_events WHERE memory_id=?",
-                    (memory_id,),
-                ).fetchone()[0])) + 1
-                conn.execute(
-                    "UPDATE memory_entries SET version=?,updated_at=?,status=?,expires_at=? WHERE memory_id=?",
-                    (duplicate_version, now, "active" if promote else existing["status"], effective_expiry, memory_id),
-                )
-                event = (
-                    "promoted_by_confirmation" if status == "active" and promote
-                    else "promoted_by_independent_evidence" if promote_by_repeat
-                    else "expiry_extended" if expiry_extended
-                    else "duplicate_source_linked"
-                )
-                self._record_event(conn,memory_id,duplicate_version,event,{
-                    "source_id":payload.source_id,
-                    "independent_user_sources": int(independent_user_evidence),
-                    **({"previous_expires_at": old_expiry, "expires_at": effective_expiry}
-                       if expiry_extended else {}),
-                    **({"publication_alias": "terminal_chinese_period",
-                        "incoming_claim": payload.content,
-                        "incoming_evidence": payload.metadata["evidence"]} if alias is not None else {}),
-                })
+        if publication_lease is not None:
+            self._validate_publication_lease(conn, publication_lease)
+        now = _now()
+        source = conn.execute("SELECT * FROM memory_sources WHERE source_id=?", (payload.source_id,)).fetchone()
+        if source is None:
+            raise KeyError(f"Unknown source: {payload.source_id}")
+        if not self._source_valid(source, now):
+            raise ValueError("Source is revoked or expired")
+        self._check_correction_fences(conn, source, payload)
+        alias = self._publication_alias(conn, payload, source) if publication_lease is not None else None
+        if alias is not None:
+            memory_id = alias["memory_id"]
+        status: MemoryStatus = "active" if payload.user_confirmed or source["trusted_source"] else "candidate"
+        existing = conn.execute("SELECT * FROM memory_entries WHERE memory_id=?", (memory_id,)).fetchone()
+        if existing:
+            prior_source = conn.execute(
+                "SELECT 1 FROM memory_entry_sources WHERE memory_id=? AND source_id=?",
+                (memory_id, payload.source_id),
+            ).fetchone() is not None
+            # Retried publication from one source is idempotent. The only
+            # same-source state change permitted is a new explicit confirmation.
+            if prior_source and not (existing["status"] == "candidate" and status == "active"):
                 if publication_lease is not None:
                     self._validate_publication_lease(conn, publication_lease)
-                conn.commit()
-                return self.get(memory_id)
-            metadata = dict(payload.metadata)
-            hints = _valid_conflict_hints(metadata.get("conflict_hints")) if payload.memory_type == "preference" else []
-            conflicts = self._find_preference_conflicts(
-                conn, payload, hints, now,
+                return self._record(conn, conn.execute("SELECT * FROM memory_entries WHERE memory_id=?", (memory_id,)).fetchone())
+            if existing["status"] in {"retracted", "superseded"}:
+                if publication_lease is not None:
+                    self._validate_publication_lease(conn, publication_lease)
+                return self._record(conn, conn.execute("SELECT * FROM memory_entries WHERE memory_id=?", (memory_id,)).fetchone())
+            if not prior_source:
+                conn.execute("INSERT INTO memory_entry_sources VALUES(?,?)", (memory_id,payload.source_id))
+            self._snapshot(conn, existing)
+            independent_user_evidence = conn.execute(
+                "SELECT COUNT(DISTINCT s.source_ref) FROM memory_entry_sources es "
+                "JOIN memory_sources s USING(source_id) WHERE es.memory_id=? "
+                "AND s.status='active' AND (s.expires_at IS NULL OR s.expires_at>?) "
+                "AND s.source_type IN ('user_message','conversation')",
+                (memory_id, now),
+            ).fetchone()[0]
+            promote_by_repeat = (
+                existing["status"] == "candidate"
+                and existing["memory_type"] == "preference"
+                and float(existing["confidence"] or 0) >= 0.75
+                and payload.confidence is not None and payload.confidence >= 0.75
+                and independent_user_evidence >= 2
+                and not prior_source
+                and not json.loads(existing["metadata"]).get("needs_review")
             )
-            if conflicts:
-                metadata["needs_review"] = True
-                metadata["conflict_ids"] = sorted({row["memory_id"] for row, _hint in conflicts})
-                if not payload.user_confirmed:
-                    status = "candidate"
-            conn.execute("""INSERT INTO memory_entries VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (memory_id,payload.memory_type,content,payload.scope,payload.project_id,status,payload.confidence,
-                 payload.sensitivity,payload.expires_at,dedupe_key,1,None,payload.extraction_model,_json(metadata),now,now))
-            conn.execute("INSERT INTO memory_entry_sources VALUES(?,?)", (memory_id,payload.source_id))
-            self._record_event(conn,memory_id,1,"created",{"status":status,"source_id":payload.source_id,"content":content,
-                **({"needs_review": True, "conflict_ids": metadata["conflict_ids"]} if conflicts else {})})
-            for peer, hint in (conflicts if payload.user_confirmed else ()):
-                peer_metadata = json.loads(peer["metadata"])
-                peer_ids = sorted(set(peer_metadata.get("conflict_ids", [])) | {memory_id})
-                peer_metadata.update(needs_review=True, conflict_ids=peer_ids)
-                self._snapshot(conn, peer)
-                version = int(peer["version"]) + 1
-                conn.execute("UPDATE memory_entries SET metadata=?,version=?,updated_at=? WHERE memory_id=?",
-                             (_json(peer_metadata), version, now, peer["memory_id"]))
-                self._record_event(conn, peer["memory_id"], version, "conflict_detected", {
-                    "with_memory_id": memory_id, "slot": hint["slot"], "condition": hint["condition"],
-                })
+            promote = (
+                existing["status"] == "candidate"
+                and not json.loads(existing["metadata"]).get("needs_review")
+                and (status == "active" or promote_by_repeat)
+            )
+            old_expiry = existing["expires_at"]
+            expiry_extended = bool(
+                payload.user_confirmed and payload.expires_at and old_expiry
+                and _is_later_expiry(payload.expires_at, old_expiry)
+            )
+            effective_expiry = payload.expires_at if expiry_extended else old_expiry
+            duplicate_version = max(int(existing["version"]), int(conn.execute(
+                "SELECT COALESCE(MAX(version),0) FROM memory_events WHERE memory_id=?",
+                (memory_id,),
+            ).fetchone()[0])) + 1
+            conn.execute(
+                "UPDATE memory_entries SET version=?,updated_at=?,status=?,expires_at=? WHERE memory_id=?",
+                (duplicate_version, now, "active" if promote else existing["status"], effective_expiry, memory_id),
+            )
+            event = (
+                "promoted_by_confirmation" if status == "active" and promote
+                else "promoted_by_independent_evidence" if promote_by_repeat
+                else "expiry_extended" if expiry_extended
+                else "duplicate_source_linked"
+            )
+            self._record_event(conn,memory_id,duplicate_version,event,{
+                "source_id":payload.source_id,
+                "independent_user_sources": int(independent_user_evidence),
+                **({"previous_expires_at": old_expiry, "expires_at": effective_expiry}
+                   if expiry_extended else {}),
+                **({"publication_alias": "terminal_chinese_period",
+                    "incoming_claim": payload.content,
+                    "incoming_evidence": payload.metadata["evidence"]} if alias is not None else {}),
+            })
             if publication_lease is not None:
                 self._validate_publication_lease(conn, publication_lease)
-            conn.commit()
-            return self.get(memory_id)
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+            return self._record(conn, conn.execute("SELECT * FROM memory_entries WHERE memory_id=?", (memory_id,)).fetchone())
+        metadata = dict(payload.metadata)
+        hints = _valid_conflict_hints(metadata.get("conflict_hints")) if payload.memory_type == "preference" else []
+        conflicts = self._find_preference_conflicts(
+            conn, payload, hints, now,
+        )
+        if conflicts:
+            metadata["needs_review"] = True
+            metadata["conflict_ids"] = sorted({row["memory_id"] for row, _hint in conflicts})
+            if not payload.user_confirmed:
+                status = "candidate"
+        conn.execute("""INSERT INTO memory_entries VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (memory_id,payload.memory_type,content,payload.scope,payload.project_id,status,payload.confidence,
+             payload.sensitivity,payload.expires_at,dedupe_key,1,None,payload.extraction_model,_json(metadata),now,now))
+        conn.execute("INSERT INTO memory_entry_sources VALUES(?,?)", (memory_id,payload.source_id))
+        self._record_event(conn,memory_id,1,"created",{"status":status,"source_id":payload.source_id,"content":content,
+            **({"needs_review": True, "conflict_ids": metadata["conflict_ids"]} if conflicts else {})})
+        for peer, hint in (conflicts if payload.user_confirmed else ()):
+            peer_metadata = json.loads(peer["metadata"])
+            peer_ids = sorted(set(peer_metadata.get("conflict_ids", [])) | {memory_id})
+            peer_metadata.update(needs_review=True, conflict_ids=peer_ids)
+            self._snapshot(conn, peer)
+            version = int(peer["version"]) + 1
+            conn.execute("UPDATE memory_entries SET metadata=?,version=?,updated_at=? WHERE memory_id=?",
+                         (_json(peer_metadata), version, now, peer["memory_id"]))
+            self._record_event(conn, peer["memory_id"], version, "conflict_detected", {
+                "with_memory_id": memory_id, "slot": hint["slot"], "condition": hint["condition"],
+            })
+        if publication_lease is not None:
+            self._validate_publication_lease(conn, publication_lease)
+        return self._record(conn, conn.execute("SELECT * FROM memory_entries WHERE memory_id=?", (memory_id,)).fetchone())
+
+    def publish_replica_in_transaction(
+        self, conn: sqlite3.Connection, payload: MemoryInput, *, source_ids: list[str],
+        target_memory_id: str | None = None, preserve_status: bool = False,
+    ) -> MemoryRecord:
+        """Publish trusted backend state without asserting human confirmation.
+
+        The caller must authorize the backend grant in this transaction. Only
+        separately registered replica provenance can establish replica activity;
+        repeated candidate observations never establish activation authority.
+        """
+        if payload.user_confirmed or not source_ids:
+            raise ValueError("replication uses backend provenance, not human confirmation")
+        now = _now()
+        sources = []
+        for source_id in source_ids:
+            source = conn.execute("SELECT * FROM memory_sources WHERE source_id=?", (source_id,)).fetchone()
+            if source is None or source["source_type"] != "node_memory_replica" or not self._source_valid(source, now):
+                raise ValueError("replica provenance is unavailable")
+            sources.append(source)
+        if target_memory_id is None:
+            record = self.create_in_transaction(conn, payload)
+            target_memory_id = record.memory_id
+        row = conn.execute("SELECT * FROM memory_entries WHERE memory_id=?", (target_memory_id,)).fetchone()
+        if row is None or row["status"] not in {"active", "candidate"}:
+            raise MemoryPublicationSuppressed("Cannot revive an inactive replicated memory")
+        if (row["scope"] != payload.scope or row["project_id"] != payload.project_id
+                or row["memory_type"] != payload.memory_type):
+            raise ValueError("replica provenance scope mismatch")
+        missing = [source["source_id"] for source in sources if not conn.execute(
+            "SELECT 1 FROM memory_entry_sources WHERE memory_id=? AND source_id=?",
+            (target_memory_id, source["source_id"]),
+        ).fetchone()]
+        if missing:
+            self._snapshot(conn, row)
+            for source_id in missing:
+                conn.execute("INSERT INTO memory_entry_sources VALUES(?,?)", (target_memory_id, source_id))
+            version = int(row["version"]) + 1
+            conn.execute("UPDATE memory_entries SET version=?,updated_at=? WHERE memory_id=?",
+                         (version, now, target_memory_id))
+            self._record_event(conn, target_memory_id, version, "node_replica_sources_linked", {"source_ids": missing})
+        if not preserve_status:
+            self.reconcile_replica_status_in_transaction(conn, target_memory_id)
+        return self._record(conn, conn.execute("SELECT * FROM memory_entries WHERE memory_id=?", (target_memory_id,)).fetchone())
+
+    def reconcile_replica_status_in_transaction(self, conn: sqlite3.Connection, memory_id: str) -> None:
+        """Derive activity from live backend publications, retaining review gates."""
+        row = conn.execute("SELECT * FROM memory_entries WHERE memory_id=?", (memory_id,)).fetchone()
+        if row is None or row["status"] not in {"active", "candidate"}:
+            return
+        sources = conn.execute("SELECT s.* FROM memory_entry_sources l JOIN memory_sources s USING(source_id) "
+                               "WHERE l.memory_id=?", (memory_id,)).fetchall()
+        live = [source for source in sources if self._source_valid(source, _now())]
+        native_active = row["status"] == "active" and any(s["source_type"] != "node_memory_replica" for s in live)
+        backend_active = any(s["source_type"] == "node_memory_replica"
+                             and json.loads(s["metadata"]).get("published_status") == "active"
+                             and not json.loads(s["metadata"]).get("needs_review") for s in live)
+        review = self._effective_metadata(conn, row).get("needs_review")
+        desired = "active" if native_active or backend_active and not review else "candidate"
+        if row["status"] != desired:
+            self._transition(conn, memory_id, desired, "authorized_node_replication",
+                             {"publication_status": desired}, int(row["version"]))
 
     @staticmethod
     def _validate_publication_lease(
@@ -755,7 +822,10 @@ class MemoryService:
                 "AND (e.expires_at IS NULL OR e.expires_at>?) "
                 "AND EXISTS (SELECT 1 FROM memory_entry_sources es "
                 "JOIN memory_sources s USING(source_id) WHERE es.memory_id=e.memory_id "
-                "AND s.status='active' AND (s.expires_at IS NULL OR s.expires_at>?))",
+                "AND s.status='active' AND (s.expires_at IS NULL OR s.expires_at>?) "
+                "AND (s.source_type!='node_memory_replica' OR "
+                "(json_extract(s.metadata,'$.published_status')='active' "
+                "AND coalesce(json_extract(s.metadata,'$.needs_review'),0)=0)))",
                 (memory_id, now, now),
             ).fetchone()
             if row is None:
@@ -785,7 +855,11 @@ class MemoryService:
             clauses.append("status IN (" + ",".join("?" for _ in statuses) + ")"); args.extend(statuses)
         if not include_expired:
             clauses.append("(expires_at IS NULL OR expires_at>?)"); args.append(now)
-            clauses.append("EXISTS (SELECT 1 FROM memory_entry_sources es JOIN memory_sources s USING(source_id) WHERE es.memory_id=memory_entries.memory_id AND s.status='active' AND (s.expires_at IS NULL OR s.expires_at>?))"); args.append(now)
+            clauses.append("EXISTS (SELECT 1 FROM memory_entry_sources es JOIN memory_sources s USING(source_id) "
+                           "WHERE es.memory_id=memory_entries.memory_id AND s.status='active' "
+                           "AND (s.expires_at IS NULL OR s.expires_at>?) AND (memory_entries.status!='active' "
+                           "OR s.source_type!='node_memory_replica' OR (json_extract(s.metadata,'$.published_status')='active' "
+                           "AND coalesce(json_extract(s.metadata,'$.needs_review'),0)=0)))"); args.append(now)
         args.append(max(1,min(int(limit),1000)))
         args.append(max(0, int(offset)))
         conn = self._connect()
@@ -827,7 +901,9 @@ class MemoryService:
                 "e.scope=?", "e.status='active'", "(e.expires_at IS NULL OR e.expires_at>?)",
                 ("EXISTS(SELECT 1 FROM memory_entry_sources es "
                  "JOIN memory_sources s USING(source_id) WHERE es.memory_id=e.memory_id "
-                 "AND s.status='active' AND (s.expires_at IS NULL OR s.expires_at>?))"),
+                 "AND s.status='active' AND (s.expires_at IS NULL OR s.expires_at>?) "
+                 "AND (s.source_type!='node_memory_replica' OR (json_extract(s.metadata,'$.published_status')='active' "
+                 "AND coalesce(json_extract(s.metadata,'$.needs_review'),0)=0)))"),
             ]
             params: list[Any] = [scope, now, now]
             if scope == "project":
@@ -1204,96 +1280,122 @@ class MemoryService:
                 expires_at: str | None = None, require_active: bool = False,
                 user_feedback: MemoryFeedbackInput | None = None) -> MemoryRecord:
         """Create a new version and preserve the old claim as superseded history."""
-        content = content.strip()
-        if not content:
-            raise ValueError("Corrected content cannot be blank")
-        if user_feedback is not None and user_feedback.reason == "do_not_store":
-            raise ValueError("do_not_store feedback can only be used when retracting memory")
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            if publication_lease is not None:
-                self._validate_publication_lease(conn, publication_lease)
-            old = conn.execute("SELECT * FROM memory_entries WHERE memory_id=?", (memory_id,)).fetchone()
-            if old is None:
-                raise KeyError(f"Memory not found: {memory_id}")
-            if int(old["version"]) != expected_version:
-                raise MemoryConflictError(f"Expected version {expected_version}, found {old['version']}")
-            if require_active and old["status"] != "active":
-                raise MemoryPublicationSuppressed("Reconciliation requires an active target")
-            if publication_lease is not None and old["status"] in {"retracted", "superseded"}:
-                raise MemoryPublicationSuppressed("Cannot revive an inactive memory")
-            if source_id:
-                source = conn.execute("SELECT * FROM memory_sources WHERE source_id=?", (source_id,)).fetchone()
-                if source is None or not self._source_valid(source,_now()):
-                    raise ValueError("Correction source is unavailable")
-                if publication_lease is not None:
-                    self._check_correction_fences(conn, source, MemoryInput(
-                        content=content, source_id=source_id, scope=old["scope"],
-                        project_id=old["project_id"], metadata=metadata or {},
-                    ))
-            old_record = self._record(conn,old)
-            self._snapshot(conn,old)
-            conn.execute("UPDATE memory_entries SET status='superseded',version=version+1,updated_at=? WHERE memory_id=? AND version=?", (_now(),memory_id,expected_version))
-            self._record_event(conn,memory_id,expected_version+1,"corrected_by",{"content":content})
-            self._clear_conflict_references(conn, memory_id)
-            now = _now()
-            new_id = uuid.uuid4().hex
-            new_source = source_id or old_record.source_ids[0]
-            source_row = conn.execute("SELECT trusted_source FROM memory_sources WHERE source_id=? AND status='active'", (new_source,)).fetchone()
-            if source_row is None:
-                raise ValueError("Correction source is unavailable")
-            status = "active" if user_confirmed or source_row["trusted_source"] else "candidate"
-            dedupe = hashlib.sha256(content.casefold().encode()).hexdigest()
-            corrected_metadata = json.loads(old["metadata"])
-            for key in ("needs_review", "conflict_ids", "conflict_hints", "consolidation_undo_peers"):
-                corrected_metadata.pop(key, None)
-            corrected_metadata.update(metadata or {})
-            conn.execute("""INSERT INTO memory_entries VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (new_id,old["memory_type"],content,old["scope"],old["project_id"],status,old["confidence"],old["sensitivity"],expires_at if metadata is not None else old["expires_at"],dedupe,1,memory_id,old["extraction_model"],_json(corrected_metadata),now,now))
-            conn.execute("INSERT INTO memory_entry_sources VALUES(?,?)",(new_id,new_source))
-            self._record_event(conn,new_id,1,"created_by_correction",{"supersedes_id":memory_id,"source_id":new_source,"content":content})
-            if user_feedback is not None:
-                new = conn.execute("SELECT * FROM memory_entries WHERE memory_id=?", (new_id,)).fetchone()
-                record_feedback(
-                    conn, feedback=user_feedback, action="correct", old=old,
-                    old_version=expected_version, new=new, created_at=now,
-                )
-            if publication_lease is not None:
-                self._validate_publication_lease(conn, publication_lease)
+            record = self.correct_in_transaction(
+                conn, memory_id, content=content, expected_version=expected_version,
+                source_id=source_id, user_confirmed=user_confirmed, publication_lease=publication_lease,
+                metadata=metadata, expires_at=expires_at, require_active=require_active,
+                user_feedback=user_feedback,
+            )
             conn.commit()
-            return self.get(new_id)
+            return record
         except Exception:
             conn.rollback()
             raise
         finally:
             conn.close()
 
+    def correct_in_transaction(self, conn: sqlite3.Connection, memory_id: str, *, content: str, expected_version: int,
+                source_id: str | None = None, user_confirmed: bool = True,
+                publication_lease: tuple[str, str, int] | None = None,
+                metadata: dict[str, Any] | None = None,
+                expires_at: str | None = None, require_active: bool = False,
+                user_feedback: MemoryFeedbackInput | None = None) -> MemoryRecord:
+        """Correct using the caller's transaction; retain all domain safeguards."""
+        content = content.strip()
+        if not content:
+            raise ValueError("Corrected content cannot be blank")
+        if user_feedback is not None and user_feedback.reason == "do_not_store":
+            raise ValueError("do_not_store feedback can only be used when retracting memory")
+        if publication_lease is not None:
+            self._validate_publication_lease(conn, publication_lease)
+        old = conn.execute("SELECT * FROM memory_entries WHERE memory_id=?", (memory_id,)).fetchone()
+        if old is None:
+            raise KeyError(f"Memory not found: {memory_id}")
+        if int(old["version"]) != expected_version:
+            raise MemoryConflictError(f"Expected version {expected_version}, found {old['version']}")
+        if require_active and old["status"] != "active":
+            raise MemoryPublicationSuppressed("Reconciliation requires an active target")
+        if publication_lease is not None and old["status"] in {"retracted", "superseded"}:
+            raise MemoryPublicationSuppressed("Cannot revive an inactive memory")
+        if source_id:
+            source = conn.execute("SELECT * FROM memory_sources WHERE source_id=?", (source_id,)).fetchone()
+            if source is None or not self._source_valid(source,_now()):
+                raise ValueError("Correction source is unavailable")
+            if publication_lease is not None:
+                self._check_correction_fences(conn, source, MemoryInput(
+                    content=content, source_id=source_id, scope=old["scope"],
+                    project_id=old["project_id"], metadata=metadata or {},
+                ))
+        old_record = self._record(conn,old)
+        self._snapshot(conn,old)
+        conn.execute("UPDATE memory_entries SET status='superseded',version=version+1,updated_at=? WHERE memory_id=? AND version=?", (_now(),memory_id,expected_version))
+        self._record_event(conn,memory_id,expected_version+1,"corrected_by",{"content":content})
+        self._clear_conflict_references(conn, memory_id)
+        now = _now()
+        new_id = uuid.uuid4().hex
+        new_source = source_id or old_record.source_ids[0]
+        source_row = conn.execute("SELECT trusted_source FROM memory_sources WHERE source_id=? AND status='active'", (new_source,)).fetchone()
+        if source_row is None:
+            raise ValueError("Correction source is unavailable")
+        status = "active" if user_confirmed or source_row["trusted_source"] else "candidate"
+        dedupe = hashlib.sha256(content.casefold().encode()).hexdigest()
+        corrected_metadata = json.loads(old["metadata"])
+        for key in ("needs_review", "conflict_ids", "conflict_hints", "consolidation_undo_peers"):
+            corrected_metadata.pop(key, None)
+        corrected_metadata.update(metadata or {})
+        conn.execute("""INSERT INTO memory_entries VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (new_id,old["memory_type"],content,old["scope"],old["project_id"],status,old["confidence"],old["sensitivity"],expires_at if metadata is not None else old["expires_at"],dedupe,1,memory_id,old["extraction_model"],_json(corrected_metadata),now,now))
+        conn.execute("INSERT INTO memory_entry_sources VALUES(?,?)",(new_id,new_source))
+        self._record_event(conn,new_id,1,"created_by_correction",{"supersedes_id":memory_id,"source_id":new_source,"content":content})
+        if user_feedback is not None:
+            new = conn.execute("SELECT * FROM memory_entries WHERE memory_id=?", (new_id,)).fetchone()
+            record_feedback(
+                conn, feedback=user_feedback, action="correct", old=old,
+                old_version=expected_version, new=new, created_at=now,
+            )
+        if publication_lease is not None:
+            self._validate_publication_lease(conn, publication_lease)
+        return self._record(conn, conn.execute("SELECT * FROM memory_entries WHERE memory_id=?", (new_id,)).fetchone())
+
     def retract(self, memory_id: str, *, expected_version: int,
                 user_feedback: MemoryFeedbackInput | None = None) -> MemoryRecord:
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            old = conn.execute("SELECT * FROM memory_entries WHERE memory_id=?", (memory_id,)).fetchone()
-            if old is None:
-                raise KeyError(f"Memory not found: {memory_id}")
-            if int(old["version"]) != expected_version:
-                raise MemoryConflictError(f"Expected version {expected_version}, found {old['version']}")
-            self._transition(conn,memory_id,"retracted","retracted",{},expected_version)
-            self._clear_conflict_references(conn, memory_id)
-            if user_feedback is not None:
-                if user_feedback.reason == "wording":
-                    raise ValueError("wording feedback requires correcting memory")
-                record_feedback(
-                    conn, feedback=user_feedback, action="discard", old=old,
-                    old_version=expected_version, new=None, created_at=_now(),
-                )
+            record = self.retract_in_transaction(
+                conn, memory_id, expected_version=expected_version, user_feedback=user_feedback,
+            )
             conn.commit()
+            return record
         except Exception:
-            conn.rollback(); raise
+            conn.rollback()
+            raise
         finally:
             conn.close()
-        return self.get(memory_id)
+
+    def retract_in_transaction(self, conn: sqlite3.Connection, memory_id: str, *, expected_version: int,
+                user_feedback: MemoryFeedbackInput | None = None) -> MemoryRecord:
+        """Retract with history and feedback inside a caller-owned transaction."""
+        old = conn.execute("SELECT * FROM memory_entries WHERE memory_id=?", (memory_id,)).fetchone()
+        if old is None:
+            raise KeyError(f"Memory not found: {memory_id}")
+        if int(old["version"]) != expected_version:
+            raise MemoryConflictError(f"Expected version {expected_version}, found {old['version']}")
+        self._transition(conn,memory_id,"retracted","retracted",{},expected_version)
+        self._clear_conflict_references(conn, memory_id)
+        if user_feedback is not None:
+            if user_feedback.reason == "wording":
+                raise ValueError("wording feedback requires correcting memory")
+            record_feedback(
+                conn, feedback=user_feedback, action="discard", old=old,
+                old_version=expected_version, new=None, created_at=_now(),
+            )
+        return self._record(conn, conn.execute(
+            "SELECT * FROM memory_entries WHERE memory_id=?", (memory_id,),
+        ).fetchone())
 
     def feedbacks(self, *, scope: MemoryScope | None = None,
                   project_id: str | None = None, limit: int = 100,
@@ -1474,7 +1576,15 @@ class MemoryService:
 
     @staticmethod
     def _source_valid(source: sqlite3.Row, now: str) -> bool:
-        return source["status"]=="active" and (source["expires_at"] is None or source["expires_at"]>now)
+        if source["status"] != "active":
+            return False
+        if source["expires_at"] is None:
+            return True
+        try:
+            expiry, current = datetime.fromisoformat(source["expires_at"]), datetime.fromisoformat(now)
+            return expiry.tzinfo is not None and current.tzinfo is not None and expiry > current
+        except (ValueError, TypeError):
+            return False
 
     def _record(self,conn: sqlite3.Connection,row: sqlite3.Row) -> MemoryRecord:
         source_ids=[str(r[0]) for r in conn.execute("SELECT source_id FROM memory_entry_sources WHERE memory_id=? ORDER BY source_id",(row["memory_id"],))]

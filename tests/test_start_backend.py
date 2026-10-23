@@ -80,3 +80,55 @@ def test_personal_release_identity_and_test_profile_isolation(monkeypatch, tmp_p
     assert os.environ["LKA_DEPLOYMENT_ID"] == "a" * 64
     start_backend.configure_profile("test", test_data_dir=tmp_path / "isolated")
     assert "LKA_DEPLOYMENT_ID" not in os.environ
+
+
+@pytest.mark.parametrize("config_text", [None, "", "[auth]\nenabled=true\nrequire_https=false\n",
+                                         "[auth]\nenabled=true\nsecure_cookie=false\n"])
+def test_cloud_startup_rejects_missing_or_insecure_auth_config(monkeypatch, tmp_path, config_text):
+    monkeypatch.setattr(start_backend, "REPO_ROOT", tmp_path)
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    config = tmp_path / "local.toml"
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(config))
+    if config_text is not None:
+        config.write_text(config_text, encoding="utf-8")
+    with pytest.raises(SystemExit, match="--require-auth.*requires"):
+        start_backend.main(["personal", "--require-auth"])
+    assert not (tmp_path / "data").exists()
+
+
+def test_cloud_startup_keeps_proxy_trust_local(monkeypatch, tmp_path):
+    monkeypatch.setattr(start_backend, "REPO_ROOT", tmp_path)
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    config = tmp_path / "local.toml"
+    config.write_text("[auth]\nenabled=true\n", encoding="utf-8")
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(config))
+    monkeypatch.setenv("FORWARDED_ALLOW_IPS", "*")
+    calls = []
+    monkeypatch.setattr("uvicorn.run", lambda *args, **kwargs: calls.append(kwargs))
+    assert start_backend.main(["personal", "--require-auth"]) == 0
+    assert calls[0]["forwarded_allow_ips"] == "127.0.0.1"
+    for args in (["personal", "--require-auth", "--reload"], ["test", "--require-auth"]):
+        with pytest.raises(SystemExit, match="--require-auth requires"):
+            start_backend.main(args)
+
+
+def test_node_startup_rejects_default_fallback_and_pins_proxy_trust(monkeypatch, tmp_path):
+    monkeypatch.setattr(start_backend, "REPO_ROOT", tmp_path)
+    monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
+    config = tmp_path / "node.toml"
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(config))
+    with pytest.raises(SystemExit, match="existing configuration"):
+        start_backend.main(["personal", "--require-node"])
+    config.write_text("", encoding="utf-8")
+    with pytest.raises(SystemExit, match="authenticated replica"):
+        start_backend.main(["personal", "--require-node"])
+    config.write_text('[sync]\nenabled=true\nrole="replica"\nhub_id="hub"\n'
+                      'hub_url="https://hub.test"\n[connections]\nenabled=true\nnode_id="pc"\n'
+                      'allowed_origins=["https://pc.test"]\n', encoding="utf-8")
+    calls = []
+    monkeypatch.setattr("uvicorn.run", lambda *args, **kwargs: calls.append(kwargs))
+    assert start_backend.main(["personal", "--require-node"]) == 0
+    assert calls[0]["forwarded_allow_ips"] == "127.0.0.1"
+    for args in (["test", "--require-node"], ["personal", "--require-node", "--reload"]):
+        with pytest.raises(SystemExit, match="--require-node requires"):
+            start_backend.main(args)

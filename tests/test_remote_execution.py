@@ -1,0 +1,602 @@
+"""Synthetic hub/node integration through durable generic Agent admission, without network or models."""
+from contextlib import closing
+
+import pytest
+
+from app.core.agent_runs import AgentRunCancelled
+from app.core.config import Settings
+from app.core.runtime import LocalKnowledgeAgentRuntime
+from app.core.tools import ToolContext
+from app.domains.devices import DeviceConfig, DeviceService, DeviceUnavailableError
+from app.domains.remote_execution import (
+    ExecutionReport,
+    RemoteExecutionConfig,
+    RemoteExecutionConflict,
+    RemoteExecutionService,
+)
+from app.domains.shared_sync import SharedSyncConfig
+from app.integrations.remote_execution import RemoteExecutionNode
+from tests.test_management_api import runtime as runtime_fixture
+from tests.test_unified_entry_quality import ScriptedClient, operation
+
+
+@pytest.fixture
+def hub(tmp_path, monkeypatch):
+    yield from runtime_fixture.__wrapped__(tmp_path, monkeypatch)
+
+
+@pytest.fixture
+def setup_remote(hub, tmp_path, monkeypatch):
+    devices = DeviceService(hub._conn, DeviceConfig(enabled=True))
+    enrolled = devices.enroll({"device_id": "pc", "name": "Work PC", "platform": "linux",
+        "systems": [{"environment_id": "linux", "workspace_ids": ["project"]}],
+        "workspace_ids": ["project"], "capabilities": ["files.read"],
+        "scopes": ["heartbeat", "execution.poll", "execution.run", "execution.result"]})
+    principal = devices.authenticate(enrolled["token"])
+    devices.heartbeat(principal)
+    service = RemoteExecutionService(hub._conn, devices, hub_id="test-hub", managed_tasks=hub.managed_tasks,
+        sessions=hub.session_service, run_store=hub.agent_run_store,
+        run_manager=hub.agent_run_manager, tool_executor=hub.tool_executor)
+    service.ensure_schema()
+    hub.managed_tasks.remote_execution = service
+    sid = hub.management_service.create()["session"]["session_id"]
+    hub.management_service.update(sid, expected_revision=1, status="active")
+    parent = hub.create_agent_run(session_id=sid, user_input="Read this project only. Do not deploy.", resumable=True)
+    hub.agent_run_manager.mark_running(parent.run_id)
+    hub.session_service.append_message(session_id=sid, role="user", content=parent.user_input,
+        payload={"trace_id": parent.trace_id}, message_id="source-user-message")
+    context = ToolContext(session_id=sid, run_id=parent.run_id, trace_id=parent.trace_id, safety_review_approved=True)
+    node = LocalKnowledgeAgentRuntime(Settings(LKA_DATA_DIR=tmp_path / "node-data", LKA_WORKSPACE_ROOTS=str(tmp_path)))
+    monkeypatch.setenv("TEST_EXECUTION_TOKEN", enrolled["token"])
+
+    def transport(method, path, payload, token):
+        assert method == "POST"
+        current = devices.authenticate(token)
+        if current is None:
+            raise PermissionError("device credential revoked")
+        if path.endswith("/claim"):
+            return service.claim(current, **payload)
+        if path.endswith("/start"):
+            return service.check(current, payload, start=True)
+        if path.endswith("/check"):
+            return service.check(current, payload)
+        if path.endswith("/report"):
+            return service.report(current, payload)
+        raise AssertionError(path)
+
+    worker = RemoteExecutionNode(node, RemoteExecutionConfig(enabled=True, environment_id="linux",
+        workspace_mappings={"project": str(tmp_path)}, allowed_tools=["filesystem.read_file"]),
+        SharedSyncConfig(hub_id="test-hub", token_env="TEST_EXECUTION_TOKEN"), transport=transport)
+    dispatch_guard = node.agent_turn_loop.execution_guard
+    node.agent_turn_loop.execution_guard = lambda run_id: (dispatch_guard(run_id), worker.check_run(run_id))
+    worker.run_once()  # First empty claim advertises this credential-bound environment.
+    yield {"hub": hub, "node": node, "service": service, "devices": devices,
+           "worker": worker, "context": context, "principal": principal}
+    worker.stop()
+    node.stop()
+
+
+def start(env, command_id="task", **target):
+    return env["hub"].managed_tasks.start_task(env["context"], command_id=command_id,
+        purpose="Read the project and report evidence", execution_target=target)
+
+
+def test_real_dispatch_round_trip_and_immutable_command(setup_remote):
+    e = setup_remote
+    receipt = start(e, device_id="pc", environment_id="linux", workspace_id="project")
+    assert start(e, device_id="pc", environment_id="linux", workspace_id="project") == receipt
+    with pytest.raises(RemoteExecutionConflict, match="different arguments"):
+        start(e, device_id="other")
+    with closing(e["hub"]._conn()) as conn:
+        assert conn.execute("SELECT count(*) FROM background_jobs WHERE kind='agent_dispatch' AND scope_id=?", (receipt["session_id"],)).fetchone()[0] == 0
+    e["node"].agent_turn_loop.llm_client = ScriptedClient([operation("final_answer", reason="Bounded task completed"), "Project checked."])
+    e["worker"].run_once()
+    local = e["node"].agent_run_manager.get_run(receipt["run_id"])
+    assert local.metadata["session_policy"]["safety_review_mode"] == "manual"
+    assert local.metadata["session_policy"]["allowed_tools"] == ["filesystem.read_file"]
+    view = local.metadata["context_views"]["tool"]
+    assert not view["full_data_authority"] and not view["full_workspace_authority"]
+    assert view["allowed_paths"]
+    assert e["node"].agent_dispatch.run_one("test-node")
+    assert e["node"].agent_run_manager.get_run(receipt["run_id"]).status.value == "completed"
+    e["worker"].run_once()
+    remote = e["service"].get(receipt["remote_execution"]["task_id"])
+    assert remote["state"] == "completed"
+    hub_run = e["hub"].agent_run_manager.get_run(receipt["run_id"])
+    assert hub_run.status.value == "completed" and hub_run.result_snapshot["answer"] == "Project checked."
+    messages = e["hub"].get_session(session_id=receipt["session_id"]).messages
+    assert any(m.role == "agent" and m.content == "Project checked." for m in messages)
+    assert hub_run.metadata["input_envelope"]["original_user_message_refs"] == ["source-user-message"]
+
+
+def test_target_failure_does_not_fall_back(setup_remote):
+    e = setup_remote
+    for target in ({"device_id": "missing"}, {"environment_id": "windows"}, {"workspace_id": "secret"}, {"capabilities": ["unapproved"]}):
+        with pytest.raises(DeviceUnavailableError):
+            start(e, **target)
+    with closing(e["hub"]._conn()) as conn:
+        assert conn.execute("SELECT count(*) FROM remote_execution_tasks").fetchone()[0] == 0
+    assert start(e, command_id="auto")["remote_execution"]["node_id"] == "pc"
+
+
+def test_revocation_fences_actual_execution_and_result(setup_remote):
+    e = setup_remote
+    receipt = start(e, device_id="pc", workspace_id="project")
+    e["worker"].run_once()
+    with closing(e["node"]._conn()) as conn:
+        journal = dict(conn.execute("SELECT * FROM remote_execution_node_tasks").fetchone())
+    e["devices"].revoke("pc", 1)
+    with pytest.raises(PermissionError):
+        e["service"].control(receipt["remote_execution"]["task_id"], command_id="revoked-continuation", action="pause")
+    with pytest.raises(AgentRunCancelled):
+        e["worker"].check_run(receipt["run_id"])
+    import json
+    with pytest.raises(PermissionError):
+        e["service"].report(e["principal"], ExecutionReport(**json.loads(journal["fence"]), report_id="late", status="completed", result={"answer": "late"}))
+    assert e["service"].get(receipt["remote_execution"]["task_id"])["state"] == "unknown"
+    assert e["hub"].agent_run_manager.get_run(receipt["run_id"]).status.value == "failed"
+
+
+def test_cancel_and_expiry_are_fenced_never_replayed(setup_remote):
+    e = setup_remote
+    receipt = start(e, command_id="cancel")
+    claim = e["service"].claim(e["principal"], environment_id="linux")
+    e["service"].cancel(receipt["remote_execution"]["task_id"])
+    with pytest.raises((PermissionError, RemoteExecutionConflict)):
+        e["service"].check(e["principal"], claim["fence"], start=True)
+    second = start(e, command_id="expire")
+    claim = e["service"].claim(e["principal"], environment_id="linux")
+    with closing(e["hub"]._conn()) as conn, conn:
+        conn.execute("UPDATE remote_execution_tasks SET lease_expires_at='2000-01-01T00:00:00+00:00' WHERE task_id=?", (second["remote_execution"]["task_id"],))
+    assert e["service"].claim(e["principal"], environment_id="linux") == {"task": None}
+    assert e["service"].get(second["remote_execution"]["task_id"])["state"] == "unknown"
+
+
+def test_unmapped_workspace_and_outage_never_execute(setup_remote):
+    e = setup_remote
+    receipt = start(e, workspace_id="project")
+    e["worker"].config.workspace_mappings = {}
+    with pytest.raises(PermissionError, match="local mapping"):
+        e["worker"].run_once()
+    assert e["node"].agent_run_manager.get_run(receipt["run_id"]) is None
+    next_receipt = start(e, command_id="outage")
+    e["worker"].run_once()
+    def offline(*args):
+        raise OSError("synthetic outage")
+    e["worker"]._transport = offline
+    with pytest.raises(AgentRunCancelled):
+        e["worker"].check_run(next_receipt["run_id"])
+    assert e["node"].agent_run_manager.is_cancel_requested(next_receipt["run_id"])
+
+
+def test_hub_shadow_cannot_resume_locally_or_reset_budget(setup_remote):
+    e = setup_remote
+    receipt = start(e)
+    with pytest.raises(RemoteExecutionConflict, match="no longer live"):
+        e["hub"].managed_tasks.control_run(e["context"], command_id="resume", run_id=receipt["run_id"], action="resume")
+    e["hub"].agent_run_manager._update_run(e["context"].run_id,
+        status=e["hub"].agent_run_manager.get_run(e["context"].run_id).status,
+        metadata_patch={"work_budget_scopes": [{"scope_id": "capped", "token_limit": 1}]})
+    with pytest.raises(RemoteExecutionConflict, match="budgets"):
+        start(e, command_id="budget")
+
+
+def test_manual_review_relay_requires_user_decision_before_effect(setup_remote):
+    from tests.test_management_delegate_approval import register
+    e = setup_remote
+    effects = []
+    register(e["hub"], [])
+    register(e["node"], effects)
+    for runtime in (e["hub"], e["node"]):
+        runtime.tool_registry.register_effect_constraint("probe-source", blocked_domains=("messages",))
+        runtime.tool_registry.get_tool("approval_probe.write").spec.origin_constraints = ("probe-source",)
+    e["worker"].config.allowed_tools = ["approval_probe.write"]
+    receipt = start(e)
+    task_id = receipt["remote_execution"]["task_id"]
+    e["node"].agent_turn_loop.llm_client = ScriptedClient([
+        operation("expand_package", package_name="approval_probe"),
+        operation("tool_call", tool_name="approval_probe.write", tool_input={}),
+    ])
+    e["worker"].run_once()
+    assert e["node"].agent_dispatch.run_one("test-node")
+    assert e["node"].agent_run_manager.get_run(receipt["run_id"]).status.value == "waiting_confirmation"
+    assert effects == []
+    e["worker"].run_once()
+    remote = e["service"].get(task_id)
+    assert remote["state"] == "waiting_confirmation"
+    review = remote["reports"][-1]["reviews"][0]
+    e["service"].decide_review(task_id, review["review_id"], decision="approve", decided_by="user")
+    e["worker"].run_once()
+    assert effects == []
+    e["node"].agent_turn_loop.llm_client = ScriptedClient([
+        operation("final_answer", reason="Explicit user approval consumed"), "Approved operation complete."])
+    assert e["node"].agent_dispatch.run_one("test-node-resume")
+    assert effects == [receipt["run_id"]]
+    e["worker"].run_once()
+    assert e["service"].get(task_id)["state"] == "completed"
+    assert "probe-source" in e["hub"].tool_executor.constraint_store.get([("session", e["context"].session_id)])
+
+
+def test_lost_terminal_ack_retries_durable_result_without_reexecution(setup_remote):
+    e = setup_remote
+    receipt = start(e)
+    e["node"].agent_turn_loop.llm_client = ScriptedClient([
+        operation("final_answer", reason="Done once"), "One result."])
+    e["worker"].run_once()
+    assert e["node"].agent_dispatch.run_one("test-node")
+    transport = e["worker"]._transport
+    dropped = []
+    def lose_ack(method, path, payload, token):
+        result = transport(method, path, payload, token)
+        if path.endswith("/report") and payload["status"] == "completed" and not dropped:
+            dropped.append(True)
+            raise OSError("result committed, response lost")
+        return result
+    e["worker"]._transport = lose_ack
+    with pytest.raises(OSError):
+        e["worker"].run_once()
+    assert e["service"].get(receipt["remote_execution"]["task_id"])["state"] == "completed"
+    e["worker"].run_once()
+    assert not e["worker"]._active()
+    with closing(e["hub"]._conn()) as conn:
+        assert conn.execute("SELECT count(*) FROM remote_execution_reports").fetchone()[0] == 1
+    assert not e["node"].agent_dispatch.run_one("must-not-execute-again")
+
+
+def test_scope_removal_and_command_delivery_dedup(setup_remote):
+    from app.domains.devices import DeviceEnrollment
+    e = setup_remote
+    receipt = start(e)
+    claim = e["service"].claim(e["principal"], environment_id="linux")
+    e["worker"]._admit(claim)
+    e["worker"]._admit(claim)
+    with closing(e["node"]._conn()) as conn:
+        assert conn.execute("SELECT count(*) FROM remote_execution_node_tasks").fetchone()[0] == 1
+        assert conn.execute("SELECT count(*) FROM agent_runs WHERE run_id=?", (receipt["run_id"],)).fetchone()[0] == 1
+    current = e["devices"].get("pc")
+    profile = {key: current[key] for key in DeviceEnrollment.model_fields}
+    profile["scopes"] = ["heartbeat", "execution.poll", "execution.run"]
+    e["devices"].update("pc", {**profile, "expected_revision": current["revision"]})
+    with pytest.raises(AgentRunCancelled):
+        e["worker"].check_run(receipt["run_id"])
+    assert e["service"].get(receipt["remote_execution"]["task_id"])["state"] == "unknown"
+
+
+def test_api_task_listing_is_bounded_and_reports_require_account(setup_remote):
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+
+    from app.api.routes.remote_execution import list_tasks
+    e = setup_remote
+    receipt = start(e)
+    e["hub"].remote_execution_service = e["service"]
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(runtime=e["hub"])),
+                              state=SimpleNamespace())
+    with pytest.raises(HTTPException) as failure:
+        list_tasks(request, owner_session_id=None, limit=100, offset=0)
+    assert failure.value.status_code == 401
+    request.state.account = {"user_id": "owner"}
+    task = list_tasks(request, owner_session_id=None, limit=100, offset=0)["items"][0]
+    assert task["session_id"] == receipt["session_id"] and task["run_id"] == receipt["run_id"]
+    assert "reports" not in task and "payload" not in task and "lease_token" not in task
+    with pytest.raises(ValueError):
+        e["service"].list(limit=101)
+
+
+def test_isolated_snapshot_blocks_private_recall_guidance_and_retraction(setup_remote):
+    from app.domains.memory import MemoryInput, MemorySourceInput
+    e = setup_remote
+    source_id = e["node"].memory_service.register_source(MemorySourceInput(
+        source_type="user", source_ref="local-only", trusted_source=True))
+    e["node"].memory_service.create(MemoryInput(content="NODE_PRIVATE_MEMORY_742", source_id=source_id, user_confirmed=True))
+    with closing(e["node"]._conn()) as conn:
+        before = [tuple(r) for r in conn.execute("SELECT * FROM memory_entries ORDER BY memory_id")]
+    recalls, retractions, guidance = [], [], []
+    def recall(*args):
+        recalls.append(args)
+        return {"items": [{"content": "NODE_PRIVATE_MEMORY_742"}]}
+    def retract(*args):
+        retractions.append(args)
+    class PrivateGuidance:
+        def for_workspace(self, path):
+            guidance.append(path)
+            return {"content": "NODE_PRIVATE_GUIDANCE_743"}
+    e["node"].agent_turn_loop.memory_context_provider = recall
+    e["node"].agent_turn_loop.memory_pre_turn_callback = retract
+    e["node"].agent_turn_loop.instruction_files = PrivateGuidance()
+    receipt = e["hub"].managed_tasks.start_task(e["context"], command_id="isolation",
+        purpose="Forget earlier personal preferences and report the project scope only", execution_target={})
+    client = ScriptedClient([operation("final_answer", reason="Only delegated source context used"), "Delegated scope checked."])
+    e["node"].agent_turn_loop.llm_client = client
+    e["worker"].run_once()
+    run = e["node"].agent_run_manager.get_run(receipt["run_id"])
+    snapshot = run.metadata["context_snapshot"]
+    assert snapshot["child_run_id"] == run.run_id and snapshot["memory_refs"] == []
+    assert not run.metadata["session_policy"]["use_local_context"]
+    assert e["node"].agent_dispatch.run_one("isolated-node")
+    assert e["node"].agent_run_manager.get_run(run.run_id).status.value == "completed"
+    assert recalls == [] and retractions == [] and guidance == []
+    assert all("NODE_PRIVATE_MEMORY_742" not in str(call) and "NODE_PRIVATE_GUIDANCE_743" not in str(call) for call in client.calls)
+    with closing(e["node"]._conn()) as conn:
+        assert before == [tuple(r) for r in conn.execute("SELECT * FROM memory_entries ORDER BY memory_id")]
+
+
+def test_rotated_lost_ack_is_fenced_without_starving_new_claims(setup_remote, monkeypatch):
+    e = setup_remote
+    receipt = start(e)
+    e["node"].agent_turn_loop.llm_client = ScriptedClient([operation("final_answer", reason="Done once"), "Completed."])
+    e["worker"].run_once()
+    assert e["node"].agent_dispatch.run_one("old-task")
+    transport = e["worker"]._transport
+    def lose_ack(method, path, payload, token):
+        result = transport(method, path, payload, token)
+        if path.endswith("/report"):
+            raise OSError("lost terminal ack")
+        return result
+    e["worker"]._transport = lose_ack
+    with pytest.raises(OSError):
+        e["worker"].run_once()
+    rotated = e["devices"].rotate("pc", 1)
+    monkeypatch.setenv("TEST_EXECUTION_TOKEN", rotated["token"])
+    e["worker"]._transport = transport
+    e["worker"].run_once()  # Fence old publication and refresh the new worker credential.
+    second = start(e, command_id="after-rotation")
+    e["worker"].run_once()
+    with closing(e["node"]._conn()) as conn:
+        old = conn.execute("SELECT state,pending_report FROM remote_execution_node_tasks WHERE run_id=?", (receipt["run_id"],)).fetchone()
+        assert old["state"] == "fenced_unpublished" and old["pending_report"]
+    assert e["node"].agent_run_manager.get_run(second["run_id"]) is not None
+
+
+def test_only_live_execution_environment_is_selected(setup_remote):
+    from app.domains.devices import DeviceEnrollment
+    e = setup_remote
+    current = e["devices"].get("pc")
+    profile = {key: current[key] for key in DeviceEnrollment.model_fields}
+    profile["systems"] = [
+        {"environment_id": "aaa-windows", "workspace_ids": ["project"]},
+        {"environment_id": "linux", "workspace_ids": ["project"]}]
+    e["devices"].update("pc", {**profile, "expected_revision": current["revision"]})
+    assert start(e, command_id="auto-live")["remote_execution"]["environment_id"] == "linux"
+    with pytest.raises(DeviceUnavailableError):
+        start(e, command_id="unserved-windows", environment_id="aaa-windows")
+    targets = e["service"].execution_targets()["items"][0]
+    assert {system["environment_id"]: system["execution_online"] for system in targets["systems"]} == {"aaa-windows": False, "linux": True}
+    with closing(e["hub"]._conn()) as conn, conn:
+        conn.execute("UPDATE remote_execution_workers SET last_seen='2000-01-01T00:00:00+00:00'")
+    with pytest.raises(DeviceUnavailableError):
+        start(e, command_id="stale-worker")
+
+
+def test_checkpoint_pause_resume_preserves_run_epoch_and_single_effect(setup_remote):
+    from tests.test_management_delegate_approval import register
+    e = setup_remote
+    effects = []
+    register(e["hub"], [])
+    register(e["node"], effects)
+    e["worker"].config.allowed_tools = ["approval_probe.write"]
+    receipt = start(e, workspace_id="project")
+    task_id = receipt["remote_execution"]["task_id"]
+    client = ScriptedClient([operation("expand_package", package_name="approval_probe"),
+        operation("tool_call", tool_name="approval_probe.write", tool_input={})])
+    e["node"].agent_turn_loop.llm_client = client
+    e["worker"].run_once()
+    assert e["node"].agent_dispatch.run_one("review")
+    e["worker"].run_once()
+    review = e["service"].get(task_id)["reports"][-1]["reviews"][0]
+    e["service"].decide_review(task_id, review["review_id"], decision="approve", decided_by="user")
+    e["worker"].run_once()
+    tool = e["node"].tool_registry.get_tool("approval_probe.write")
+    invoke = tool.invoke
+
+    def pause_after_effect(**kwargs):
+        result = invoke(**kwargs)
+        e["service"].control(task_id, command_id="pause-once", action="pause")
+        return result
+
+    tool.invoke = pause_after_effect
+    assert e["node"].agent_dispatch.run_one("effect-once")
+    assert effects == [receipt["run_id"]]
+    assert e["node"].agent_run_manager.get_run(receipt["run_id"]).status.value == "paused"
+    transport = e["worker"]._transport
+    dropped = []
+
+    def lose_pause_ack(method, path, payload, token):
+        result = transport(method, path, payload, token)
+        if path.endswith("/report") and payload["status"] == "paused" and not dropped:
+            dropped.append(True)
+            raise OSError("pause report committed; ack lost")
+        return result
+
+    e["worker"]._transport = lose_pause_ack
+    with pytest.raises(OSError):
+        e["worker"].run_once()
+    e["worker"].run_once()
+    before = e["service"].get(task_id)
+    assert before["state"] == "paused"
+    assert e["hub"].agent_run_manager.get_run(receipt["run_id"]).metadata["paused_from_status"] == "running"
+    command = e["hub"].managed_tasks.control_run(e["context"], command_id="resume-once", run_id=receipt["run_id"], action="resume")
+    assert e["hub"].managed_tasks.control_run(e["context"], command_id="resume-once", run_id=receipt["run_id"], action="resume") == command
+    e["worker"].run_once()
+    assert e["service"].get(task_id)["state"] == "resuming"
+    import json
+    paused_report = e["service"].get(task_id)["reports"][-1]
+    with closing(e["node"]._conn()) as conn:
+        fence = json.loads(conn.execute("SELECT fence FROM remote_execution_node_tasks WHERE run_id=?", (receipt["run_id"],)).fetchone()[0])
+    e["service"].report(e["principal"], {**paused_report, **fence, "report_id": "distinct-paused-snapshot"})
+    assert e["service"].get(task_id)["state"] == "resuming"
+    with pytest.raises(RemoteExecutionConflict, match="checkpoint state"):
+        e["service"].control(task_id, command_id="second-resume", action="resume")
+    e["worker"].run_once()
+    e["node"].agent_turn_loop.llm_client = ScriptedClient([operation("final_answer", reason="Resumed after completed effect"), "Finished once."])
+    assert e["node"].agent_dispatch.run_one("resume-once")
+    e["worker"].run_once()
+    after = e["service"].get(task_id)
+    assert after["state"] == "completed" and after["lease_epoch"] == before["lease_epoch"]
+    assert effects == [receipt["run_id"]]
+    assert not e["node"].agent_dispatch.run_one("no-second-resume")
+
+
+def test_followup_uses_same_session_durable_command_and_frozen_workspace(setup_remote):
+    e = setup_remote
+    receipt = start(e, workspace_id="project")
+    e["node"].agent_turn_loop.llm_client = ScriptedClient([operation("final_answer", reason="Done"), "First result."])
+    e["worker"].run_once()
+    assert e["node"].agent_dispatch.run_one("first")
+    e["worker"].run_once()
+    args = {"command_id": "followup", "session_id": receipt["session_id"], "expected_run_id": receipt["run_id"], "purpose": "Explain the existing result without repeating operations"}
+    followup = e["hub"].managed_tasks.send_instruction(e["context"], **args)
+    assert e["hub"].managed_tasks.send_instruction(e["context"], **args) == followup
+    assert followup["session_id"] == receipt["session_id"] and followup["run_id"] != receipt["run_id"]
+    e["node"].agent_turn_loop.llm_client = ScriptedClient([operation("final_answer", reason="Followup only"), "Second result."])
+    e["worker"].run_once()
+    e["worker"].run_once()
+    assert e["node"].agent_dispatch.run_one("followup")
+    local_followup = e["node"].agent_run_manager.get_run(followup["run_id"])
+    assert local_followup.status.value == "completed", local_followup.model_dump(mode="json")
+    e["worker"].run_once()
+    assert e["service"].get(followup["remote_execution"]["task_id"])["state"] == "completed"
+    messages = e["hub"].get_session(session_id=receipt["session_id"]).messages
+    assert [m.content for m in messages if m.role == "agent"] == ["First result.", "Second result."]
+    with closing(e["node"]._conn()) as conn:
+        assert conn.execute("SELECT count(*) FROM agent_sessions WHERE session_id=?", (receipt["session_id"],)).fetchone()[0] == 1
+    second = e["service"].account_instruction(followup["remote_execution"]["task_id"], command_id="account-next", expected_run_id=followup["run_id"], purpose="Check prior evidence", actor="owner")
+    new_dir = e["node"].settings.data_dir / "other-workspace"
+    new_dir.mkdir()
+    e["worker"].config.workspace_mappings["project"] = str(new_dir)
+    with pytest.raises(PermissionError, match="workspace mapping changed"):
+        e["worker"].run_once()
+    assert e["node"].agent_run_manager.get_run(second["run_id"]) is None
+
+
+def test_continuation_rejects_unknown_revocation_and_changed_owner(setup_remote):
+    e = setup_remote
+    receipt = start(e)
+    task_id = receipt["remote_execution"]["task_id"]
+    e["worker"].run_once()
+    with closing(e["hub"]._conn()) as conn, conn:
+        conn.execute("UPDATE remote_execution_tasks SET lease_expires_at='2000-01-01T00:00:00+00:00' WHERE task_id=?", (task_id,))
+    with pytest.raises(RemoteExecutionConflict, match="no longer live"):
+        e["service"].control(task_id, command_id="unknown", action="resume")
+    with pytest.raises(RemoteExecutionConflict, match="unknown effects"):
+        e["hub"].managed_tasks.send_instruction(e["context"], command_id="unknown-followup", session_id=receipt["session_id"], expected_run_id=receipt["run_id"], purpose="Do it again")
+    e["worker"].run_once()
+    next_receipt = start(e, command_id="new")
+    e["worker"].run_once()
+    with closing(e["hub"]._conn()) as conn, conn:
+        conn.execute("UPDATE agent_sessions SET creator_session_id='other-manager' WHERE session_id=?", (next_receipt["session_id"],))
+    with pytest.raises(PermissionError, match="owner changed"):
+        e["service"].control(next_receipt["remote_execution"]["task_id"], command_id="changed-owner", action="pause")
+    with pytest.raises(AgentRunCancelled):
+        e["worker"].check_run(next_receipt["run_id"])
+
+
+def test_native_question_answer_relay_once_survives_runtime_restart(setup_remote):
+    from app.core.multi_agent import (
+        ForkPolicy,
+        Plan,
+        PlanStatus,
+        PlanStep,
+        PlanStepStatus,
+        ScopeGrant,
+    )
+    e = setup_remote
+    receipt = start(e)
+    task_id, run_id = receipt["remote_execution"]["task_id"], receipt["run_id"]
+    e["worker"].run_once()
+    runtime = e["node"]
+    loop = runtime.agent_turn_loop
+    plan = Plan(correlation_id="question", plan_id="question-plan", parent_run_id=run_id,
+        session_id=receipt["session_id"], objective="Resolve one question", status=PlanStatus.RUNNING,
+        steps=(PlanStep(correlation_id="question", step_id="root_coordinator", objective="Resolve question",
+            output_contract="Answer once", status=PlanStepStatus.RUNNING),))
+    runtime.agent_run_manager.record_multi_agent_plan(run_id, event_type="plan_created",
+        payload={"plan_id": plan.plan_id}, plan=plan.model_dump(mode="json"))
+    current = runtime.agent_run_manager.get_run(run_id)
+    runtime.agent_run_manager._update_run(run_id, status=current.status, metadata_patch={"multi_agent_replan_required": True})
+    loop.fork_policy = ForkPolicy(max_depth=0, max_children=0, max_fork_size=1, allowed_scope=ScopeGrant())
+    observations = []
+
+    def decide(**kwargs):
+        if any(o.get("action") == "user_answer" for o in kwargs["observations"]):
+            return {"action": "final_answer", "reason": "Use the journaled answer"}
+        return {"action": "plan_patch", "operation": {"patch_id": "ask-region", "plan_id": plan.plan_id,
+            "expected_revision": 0, "operation": "ask_user", "reason": "Need region", "user_question": "Which region?"}}
+
+    def answer(**kwargs):
+        observations.extend(kwargs["observations"])
+        return "Northern region selected."
+
+    loop._decide_next_action = decide
+    loop._answer_with_llm = answer
+    loop.llm_client = ScriptedClient([])
+    assert runtime.agent_dispatch.run_one("ask")
+    local = runtime.agent_run_manager.get_run(run_id)
+    assert local.status.value == "waiting_user", local.error
+    e["worker"].run_once()
+    remote = e["service"].get(task_id)
+    question = remote["reports"][-1]["pending_user_question"]
+    assert question["question"] == "Which region?"
+    args = {"command_id": "answer-once", "action": "answer", "question_id": question["question_id"], "answer": "Northern region"}
+    accepted = e["service"].control(task_id, **args)
+    assert e["service"].control(task_id, **args) == accepted
+    with pytest.raises(RemoteExecutionConflict, match="different arguments"):
+        e["service"].control(task_id, **{**args, "answer": "Different answer"})
+    e["worker"].run_once()
+    # Reconstruct runtime, graph, private answer journal and outbound delivery
+    # from disk after acceptance, before checkpoint consumption.
+    worker = e["worker"]
+    settings = runtime.settings
+    runtime.remote_execution_worker = worker
+    runtime.stop()
+    restarted = LocalKnowledgeAgentRuntime(settings)
+    try:
+        resumed_worker = RemoteExecutionNode(restarted, worker.config, worker.sync_config, transport=worker._transport)
+        restarted.remote_execution_worker = resumed_worker
+        dispatch_guard = restarted.agent_turn_loop.execution_guard
+        restarted.agent_turn_loop.execution_guard = lambda rid: (dispatch_guard(rid), resumed_worker.check_run(rid))
+        restarted.agent_turn_loop._decide_next_action = decide
+        restarted.agent_turn_loop._answer_with_llm = answer
+        restarted.agent_turn_loop.llm_client = ScriptedClient([])
+        resumed_worker.run_once()
+        assert restarted.agent_dispatch.run_one("answer")
+        assert restarted.agent_run_manager.get_run(run_id).status.value == "completed"
+        resumed_worker.run_once()
+        assert e["service"].get(task_id)["state"] == "completed"
+        assert sum(o.get("action") == "user_answer" for o in observations) == 1
+        assert not restarted.agent_dispatch.run_one("no-second-answer")
+    finally:
+        restarted.stop()
+
+
+def test_continuation_api_requires_account_and_rejects_wrong_question(setup_remote):
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+
+    from app.api.routes.remote_execution import (
+        ControlCommand,
+        FollowupInstruction,
+        UserAnswer,
+        answer_question,
+        pause_task,
+        resume_task,
+        send_instruction,
+    )
+    e = setup_remote
+    receipt = start(e)
+    task_id = receipt["remote_execution"]["task_id"]
+    e["hub"].remote_execution_service = e["service"]
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(runtime=e["hub"])), state=SimpleNamespace())
+    for method, payload in ((pause_task, ControlCommand(command_id="pause")),
+                            (resume_task, ControlCommand(command_id="resume")),
+                            (answer_question, UserAnswer(command_id="answer", question_id="wrong", answer="No")),
+                            (send_instruction, FollowupInstruction(command_id="next", expected_run_id=receipt["run_id"], purpose="Followup"))):
+        with pytest.raises(HTTPException) as error:
+            method(task_id, payload, request)
+        assert error.value.status_code == 401
+    request.state.account = {"user_id": "owner"}
+    with pytest.raises(HTTPException) as error:
+        resume_task(task_id, ControlCommand(command_id="resume"), request)
+    assert error.value.status_code == 409
