@@ -13,6 +13,7 @@ from xml.etree import ElementTree
 PUBLIC_DOCS = frozenset({
     "README.md", "getting_started.md", "configuration.md", "usage.md",
     "architecture.md", "maintenance.md", "api_contract.md", "distributed_client_handoff.md",
+    "deployment_migration.md",
 })
 LOCAL_PREFIXES = ("docs/_engineering/", "evals/baselines/", "tmp_")
 

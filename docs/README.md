@@ -11,6 +11,7 @@
 | 第一次安装或在另一台电脑使用 | [安装与开始使用](getting_started.md) |
 | 配置模型、邮箱、搜索和后台任务 | [配置模型与数据连接](configuration.md) |
 | 使用项目、记忆、消息和定时简报 | [日常使用](usage.md) |
+| 迁移现有数据到云端、安装其他电脑 | [部署与旧数据迁移](deployment_migration.md) |
 | 更新版本、备份或排查运行问题 | [更新、备份与故障检查](maintenance.md) |
 | 配置 Ubuntu 云端核心与电脑副本 | [云端部署](maintenance.md#ubuntu-2204-云端共享核心)、[账号与同步配置](configuration.md#可选云端账号设备与共享同步) |
 | 了解各部分如何协作 | [系统说明](architecture.md) |
