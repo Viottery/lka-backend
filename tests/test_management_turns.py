@@ -7,6 +7,11 @@ from app.domains.management import ManagementService
 from tests.test_unified_entry_quality import operation, runtime_for
 
 
+def original_reasoning(runtime, run_id):
+    metadata = runtime.agent_run_manager.get_run(run_id).metadata
+    return metadata.get("llm_reasoning_level"), metadata.get("llm_reasoning_source")
+
+
 def configure_policy(runtime):
     service = ManagementService(runtime._conn, runtime.session_service)
     service.ensure_schema()
@@ -139,13 +144,18 @@ def test_replacement_freezes_current_policy_and_retries_keep_binding(tmp_path, m
         runtime.session_service.run_policy_provider = lambda _: new_policy
         replacement = runtime.replace_agent_run(original.run_id, user_input="New task",
                                                  command_id="replace", request_fingerprint="same-input")
-        assert replacement.metadata["session_policy"] == new_policy.model_dump(mode="json")
+        # Reasoning strength is frozen from the replaced run (since semantic
+        # reasoning levels); every other field follows the current session policy.
+        expected = {**new_policy.model_dump(mode="json"),
+                    "llm_reasoning_level": original_reasoning(runtime, original.run_id)[0],
+                    "llm_reasoning_source": original_reasoning(runtime, original.run_id)[1]}
+        assert replacement.metadata["session_policy"] == expected
         # Retrying the accepted command must not rebind it to later settings.
         runtime.session_service.run_policy_provider = lambda _: SessionRunPolicy()
         replay = runtime.replace_agent_run(original.run_id, user_input="New task",
                                             command_id="replace", request_fingerprint="same-input")
         assert replay.run_id == replacement.run_id
-        assert replay.metadata["session_policy"] == new_policy.model_dump(mode="json")
+        assert replay.metadata["session_policy"] == expected
         result = runtime.run_agent_turn(session_id=sid, user_input="New task", existing_run_id=replacement.run_id)
         assert result.answer == "Replacement."
         assert runtime.agent_turn_loop._package_catalog(runtime.agent_turn_loop._tool_view_for_run(result.run_id)) == []

@@ -37,6 +37,12 @@ def setup_bound(runtime):
 
 def test_manager_only_reads_matter_through_direct_domain_tools(runtime):
     sid = runtime.management_service.create()["session"]["session_id"]
+    # New managers start paused; supervisor write tools require active management.
+    paused_run = runtime.create_agent_run(session_id=sid, user_input="Paused")
+    paused = runtime.agent_turn_loop._tool_view_for_run(paused_run.run_id)
+    assert not paused.allows_tool(tool_name="management.organize_work", package="management", read_only=False)
+    runtime.agent_run_manager.mark_cancelled(paused_run.run_id)
+    runtime.management_service.update(sid, expected_revision=1, status="active")
     run = runtime.create_agent_run(session_id=sid, user_input="Read only")
     view = runtime.agent_turn_loop._tool_view_for_run(run.run_id)
     assert view.allows_tool(tool_name="matter.get", package="matter", read_only=True)
@@ -77,8 +83,9 @@ def test_simple_manager_query_does_not_create_matter(runtime):
 
 def test_bound_matter_snapshot_and_final_proposal_share_delivery_transaction(runtime):
     sid, _, matter, run = setup_bound(runtime)
+    # The bound Matter is frozen by revision; the prompt carries references only
+    # (since 70a22fe), so neither the Matter title nor the legacy objective is inlined.
     assert run.metadata["manager_matter_versions"] == {matter.matter_id: matter.revision}
-    assert "Current business objective" in run.user_input
     assert "Legacy objective must not win" not in run.user_input
     context = ToolContext(session_id=sid, run_id=run.run_id, safety_review_approved=True)
     receipt = runtime.management_work.organize_work(context, "finish", [{"op": "update", "matter_id": matter.matter_id,

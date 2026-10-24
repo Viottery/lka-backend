@@ -107,7 +107,9 @@ def test_tiny_unicode_budgets_never_publish_an_over_budget_window(tmp_path, budg
     conn.executescript(
         """
         CREATE TABLE agent_sessions(session_id TEXT PRIMARY KEY, title TEXT, status TEXT,
-            metadata TEXT, created_at TEXT, updated_at TEXT);
+            metadata TEXT, created_at TEXT, updated_at TEXT,
+            kind TEXT NOT NULL DEFAULT 'ordinary', creation_source TEXT NOT NULL DEFAULT 'unknown',
+            creator_session_id TEXT);
         CREATE TABLE agent_session_messages(message_id TEXT PRIMARY KEY, session_id TEXT,
             role TEXT, content TEXT, payload TEXT, created_at TEXT);
         CREATE TABLE agent_session_context_windows(session_id TEXT PRIMARY KEY,
@@ -115,7 +117,8 @@ def test_tiny_unicode_budgets_never_publish_an_over_budget_window(tmp_path, budg
             token_estimate INTEGER, updated_at TEXT);
         CREATE TABLE agent_session_effects(effect_id TEXT PRIMARY KEY, session_id TEXT,
             effect_type TEXT, created_at TEXT);
-        INSERT INTO agent_sessions VALUES('s', 's', 'active', '{}', 't', 't');
+        INSERT INTO agent_sessions(session_id, title, status, metadata, created_at, updated_at)
+            VALUES('s', 's', 'active', '{}', 't', 't');
         """
     )
     conn.close()
@@ -162,7 +165,9 @@ def _persistent_service(tmp_path):
     conn.executescript(
         """
         CREATE TABLE agent_sessions(session_id TEXT PRIMARY KEY, title TEXT, status TEXT,
-            metadata TEXT, created_at TEXT, updated_at TEXT);
+            metadata TEXT, created_at TEXT, updated_at TEXT,
+            kind TEXT NOT NULL DEFAULT 'ordinary', creation_source TEXT NOT NULL DEFAULT 'unknown',
+            creator_session_id TEXT);
         CREATE TABLE agent_session_messages(message_id TEXT PRIMARY KEY, session_id TEXT,
             role TEXT, content TEXT, payload TEXT, created_at TEXT);
         CREATE TABLE agent_session_context_windows(session_id TEXT PRIMARY KEY,
@@ -171,7 +176,8 @@ def _persistent_service(tmp_path):
         CREATE TABLE agent_session_effects(effect_id TEXT PRIMARY KEY, session_id TEXT,
             effect_type TEXT, created_at TEXT);
         CREATE TABLE compact_jobs(session_id TEXT, revision INTEGER, target_seq INTEGER);
-        INSERT INTO agent_sessions VALUES('s', 's', 'active', '{}', 't', 't');
+        INSERT INTO agent_sessions(session_id, title, status, metadata, created_at, updated_at)
+            VALUES('s', 's', 'active', '{}', 't', 't');
         """
     )
     conn.close()

@@ -103,7 +103,9 @@ def test_large_manager_event_batch_and_full_goal_remain_readable(runtime):
     run = bind(runtime)
     purpose = run.metadata['input_envelope']['purpose']
     assert 'management.read_events' in purpose and 'management.read_goal' in purpose
-    assert goal['goal_id'] in purpose
+    # The prompt carries references only (since 70a22fe); the full goal stays
+    # readable through management.read_goal, checked below.
+    assert run.metadata['input_envelope']['debug_info']['event_count'] == 16
     assert runtime.management_goals.get_goal(sid, goal['goal_id'])['objective'] == objective
     events = runtime.management_goals.list_events(sid)['events']
     assert len(events) == 17
