@@ -172,7 +172,10 @@ class AccountService:
         valid = _verify(password, stored)
         if not valid or row is None or row["disabled"]:
             raise AccountError("Invalid username or password", 401)
-        token, csrf, session_id = secrets.token_urlsafe(32), secrets.token_urlsafe(32), secrets.token_hex(16)
+        token, session_id = secrets.token_urlsafe(32), secrets.token_hex(16)
+        # Derived from the opaque session credential so any tab holding the
+        # HttpOnly cookie can recover it through /auth/me; only its hash is stored.
+        csrf = self.csrf_for(token)
         now = int(time.time())
         with self._db(write=True) as conn:
             current = self._admin(conn, row["user_id"])
@@ -201,6 +204,11 @@ class AccountService:
     @staticmethod
     def check_csrf(account: dict, csrf: str):
         return bool(csrf) and len(csrf) <= 512 and hmac.compare_digest(account["csrf_hash"], _digest(csrf))
+
+    @staticmethod
+    def csrf_for(session_token: str) -> str:
+        """Recoverable only with the session credential itself (HttpOnly cookie)."""
+        return hmac.new(session_token.encode(), b"lka-account-csrf-v1", hashlib.sha256).hexdigest()
 
     def list_accounts(self, actor_user_id: str):
         with self._db() as conn:

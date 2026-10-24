@@ -1550,7 +1550,9 @@ limit 1..200，offset 0..1,000,000，q 最长 500 字符，按字面子串搜索
 | `GET /managers/{session_id}` | 返回一个管理会话与 controller，不是管理会话则 404 |
 | `PATCH /managers/{session_id}` | 修改 status、模型或推理默认值，必须携带 expected_revision；冲突 409 |
 
-单项响应为 `{session: {...}, controller: {...}}`。controller 包含 session_id、
+单项响应为 `{session: {...}, controller: {...}, autonomy: {autonomous_enabled: false}}`。
+`autonomy.autonomous_enabled` 反映服务器是否允许自主跟进，与 controller 的 active/paused 独立。
+controller 包含 session_id、
 status(active/paused)、revision、llm_client_name、llm_model、llm_answer_client_name、llm_answer_model、reasoning_level、created_at、updated_at、default_execution_workspace。
 默认执行父目录通过创建或 PATCH 的 default_execution_workspace:{path,platform} 配置，后端验证并返回 backend_path；null 清除。PATCH 必须使用 expected_revision。POST /managers/default 的目录仅在首次创建时采用，后续不覆盖已有配置。
 此字段不赋予主管自身 session.workspace，也不是审批授权。
@@ -1635,7 +1637,7 @@ controller active 才能发出管理写命令；paused 可对话和读取结果�
 替换还含 `replaced_run_snapshot`，分别描述新 run 已排队和旧 run 已取消，不能沿用介入前的 paused。
 `accepted` 是命令受理状态，不能当作运行完成；暂停请求中的 `pause_requested=true` 不等于已暂停。
 回执快照随命令固定，幂等重放保持原值；需查询当前状态时使用新的只读查询。
-workspace_path 支持已有会话路径协议（含 Windows 到 WSL 映射），仍验证工作区根。省略时使用 controller.default_execution_workspace 创建独立任务目录；未配置可接受无目录的数据任务，但其冻结路径为空，不开放工作区工具。默认执行目录在受理时冻结，不受后来默认目录或会话目录修改影响，也不回退到后端首工作区。有执行目录的助理任务不把该目录作为文件访问边界；工作区外文件与 Bash cwd 进入现有逐调用安全审查，审批模式继承发起轮选择，命中危险操作黑名单时等待用户审批，工具白名单与数据源授权不变。指定另一位置的新项目时，可选择其已有父目录，让执行会话创建项目目录与文件。
+workspace_path 支持已有会话路径协议（含 Windows 到 WSL 映射），仍验证工作区根。省略时使用 controller.default_execution_workspace 创建独立任务目录；controller 未指定时可使用服务端配置的 management.default_task_parent。两者都未配置时可接受无目录的数据任务，但其冻结路径为空，不开放工作区工具。默认执行目录在受理时冻结，不受后来默认目录或会话目录修改影响，也不回退到后端首工作区。有执行目录的助理任务不把该目录作为文件访问边界；工作区外文件与 Bash cwd 进入现有逐调用安全审查，审批模式继承发起轮选择，命中危险操作黑名单时等待用户审批，工具白名单与数据源授权不变。指定另一位置的新项目时，可选择其已有父目录，让执行会话创建项目目录与文件。
 `management.start_task` 的可选 `workspace_path` 可省略或传 null，两者均使用已配置的前端默认独立工作区；显式路径仍须为有效的已有目录，审批照常执行。
 
 `management.read_task_result(run_id,section?,start_char?,max_chars?,evidence_offset?,invocation_id?)` 返回本主管及直属事务线所属独立 root 的执行状态和分页结果，事务线仅能读取自己任务；普通或 child caller 不获授。section 为 answer（默认）、evidence 或 observation。结果还附有界 `execution_receipts`：保留已注册 Matter 写工具明确返回的记录 ID、修订号、标题、状态与日期字段，并标明未确认执行、缺失字段或截断；仅为历史执行回执，不代表当前状态、语义正确或业务事项完成。可按回执的 `read_evidence` 和证据长度继续读取完整的安全字段投影。`mail_coverage_receipts` 经过与历史来源读取相同的权限、来源版本及操作记录校验，提供已执行查询的时间范围、数量、分页状态和各邮件正文交付长度／截断标记，不提供正文、发件人或语义判断；来源不可重验时标为不可用，必要正文沿 `read_observation` 获取。两类回执的默认预览总量有界（不超过 12000 JSON 字符），省略项在分页证据中仍可读取。evidence 的 content 为 JSON 字符片段，按 next_char 拼接后解析；保留实际持久工具证据的白名单字段，不包含系统提示、metadata、工具输入或 shell stdout。每次结果附有界 evidence_index（按 evidence_offset 每页 20 条）、successful_operation_count、error_type、task_outcome 和恢复提示，失败或空回答也可保留成功工具结果；操作计数来自原始工具结果 artifact，不代表业务完成。section=observation 必带 invocation_id，仅为仍授权的只读、非 Bash 原工具结果返回当前 run 的 observation 句柄；缓存 reader 的代理输出不能代替原工具权限，需选择原始生产者的证据条目；其 evidence 回执只保留状态与索引，不投影代理正文；原文通过 observation.read/search/group 按需读取。每次回读复验归属、会话存活、权限和原始／复制内容版本，完整读完仍标 historical_only=true、current_evidence=false。deleted、非归属和 child run 均拒绝，证据不代替新操作审批。
@@ -2794,7 +2796,8 @@ session 级工具禁用；事项候选仍须通过专用人工决定流程。没
 
 以下能力默认关闭，配置及范围见[配置说明](configuration.md#可选云端账号设备与共享同步)。
 启用账号后，除最小 `GET /health`、固定 `/client` 登录资源与信息、受 Origin 限制的 `POST /auth/login`，普通 API、文档、
-文件和事件流均需登录；`/node/*` 单独要求有效设备令牌，不能用账号令牌代替。
+文件和事件流均需登录；另可通过 `[client].workbench_dir` 提供公开的 `/desktop-pet/` 静态入口，
+其页面所调用的数据 API 仍需认证。`/node/*` 单独要求有效设备令牌，不能用账号令牌代替。
 所有账号共享同一套个人数据，当前没有租户隔离或普通成员角色。
 
 ### 登录与账号管理
@@ -2805,7 +2808,7 @@ session 级工具禁用；事项候选仍须通过专用人工决定流程。没
 | 接口 | 请求与行为 |
 | --- | --- |
 | `POST /auth/login` | `{username,password}`；返回 account、session_id、csrf_token、expires_at（Unix 秒），浏览器另收 HttpOnly cookie |
-| `GET /auth/me` | 返回当前账号和会话的安全字段 |
+| `GET /auth/me` | 返回当前账号和会话的安全字段；采用派生规则的浏览器 cookie 会话另含 csrf_token，原生令牌请求不含 |
 | `POST /auth/logout` | 撤销当前会话，204 |
 | `POST /auth/password` | `{current_password,new_password}`；撤销该账号全部会话，204 |
 | `GET /auth/sessions` | 当前账号的有效会话，`{items:[...]}` |
@@ -2817,6 +2820,8 @@ session 级工具禁用；事项候选仍须通过专用人工决定流程。没
 
 浏览器登录必须提供配置中精确匹配的 Origin；cookie 写请求还要带 `X-CSRF-Token`。
 前端跨源请求需 `credentials: include`；cookie 为 SameSite=Strict，跨站部署应使用同站 HTTPS 入口。
+新标签页可用有效 cookie 调用 `/auth/me` 恢复匹配该会话的 CSRF，不返回登录 token 或 csrf_hash；
+升级前不兼容派生规则的会话需要重新登录。
 原生/API 客户端必须显式启用 `auth.allow_bearer_sessions`，登录时发送 `X-LKA-Client: native`
 且不带 Origin，才在响应中获得 token。后续优先以 `X-LKA-Account-Token: <token>` 提供账号身份，
 让 `Authorization` 留给消息 IMPORT/API/CONTROL 等独立凭据；没有其他凭据时也支持
@@ -2974,6 +2979,11 @@ management.start_task 新增可选 execution_target：省略沿用云端本机�
 或用 `{device_id,environment_id,workspace_id,capabilities}` 指定要求。
 与本机 workspace_path 不能混用。命令 ID 去重、目标、来源/工具范围、节点凭据代次及租约持久冻结。
 返回原任务 session_id/run_id 及 remote_execution.task_id；云端 shadow 不运行第二次执行。
+任务摘要含 `title`、`session_id`、`node_id`、`environment_id`、`workspace_id`，用于按实际执行设备归类。
+`approval` 含 `requested_mode`、`effective_mode`（skip/llm/manual）和
+`source`（request/node_policy/host_execution/legacy）；节点尚未回报或旧记录缺字段时 effective_mode 为 null。
+节点默认 `remote_execution.review_policy=manual`；操作者明确配置 inherit 后，新任务可沿用冻结的
+发起轮审批模式，原生主机执行仍强制人工。既有运行不追溯修改审批，审查记录始终保留。
 
 | 接口 | 行为 |
 | --- | --- |

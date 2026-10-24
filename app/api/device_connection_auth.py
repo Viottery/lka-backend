@@ -12,6 +12,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import Headers
 from starlette.responses import JSONResponse
 
+from app.api.routes.distributed_client import is_workbench_asset_request
 from app.domains.device_connections import is_loopback
 
 
@@ -69,7 +70,8 @@ class DeviceConnectionAuthMiddleware:
         # Account login remains available as an independent, local credential.
         if (path == "/health" or path == "/auth" or path.startswith("/auth/")
                 or method in {"GET", "HEAD"} and path in {
-                    "/client", "/client/info", "/client/client.html", "/client/client.js", "/client/client.css"}):
+                    "/client", "/client/info", "/client/client.html", "/client/client.js", "/client/client.css"}
+                or is_workbench_asset_request(scope)):
             return await self.app(scope, receive, send)
         if scope["type"] == "websocket":
             return await reject(403, "direct node WebSocket transport unavailable")

@@ -13,7 +13,13 @@
 [management]
 # Management tools and durable task dispatch. Autonomous turns are separately opt-in.
 enabled = false
+# Wake the assistant in the background when a task finishes or a goal is due.
+# Separate from the UI's "启用管理", which only allows organizing and dispatch.
 autonomous_enabled = false
+# Absolute directory on THIS host for assistant tasks run here when the
+# assistant has no default_execution_workspace (e.g. a cloud hub). Each task
+# gets its own child directory; empty keeps file/shell tools unavailable.
+default_task_parent = ""
 # Enable only after all clients understand visibility and rebuild their Matter cache.
 internal_items_enabled = false
 # Accepted agent tasks dispatch independently; no fixed management worker pool.
@@ -230,6 +236,12 @@ auto_index_on_import = false
 # be requested explicitly through semantic-index sync.
 local_files_only = true
 
+[client]
+# Optional same-origin LKA Desktop workbench, e.g. "/home/me/lka-desktop/app/web/pet".
+# Served at /desktop-pet/ (entry: /desktop-pet/connect.html). Static files are
+# public like /client; every API request keeps its own account/node auth gate.
+workbench_dir = ""
+
 # Optional personal cloud instance. Accounts are trusted coadministrators of ONE
 # shared dataset; this is not multi-tenant isolation. Bootstrap through the CLI.
 [auth]
@@ -281,6 +293,7 @@ enabled = false
 workspace_mappings = {} # Same workspace ID must match connections.workspace_roots.
 allowed_tools = [] # Explicit node-local execution grant. Empty grants no tools.
 shell_trust = "disabled" # "host_user" acknowledges native OS-user access; bash.run + manual approval required.
+review_policy = "manual" # Node policy: "inherit" uses the task's frozen skip/llm/manual; native host execution still requires manual.
 poll_seconds = 3
 lease_seconds = 90
 max_task_bytes = 1048576

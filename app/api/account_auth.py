@@ -7,6 +7,8 @@ from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import Headers
 from starlette.responses import JSONResponse
 
+from app.api.routes.distributed_client import is_workbench_asset_request
+
 
 class AccountAuthMiddleware:
     def __init__(self, app):
@@ -27,6 +29,8 @@ class AccountAuthMiddleware:
         if (scope["type"] == "http" and scope["method"] in {"GET", "HEAD"}
                 and path in {"/client", "/client/info", "/client/client.html",
                              "/client/client.js", "/client/client.css"}):
+            return await self.app(scope, receive, send)
+        if is_workbench_asset_request(scope):
             return await self.app(scope, receive, send)
 
         async def reject(status, detail):
@@ -102,6 +106,12 @@ class AccountAuthMiddleware:
             return await reject(403, "Allowed Origin and CSRF token required")
         state["account"] = {key: value for key, value in account.items() if key != "csrf_hash"}
         state["account_bearer"] = using_bearer
+        # Lets /auth/me hand a cookie session its own recoverable CSRF token,
+        # only when it matches the stored hash (sessions predating derivation do not).
+        if not using_bearer:
+            derived = service.csrf_for(token)
+            if service.check_csrf(account, derived):
+                state["account_csrf"] = derived
         streaming = False
         closed = False
 

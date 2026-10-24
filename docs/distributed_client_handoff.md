@@ -27,6 +27,20 @@
 会话索引、草稿、文件列表、运行、事件游标和待审批项按 origin/node_id 隔离。
 切换目标时取消旧界面的订阅，再加载新目标的数据；不能把旧 session_id 自动发送到新节点。
 
+### LKA Desktop 的实现方式
+
+- 浏览器与手机打开目标服务自身 origin 下的 `/desktop-pet/connect.html`
+  （后端 `[client].workbench_dir` 或路径转发，见[配置说明](configuration.md#同源托管工作台)）。
+  云端入口登录后列出设备；进入设备时把一次性 grant 与非秘密设备目录放在 fragment 中跳转。
+- 节点页面只保留普通会话、`/local/workspaces` 文件、共享记忆镜像与连接管理，
+  审批读取当前运行的 `/agent/runs/{id}/safety-reviews`。
+- 云端离线时，入口页面由 Service Worker 缓存外壳，列出此浏览器之前进入过的设备；
+  每台设备用自己的 cookie 校验，失效时提示回云端重新进入，不改连其他电脑。
+- 桌宠与本机工作台经前端服务的 loopback `/cloud` 网关使用云端，前端服务以原生客户端登录，
+  账号 token 由本机服务持有，默认保存在进程内存；Windows 可显式配置独立的 DPAPI
+  加密会话文件以便重启恢复，不保存密码或向页面传递 token。本机后端为 replica 时，真理、待办、项目与记忆走 `/cloud`，
+  普通会话仍走本机 `/workbench`。Java 窗口不提供设备跳转。
+
 ## 浏览器与原生认证
 
 ### 浏览器
@@ -40,9 +54,10 @@
 云端 `POST /auth/login` 请求 `{username,password}`，返回
 `{account,session_id,csrf_token,expires_at}` 并设置 HttpOnly/Secure/Strict cookie。
 浏览器请求须携带配置允许的精确 Origin；写请求还须 `X-CSRF-Token`。
-密码不保存到浏览器存储。`GET /auth/me` 返回账号和会话安全字段，不返回 CSRF 明文；
-云端 CSRF 仅在登录时返回，可按 origin 保存在当前标签页 sessionStorage。
-凭据遗失时重新登录后再写入，不能把 csrf_hash 当作请求 token。节点的 `/connections/me` 支持恢复 CSRF。
+密码不保存到浏览器存储。`GET /auth/me` 返回账号和会话安全字段；有效的浏览器 cookie
+会话可同时恢复 `csrf_token`，新标签页不必重新登录。CSRF 可按 origin 保存在当前标签页
+sessionStorage；旧版会话未采用派生规则时仍需重新登录。原生账号令牌请求不会返回此字段，
+也不能把 csrf_hash 当作请求 token。节点的 `/connections/me` 同样支持恢复 CSRF。
 `POST /auth/logout` 返回 204；`POST /auth/password` 会撤销该账号的云端登录会话。
 
 ### Java 或其他原生客户端
@@ -164,6 +179,14 @@ Content-Type: application/json
 设备偏好 `/devices/selection` 的保存/解析不等于任务已经锁定；
 最终派发约束以受理的 execution_target 和任务回执为准。
 当前没有把浏览器任意工具参数直接执行的通用远程 RPC。
+
+远程任务索引的 `session_id`、`title`、`node_id`、`environment_id` 与 `workspace_id` 用于按实际
+执行设备展示“真理派发”。云端保存管理记录不代表在云端执行；节点页面从云端读取该索引，
+不向节点 `/sessions` 请求远程执行会话。普通会话响应的 `metadata.remote_execution` 也提供目标引用。
+`approval` 返回 `requested_mode`、`effective_mode` 和 `source`（request、node_policy、host_execution、legacy）。
+节点领取前或旧节点尚未回报时 `effective_mode` 为 null，界面应显示待确认策略。
+节点 `remote_execution.review_policy=inherit` 才允许沿用派发时模式；默认 manual。
+审批策略变化不追溯修改旧运行，原生主机执行仍要求人工审批。
 
 | 云端接口 | 行为 |
 | --- | --- |

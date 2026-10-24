@@ -102,7 +102,14 @@ async def login(payload: LoginRequest, request: Request, response: Response):
 
 @router.get("/me")
 async def me(request: Request):
-    return _account(request)
+    account = dict(_account(request))
+    # Same model as a node's /connections/me: a new tab or a sibling device page
+    # holding the HttpOnly cookie recovers its CSRF token without re-login.
+    # Sessions created before this derivation fall back to signing in again.
+    csrf = getattr(request.state, "account_csrf", "")
+    if csrf:
+        account["csrf_token"] = csrf
+    return account
 
 
 @router.post("/logout", status_code=204)

@@ -41,6 +41,8 @@ class ManagedTaskService:
         self.replace, self.interrupt, self.enabled = replace, interrupt, enabled
         self.guard = guard
         self.durable_execution = durable_execution
+        # Optional {path, platform} configured by the operator; set by the runtime.
+        self.default_task_parent = None
 
     def require_durable_execution(self):
         if not self.durable_execution():
@@ -271,6 +273,14 @@ class ManagedTaskService:
         result = {"command_id": command_id, "session_id": run.session_id, "run_id": run.run_id,
                   "status": "accepted", "action": action, "snapshot_at": now,
                   "snapshot_kind": "command_commit", "run_snapshot": self._run_view(persisted)}
+        metadata = persisted.get("metadata", {})
+        if (metadata.get("execution_workspace") is None and "remote_execution" not in metadata
+                and action == "start_task"):
+            # Accepted, but file and command tools are withheld; say so at dispatch
+            # instead of letting the task discover it after an empty session list.
+            result["workspace_notice"] = ("no_execution_workspace: file and shell tools are unavailable; "
+                                          "pass workspace_path, set default_execution_workspace or "
+                                          "management.default_task_parent for work that needs files or commands")
         replaced_id = persisted.get("metadata", {}).get("replaces_run_id")
         if replaced_id:
             previous = conn.execute("SELECT record_payload FROM agent_runs WHERE run_id=?", (replaced_id,)).fetchone()
@@ -491,8 +501,9 @@ class ManagedTaskService:
             workspace = self.workspace(workspace_path) if workspace_path is not None else delegate["workspace"]
         elif workspace_path is not None:
             workspace = self.workspace(workspace_path)
-        elif not prior and create_workspace and parent and parent["default_execution_workspace"]:
-            base = self.management.resolve_execution_workspace(json.loads(parent["default_execution_workspace"]))
+        elif not prior and create_workspace and (parent and parent["default_execution_workspace"] or self.default_task_parent):
+            configured = json.loads(parent["default_execution_workspace"]) if parent and parent["default_execution_workspace"] else self.default_task_parent
+            base = self.management.resolve_execution_workspace(configured)
             # Stable across concurrent retries, distinct for every accepted command/session.
             name = "task_" + sha256(_json([context.session_id, command_id]).encode()).hexdigest()[:24]
             directory = Path(base["backend_path"]) / name

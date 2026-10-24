@@ -894,6 +894,13 @@ class LocalKnowledgeAgentRuntime:
             durable_execution=lambda: self.local_app_config.agent.checkpoint_backend == "sqlite",
         )
         self.managed_tasks.ensure_schema()
+        task_parent = self.local_app_config.management.default_task_parent
+        if task_parent:
+            self.managed_tasks.default_task_parent = {
+                "path": task_parent,
+                "platform": "windows" if PureWindowsPath(task_parent).is_absolute() and not task_parent.startswith("/")
+                else self.platform.name,
+            }
         from app.core.session_inputs import SessionInputQueue
 
         self.session_inputs = SessionInputQueue(

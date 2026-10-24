@@ -135,6 +135,9 @@ class RemoteExecutionNode:
         if original.metadata.get("remote_execution") != payload["target"]:
             raise PermissionError("remote session provenance mismatch")
         policy = dict(original.metadata.get("session_policy", {}))
+        requested_review = policy.get("safety_review_mode") or "manual"
+        effective_review = requested_review if self.config.review_policy == "inherit" else "manual"
+        review_source = "request" if self.config.review_policy == "inherit" else "node_policy"
         tools = {s.name: s for s in self.runtime.tool_registry.list_tools()}
         approved = set(self.config.allowed_tools)
         requested = set(policy.get("allowed_tools") or ())
@@ -142,7 +145,7 @@ class RemoteExecutionNode:
             requested &= set(predecessor.metadata["session_policy"].get("allowed_tools") or ())
         allowed = sorted(name for name in requested & approved & tools.keys() if not name.startswith("management."))
         policy.update(allow_default_workspace=False, allow_fork=False, use_local_context=False,
-                      safety_review_mode="manual", allowed_tools=allowed,
+                      safety_review_mode=effective_review, allowed_tools=allowed,
                       allowed_paths=[workspace["backend_path"]] if workspace else [],
                       llm_client_name=None, llm_model=None,
                       llm_answer_client_name=None, llm_answer_model=None)
@@ -165,6 +168,10 @@ class RemoteExecutionNode:
             mounted_workspace=bool(mounted and workspace_id and mounted.is_mounted(workspace_id)))
         if predecessor:
             host_execution = host_execution and predecessor.metadata.get("context_views", {}).get("tool", {}).get("host_execution_authority", False)
+        if host_execution:
+            # Native OS-user execution keeps its existing mandatory review gate.
+            policy["safety_review_mode"] = "manual"
+            review_source = "host_execution"
         view = ToolView(host_execution_authority=host_execution, snapshot_id="remote_execution:" + payload["task_id"],
                         child_run_id=original.run_id, allowed_tools=tuple(allowed),
                         allowed_paths=paths, full_workspace_authority=False,
@@ -198,6 +205,8 @@ class RemoteExecutionNode:
         metadata = {"entrypoint": "agent.turn", "orchestrator": "langgraph",
                     "remote_execution": payload["target"], "input_envelope": original.metadata["input_envelope"],
                     "session_policy": policy, "execution_workspace": workspace,
+                    "remote_approval": {"requested_mode": requested_review,
+                                        "effective_mode": policy["safety_review_mode"], "source": review_source},
                     "context_views": {"tool": view.model_dump(mode="json")},
                     "context_snapshot": snapshot.model_dump(mode="json")}
         # Never import unrestricted parent metadata, source caches, prior prompts,
@@ -216,7 +225,7 @@ class RemoteExecutionNode:
             if workspace:
                 session_metadata["workspace"] = workspace
             conn.execute("INSERT OR IGNORE INTO agent_sessions(session_id,title,status,metadata,kind,created_at,updated_at,creation_source,creator_session_id) VALUES(?,?,'active',?,'ordinary',?,?,'assistant',?)",
-                         (run.session_id, "Delegated task", _json(session_metadata), stamp, stamp,
+                         (run.session_id, payload.get("title") or "Delegated task", _json(session_metadata), stamp, stamp,
                           payload["target"]["owner_session_id"]))
             if predecessor:
                 existing = conn.execute("SELECT metadata,creator_session_id,status FROM agent_sessions WHERE session_id=?", (run.session_id,)).fetchone()
@@ -307,6 +316,10 @@ class RemoteExecutionNode:
             with closing(runtime._conn()) as conn:
                 applied_commands = [r[0] for r in conn.execute("SELECT command_id FROM remote_execution_node_controls WHERE hub_id=? AND task_id=? ORDER BY rowid DESC LIMIT 100", (row["hub_id"], row["task_id"]))]
             snapshot = {"applied_commands": applied_commands[-100:],
+                        "approval": run.metadata.get("remote_approval") or {
+                            "requested_mode": run.metadata.get("session_policy", {}).get("safety_review_mode") or "manual",
+                            "effective_mode": run.metadata.get("session_policy", {}).get("safety_review_mode") or "manual",
+                            "source": "legacy"},
                         "pending_user_question": run.metadata.get("pending_user_question") if status == "waiting_user" else None,
                         "paused_from_status": run.metadata.get("paused_from_status") if status == "paused" else None,
                         "effect_constraints": effect_constraints, "status": status, "messages": [{"message_id": m["message_id"], "role": m["role"],

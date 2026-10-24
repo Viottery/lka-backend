@@ -109,6 +109,73 @@ def test_real_dispatch_round_trip_and_immutable_command(setup_remote):
     assert hub_run.metadata["input_envelope"]["original_user_message_refs"] == ["source-user-message"]
 
 
+@pytest.mark.parametrize(("node_policy", "requested_mode", "effective_mode", "source"), [
+    ("manual", "skip", "manual", "node_policy"),
+    ("inherit", "skip", "skip", "request"),
+    ("inherit", "llm", "llm", "request"),
+    ("inherit", "manual", "manual", "request"),
+])
+def test_remote_review_policy_is_explicit_and_frozen(setup_remote, node_policy, requested_mode, effective_mode, source):
+    e = setup_remote
+    e["context"] = e["context"].model_copy(update={"safety_review_mode": requested_mode})
+    e["worker"].config.review_policy = node_policy
+    receipt = start(e, device_id="pc", workspace_id="project")
+    task_id = receipt["remote_execution"]["task_id"]
+    queued = e["service"].get(task_id)
+    assert queued["approval"]["requested_mode"] == requested_mode
+    assert queued["approval"]["effective_mode"] is None
+    assert queued["title"] == "管理任务" and queued["session_id"] == receipt["session_id"]
+    e["worker"].run_once()
+    local = e["node"].agent_run_manager.get_run(receipt["run_id"])
+    assert local.metadata["session_policy"]["safety_review_mode"] == effective_mode
+    expected = {"requested_mode": requested_mode, "effective_mode": effective_mode, "source": source}
+    assert local.metadata["remote_approval"] == expected
+    e["worker"].run_once()  # Publish the node's effective policy on its next outbound report.
+    assert e["service"].get(task_id)["approval"] == expected
+    assert e["service"].list()["items"][0]["approval"] == expected
+    # Changing node configuration affects future admissions, not this run.
+    e["worker"].config.review_policy = "manual" if node_policy == "inherit" else "inherit"
+    e["worker"].run_once()
+    assert e["node"].agent_run_manager.get_run(receipt["run_id"]).metadata["remote_approval"] == expected
+
+
+def test_inherited_skip_executes_workspace_write_and_still_records_review(setup_remote, tmp_path):
+    e = setup_remote
+    e["context"] = e["context"].model_copy(update={"safety_review_mode": "skip"})
+    e["worker"].config.review_policy = "inherit"
+    e["worker"].config.allowed_tools = ["filesystem.create_file"]
+    e["node"].agent_turn_loop.llm_client = ScriptedClient([
+        operation("expand_package", package_name="filesystem"),
+        operation("tool_call", tool_name="filesystem.create_file", tool_input={"path": "automatic.txt", "content": "automatic review recorded"}),
+        operation("final_answer", reason="File creation verified"), "File created.",
+    ])
+    receipt = start(e, device_id="pc", workspace_id="project")
+    e["worker"].run_once()
+    assert e["node"].agent_dispatch.run_one("automatic-review")
+    run = e["node"].agent_run_manager.get_run(receipt["run_id"])
+    assert run.status.value == "completed", run.model_dump(mode="json")
+    assert (tmp_path / "automatic.txt").read_text() == "automatic review recorded"
+    reviews = e["node"].agent_run_manager.list_safety_reviews(run.run_id)
+    assert any(review.tool_name == "filesystem.create_file" and review.status.value == "approved"
+               and review.mode.value == "skip" for review in reviews)
+    e["worker"].run_once()
+    assert e["service"].get(receipt["remote_execution"]["task_id"])["approval"]["effective_mode"] == "skip"
+
+
+def test_inherit_does_not_automatically_approve_native_host_execution(setup_remote):
+    e = setup_remote
+    e["context"] = e["context"].model_copy(update={"safety_review_mode": "skip"})
+    e["worker"].config.review_policy = "inherit"
+    e["worker"].config.shell_trust = "host_user"
+    e["worker"].config.allowed_tools = ["bash.run"]
+    receipt = start(e, device_id="pc", workspace_id="project")
+    e["worker"].run_once()
+    run = e["node"].agent_run_manager.get_run(receipt["run_id"])
+    assert run.metadata["context_views"]["tool"]["host_execution_authority"] is True
+    assert run.metadata["session_policy"]["safety_review_mode"] == "manual"
+    assert run.metadata["remote_approval"] == {"requested_mode": "skip", "effective_mode": "manual", "source": "host_execution"}
+
+
 def test_target_failure_does_not_fall_back(setup_remote):
     e = setup_remote
     for target in ({"device_id": "missing"}, {"environment_id": "windows"}, {"workspace_id": "secret"}, {"capabilities": ["unapproved"]}):

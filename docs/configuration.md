@@ -108,6 +108,34 @@ kind 也可为 `assistant_note`；
 
 节点在上面的 replica 配置基础上增加：
 
+#### 同源托管工作台
+
+云端与节点都可以在自己的 HTTPS origin 下提供 LKA Desktop 浏览器工作台，二选一：
+
+- 后端托管：`[client].workbench_dir` 填前端仓库 `app/web/pet` 的绝对路径，页面位于
+  `/desktop-pet/`，入口为 `/desktop-pet/connect.html`。静态文件与 `/client` 一样无需登录，
+  只允许已知静态类型，拒绝隐藏文件与越界路径；所有 API 仍走原账号/节点认证。
+- 路径转发：不改后端配置，用 Tailscale serve 或反向代理把 `/desktop-pet/` 映射到同一目录，
+  其余路径转发到后端，例如 `tailscale serve --https=443 --set-path=/desktop-pet /path/to/app/web/pet`
+  再加 `tailscale serve --https=443 http://127.0.0.1:8765`。
+
+两种方式都要让后端看到 `https` scheme（`require_https`、节点 cookie 依赖它）；
+`scripts/start_backend.py` 在要求认证时只信任 127.0.0.1 的代理头。节点
+`connections.allowed_origins` 填节点自己的 HTTPS origin。页面先读 `/client/info` 判断
+hub/replica 角色；replica 另返回 `sync.hub_url`，节点页面据此直接连接云端，
+在任何一台电脑上都保留真理与待办入口（云端可达时）。为此云端 `auth.allowed_origins`
+除云端自身外还要列出各节点的 HTTPS origin（云端 CORS 随之放行带凭据请求）。
+Tailscale 的 `*.ts.net` 名称属于同一站点（ts.net 是公共后缀），SameSite=Strict 的云端
+cookie 在节点页面的请求中仍会携带；`/auth/me` 为 cookie 会话返回由会话凭据派生的
+CSRF，同一浏览器的新标签页不需要重新登录。
+
+云端本机执行的助理任务需要服务器上的目录：设置 `[management].default_task_parent`
+为云端主机的绝对路径（每个任务在其下建独立子目录），或为助理配置
+`default_execution_workspace`。都没有时任务仍可做数据类工作，但派发回执带
+`workspace_notice`，文件与命令工具不可用，不会回退到后端源码目录。
+`[management].autonomous_enabled` 控制任务完成后是否在后台自动唤醒助理汇报；
+界面中的“启用管理”只表示允许整理事项与派发任务。
+
 ```toml
 [connections]
 enabled = true
@@ -126,7 +154,8 @@ poll_seconds = 3
 同一 workspace_id 在两个映射中必须指向相同本机路径，并包含于该节点的 LKA_WORKSPACE_ROOTS；
 Linux 路径不能直接复制到 Windows。节点已登记的环境必须批准该 workspace_id。
 allowed_tools 是节点操作者明确授予远程任务的工具；空列表不提供工具，不因云端任务要求扩大。
-远程任务使用原安全审查并强制 manual，权限、租约和审批不用脏缓存判断。
+远程任务使用原安全审查，节点默认强制 manual；明确允许 inherit 后按下文的节点策略执行。
+权限、租约和审批不用脏缓存判断。
 跨机累计后台预算尚不能转移，带该类预算的委派明确拒绝；不重置额度。
 
 节点轮询接收一次性连接授权的哈希，客户端在节点 `/connections/redeem` 兑换本地会话，
@@ -138,6 +167,11 @@ allowed_tools 是节点操作者明确授予远程任务的工具；空列表不
 助理派发时 execution_target 可包含 device_id、environment_id、workspace_id、capabilities，
 workspace_path 仅用于原本机执行，不能与远程 target 混用。远程任务会话从云端查看，
 普通会话及文件管理从节点 `/client` 访问。远程任务支持取消、审批、检查点暂停/继续和用户问答。
+节点 `[remote_execution].review_policy` 默认 `manual`，强制人工审批；明确设置为 `inherit` 后，
+新任务沿用派发时冻结的 `skip`、`llm` 或 `manual`，`skip` 仍保留逐调用安全审查记录。
+任务详情返回 `approval.requested_mode`、`effective_mode` 和 `source`，说明派发请求与节点实际策略；
+节点领取前生效模式为 null，旧节点没有回报时不能据请求模式推断已经自动批准。
+配置修改只影响新领取任务，现有运行继续沿用原策略；原生主机执行仍强制人工审批。
 已确认终态后可在原会话补充指令，执行目标和工作区保持绑定；未知副作用不自动恢复。
 Linux 节点可使用操作者已建立的原生挂载：在 workspace_roots 登记挂载根目录，
 再以 `connections.workspace_mounts.<ID>` 配置 expected_filesystem、expected_source、read_only

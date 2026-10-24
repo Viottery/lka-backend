@@ -94,6 +94,18 @@ def test_no_parent_allows_data_work_but_disables_checkout_fallback(runtime, mana
     assert record["metadata"]["execution_workspace"] is None
     assert record["metadata"]["session_policy"]["allow_default_workspace"] is False
     assert runtime.get_session(session_id=result["session_id"]).session.workspace is None
+    # The receipt says the tools are withheld instead of leaving it to discovery.
+    assert result["workspace_notice"].startswith("no_execution_workspace")
+
+
+def test_server_task_parent_serves_assistants_without_a_default(runtime, manager_context, tmp_path):
+    parent = tmp_path / "server-tasks"
+    parent.mkdir()
+    runtime.managed_tasks.default_task_parent = {"path": str(parent), "platform": runtime.platform.name}
+    result = runtime.managed_tasks.start_task(manager_context, command_id="server", purpose="Check the server")
+    workspace = runtime.get_session(session_id=result["session_id"]).session.workspace
+    assert workspace is not None and workspace.backend_path.startswith(str(parent))
+    assert "workspace_notice" not in result
 
 
 def test_windows_default_keeps_frontend_path_and_backend_mapping(runtime, manager_context, tmp_path):

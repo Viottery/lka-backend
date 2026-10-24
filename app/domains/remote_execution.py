@@ -34,6 +34,7 @@ class RemoteExecutionConfig(BaseModel):
     environment_id: Identifier | None = None
     workspace_mappings: dict[Identifier, str] = Field(default_factory=dict, max_length=100)
     shell_trust: Literal["disabled", "host_user"] = "disabled"
+    review_policy: Literal["manual", "inherit"] = "manual"
     allowed_tools: list[str] = Field(default_factory=list, max_length=256)
     poll_seconds: float = Field(default=3, ge=0.25, le=3600)
     lease_seconds: int = Field(default=90, ge=10, le=3600)
@@ -56,6 +57,13 @@ class ExecutionFence(BaseModel):
     environment_id: Identifier
 
 
+class ExecutionApproval(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    requested_mode: Literal["skip", "llm", "manual"]
+    effective_mode: Literal["skip", "llm", "manual"]
+    source: Literal["request", "node_policy", "host_execution", "legacy"]
+
+
 class ExecutionReport(ExecutionFence):
     report_id: Identifier
     status: Literal["running", "waiting_confirmation", "waiting_user", "paused", "completed", "failed", "cancelled"]
@@ -67,6 +75,7 @@ class ExecutionReport(ExecutionFence):
     pending_user_question: dict | None = None
     paused_from_status: str | None = None
     applied_commands: list[Annotated[str, Field(min_length=1, max_length=400)]] = Field(default_factory=list, max_length=100)
+    approval: ExecutionApproval | None = None
 
 
 class RemoteExecutionConflict(ValueError):
@@ -219,7 +228,9 @@ class RemoteExecutionService:
                       "environment_id": environment, "workspace_id": target["workspace_id"]}
             run.metadata["remote_execution"] = marker
             policy = run.metadata["session_policy"]
-            policy.update(allow_default_workspace=False, allow_fork=False, safety_review_mode="manual")
+            policy.update(allow_default_workspace=False, allow_fork=False)
+            policy["safety_review_mode"] = policy.get("safety_review_mode") or "manual"
+            run.metadata["remote_approval_requested"] = policy["safety_review_mode"]
             # Source grants are copied as bounded structured scope, never inferred
             # from delegated prose. Absent source grants expose no node-local data.
             source_view = (caller.metadata.get("context_views") or {}).get("tool")
@@ -227,6 +238,7 @@ class RemoteExecutionService:
             if scope and scope.get("max_tool_calls") is not None:
                 raise RemoteExecutionConflict("remote execution cannot transfer cumulative source tool budgets")
             payload = {"hub_id": self.hub_id, "task_id": task_id, "target": marker,
+                       "title": prepared["title"],
                        "run": run.model_dump(mode="json"), "source_view": scope,
                        "effect_constraints": policies}
             if len(_json(payload).encode()) > 1048576:
@@ -317,7 +329,11 @@ class RemoteExecutionService:
 
     def report(self, principal, report):
         report = ExecutionReport.model_validate(report)
-        encoded = _json(report.model_dump(mode="json", exclude={"lease_token"}))
+        report_data = report.model_dump(mode="json", exclude={"lease_token", "approval"})
+        # Keep pre-upgrade durable report fingerprints stable on retry.
+        if report.approval is not None:
+            report_data["approval"] = report.approval.model_dump(mode="json")
+        encoded = _json(report_data)
         if len(encoded.encode()) > 1048576:
             raise ValueError("execution report exceeds 1 MiB")
         fingerprint = hashlib.sha256(encoded.encode()).hexdigest()
@@ -412,11 +428,22 @@ class RemoteExecutionService:
         return {"task_id": report.task_id, "report_id": report.report_id, "accepted": True}
 
     @staticmethod
-    def _summary(row):
+    def _summary(row, conn):
         payload = json.loads(row["payload"])
+        session = conn.execute("SELECT title FROM agent_sessions WHERE session_id=?",
+                               (payload["run"]["session_id"],)).fetchone()
+        latest = conn.execute("SELECT json_extract(payload,'$.approval') FROM remote_execution_reports WHERE task_id=? "
+                              "ORDER BY created_at DESC,report_id DESC LIMIT 1", (row["task_id"],)).fetchone()
+        approval = json.loads(latest[0]) if latest and latest[0] else None
+        if not approval:
+            metadata = payload["run"].get("metadata", {})
+            approval = {"requested_mode": metadata.get("remote_approval_requested") or
+                        metadata.get("session_policy", {}).get("safety_review_mode") or "manual",
+                        "effective_mode": None, "source": "node_policy" if "remote_approval_requested" in metadata else "legacy"}
         return {key: row[key] for key in ("task_id", "owner_session_id", "command_id", "node_id", "environment_id", "workspace_id", "state", "lease_epoch", "lease_expires_at", "created_at", "updated_at")} | {
             "session_id": payload["run"]["session_id"], "run_id": payload["run"]["run_id"],
-            "target": json.loads(row["target"])}
+            "title": session[0] if session else payload.get("title", "管理任务"),
+            "approval": approval, "target": json.loads(row["target"])}
 
     def list(self, *, owner_session_id=None, limit=100, offset=0):
         if type(limit) is not int or not 1 <= limit <= 100 or type(offset) is not int or offset < 0:
@@ -425,7 +452,7 @@ class RemoteExecutionService:
         with self._connection() as conn:
             rows = conn.execute("SELECT * FROM remote_execution_tasks WHERE (? IS NULL OR owner_session_id=?) ORDER BY created_at DESC,task_id DESC LIMIT ? OFFSET ?",
                                 (owner_session_id, owner_session_id, limit + 1, offset)).fetchall()
-            return {"items": [self._summary(row) for row in rows[:limit]],
+            return {"items": [self._summary(row, conn) for row in rows[:limit]],
                     "next_offset": offset + limit if len(rows) > limit else None}
 
     def get(self, task_id, *, owner_session_id=None, limit=20, offset=0):
@@ -443,7 +470,7 @@ class RemoteExecutionService:
                     break
                 reports.append(json.loads(report[0]))
                 size += len(report[0].encode())
-            return self._summary(row) | {"reports": reports,
+            return self._summary(row, conn) | {"reports": reports,
                 "next_offset": offset + len(reports) if len(rows) > len(reports) else None}
 
     def cancel(self, task_id):
@@ -569,7 +596,10 @@ class RemoteExecutionService:
                 raise RemoteExecutionConflict("remote execution cannot reset cumulative background budgets")
             # The new instruction does not grant new tools, sources, paths or budgets.
             run = self.tasks._new_run(session_id, envelope, caller)
-            run.metadata["session_policy"] = previous["run"]["metadata"]["session_policy"]
+            previous_policy = previous["run"]["metadata"]["session_policy"]
+            requested_mode = (getattr(context, "safety_review_mode", None) if caller else None) or previous_policy.get("safety_review_mode") or "manual"
+            run.metadata["session_policy"] = {**previous_policy, "safety_review_mode": requested_mode}
+            run.metadata["remote_approval_requested"] = requested_mode
             task_id = "remote_task_" + uuid4().hex
             marker = {**previous["target"], "task_id": task_id}
             run.metadata["remote_execution"] = marker

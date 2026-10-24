@@ -562,6 +562,10 @@ class ManagementConfig(BaseModel):
 
     enabled: bool = False
     autonomous_enabled: bool = False
+    # Server-approved parent for assistant tasks run on this backend when the
+    # assistant has no default_execution_workspace (e.g. a cloud hub whose
+    # browsers cannot name a server directory). Absolute path on this host.
+    default_task_parent: str = ""
     attention_sweep_interval_seconds: int = Field(default=1800, ge=0, le=86400)
     internal_items_enabled: bool = False
     # Legacy input accepted for old configuration files; dispatch is dynamic.
@@ -579,7 +583,25 @@ class ManagementConfig(BaseModel):
     execution_max_tokens: int | None = Field(default=None, ge=1)
 
 
+class ClientConfig(BaseModel):
+    """Optional same-origin hosting of the LKA Desktop browser workbench.
+
+    `workbench_dir` points at a checkout's `app/web/pet` directory. Its static
+    files are public like `/client`; every API request keeps its own auth gate.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    workbench_dir: str = ""
+
+    @model_validator(mode="after")
+    def absolute_directory(self) -> ClientConfig:
+        if self.workbench_dir and not Path(self.workbench_dir).expanduser().is_absolute():
+            raise ValueError("client.workbench_dir must be an absolute directory")
+        return self
+
+
 class LocalAppConfig(BaseModel):
+    client: ClientConfig = Field(default_factory=ClientConfig)
     auth: AccountConfig = Field(default_factory=AccountConfig)
     devices: DeviceConfig = Field(default_factory=DeviceConfig)
     sync: SharedSyncConfig = Field(default_factory=SharedSyncConfig)

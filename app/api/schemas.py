@@ -342,13 +342,20 @@ class AgentRunResponse(BaseModel):
     error: str | None = None
     has_result: bool = False
     pending_user_question: PendingAgentQuestionResponse | None = None
+    # Remote tasks are reviewed through /remote-execution/tasks/{task_id};
+    # only routing identifiers are exposed, never the frozen task snapshot.
+    remote_execution: dict[str, str] | None = None
 
     @classmethod
     def from_record(cls, record: AgentRunRecord) -> AgentRunResponse:
-        payload = record.model_dump(include=set(cls.model_fields) - {"has_result"}, mode="python")
+        payload = record.model_dump(include=set(cls.model_fields) - {"has_result", "remote_execution"}, mode="python")
+        marker = record.metadata.get("remote_execution")
+        remote = ({key: str(marker[key]) for key in ("task_id", "node_id", "environment_id", "workspace_id")
+                   if isinstance(marker.get(key), str)} if isinstance(marker, dict) and marker.get("task_id") else None)
         return cls(
             **payload,
             has_result=record.result_snapshot is not None,
+            remote_execution=remote,
             pause_requested=(record.metadata.get("pause_requested") is True and record.status in {
                 AgentRunStatus.QUEUED, AgentRunStatus.RUNNING, AgentRunStatus.PAUSED,
                 AgentRunStatus.WAITING_CONFIRMATION, AgentRunStatus.WAITING_USER,

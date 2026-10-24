@@ -87,6 +87,27 @@ def test_cookie_login_csrf_logout(service, admin):
     asyncio.run(scenario())
 
 
+def test_new_tab_recovers_csrf_from_cookie_but_bearer_never_receives_it(service, admin):
+    async def scenario():
+        app = application(service)
+        async with client(app) as first:
+            issued = (await login(first)).json()["csrf_token"]
+            cookie = first.cookies.get("lka_session")
+        # A second tab shares only the HttpOnly cookie, not sessionStorage.
+        async with client(app) as second:
+            second.cookies.set("lka_session", cookie)
+            me = (await second.get("/auth/me")).json()
+            assert me["csrf_token"] == issued
+            assert "csrf_hash" not in me
+            assert (await second.post("/write", headers={"Origin": ORIGIN, "X-CSRF-Token": me["csrf_token"]})).status_code == 200
+        async with client(app) as native:
+            token = (await native.post("/auth/login", json={"username": "owner", "password": PASSWORD},
+                                       headers={"X-LKA-Client": "native"})).json()["token"]
+            me = await native.get("/auth/me", headers={"X-LKA-Account-Token": token, "X-LKA-Client": "native"})
+            assert me.status_code == 200 and "csrf_token" not in me.json()
+    asyncio.run(scenario())
+
+
 def test_native_bearer_is_opt_in_and_revoked(service, admin):
     async def scenario():
         app = application(service)
