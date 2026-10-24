@@ -4,6 +4,12 @@
 先确定唯一主数据源，保留原安装与测试数据；不把多份 SQLite 合并，也不在新设备克隆整个主库。
 代码安装见[开始使用](getting_started.md)，接口和设备 scopes 见[客户端交付](distributed_client_handoff.md)。
 
+由另一台 Windows 上的 Codex 同时完成云端和客户端部署时，使用
+[Codex 部署交接](../scripts/deploy/CODEX_DEPLOY.md)。专用私有 GitHub 仓库可保存配套提交清单、
+准备脚本和加密 Release 数据包；`scripts/deploy/download_handoff.py` 自动下载、续传和校验分片，
+`prepare_windows.ps1` 获取固定代码、准备依赖并可通过 SSH 自动上传暂存包。
+明文快照和密钥不进入 Git；解密只在新暂存目录执行，不直接覆盖现有服务或数据库。
+
 ## 数据归属与迁移范围
 
 | 内容 | 迁移后位置 | 保留方式 |
