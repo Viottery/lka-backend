@@ -177,6 +177,7 @@ def decrypt(package, key_file, output):
             with tarpath.open("wb") as plain:
                 _gpg(["--decrypt", "--output", "-", str(cipher)], home, passphrase_file=key_file, stdout=plain)
         except BaseException:
+            tarpath.unlink(missing_ok=True)
             _kill_agent(home)
             raise
         try:

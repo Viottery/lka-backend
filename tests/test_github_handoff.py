@@ -51,6 +51,7 @@ def test_tampered_cipher_and_wrong_key_leave_no_extract(snapshot, tmp_path):
     with pytest.raises(ValueError, match="GPG operation failed"):
         handoff.decrypt(out2, wrong, tmp_path / "unpack2")
     assert not (tmp_path / "unpack2/snapshot").exists()
+    assert not (tmp_path / "unpack2/.verified-archive.tar.gz").exists()
 
 
 def test_fresh_paths_key_boundary_and_unsafe_archive(tmp_path, snapshot, monkeypatch):
@@ -72,4 +73,3 @@ def test_fresh_paths_key_boundary_and_unsafe_archive(tmp_path, snapshot, monkeyp
     with pytest.raises(ValueError, match="Unsafe archive"):
         handoff.decrypt(out, key, tmp_path / "unsafe")
     assert not (tmp_path / "escape").exists()
-

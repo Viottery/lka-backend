@@ -118,4 +118,3 @@ def test_nonprivate_repo_and_corrupt_download_fail(tmp_path, monkeypatch):
     with pytest.raises(dl.DownloadError, match="checksum mismatch"):
         dl.download("acme/private", "v1", tmp_path / "corrupt", token="tok")
     assert not (tmp_path / "corrupt/part-0001.gpg").exists()
-
