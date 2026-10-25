@@ -85,6 +85,29 @@ def test_capture_while_paused_and_explicit_autonomy_opt_in(runtime):
     assert runtime.management_coordinator.tick()["scheduled"] == 0
 
 
+def test_whole_idle_management_tick_skips_writer_admission(runtime, monkeypatch):
+    sid = runtime.management_service.create()['session']['session_id']
+    runtime.management_service.update(sid, expected_revision=1, status='active')
+    runtime.management_goals.create_goal(sid, objective='Not yet due')
+    runtime.local_app_config.management.autonomous_enabled = False
+    coordinator = runtime.management_coordinator
+    now = datetime.now(UTC)
+    coordinator.tick(now=now)  # Initialize any persisted sweep clocks once.
+    statements = []
+    for service in (coordinator, coordinator.goals, coordinator.work_queue, coordinator.delegates,
+                    coordinator.supervision, coordinator.attention, coordinator.schedules, coordinator.watch_subscriptions):
+        original = service._conn
+        def traced(factory=original):
+            conn = factory()
+            conn.set_trace_callback(statements.append)
+            return conn
+        monkeypatch.setattr(service, '_conn', traced)
+    for _ in range(4):
+        assert coordinator.tick(now=now) == {'captured': 0, 'scheduled': 0}
+    assert not any(sql.lstrip().upper().startswith(('BEGIN IMMEDIATE', 'INSERT', 'UPDATE', 'DELETE'))
+                   for sql in statements)
+
+
 def test_foreground_wins_admission_without_losing_inbox(runtime):
     sid, _ = timer(runtime)
     assert runtime.management_coordinator.tick()["scheduled"] == 1
@@ -111,6 +134,35 @@ def test_concurrent_ticks_bind_one_root_and_small_queue_payload(runtime):
         payloads = [r[0] for r in conn.execute("SELECT payload_json FROM background_jobs")]
     assert all(len(p.encode()) < 4096 and "Check progress" not in p for p in payloads)
     assert runtime.management_goals.list_executions(sid)["executions"][0]["run_id"] == run.run_id
+
+
+def test_reconcile_rechecks_binding_after_waiting_for_writer(runtime, monkeypatch):
+    sid, _ = timer(runtime)
+    runtime.management_coordinator.tick()
+    run = bind(runtime)
+    runtime.agent_run_manager.mark_running(run.run_id)
+    runtime.agent_run_manager.complete_run(run.run_id)
+    factory = runtime.management_coordinator._conn
+
+    class Connection:
+        def __init__(self):
+            self.conn = factory()
+        def execute(self, sql, *args):
+            if sql == "BEGIN IMMEDIATE":
+                # Another publisher/reconciler wins after our read preflight.
+                with closing(factory()) as other, other:
+                    other.execute("UPDATE manager_executions SET status='completed' WHERE run_id=?", (run.run_id,))
+            return self.conn.execute(sql, *args)
+        def __getattr__(self, name):
+            return getattr(self.conn, name)
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return self.conn.__exit__(*args)
+
+    monkeypatch.setattr(runtime.management_coordinator, "_conn", Connection)
+    runtime.management_coordinator.reconcile()
+    assert runtime.management_goals.list_executions(sid)["executions"][0]["status"] == "completed"
 
 
 def test_bound_before_restart_executes_original_and_publishes_once(runtime):

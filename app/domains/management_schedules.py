@@ -238,6 +238,13 @@ class ManagementScheduleService:
         """Capture at most the latest due occurrence and atomically advance its watermark."""
         instant = _instant(now)
         count = 0
+        with closing(self._conn()) as probe:
+            due_exists = probe.execute(
+                "SELECT 1 FROM manager_schedules WHERE enabled=1 AND next_run_at IS NOT NULL "
+                "AND next_run_at<=? LIMIT 1", (instant.isoformat(),),
+            ).fetchone() is not None
+        if not due_exists:
+            return 0
         with closing(self._conn()) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
             rows = conn.execute("SELECT p.*,c.status AS controller_status,s.status AS session_status FROM manager_schedules p "

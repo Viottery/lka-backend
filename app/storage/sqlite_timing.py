@@ -90,7 +90,7 @@ class TimingRecorder:
         except Exception:  # noqa: BLE001, S110 - logging failure must not affect the operation.
             pass
 
-    def record(self, *, database, phase, operation, statement_id, elapsed_ms, error):
+    def record(self, *, database, phase, operation, statement_id, elapsed_ms, error, details=None):
         context = _request.get()
         if context is not None:
             with context.lock:
@@ -121,6 +121,7 @@ class TimingRecorder:
                 "error_callsite": _error_callsite() if error is not None else None,
                 "request_id": context.request_id if context else None,
                 "sampled": sampled,
+                **({"transaction": details} if details else {}),
             })
         self.flush_summary()
 
@@ -256,6 +257,12 @@ class TimedCursor(QueuedCursor):
 
 class TimedConnection(QueuedConnection):
     _timing_database = "other"
+
+    def _observe_write_queue(self, phase, elapsed_ms, *, error=None, details=None):
+        recorder = _recorder
+        if recorder is not None:
+            recorder.record(database=self._timing_database, phase=phase, operation="TRANSACTION",
+                            statement_id=None, elapsed_ms=elapsed_ms, error=error, details=details)
 
     def cursor(self, factory=None):
         return super().cursor(factory or TimedCursor)

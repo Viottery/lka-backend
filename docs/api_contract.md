@@ -3074,6 +3074,10 @@ management.start_task 的 execution_target 省略或为 null 时沿用云端本�
 | `POST /node/execution/start`、`/check` | execution.run，task_id/lease_epoch/lease_token/environment_id，执行点校验 |
 | `POST /node/execution/report` | execution.result，同租约身份、report_id、状态、messages/reviews/result；同 ID 相同内容幂等 |
 
+空领取返回 `task: null` 及可选 `poll_after_seconds`，后者为依据云端在线阈值给出的空闲轮询上限建议，
+当前不超过 15 秒。新版节点仅在无活动任务时逐步退避，并保留节点配置的轮询间隔下限；
+旧云端不返回该字段时继续按配置周期轮询。该建议不改变执行租约、授权或回报协议。
+
 远程任务仍通过注册工具及安全门执行，不提供远程裸命令接口。
 节点保存独立任务回执和待回报内容；响应丢失重试不重复执行。永久失效的回报保留在节点，
 不能阻塞后续任务。租约过期、断云或授权失效时停止后续步骤，云端标记 unknown，

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from contextvars import ContextVar
+from copy import deepcopy
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
@@ -1092,20 +1093,171 @@ class SqliteAgentRunStore:
     def prune_graph_runtime_artifacts(self, run_id: str, *, keep_artifact_id: str | None) -> int:
         """Drop superseded per-step graph snapshots of a finished run.
 
-        Each graph step saves a full runtime snapshot (LLM, tool and progress
-        events). Only the newest one is ever loaded again; the run's result
-        artifact and event log keep the history. Non-terminal runs are untouched.
+        Keep the latest manifest and its shared immutable parts. The run's result
+        artifact and event log keep its audit history. Non-terminal runs are untouched.
         """
         with connect(self.db_path) as conn:
             status = conn.execute("SELECT status FROM agent_runs WHERE run_id = ?", (run_id,)).fetchone()
             if status is None or status["status"] not in TERMINAL_RUN_STATUSES:
                 return 0
+            kept = conn.execute(
+                "SELECT content_hash,payload FROM agent_run_artifacts WHERE artifact_id=? AND run_id=? "
+                "AND kind='agent_graph_runtime'", (keep_artifact_id, run_id),
+            ).fetchone()
+            if kept is None:
+                return 0
+            conn.execute("BEGIN IMMEDIATE")
+            status = conn.execute("SELECT status FROM agent_runs WHERE run_id=?", (run_id,)).fetchone()
+            if status is None or status["status"] not in TERMINAL_RUN_STATUSES:
+                return 0
+            kept = conn.execute(
+                "SELECT content_hash,payload FROM agent_run_artifacts WHERE artifact_id=? AND run_id=? "
+                "AND kind='agent_graph_runtime'", (keep_artifact_id, run_id),
+            ).fetchone()
+            if kept is None:
+                return 0
+            if sha256(kept["payload"].encode("utf-8")).hexdigest() != kept["content_hash"]:
+                raise ValueError("Graph runtime manifest checksum changed.")
+            manifest = _json_load(kept["payload"])
+            live_parts = {
+                ref["artifact_id"] for field in manifest.get("fields", {}).values() for ref in field["parts"]
+            } if manifest.get("graph_runtime_format") == 2 else set()
             cursor = conn.execute(
                 "DELETE FROM agent_run_artifacts WHERE run_id = ? AND kind = 'agent_graph_runtime' "
                 "AND artifact_id IS NOT ?",
                 (run_id, keep_artifact_id),
             )
-            return cursor.rowcount
+            removed = cursor.rowcount
+            stale = [row[0] for row in conn.execute(
+                "SELECT artifact_id FROM agent_run_artifacts WHERE run_id=? AND kind='agent_graph_runtime_part'",
+                (run_id,),
+            ) if row[0] not in live_parts]
+            conn.executemany("DELETE FROM agent_run_artifacts WHERE artifact_id=?", [(value,) for value in stale])
+            return removed + len(stale)
+
+    def put_graph_runtime(self, run_id: str, data: dict[str, Any], *, created_at: str) -> dict[str, Any]:
+        """Share immutable bounded chunks across checkpoints instead of copying every growing prefix.
+
+        Parts and their manifest commit together. All serialization/hash work happens
+        before write admission; an identical checkpoint is a read-only lookup.
+        """
+        prepared = {}
+
+        def part(value):
+            encoded = _json_dump({"value": value})
+            digest = sha256(encoded.encode("utf-8")).hexdigest()
+            identifier = f"agent_graph_part_{run_id}_{digest}"
+            prepared[identifier] = ("agent_graph_runtime_part", digest, encoded)
+            return {"artifact_id": identifier, "content_hash": digest}
+
+        fields = {}
+        for key, value in data.items():
+            if not isinstance(value, list):
+                fields[key] = {"type": "value", "parts": [part(value)]}
+                continue
+            refs, chunk, size = [], [], 0
+            for item in value:
+                item_size = len(_json_dump({"value": item}).encode("utf-8"))
+                if chunk and (len(chunk) >= 8 or size + item_size > 65536):
+                    refs.append(part(chunk)); chunk, size = [], 0
+                chunk.append(item); size += item_size
+            if chunk:
+                refs.append(part(chunk))
+            fields[key] = {"type": "list", "parts": refs}
+        manifest = _json_dump({"graph_runtime_format": 2, "run_id": run_id, "fields": fields})
+        digest = sha256(manifest.encode("utf-8")).hexdigest()
+        identifier = f"agent_graph_runtime_{run_id}_{digest}"
+        prepared[identifier] = ("agent_graph_runtime", digest, manifest)
+        ref = {"artifact_id": identifier, "kind": "agent_graph_runtime", "content_hash": digest,
+               "summary": "Private Agent graph runtime data."}
+
+        ids = list(prepared)
+
+        def missing_parts(conn):
+            # Metadata-only lookups do not load previous large payloads.
+            found = {}
+            for start in range(0, len(ids), 400):
+                page = ids[start:start + 400]
+                rows = conn.execute(
+                    "SELECT artifact_id,kind,content_hash FROM agent_run_artifacts WHERE run_id=? "
+                    "AND artifact_id IN (" + ",".join("?" for _ in page) + ")", (run_id, *page),
+                )
+                found.update({row["artifact_id"]: (row["kind"], row["content_hash"]) for row in rows})
+            for key, (kind, content_hash, _) in prepared.items():
+                if key in found and found[key] != (kind, content_hash):
+                    raise ValueError("Graph runtime artifact identity changed.")
+            return [key for key in ids if key not in found]
+
+        def persist(conn):
+            missing = missing_parts(conn)
+            if not missing:
+                return
+            conn.execute("BEGIN IMMEDIATE")
+            # A concurrent terminal cleanup may have removed parts after our
+            # preflight. Revalidate before committing parts and manifest together.
+            missing = missing_parts(conn)
+            conn.executemany(
+                "INSERT INTO agent_run_artifacts(artifact_id,run_id,kind,content_hash,summary,payload,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(artifact_id) DO NOTHING",
+                [(key, run_id, prepared[key][0], prepared[key][1], "Private Agent graph runtime data.",
+                  prepared[key][2], created_at, created_at) for key in missing],
+            )
+        persist_sqlite(lambda: connect(self.db_path), persist)
+        return ref
+
+    def load_graph_runtime(self, artifact_id: str) -> dict[str, Any] | None:
+        """Reconstruct one immutable checkpoint, accepting pre-chunking snapshots too."""
+        with connect(self.db_path) as conn:
+            conn.execute("BEGIN")
+            row = conn.execute(
+                "SELECT run_id,content_hash,payload FROM agent_run_artifacts WHERE artifact_id=? AND kind='agent_graph_runtime'",
+                (artifact_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            if sha256(row["payload"].encode("utf-8")).hexdigest() != row["content_hash"]:
+                raise ValueError("Graph runtime manifest checksum changed.")
+            value = _json_load(row["payload"])
+            if value.get("graph_runtime_format") != 2:
+                return value
+            if value.get("run_id") != row["run_id"] or not isinstance(value.get("fields"), dict):
+                raise ValueError("Invalid graph runtime manifest.")
+            wanted = {}
+            for field in value["fields"].values():
+                if (not isinstance(field, dict) or field.get("type") not in {"value", "list"}
+                        or not isinstance(field.get("parts"), list)
+                        or field["type"] == "value" and len(field["parts"]) != 1):
+                    raise ValueError("Invalid graph runtime field.")
+                for ref in field["parts"]:
+                    wanted[ref["artifact_id"]] = ref["content_hash"]
+            loaded, ids = {}, list(wanted)
+            for start in range(0, len(ids), 400):
+                page = ids[start:start + 400]
+                rows = conn.execute(
+                    "SELECT artifact_id,content_hash,payload FROM agent_run_artifacts WHERE run_id=? "
+                    "AND kind='agent_graph_runtime_part' AND artifact_id IN (" + ",".join("?" for _ in page) + ")",
+                    (row["run_id"], *page),
+                )
+                for part_row in rows:
+                    key = part_row["artifact_id"]
+                    if (part_row["content_hash"] != wanted[key]
+                            or sha256(part_row["payload"].encode("utf-8")).hexdigest() != wanted[key]):
+                        raise ValueError("Graph runtime part checksum changed.")
+                    loaded[key] = _json_load(part_row["payload"])["value"]
+            if set(loaded) != set(wanted):
+                raise ValueError("Graph runtime part is missing or belongs to another run.")
+            data = {}
+            for key, field in value["fields"].items():
+                # Identical fields may share persisted parts, but their restored
+                # mutable values must retain ordinary JSON snapshot semantics.
+                values = [deepcopy(loaded[ref["artifact_id"]]) for ref in field["parts"]]
+                if field["type"] == "list":
+                    if not all(isinstance(part_value, list) for part_value in values):
+                        raise ValueError("Invalid graph runtime list part.")
+                    data[key] = [item for part_value in values for item in part_value]
+                else:
+                    data[key] = values[0]
+            return data
 
     def load_artifact(self, artifact_id: str) -> dict[str, Any] | None:
         with connect(self.db_path) as conn:
@@ -1191,13 +1343,21 @@ class SqliteAgentRunStore:
     def list_session_progress(self, session_id: str, *, limit: int = 48) -> list[dict[str, Any]]:
         """Private, bounded index lookup; callers must revalidate each owning run."""
         with connect(self.db_path) as conn:
+            conn.execute("BEGIN")
             rows = conn.execute(
-                "SELECT a.payload FROM agent_run_artifacts a JOIN agent_runs r ON r.run_id=a.run_id "
+                "SELECT a.artifact_id FROM agent_run_artifacts a JOIN agent_runs r ON r.run_id=a.run_id "
                 "WHERE a.kind='session_progress' AND r.session_id=? "
                 "ORDER BY a.updated_at DESC, a.artifact_id DESC LIMIT ?",
                 (session_id, min(64, max(1, limit))),
             ).fetchall()
-        return [_json_load(row["payload"]) for row in rows]
+            ids = [row["artifact_id"] for row in rows]
+            if not ids:
+                return []
+            payloads = {row["artifact_id"]: row["payload"] for row in conn.execute(
+                "SELECT artifact_id,payload FROM agent_run_artifacts WHERE artifact_id IN ("
+                + ",".join("?" for _ in ids) + ")", ids,
+            )}
+        return [_json_load(payloads[key]) for key in ids]
 
     def claim_tool_invocation(
         self,

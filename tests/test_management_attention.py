@@ -59,6 +59,25 @@ def test_default_policy_is_off_and_configuration_is_cas_not_a_schedule(state):
     assert service.tick(NOW) == 1
 
 
+@pytest.mark.parametrize('captured_before', [False, True])
+def test_idle_attention_poll_does_not_reserve_writer_or_reinsert_duplicate(state, monkeypatch, captured_before):
+    factory, _, _, _, service, _ = state
+    enable(state)
+    if captured_before:
+        make(state, due_at='2026-10-19')
+        assert service.tick(NOW) == 1
+    statements = []
+    def traced():
+        conn = factory()
+        conn.set_trace_callback(statements.append)
+        return conn
+    monkeypatch.setattr(service, '_conn', traced)
+    for _ in range(4):
+        assert service.tick(NOW) == 0
+    assert not any(sql.lstrip().upper().startswith(('BEGIN IMMEDIATE', 'INSERT', 'UPDATE', 'DELETE'))
+                   for sql in statements)
+
+
 def test_due_and_local_scheduling_phases_exclude_internal_and_finished(state):
     _, _, _, _, service, sid = state
     enable(state)

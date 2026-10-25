@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import queue
 import threading
+import time
 from collections.abc import Callable, Iterable
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -106,12 +107,12 @@ class InMemoryAgentRunManager:
         self.safety_reviews = InMemorySafetyReviewStore()
         self._user_continuations: dict[str, tuple[str, str, str]] = {}
         self.durable_store = durable_store
-        self._pending_delta_events: queue.Queue[AgentRunEvent | None] | None = None
+        self._pending_delta_events: queue.Queue[dict[str, Any] | None] | None = None
         self._event_writer: threading.Thread | None = None
         self._event_writer_error: BaseException | None = None
         self._closed = False
         if durable_store is not None:
-            self._pending_delta_events = queue.Queue()
+            self._pending_delta_events = queue.Queue(maxsize=2048)
             self._event_writer = threading.Thread(
                 target=self._write_delta_events,
                 name="lka-agent-event-writer",
@@ -1755,34 +1756,50 @@ class InMemoryAgentRunManager:
     def _queue_delta_event(self, event: AgentRunEvent) -> None:
         if self._pending_delta_events is None:
             return
-        self._pending_delta_events.put(event)
+        # Queue only the durable delta, not another copy of its growing prefix.
+        self._pending_delta_events.put(SqliteAgentRunStore._event_for_storage(event.model_dump(mode="json")))
 
     def _write_delta_events(self) -> None:
         if self._pending_delta_events is None or self.durable_store is None:
             return
+        carry = None
         while True:
-            first = self._pending_delta_events.get()
+            first = carry if carry is not None else self._pending_delta_events.get()
+            carry = None
             if first is None:
                 self._pending_delta_events.task_done()
                 return
             batch = [first]
-            while len(batch) < 64:
+            size = len(json.dumps(first, ensure_ascii=False).encode("utf-8"))
+            deadline = time.monotonic() + .05
+            stopping = False
+            while len(batch) < 64 and size < 262144:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
                 try:
-                    next_event = self._pending_delta_events.get_nowait()
+                    next_event = self._pending_delta_events.get(timeout=remaining)
                 except queue.Empty:
                     break
                 if next_event is None:
                     self._pending_delta_events.task_done()
-                    self._pending_delta_events.put(None)
+                    stopping = True
+                    break
+                next_size = len(json.dumps(next_event, ensure_ascii=False).encode("utf-8"))
+                if size + next_size > 262144:
+                    carry = next_event
                     break
                 batch.append(next_event)
+                size += next_size
             try:
-                self.durable_store.save_events([event.model_dump(mode="json") for event in batch])
+                self.durable_store.save_events(batch)
             except BaseException as exc:  # noqa: BLE001 - surfaced by flush/close callers.
                 self._event_writer_error = exc
             finally:
                 for _ in batch:
                     self._pending_delta_events.task_done()
+            if stopping:
+                return
 
     def flush_events(self) -> None:
         if self._pending_delta_events is None:

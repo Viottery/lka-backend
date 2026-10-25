@@ -3,6 +3,7 @@
 import asyncio
 import json
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from fastapi import FastAPI
@@ -87,6 +88,39 @@ def test_write_lock_timeout_remains_an_error_and_is_timed(recorded, tmp_path):
     assert failed[0]["error_callsite"]["file"] == "tests/test_sqlite_timing.py"
     assert failed[0]["error_callsite"]["function"] == "test_write_lock_timeout_remains_an_error_and_is_timed"
     assert failed[0]["elapsed_ms"] >= 15
+
+
+def test_queue_wait_and_transaction_owner_are_separate_and_private(recorded, tmp_path, caplog):
+    from app.storage.sqlite_write_queue import SqliteWriteQueueError, WriteQueuePolicy
+
+    _, path = recorded
+    owner = timing.connect_sqlite(tmp_path / "lka.sqlite3")
+    owner.execute("CREATE TABLE secret_table(value TEXT)").close()
+    def wait_for_owner():
+        waiter = timing.connect_sqlite(tmp_path / "lka.sqlite3", write_policy=WriteQueuePolicy(wait_seconds=.02))
+        try:
+            waiter.execute("BEGIN IMMEDIATE")
+        finally:
+            waiter.close()
+    try:
+        owner.execute("BEGIN IMMEDIATE")
+        owner.execute("INSERT INTO secret_table VALUES (?)", ("secret_payload",))
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(wait_for_owner)
+            with pytest.raises(SqliteWriteQueueError, match="wait timed out"):
+                future.result(timeout=2)
+        owner.rollback()
+    finally:
+        owner.close()
+    rows = records(path, "sqlite")
+    waiting = [row for row in rows if row["phase"] == "queue_wait"]
+    held = [row for row in rows if row["phase"] == "transaction"]
+    assert any(not row["success"] for row in waiting)
+    assert any(row["elapsed_ms"] >= 10 for row in held)
+    assert all(row["transaction"]["callsite"]["file"] == "tests/test_sqlite_timing.py" for row in held)
+    assert "writer_age_seconds=" in caplog.text and "transaction_id" in caplog.text
+    output = path.read_text() + caplog.text
+    assert all(secret not in output for secret in ["secret_table", "secret_payload", str(tmp_path)])
 
 
 def test_failed_deferred_commit_preserves_sqlite_context_rollback(recorded, tmp_path):

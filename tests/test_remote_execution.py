@@ -82,6 +82,107 @@ def start(env, command_id="task", **target):
         purpose="Read the project and report evidence", execution_target=target)
 
 
+def test_idle_claim_skips_writes_until_candidate_or_presence_due(setup_remote, monkeypatch):
+    from datetime import UTC, datetime, timedelta
+    e = setup_remote
+    service, principal = e["service"], e["principal"]
+    writes = 0
+    original = service._connection
+    from contextlib import contextmanager
+    @contextmanager
+    def counted(*, write=False, task_admission=False):
+        nonlocal writes
+        writes += int(write)
+        with original(write=write, task_admission=task_admission) as conn:
+            yield conn
+    monkeypatch.setattr(service, "_connection", counted)
+    # Fixture advertises once; subsequent empty claims must be read-only.
+    before = service.claim(principal, environment_id="linux")
+    assert before["task"] is None and before["poll_after_seconds"] == 15
+    assert writes == 0
+    for _ in range(20):
+        assert service.claim(principal, environment_id="linux")["task"] is None
+    assert writes == 0
+    with closing(e["hub"]._conn()) as conn:
+        seen = conn.execute("SELECT last_seen FROM remote_execution_workers WHERE node_id='pc' AND environment_id='linux'").fetchone()[0]
+    assert service._worker_online(e["hub"]._conn(), "pc", "linux", principal["credential_version"])
+    with closing(e["hub"]._conn()) as conn, conn:
+        conn.execute("UPDATE remote_execution_workers SET last_seen=? WHERE node_id='pc' AND environment_id='linux'",
+                     ((datetime.now(UTC) - timedelta(seconds=16)).isoformat(),))
+    service.claim(principal, environment_id="linux")
+    assert writes == 1
+    with closing(e["hub"]._conn()) as conn:
+        refreshed = conn.execute("SELECT last_seen FROM remote_execution_workers WHERE node_id='pc' AND environment_id='linux'").fetchone()[0]
+    assert refreshed > seen
+
+
+def test_idle_claim_presence_hint_respects_short_online_threshold(setup_remote):
+    from app.domains.devices import DeviceConfig
+    e = setup_remote
+    e["devices"].config = DeviceConfig(enabled=True, online_threshold_seconds=5)
+    response = e["service"].claim(e["principal"], environment_id="linux")
+    assert response["task"] is None
+    assert response["poll_after_seconds"] == pytest.approx(5 / 3)
+    with closing(e["hub"]._conn()) as conn:
+        row = conn.execute("SELECT last_seen FROM remote_execution_workers WHERE node_id='pc' AND environment_id='linux'").fetchone()
+    from datetime import UTC, datetime
+    assert (datetime.now(UTC) - datetime.fromisoformat(row["last_seen"])).total_seconds() < 5
+
+
+def test_background_idle_claim_backoff_preserves_explicit_probe(setup_remote, monkeypatch):
+    from app.integrations import remote_execution
+    worker = setup_remote['worker']
+    clock, requests = [100.0], []
+    worker.config.poll_seconds = 3
+    worker._idle_claim_delay = 3
+    worker._next_idle_claim = 0
+    monkeypatch.setattr(remote_execution.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(worker, '_request', lambda *args: (requests.append(args), {'task': None, 'poll_after_seconds': 15})[1])
+    worker.run_once(_background=True)
+    assert worker._idle_claim_delay == 6
+    worker.run_once(_background=True)
+    assert len(requests) == 1
+    worker.run_once()
+    assert len(requests) == 2
+    clock[0] = worker._next_idle_claim
+    worker.run_once(_background=True)
+    assert worker._idle_claim_delay == 15
+    # A deliberately longer operator interval must remain longer.
+    worker.config.poll_seconds = 25
+    worker.run_once()
+    assert worker._idle_claim_delay == 25
+
+
+def test_old_hub_without_backoff_hint_keeps_configured_poll(setup_remote, monkeypatch):
+    from app.integrations import remote_execution
+    worker = setup_remote['worker']
+    worker.config.poll_seconds = 3
+    requests = []
+    monkeypatch.setattr(remote_execution.time, 'monotonic', lambda: 100.0)
+    monkeypatch.setattr(worker, '_request', lambda *args: (requests.append(args), {'task': None})[1])
+    worker.run_once()
+    assert worker._idle_claim_delay == 3
+    assert worker._next_idle_claim == 0
+    worker.run_once(_background=True)
+    assert len(requests) == 2
+
+
+def test_claim_admission_resumes_active_loop_interval():
+    from types import SimpleNamespace
+    worker = RemoteExecutionNode.__new__(RemoteExecutionNode)
+    state = {'active': False, 'stopped': False, 'waits': []}
+    worker.config = SimpleNamespace(poll_seconds=3)
+    worker._idle_claim_delay = 15
+    worker._active = lambda: [object()] if state['active'] else []
+    worker.run_once = lambda **kwargs: state.update(active=True)
+    def wait(delay):
+        state['waits'].append(delay)
+        state['stopped'] = True
+    worker._stop = SimpleNamespace(is_set=lambda: state['stopped'], wait=wait)
+    worker._loop()
+    assert state['waits'] == [3]
+
+
 def test_management_discovery_includes_local_hub_without_changing_remote_items(setup_remote):
     e = setup_remote
     targets = e["hub"].managed_tasks.list_execution_targets(e["context"])
@@ -564,7 +665,7 @@ def test_cancel_and_expiry_are_fenced_never_replayed(setup_remote):
     claim = e["service"].claim(e["principal"], environment_id="linux")
     with closing(e["hub"]._conn()) as conn, conn:
         conn.execute("UPDATE remote_execution_tasks SET lease_expires_at='2000-01-01T00:00:00+00:00' WHERE task_id=?", (second["remote_execution"]["task_id"],))
-    assert e["service"].claim(e["principal"], environment_id="linux") == {"task": None}
+    assert e["service"].claim(e["principal"], environment_id="linux")["task"] is None
     assert e["service"].get(second["remote_execution"]["task_id"])["state"] == "unknown"
 
 

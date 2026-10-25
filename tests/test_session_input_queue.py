@@ -74,6 +74,36 @@ def test_acceptance_is_immediate_history_once_without_running_models(runtime):
     assert len(runtime.get_session(session_id=session_id).messages) == 2
 
 
+def test_empty_session_input_tick_does_not_enter_any_write_transaction(runtime, monkeypatch):
+    sid(runtime)
+    runtime.session_inputs.ensure_schema()
+    statements = []
+    original = runtime.session_inputs._conn
+    def traced():
+        conn = original()
+        conn.set_trace_callback(statements.append)
+        return conn
+    runtime.session_inputs._conn = traced
+    monkeypatch.setattr(runtime.session_inputs, '_bind', lambda _sid: pytest.fail('idle queue bound'))
+    runtime.session_inputs.tick()
+    assert any(sql.lstrip().upper().startswith('SELECT') for sql in statements)
+    assert not any(sql.lstrip().upper().startswith(('BEGIN IMMEDIATE', 'INSERT', 'UPDATE', 'DELETE'))
+                   for sql in statements)
+
+
+@pytest.mark.parametrize('finished', [False, True])
+def test_unchanged_watched_user_run_does_not_reenter_write_queue(runtime, monkeypatch, finished):
+    session_id = sid(runtime)
+    submit(runtime, session_id, 'first')
+    runtime.session_inputs.tick()
+    run = input_run(runtime, session_id)
+    if finished:
+        complete(runtime, run)
+    monkeypatch.setattr(runtime.session_inputs, '_bind', lambda _: pytest.fail('unchanged watch acquired a write permit'))
+    for _ in range(20):
+        runtime.session_inputs.tick()
+
+
 def test_legacy_retry_ignores_null_reasoning_field(runtime):
     session_id = sid(runtime)
     legacy = submit(runtime, session_id, 'legacy')

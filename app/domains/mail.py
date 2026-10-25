@@ -324,129 +324,137 @@ class MailService:
         account_id = _stable_id("mail_account", account.provider, account.email_address.lower())
         now = _now_iso()
         imported_attachments = 0
-        conn = self._conn_factory()
+        # Do all pure/expensive preparation before opening SQLite's write
+        # transaction. Preserve input order (including repeated external IDs):
+        # the last occurrence is the final stored snapshot.
+        prepared = []
+        for message in messages:
+            message_id = _stable_id("mail_msg", account_id, message.external_id)
+            recipients_json = json.dumps(message.to, ensure_ascii=False, sort_keys=True)
+            cc_json = json.dumps(message.cc, ensure_ascii=False, sort_keys=True)
+            chunks = self._chunk_text(message.body_text)
+            attachments = [(a.external_id, _stable_id("mail_att", message_id, a.external_id),
+                            a.name, a.content_type, a.size) for a in message.attachments]
+            prepared.append((message, message_id, recipients_json, cc_json, chunks, attachments))
+        def batch_is_dirty(conn):
+            account_row = conn.execute("SELECT account_id,display_name FROM mail_accounts WHERE provider=? AND email_address=?",
+                                       (account.provider, account.email_address.lower())).fetchone()
+            if account_row is None or account_row['display_name'] != account.display_name:
+                return True
+            message_state = {}
+            attachment_state = {}
+            for message, message_id, recipients_json, cc_json, _chunks, attachments in prepared:
+                if message.external_id not in message_state:
+                    current = conn.execute("SELECT folder,subject,sender,recipients,cc,received_at,body_text FROM mail_messages WHERE account_id=? AND external_id=?",
+                                           (account_id, message.external_id)).fetchone()
+                    message_state[message.external_id] = tuple(current) if current is not None else None
+                    attachment_state[message.external_id] = {
+                        row['external_id']: (row['external_id'], row['name'], row['content_type'], row['size'])
+                        for row in conn.execute("SELECT external_id,name,content_type,size FROM mail_attachments WHERE message_id=?",
+                                                (message_id,))
+                    }
+                desired = (message.folder, message.subject, message.sender, recipients_json, cc_json,
+                           message.received_at, message.body_text)
+                if message_state[message.external_id] != desired:
+                    message_state[message.external_id] = desired
+                    return True
+                for external_id, _attachment_id, name, content_type, size in attachments:
+                    desired_attachment = (external_id, name, content_type, size)
+                    if attachment_state[message.external_id].get(external_id) != desired_attachment:
+                        attachment_state[message.external_id][external_id] = desired_attachment
+                        return True
+            return False
+
+        # Read-only preflight avoids write admission for an unchanged batch.
+        read_conn = self._conn_factory()
         try:
-            conn.execute(
-                """
-                INSERT INTO mail_accounts(
-                    account_id, provider, email_address, display_name, created_at, updated_at
-                )
-                VALUES(?, ?, ?, ?, ?, ?)
-                ON CONFLICT(provider, email_address) DO UPDATE SET
-                    display_name=excluded.display_name,
-                    updated_at=excluded.updated_at
-                """,
-                (
-                    account_id,
-                    account.provider,
-                    account.email_address.lower(),
-                    account.display_name,
-                    now,
-                    now,
-                ),
-            )
-
-            for message in messages:
-                message_id = _stable_id("mail_msg", account_id, message.external_id)
-                recipients_json = json.dumps(message.to, ensure_ascii=False, sort_keys=True)
-                cc_json = json.dumps(message.cc, ensure_ascii=False, sort_keys=True)
-                conn.execute(
-                    """
-                    INSERT INTO mail_messages(
-                        message_id, account_id, external_id, folder, subject, sender,
-                        recipients, cc, received_at, body_text, created_at, updated_at
-                    )
-                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(account_id, external_id) DO UPDATE SET
-                        folder=excluded.folder,
-                        subject=excluded.subject,
-                        sender=excluded.sender,
-                        recipients=excluded.recipients,
-                        cc=excluded.cc,
-                        received_at=excluded.received_at,
-                        body_text=excluded.body_text,
-                        updated_at=excluded.updated_at
-                    """,
-                    (
-                        message_id,
-                        account_id,
-                        message.external_id,
-                        message.folder,
-                        message.subject,
-                        message.sender,
-                        recipients_json,
-                        cc_json,
-                        message.received_at,
-                        message.body_text,
-                        now,
-                        now,
-                    ),
-                )
-                conn.execute("DELETE FROM mail_messages_fts WHERE message_id = ?", (message_id,))
-                conn.execute(
-                    """
-                    INSERT INTO mail_messages_fts(message_id, subject, sender, folder, body_text)
-                    VALUES(?, ?, ?, ?, ?)
-                    """,
-                    (
-                        message_id,
-                        message.subject,
-                        message.sender,
-                        message.folder,
-                        message.body_text,
-                    ),
-                )
-                conn.execute("DELETE FROM mail_chunks WHERE message_id = ?", (message_id,))
-                for chunk_index, chunk_text in enumerate(self._chunk_text(message.body_text)):
-                    conn.execute(
-                        """
-                        INSERT INTO mail_chunks(
-                            chunk_id, message_id, chunk_index, text, created_at
-                        )
-                        VALUES(?, ?, ?, ?, ?)
-                        """,
-                        (
-                            _stable_id("mail_chunk", message_id, str(chunk_index)),
-                            message_id,
-                            chunk_index,
-                            chunk_text,
-                            now,
-                        ),
-                    )
-
-                for attachment in message.attachments:
-                    attachment_id = _stable_id(
-                        "mail_att",
-                        message_id,
-                        attachment.external_id,
-                    )
-                    conn.execute(
-                        """
-                        INSERT INTO mail_attachments(
-                            attachment_id, message_id, external_id, name,
-                            content_type, size, created_at
-                        )
-                        VALUES(?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(message_id, external_id) DO UPDATE SET
-                            name=excluded.name,
-                            content_type=excluded.content_type,
-                            size=excluded.size
-                        """,
-                        (
-                            attachment_id,
-                            message_id,
-                            attachment.external_id,
-                            attachment.name,
-                            attachment.content_type,
-                            attachment.size,
-                            now,
-                        ),
-                    )
-                    imported_attachments += 1
-
-            conn.commit()
+            read_conn.execute("BEGIN")
+            dirty = batch_is_dirty(read_conn)
+            read_conn.commit()
         finally:
-            conn.close()
+            read_conn.close()
+        if dirty:
+            conn = self._conn_factory()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                account_row = conn.execute("SELECT account_id,display_name FROM mail_accounts WHERE provider=? AND email_address=?",
+                                           (account.provider, account.email_address.lower())).fetchone()
+                if account_row is None:
+                    conn.execute("INSERT INTO mail_accounts(account_id,provider,email_address,display_name,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                                 (account_id, account.provider, account.email_address.lower(), account.display_name, now, now))
+                elif account_row['display_name'] != account.display_name:
+                    conn.execute("UPDATE mail_accounts SET display_name=?,updated_at=? WHERE account_id=?",
+                                 (account.display_name, now, account_row['account_id']))
+
+                for message, message_id, recipients_json, cc_json, chunks, attachments in prepared:
+                    current = conn.execute(
+                        "SELECT folder,subject,sender,recipients,cc,received_at,body_text "
+                        "FROM mail_messages WHERE account_id=? AND external_id=?",
+                        (account_id, message.external_id),
+                    ).fetchone()
+                    changed = current is None or tuple(current) != (
+                        message.folder, message.subject, message.sender, recipients_json,
+                        cc_json, message.received_at, message.body_text,
+                    )
+                    if changed:
+                        conn.execute(
+                            """
+                            INSERT INTO mail_messages(
+                                message_id, account_id, external_id, folder, subject, sender,
+                                recipients, cc, received_at, body_text, created_at, updated_at
+                            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(account_id, external_id) DO UPDATE SET
+                                folder=excluded.folder, subject=excluded.subject, sender=excluded.sender,
+                                recipients=excluded.recipients, cc=excluded.cc, received_at=excluded.received_at,
+                                body_text=excluded.body_text, updated_at=excluded.updated_at
+                            """,
+                            (message_id, account_id, message.external_id, message.folder, message.subject,
+                             message.sender, recipients_json, cc_json, message.received_at,
+                             message.body_text, now, now),
+                        )
+                        conn.execute("DELETE FROM mail_messages_fts WHERE message_id = ?", (message_id,))
+                        conn.execute(
+                            "INSERT INTO mail_messages_fts(message_id,subject,sender,folder,body_text) VALUES(?,?,?,?,?)",
+                            (message_id, message.subject, message.sender, message.folder, message.body_text),
+                        )
+                        conn.execute("DELETE FROM mail_chunks WHERE message_id = ?", (message_id,))
+                        for chunk_index, chunk_text in enumerate(chunks):
+                            conn.execute(
+                                "INSERT INTO mail_chunks(chunk_id,message_id,chunk_index,text,created_at) VALUES(?,?,?,?,?)",
+                                (_stable_id("mail_chunk", message_id, str(chunk_index)), message_id,
+                                 chunk_index, chunk_text, now),
+                            )
+
+                    existing_attachments = {
+                        row['external_id']: tuple(row)
+                        for row in conn.execute(
+                            "SELECT external_id,name,content_type,size FROM mail_attachments WHERE message_id=?",
+                            (message_id,),
+                        )
+                    }
+                    for external_id, attachment_id, name, content_type, size in attachments:
+                        desired_attachment = (external_id, name, content_type, size)
+                        if existing_attachments.get(external_id) == desired_attachment:
+                            imported_attachments += 1
+                            continue
+                        conn.execute(
+                            """
+                            INSERT INTO mail_attachments(
+                                attachment_id, message_id, external_id, name, content_type, size, created_at
+                            ) VALUES(?, ?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(message_id, external_id) DO UPDATE SET
+                                name=excluded.name, content_type=excluded.content_type, size=excluded.size
+                            """,
+                            (attachment_id, message_id, external_id, name, content_type, size, now),
+                        )
+                        existing_attachments[external_id] = desired_attachment
+                        imported_attachments += 1
+
+                conn.commit()
+            finally:
+                conn.close()
+        else:
+            imported_attachments = sum(len(item[5]) for item in prepared)
 
         return MailImportResult(
             account_id=account_id,

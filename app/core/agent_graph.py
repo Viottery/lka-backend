@@ -1870,6 +1870,8 @@ class AgentGraphRunner:
     def _save_data(self, run_id: str, data: dict[str, Any]) -> dict[str, Any]:
         if self.artifact_store is None:
             return {"payload": data}
+        if hasattr(self.artifact_store, "put_graph_runtime"):
+            return self.artifact_store.put_graph_runtime(run_id, data, created_at=datetime.now(UTC).isoformat())
         content_hash = sha256(
             json.dumps(
                 data, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str
@@ -1975,7 +1977,8 @@ class AgentGraphRunner:
             return dict(ref["payload"])
         if self.artifact_store is None:
             raise RuntimeError("Graph runtime artifact store is unavailable.")
-        value = self.artifact_store.load_artifact(str(ref["artifact_id"]))
+        loader = getattr(self.artifact_store, "load_graph_runtime", self.artifact_store.load_artifact)
+        value = loader(str(ref["artifact_id"]))
         if value is None:
             raise RuntimeError("Graph runtime artifact is missing.")
         return value

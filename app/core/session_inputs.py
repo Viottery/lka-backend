@@ -324,7 +324,36 @@ class SessionInputQueue:
 
     def tick(self):
         with closing(self._conn()) as conn:
-            session_ids = [row[0] for row in conn.execute('SELECT session_id FROM session_input_queues')]
+            # Keep the polling read-only and avoid opening a write transaction for
+            # idle queues. Include queues needing failed-watch reconciliation,
+            # even when they have no pending input.
+            session_ids = [row[0] for row in conn.execute("""
+                SELECT q.session_id
+                FROM session_input_queues q
+                WHERE (q.paused=0 AND q.watched_run_id IS NOT NULL AND NOT EXISTS (
+                    SELECT 1 FROM agent_runs w WHERE w.run_id=q.watched_run_id
+                )) OR (q.paused=0 AND q.watched_run_id IS NOT NULL AND EXISTS (
+                    SELECT 1 FROM agent_runs w WHERE w.run_id=q.watched_run_id
+                      AND (coalesce(json_extract(w.record_payload,'$.metadata.session_input_id'),'')!=''
+                           OR coalesce(json_extract(w.record_payload,'$.metadata.input_envelope.origin'),'user')='user')
+                      AND w.status IN ('failed','cancelled','timed_out')
+                )) OR (q.paused=0 AND EXISTS (
+                    SELECT 1 FROM agent_runs a WHERE a.session_id=q.session_id
+                      AND a.status NOT IN ('completed','failed','cancelled','timed_out')
+                      AND json_extract(a.record_payload,'$.parent_run_id') IS NULL
+                      AND a.run_id IS NOT q.watched_run_id
+                      AND (coalesce(json_extract(a.record_payload,'$.metadata.session_input_id'),'')!=''
+                           OR coalesce(json_extract(a.record_payload,'$.metadata.input_envelope.origin'),'user')='user')
+                )) OR (q.paused=0 AND NOT EXISTS (
+                    SELECT 1 FROM agent_runs a WHERE a.session_id=q.session_id
+                      AND a.status NOT IN ('completed','failed','cancelled','timed_out')
+                      AND json_extract(a.record_payload,'$.parent_run_id') IS NULL
+                ) AND EXISTS (
+                    SELECT 1 FROM session_inputs i WHERE i.session_id=q.session_id
+                      AND i.run_id IS NULL AND i.cancelled=0
+                ))
+                ORDER BY q.session_id
+            """)]
         for sid in session_ids:
             try:
                 self._bind(sid)

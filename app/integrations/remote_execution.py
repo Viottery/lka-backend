@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import threading
+import time
 from contextlib import closing
 from pathlib import Path
 
@@ -31,6 +32,8 @@ class RemoteExecutionNode:
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._thread = None
+        self._idle_claim_delay = config.poll_seconds
+        self._next_idle_claim = 0.0
         self.last_error = None
         if not sync_config.hub_id or not config.environment_id:
             raise ValueError("remote execution requires a pinned hub and local environment identity")
@@ -397,7 +400,7 @@ class RemoteExecutionNode:
             conn.execute("UPDATE remote_execution_node_tasks SET pending_report=NULL,pending_cursor=NULL,pending_event_cursor=NULL,message_cursor=?,event_cursor=?,last_snapshot=?,state=? WHERE hub_id=? AND task_id=?",
                          (cursor, event_cursor, snapshot_hash, state, row["hub_id"], row["task_id"]))
 
-    def run_once(self):
+    def run_once(self, *, _background=False):
         if not self._lock.acquire(blocking=False):
             return self.status()
         try:
@@ -431,9 +434,30 @@ class RemoteExecutionNode:
                     if not terminal and (local is None or local.status.value not in {"paused", "waiting_user", "waiting_confirmation"}):
                         self._fence_local(row)
                     raise
+            has_active = bool(self._active())
+            # Active tasks keep their configured cadence. Explicit run_once
+            # calls always probe, even during a background idle backoff.
+            if _background and not has_active and time.monotonic() < self._next_idle_claim:
+                self.last_error = None
+                return self.status()
             claim = self._request("claim", {"environment_id": self.config.environment_id})
             if claim.get("task") is not None:
                 self._admit(claim)
+                self._idle_claim_delay = self.config.poll_seconds
+                self._next_idle_claim = 0.0
+            elif has_active:
+                self._idle_claim_delay = self.config.poll_seconds
+                self._next_idle_claim = 0.0
+            else:
+                hint = claim.get("poll_after_seconds")
+                if (isinstance(hint, (int, float)) and not isinstance(hint, bool)
+                        and 0 < hint <= 15):
+                    self._idle_claim_delay = max(self.config.poll_seconds, min(hint, self._idle_claim_delay * 2))
+                    self._next_idle_claim = time.monotonic() + self._idle_claim_delay
+                else:
+                    # Older hubs do not provide a safe presence-derived cap.
+                    self._idle_claim_delay = self.config.poll_seconds
+                    self._next_idle_claim = 0.0
             self.last_error = None
         except Exception as exc:
             self.last_error = str(exc) if isinstance(exc, CloudSyncError) else type(exc).__name__
@@ -455,10 +479,11 @@ class RemoteExecutionNode:
     def _loop(self):
         while not self._stop.is_set():
             try:
-                self.run_once()
+                self.run_once(_background=True)
             except Exception:  # noqa: BLE001, S110 - recorded as a category by run_once.
                 pass
-            self._stop.wait(self.config.poll_seconds)
+            delay = self.config.poll_seconds if self._active() else self._idle_claim_delay
+            self._stop.wait(delay)
 
     def stop(self):
         self._stop.set()

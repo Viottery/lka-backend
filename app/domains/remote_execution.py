@@ -426,14 +426,41 @@ class RemoteExecutionService:
         return row
 
     def claim(self, principal, *, environment_id):
-        self.reconcile()
         token = uuid4().hex + uuid4().hex
+        poll_after_seconds = min(15.0, self.devices.config.online_threshold_seconds / 3)
+        # Avoid a write transaction for the common idle poll. Both the candidate
+        # and presence checks are repeated under the write lock below.
+        now = datetime.now(UTC)
+        with self._connection() as conn:
+            profile = self.devices.require_node(conn, principal, "execution.poll")
+            if not self._profile_allows(profile, {"workspace_id": None, "capabilities": []}, environment_id):
+                raise PermissionError("execution worker environment or scopes are not approved")
+            worker = conn.execute("SELECT credential_version,last_seen FROM remote_execution_workers WHERE node_id=? AND environment_id=?",
+                                  (principal["node_id"], environment_id)).fetchone()
+            has_candidate = conn.execute("SELECT 1 FROM remote_execution_tasks WHERE node_id=? AND environment_id=? AND state='queued' LIMIT 1",
+                                         (principal["node_id"], environment_id)).fetchone()
+            presence_due = (worker is None or worker["credential_version"] != principal["credential_version"]
+                            or (now - datetime.fromisoformat(worker["last_seen"])).total_seconds()
+                            >= poll_after_seconds)
+            if not has_candidate and not presence_due:
+                return {"task": None, "poll_after_seconds": poll_after_seconds}
         with self._connection(write=True) as conn:
             profile = self.devices.require_node(conn, principal, "execution.poll")
             if not self._profile_allows(profile, {"workspace_id": None, "capabilities": []}, environment_id):
                 raise PermissionError("execution worker environment or scopes are not approved")
-            conn.execute("INSERT INTO remote_execution_workers VALUES(?,?,?,?) ON CONFLICT(node_id,environment_id) DO UPDATE SET credential_version=excluded.credential_version,last_seen=excluded.last_seen",
-                         (principal["node_id"], environment_id, principal["credential_version"], _now()))
+            # A queued task can arrive immediately after the read-only idle check;
+            # service it even when the worker presence write is still fresh.
+            candidate = conn.execute("SELECT 1 FROM remote_execution_tasks WHERE node_id=? AND environment_id=? AND state='queued' LIMIT 1",
+                                     (principal["node_id"], environment_id)).fetchone()
+            worker = conn.execute("SELECT credential_version,last_seen FROM remote_execution_workers WHERE node_id=? AND environment_id=?",
+                                  (principal["node_id"], environment_id)).fetchone()
+            now = datetime.now(UTC)
+            presence_due = (worker is None or worker["credential_version"] != principal["credential_version"]
+                            or (now - datetime.fromisoformat(worker["last_seen"])).total_seconds()
+                            >= poll_after_seconds)
+            if presence_due or candidate:
+                conn.execute("INSERT INTO remote_execution_workers VALUES(?,?,?,?) ON CONFLICT(node_id,environment_id) DO UPDATE SET credential_version=excluded.credential_version,last_seen=excluded.last_seen",
+                             (principal["node_id"], environment_id, principal["credential_version"], _now()))
             # A lost lease has unknown effects. Never put it back into the queue.
             # Reconciliation handles expiry and updates hub shadow runs together.
             rows = conn.execute("SELECT * FROM remote_execution_tasks WHERE node_id=? AND environment_id=? AND state='queued' ORDER BY created_at,task_id",
@@ -448,7 +475,7 @@ class RemoteExecutionService:
                 return {"task": json.loads(row["payload"]), "fence": {"task_id": row["task_id"],
                         "lease_epoch": row["lease_epoch"] + 1, "lease_token": token, "environment_id": environment_id},
                         "lease_expires_at": expires}
-        return {"task": None}
+        return {"task": None, "poll_after_seconds": poll_after_seconds}
 
     def check(self, principal, fence, *, start=False):
         fence = ExecutionFence.model_validate(fence)
@@ -854,40 +881,44 @@ class RemoteExecutionService:
 
     def reconcile(self):
         """Fence unknown effects and cancelled targets; never resubmit a run."""
-        # Idle workers poll frequently. With no unfinished remote work there is
-        # nothing to fence; don't compete with foreground writers for that read.
-        # A newly admitted task is rechecked on its next claim/check, and the
-        # mutating path below always rereads authority inside its transaction.
-        with self._connection() as conn:
-            if conn.execute("SELECT 1 FROM remote_execution_tasks WHERE state NOT IN "
-                            "('completed','failed','cancelled','unknown') LIMIT 1").fetchone() is None:
-                return 0
-        changed = []
-        with self._connection(write=True) as conn:
-            rows = conn.execute("SELECT * FROM remote_execution_tasks WHERE state NOT IN ('completed','failed','cancelled','unknown')").fetchall()
+        def pending(conn):
+            rows = conn.execute("SELECT * FROM remote_execution_tasks WHERE state NOT IN "
+                                "('completed','failed','cancelled','unknown')").fetchall()
             for row in rows:
                 state = None
                 device = conn.execute("SELECT * FROM cloud_devices WHERE device_id=?", (row["node_id"],)).fetchone()
                 target = json.loads(row["target"])
-                if (device is None or device["revoked"] or not self._profile_allows(json.loads(device["profile"]), target, row["environment_id"])
+                if (device is None or device["revoked"]
+                        or not self._profile_allows(json.loads(device["profile"]), target, row["environment_id"])
                         or row["credential_version"] is not None and row["credential_version"] != device["credential_version"]):
                     state = "unknown" if row["state"] != "queued" else "cancelled"
                 elif row["lease_expires_at"] and row["lease_expires_at"] <= _now():
                     state = "unknown"
                 payload = json.loads(row["payload"])
+                run = None
                 if self.run_store:
-                    stored = conn.execute("SELECT record_payload FROM agent_runs WHERE run_id=?", (payload["run"]["run_id"],)).fetchone()
+                    stored = conn.execute("SELECT record_payload FROM agent_runs WHERE run_id=?",
+                                          (payload["run"]["run_id"],)).fetchone()
                     run = AgentRunRecord.model_validate_json(stored[0]) if stored else None
                     if run is None or run.metadata.get("cancel_requested"):
                         state = "cancelled"
-                    if state and run and run.status.value not in {"completed", "failed", "cancelled", "timed_out"}:
-                        run.status = AgentRunStatus.CANCELLED if state == "cancelled" else AgentRunStatus.FAILED
-                        run.error_type = "remote_execution_" + state
-                        run.error = "Remote execution authority ended; effects may be unknown. Do not automatically replay."
-                        self.run_store.save_run_in_transaction(conn, run.model_dump(mode="json"), updated_at=_now())
-                        changed.append(run)
                 if state:
-                    conn.execute("UPDATE remote_execution_tasks SET state=?,lease_epoch=lease_epoch+1,updated_at=? WHERE task_id=?", (state, _now(), row["task_id"]))
+                    yield row, state, run
+
+        with self._connection() as conn:
+            if next(pending(conn), None) is None:
+                return 0
+        changed = []
+        with self._connection(write=True) as conn:
+            for row, state, run in pending(conn):
+                if run and run.status.value not in {"completed", "failed", "cancelled", "timed_out"}:
+                    run.status = AgentRunStatus.CANCELLED if state == "cancelled" else AgentRunStatus.FAILED
+                    run.error_type = "remote_execution_" + state
+                    run.error = "Remote execution authority ended; effects may be unknown. Do not automatically replay."
+                    self.run_store.save_run_in_transaction(conn, run.model_dump(mode="json"), updated_at=_now())
+                    changed.append(run)
+                conn.execute("UPDATE remote_execution_tasks SET state=?,lease_epoch=lease_epoch+1,updated_at=? WHERE task_id=?",
+                             (state, _now(), row["task_id"]))
         for run in changed:
             self.run_manager.refresh_after_transaction(run)
         return len(changed)

@@ -445,52 +445,74 @@ class ManagementDelegateService:
                 conn.execute("UPDATE manager_delegates SET state='completed',revision=revision+1,updated_at=? WHERE delegate_id=?",
                              (stamp, row['delegate_id']))
 
+    def _capture_candidates(self, conn):
+        """Build currently actionable events using reads only."""
+        candidates = []
+        rows = conn.execute("SELECT d.delegate_id,d.parent_session_id,d.session_id,d.revision,r.record_payload "
+                            "FROM manager_delegates d JOIN agent_runs r ON r.run_id=("
+                            "SELECT a.run_id FROM agent_runs a WHERE a.session_id=d.session_id "
+                            "AND json_extract(a.record_payload,'$.parent_run_id') IS NULL "
+                            "ORDER BY a.created_at DESC,a.run_id DESC LIMIT 1) WHERE d.state='active'").fetchall()
+        for row in rows:
+            record = json.loads(row['record_payload'])
+            status = record['status']
+            payload = {'delegate_execution_issue': row['delegate_id'], 'delegate_id': row['delegate_id'],
+                       'session_id': row['session_id'], 'run_id': record['run_id'], 'status': status,
+                       'delegate_revision': row['revision']}
+            if status in ('waiting_user', 'waiting_confirmation'):
+                waiting = self.goals._waiting_payload(conn, record)
+                if waiting is None:
+                    continue
+                payload.update(waiting)
+                view = self.tasks._run_view(record)
+                if view.get('pending_user_question'):
+                    question = view['pending_user_question']
+                    payload['pending_user_question'] = {'question_id': question['question_id'],
+                                                        'question': question['question'][:350]}
+                if view.get('user_control'):
+                    payload['user_control'] = view['user_control']
+            elif status == 'completed':
+                if conn.execute("SELECT 1 FROM manager_inbox WHERE session_id=? AND consumed_execution_id IS NULL "
+                                "AND (kind='task_terminal' OR json_extract(payload,'$.task_waiting')=1) LIMIT 1",
+                                (row['session_id'],)).fetchone():
+                    continue
+                if conn.execute('SELECT 1 FROM manager_delegate_reports WHERE run_id=?', (record['run_id'],)).fetchone():
+                    continue
+                try:
+                    self._finished_tasks(conn, row['session_id'])
+                except ManagementConflictError:
+                    continue
+                payload['status'] = 'missing_report'
+            elif status not in ('failed', 'cancelled', 'timed_out'):
+                continue
+            dedup = 'delegate_execution_issue:' + record['run_id'] + ':' + payload['status']
+            if payload.get('task_waiting'):
+                dedup += ':' + str(payload.get('question_id') or payload.get('review_id') or '')
+            if conn.execute('SELECT 1 FROM manager_inbox WHERE session_id=? AND dedup_key=?',
+                            (row['parent_session_id'], dedup)).fetchone():
+                continue
+            candidates.append((row, dedup, payload))
+        return candidates
+
     def capture_events(self):
         """Surface execution failure or a missing handoff without interpreting results."""
+        read_conn = self._conn()
+        try:
+            read_conn.execute('BEGIN')
+            candidates = self._capture_candidates(read_conn)
+            read_conn.commit()
+        finally:
+            read_conn.close()
+        if not candidates:
+            return 0
+
         captured = 0
         with closing(self._conn()) as conn, conn:
             conn.execute('BEGIN IMMEDIATE')
-            rows = conn.execute("SELECT d.delegate_id,d.parent_session_id,d.session_id,d.revision,r.record_payload "
-                                "FROM manager_delegates d JOIN agent_runs r ON r.run_id=("
-                                "SELECT a.run_id FROM agent_runs a WHERE a.session_id=d.session_id "
-                                "AND json_extract(a.record_payload,'$.parent_run_id') IS NULL "
-                                "ORDER BY a.created_at DESC,a.run_id DESC LIMIT 1) WHERE d.state='active'").fetchall()
-            for row in rows:
-                record = json.loads(row['record_payload'])
-                status = record['status']
-                payload = {'delegate_execution_issue': row['delegate_id'], 'delegate_id': row['delegate_id'],
-                           'session_id': row['session_id'], 'run_id': record['run_id'], 'status': status, 'delegate_revision': row['revision']}
-                if status in ('waiting_user', 'waiting_confirmation'):
-                    waiting = self.goals._waiting_payload(conn, record)
-                    if waiting is None:
-                        continue
-                    payload.update(waiting)
-                    view = self.tasks._run_view(record)
-                    if view.get('pending_user_question'):
-                        question = view['pending_user_question']
-                        payload['pending_user_question'] = {'question_id': question['question_id'],
-                                                            'question': question['question'][:350]}
-                    if view.get('user_control'):
-                        payload['user_control'] = view['user_control']
-                elif status == 'completed':
-                    # A finished dispatching turn is waiting for the next result
-                    # turn, even if all its tasks finished between two scans.
-                    if conn.execute("SELECT 1 FROM manager_inbox WHERE session_id=? AND consumed_execution_id IS NULL "
-                                    "AND (kind='task_terminal' OR json_extract(payload,'$.task_waiting')=1) LIMIT 1",
-                                    (row['session_id'],)).fetchone():
-                        continue
-                    if conn.execute('SELECT 1 FROM manager_delegate_reports WHERE run_id=?', (record['run_id'],)).fetchone():
-                        continue
-                    try:
-                        self._finished_tasks(conn, row['session_id'])
-                    except ManagementConflictError:
-                        continue
-                    payload['status'] = 'missing_report'
-                elif status not in ('failed', 'cancelled', 'timed_out'):
-                    continue
-                dedup = 'delegate_execution_issue:' + record['run_id'] + ':' + payload['status']
-                if payload.get('task_waiting'):
-                    dedup += ':' + str(payload.get('question_id') or payload.get('review_id') or '')
+            # Rebuild candidates under the writer lock so latest-run, delegate
+            # ownership/state, waits, reports, task status and dedup are current.
+            candidates = self._capture_candidates(conn)
+            for row, dedup, payload in candidates:
                 captured += self.goals._event(conn, row['parent_session_id'], dedup, 'timer', payload,
                                                datetime.now(UTC).isoformat())
         return captured

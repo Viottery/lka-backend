@@ -324,10 +324,22 @@ class ManagementCoordinator:
         self.reconcile()
         scheduled = 0
         with closing(self._conn()) as conn, conn:
-            conn.execute("BEGIN IMMEDIATE")
             ids = [r[0] for r in conn.execute("SELECT DISTINCT session_id FROM manager_inbox "
                                             "WHERE consumed_execution_id IS NULL")]
+            candidates = []
             for sid in ids:
+                # _pending can mark stale evidence obsolete, so run it inside
+                # the transaction only after a read-only preflight finds work.
+                if not self._eligible(conn, sid, now):
+                    continue
+                if conn.execute("SELECT 1 FROM background_jobs WHERE kind='manager_wake' AND scope_id=? "
+                                "AND status IN ('queued','running','retry_wait')", (sid,)).fetchone():
+                    continue
+                candidates.append(sid)
+            if not candidates:
+                return {"captured": captured, "scheduled": 0}
+            conn.execute("BEGIN IMMEDIATE")
+            for sid in candidates:
                 if not self._eligible(conn, sid, now) or not self._pending(conn, sid):
                     continue
                 if conn.execute("SELECT 1 FROM background_jobs WHERE kind='manager_wake' AND scope_id=? "
@@ -690,11 +702,19 @@ class ManagementCoordinator:
     def reconcile(self):
         """Release failed bindings without consuming evidence or replaying writes."""
         with closing(self._conn()) as conn, conn:
+            rows = conn.execute("SELECT e.execution_id "
+                                "FROM manager_executions e JOIN agent_runs r ON r.run_id=e.run_id WHERE e.status='bound' "
+                                "AND r.status IN ('completed','failed','cancelled','timed_out')").fetchall()
+            if not rows:
+                return
             conn.execute("BEGIN IMMEDIATE")
-            rows = conn.execute("SELECT e.execution_id,e.session_id,e.controller_revision,r.status,r.record_payload "
-                                "FROM manager_executions e JOIN agent_runs r ON r.run_id=e.run_id WHERE e.status='bound'").fetchall()
-            for row in rows:
-                if row["status"] not in _TERMINAL:
+            for candidate in rows:
+                row = conn.execute(
+                    "SELECT r.status FROM manager_executions e JOIN agent_runs r ON r.run_id=e.run_id "
+                    "WHERE e.execution_id=? AND e.status='bound'",
+                    (candidate["execution_id"],),
+                ).fetchone()
+                if row is None or row["status"] not in _TERMINAL:
                     continue
                 # A completed run must have an atomic publication record. Never
                 # infer a successful delivery from a lone terminal run row.
@@ -702,7 +722,7 @@ class ManagementCoordinator:
                 if row["status"] == "cancelled":
                     status = "superseded"
                 conn.execute("UPDATE manager_executions SET status=?,updated_at=? WHERE execution_id=?",
-                             (status, datetime.now(UTC).isoformat(), row["execution_id"]))
+                             (status, datetime.now(UTC).isoformat(), candidate["execution_id"]))
 
     def run_one(self, owner=None):
         return self.worker.run_one(owner)

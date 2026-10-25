@@ -12,6 +12,7 @@ import ntpath
 import os
 import re
 import sqlite3
+import sys
 import threading
 import time
 import weakref
@@ -32,16 +33,48 @@ _PERSISTENT_PRAGMAS = frozenset({
     "page_size", "auto_vacuum", "secure_delete", "encoding",
 })
 _COMMAND_PRAGMAS = frozenset({"optimize", "wal_checkpoint", "incremental_vacuum"})
+_SOURCE_PREFIX = os.path.normcase(str(Path(__file__).resolve().parents[2]) + os.sep)
+
+
+def _write_callsite():
+    frame = sys._getframe(1)
+    try:
+        for _ in range(24):
+            if frame is None:
+                break
+            filename = os.path.normcase(frame.f_code.co_filename)
+            if filename.startswith(_SOURCE_PREFIX):
+                relative = filename[len(_SOURCE_PREFIX):].replace(os.sep, "/")
+                if relative not in {"app/storage/sqlite_write_queue.py", "app/storage/sqlite_timing.py",
+                                    "app/storage/sqlite_retry.py"}:
+                    return {"file": relative, "function": frame.f_code.co_name, "line": frame.f_lineno}
+            frame = frame.f_back
+    finally:
+        del frame
+    return None
+
+
+def _observe(conn, phase, elapsed_ms, *, error=None, details=None):
+    try:
+        observer = getattr(conn, "_observe_write_queue", None)
+        if observer is not None:
+            observer(phase, elapsed_ms, error=error, details=details)
+    except Exception:  # noqa: BLE001, S110 - metrics cannot alter transaction outcomes.
+        pass
 
 
 def _log_queue_failure(conn, reason, age_seconds=None):
     with conn._write_queue.condition:
         writer_thread_id = conn._write_queue.owner_thread
-    _logger.warning("SQLite write queue %s database=%s thread_id=%s writer_thread_id=%s age_seconds=%s",
+        owner = dict(conn._write_queue.owner_details)
+        owner_age = (time.monotonic() - conn._write_queue.owner_started
+                     if conn._write_queue.owner_started is not None else None)
+    _logger.warning("SQLite write queue %s database=%s thread_id=%s writer_thread_id=%s age_seconds=%s writer_age_seconds=%s owner=%s",
                     reason, getattr(conn, "_timing_database", "other"),
                     threading.get_ident(),
                     writer_thread_id,
-                    round(age_seconds, 3) if age_seconds is not None else None)
+                    round(age_seconds, 3) if age_seconds is not None else None,
+                    round(owner_age, 3) if owner_age is not None else None, owner)
 
 
 class SqliteWriteQueueError(sqlite3.OperationalError):
@@ -142,6 +175,8 @@ class _DatabaseQueue:
         self.waiters = deque()
         self.owner = None
         self.owner_thread = None
+        self.owner_started = None
+        self.owner_details = {}
 
     def acquire(self, conn):
         with self.condition:
@@ -157,7 +192,9 @@ class _DatabaseQueue:
                 _log_queue_failure(conn, "full")
                 raise SqliteWriteQueueError("SQLite write queue is full")
             self.waiters.append(ticket)
-        deadline = time.monotonic() + conn._write_policy.wait_seconds
+        started = time.monotonic()
+        deadline = started + conn._write_policy.wait_seconds
+        details = {"transaction_id": uuid4().hex, "callsite": _write_callsite()}
         try:
             with self.condition:
                 while self.owner is not None or self.waiters[0] is not ticket:
@@ -169,6 +206,8 @@ class _DatabaseQueue:
                 self.waiters.popleft()
                 self.owner = conn
                 self.owner_thread = threading.get_ident()
+                self.owner_started = time.monotonic()
+                self.owner_details = details
                 with conn._lifecycle_lock:
                     conn._lease_generation += 1
                     conn._write_started = time.monotonic()
@@ -176,19 +215,26 @@ class _DatabaseQueue:
                     conn._progress_deadline = conn._write_started + conn._write_policy.transaction_seconds
                 with _thread_holds_lock:
                     _thread_holds.setdefault(threading.get_ident(), set()).add(self.key)
-        except BaseException:
+            _observe(conn, "queue_wait", (time.monotonic() - started) * 1000, details=details)
+        except BaseException as exc:
             with self.condition:
                 try:
                     self.waiters.remove(ticket)
                 except ValueError:
                     pass
                 self.condition.notify_all()
+            _observe(conn, "queue_wait", (time.monotonic() - started) * 1000, error=exc,
+                     details=details)
             raise
 
     def release(self, conn):
+        observed = None
         with self.condition:
             if self.owner is conn:
+                observed = ((time.monotonic() - self.owner_started) * 1000, self.owner_details)
                 self.owner = None
+                self.owner_started = None
+                self.owner_details = {}
                 if self.owner_thread is not None:
                     with _thread_holds_lock:
                         held = _thread_holds.get(self.owner_thread)
@@ -199,6 +245,9 @@ class _DatabaseQueue:
                 self.owner_thread = None
                 conn._progress_deadline = None
                 self.condition.notify_all()
+        if observed is not None:
+            error = SqliteTransactionTimeoutError("expired") if conn._poisoned else None
+            _observe(conn, "transaction", observed[0], error=error, details=observed[1])
 
 
 def _watchdog():

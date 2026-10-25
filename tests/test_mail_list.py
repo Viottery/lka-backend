@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
 import pytest
 
@@ -8,7 +10,7 @@ from app.core.context_driver import ToolView
 from app.core.multi_agent import SideEffectLevel
 from app.core.tools import ToolContext, ToolInvocation
 from app.domains.knowledge import KnowledgeSearchResult, KnowledgeService
-from app.domains.mail import MailAccountInput, MailMessageInput, MailService
+from app.domains.mail import MailAccountInput, MailAttachmentInput, MailMessageInput, MailService
 from app.domains.mail_knowledge import MailKnowledgeMirror
 from app.tool_packages.mail import ListMailTool
 
@@ -66,6 +68,102 @@ def test_mail_list_pages_21_to_40_metadata_only_and_counts(mail_service):
     assert result.listing_id
     assert result.coverage == {"start_rank": 21, "end_rank": 40}
     assert all("body_text" not in card.model_dump() and "snippet" not in card.model_dump() for card in result.messages)
+
+
+def test_mail_reimport_skips_unchanged_index_writes_and_preserves_attachment_upsert_contract(mail_service):
+    account = MailAccountInput(email_address='trace@example.com')
+    message = MailMessageInput(external_id='same', subject='hello', body_text='stable text',
+                               attachments=[{'external_id': 'a', 'name': 'old.pdf'}])
+    statements = []
+    original_factory = mail_service._conn_factory
+    def traced_factory():
+        conn = original_factory()
+        conn.set_trace_callback(statements.append)
+        return conn
+    mail_service._conn_factory = traced_factory
+    mail_service.import_messages(account=account, messages=[message])
+    initial_index_writes = sum('mail_messages_fts' in sql.lower() or 'mail_chunks' in sql.lower()
+                               for sql in statements)
+    assert initial_index_writes > 0  # FTS shadow-table trace counts vary by SQLite version.
+    statements.clear()
+    mail_service.import_messages(account=account, messages=[message])
+    mail_service._conn_factory = original_factory
+    assert not any('mail_messages_fts' in sql.lower() or 'mail_chunks' in sql.lower()
+                   for sql in statements)
+    writes = sum(sql.lstrip().upper().startswith(('INSERT', 'UPDATE', 'DELETE', 'REPLACE'))
+                 for sql in statements)
+    assert writes == 0
+    assert not any(sql.lstrip().upper().startswith('BEGIN IMMEDIATE') for sql in statements)
+
+    updated = message.model_copy(update={'subject': 'changed', 'attachments': [
+        message.attachments[0].model_copy(update={'name': 'new.pdf'}),
+        MailAttachmentInput(external_id='b', name='added.txt')]})
+    mail_service.import_messages(account=account, messages=[updated])
+    mail_service.import_messages(account=account, messages=[MailMessageInput(external_id='same')])
+    conn = mail_service._conn_factory()
+    try:
+        rows = conn.execute('SELECT external_id,name FROM mail_attachments ORDER BY external_id').fetchall()
+        assert [tuple(row) for row in rows] == [('a', 'new.pdf'), ('b', 'added.txt')]
+    finally:
+        conn.close()
+
+
+def test_mail_import_duplicate_id_uses_last_snapshot_and_rolls_back_whole_batch(mail_service):
+    account = MailAccountInput(email_address='atomic@example.com')
+    first = MailMessageInput(external_id='dup', subject='first', body_text='first body')
+    last = MailMessageInput(external_id='dup', subject='last', body_text='last body')
+    mail_service.import_messages(account=account, messages=[first, last])
+    assert mail_service.search_messages(query='last').messages[0].subject == 'last'
+
+    conn = mail_service._conn_factory()
+    conn.execute("CREATE TRIGGER fail_mail_attachment BEFORE INSERT ON mail_attachments "
+                 "WHEN NEW.external_id='boom' BEGIN SELECT RAISE(ABORT,'triggered'); END")
+    conn.commit()
+    conn.close()
+    with pytest.raises(sqlite3.IntegrityError, match='triggered'):
+        mail_service.import_messages(account=account, messages=[
+            MailMessageInput(external_id='dup', subject='partial', body_text='changed'),
+            MailMessageInput(external_id='new', body_text='new body',
+                              attachments=[MailAttachmentInput(external_id='boom', name='bad')])])
+    assert mail_service.search_messages(query='last').messages[0].subject == 'last'
+
+
+def test_mail_import_concurrent_first_account_creation_is_serialized(mail_service):
+    account = MailAccountInput(email_address='concurrent@example.com')
+    messages = [MailMessageInput(external_id='shared', subject='same', body_text='same body')]
+    barrier = Barrier(2)
+
+    def import_batch():
+        barrier.wait()
+        return mail_service.import_messages(account=account, messages=messages)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: import_batch(), range(2)))
+    assert [result.imported_messages for result in results] == [1, 1]
+    conn = mail_service._conn_factory()
+    try:
+        assert conn.execute("SELECT count(*) FROM mail_accounts WHERE email_address='concurrent@example.com'").fetchone()[0] == 1
+        assert conn.execute("SELECT count(*) FROM mail_messages WHERE external_id='shared'").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_mail_import_repeated_attachment_id_tracks_each_in_batch_update(mail_service):
+    account = MailAccountInput(email_address='repeated-attachment@example.com')
+    original = MailMessageInput(external_id='repeat', attachments=[
+        MailAttachmentInput(external_id='same', name='A')])
+    mail_service.import_messages(account=account, messages=[original])
+    updates = original.model_copy(update={'attachments': [
+        MailAttachmentInput(external_id='same', name='B'),
+        MailAttachmentInput(external_id='same', name='A'),
+    ]})
+    mail_service.import_messages(account=account, messages=[updates])
+    conn = mail_service._conn_factory()
+    try:
+        row = conn.execute("SELECT name FROM mail_attachments WHERE external_id='same'").fetchone()
+        assert row['name'] == 'A'
+    finally:
+        conn.close()
 
 
 def test_mail_list_half_open_dates_and_account_grants(mail_service):

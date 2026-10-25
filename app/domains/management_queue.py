@@ -209,6 +209,17 @@ class ManagementQueueService:
         now = now.astimezone(UTC)
         stamp = now.isoformat()
         released = 0
+        # Reconciliation and scheduling have separate read-only existence
+        # checks so an empty poll never reserves SQLite's writer lock.
+        with closing(self._conn()) as probe:
+            terminal_exists = probe.execute(
+                "SELECT 1 FROM manager_work_queue q JOIN agent_runs r ON r.run_id=q.run_id "
+                "WHERE q.state!='finished' AND r.status IN ('completed','failed','cancelled','timed_out') LIMIT 1"
+            ).fetchone() is not None
+            pending_exists = (self.config.enabled and self.tasks.durable_execution()
+                              and probe.execute("SELECT 1 FROM manager_work_queue WHERE state='pending' LIMIT 1").fetchone() is not None)
+        if not terminal_exists and not pending_exists:
+            return 0
         with closing(self._conn()) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
             # Reconcile only persisted terminal outcomes; waits/pauses retain write reservations.

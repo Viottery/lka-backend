@@ -161,6 +161,25 @@ class ManagementWatchService:
     def tick(self, now=None):
         stamp = _instant(now).isoformat()
         captured = 0
+        read_conn = self._conn()
+        try:
+            read_conn.execute("BEGIN")
+            policies = read_conn.execute(
+                "SELECT * FROM manager_watch_subscriptions WHERE enabled=1 ORDER BY session_id,watch_id"
+            ).fetchall()
+            has_candidates = any(
+                self._current(read_conn, policy)
+                and read_conn.execute(
+                    "SELECT 1 FROM watch_briefings WHERE watch_id=? AND rowid>? LIMIT 1",
+                    (policy["watch_id"], policy["cursor"]),
+                ).fetchone() is not None
+                for policy in policies
+            )
+            read_conn.commit()
+        finally:
+            read_conn.close()
+        if not has_candidates:
+            return 0
         with closing(self._conn()) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
             policies = conn.execute("SELECT * FROM manager_watch_subscriptions WHERE enabled=1 ORDER BY session_id,watch_id").fetchall()

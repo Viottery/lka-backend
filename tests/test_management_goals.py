@@ -127,6 +127,37 @@ def test_concurrent_capture_commits_one_timer_event(state):
     assert len(service.list_events(sid)["events"]) == 1
 
 
+def test_empty_capture_skips_write_transaction_and_does_not_advance_inbox_sequence(state):
+    factory, _, _, service, sid = state
+    run_id, task_sid = task(state)
+    with closing(factory()) as conn, conn:
+        conn.execute("CREATE TABLE managed_session_links(manager_session_id TEXT,task_session_id TEXT,run_id TEXT)")
+        conn.execute("INSERT INTO managed_session_links VALUES(?,?,?)", (sid, task_sid, run_id))
+    assert service.capture_events() == 1
+    with closing(factory()) as conn, conn:
+        before_seq = conn.execute("SELECT seq FROM sqlite_sequence WHERE name='manager_inbox'").fetchone()[0]
+    write_transactions = 0
+    def traced_factory():
+        nonlocal write_transactions
+        conn = factory()
+        execute = conn.execute
+        def traced(sql, *args, **kwargs):
+            nonlocal write_transactions
+            if sql.strip().upper().startswith("BEGIN IMMEDIATE"):
+                write_transactions += 1
+            return execute(sql, *args, **kwargs)
+        conn.execute = traced
+        return conn
+    quiet = ManagementGoalService(traced_factory, state[2])
+    quiet.ensure_schema()
+    write_transactions = 0
+    for _ in range(4):
+        assert quiet.capture_events() == 0
+    assert write_transactions == 0
+    with closing(factory()) as conn:
+        assert conn.execute("SELECT seq FROM sqlite_sequence WHERE name='manager_inbox'").fetchone()[0] == before_seq
+
+
 def test_terminal_capture_uses_links_and_unlinked_goal_wait_without_raw_content(state):
     factory, _, _, service, sid = state
     linked, task_sid = task(state, status="failed")

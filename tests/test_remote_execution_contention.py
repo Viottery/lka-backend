@@ -28,7 +28,34 @@ def test_idle_reconciliation_reads_while_another_writer_is_active(remote):
         blocker.rollback()
 
 
-def test_claim_retries_only_lock_admission_without_repeating_lease(remote, monkeypatch):
+def test_healthy_leased_reconciliation_skips_write_admission(remote, monkeypatch):
+    from tests.test_remote_execution import start
+    service = remote["service"]
+    start(remote, device_id="pc", environment_id="linux", workspace_id="project")
+    claim = service.claim(remote["principal"], environment_id="linux")
+    assert claim["task"] is not None
+    path = remote["hub"].agent_run_store.db_path
+    with closing(sqlite3.connect(path)) as blocker:
+        blocker.execute("BEGIN IMMEDIATE")
+        attempts = []
+
+        class Connection(sqlite3.Connection):
+            def execute(self, sql, parameters=()):
+                if sql == "BEGIN IMMEDIATE":
+                    attempts.append(sql)
+                return super().execute(sql, parameters)
+
+        def connection():
+            conn = sqlite3.connect(path, timeout=0.01, factory=Connection)
+            conn.row_factory = sqlite3.Row
+            return conn
+        monkeypatch.setattr(service, "_conn", connection)
+        assert service.reconcile() == 0
+        assert attempts == []
+        blocker.rollback()
+
+
+def test_idle_claim_does_not_wait_for_an_unrelated_writer(remote, monkeypatch):
     service = remote["service"]
     path = remote["hub"].agent_run_store.db_path
     with closing(sqlite3.connect(path)) as blocker:
@@ -46,10 +73,43 @@ def test_claim_retries_only_lock_admission_without_repeating_lease(remote, monke
                     raise
 
         monkeypatch.setattr(service, "_conn", lambda: sqlite3.connect(path, timeout=0.01, factory=Connection))
-        assert service.claim(remote["principal"], environment_id="linux") == {"task": None}
-        assert len(attempts) == 2
+        assert service.claim(remote["principal"], environment_id="linux")["task"] is None
+        assert len(attempts) == 0
         with closing(sqlite3.connect(path)) as conn:
             assert conn.execute("SELECT count(*) FROM remote_execution_tasks").fetchone()[0] == 0
+
+
+def test_claim_retries_only_lock_admission_without_repeating_lease(remote, monkeypatch):
+    from tests.test_remote_execution import start
+    service = remote["service"]
+    start(remote, device_id="pc", environment_id="linux", workspace_id="project")
+    path = remote["hub"].agent_run_store.db_path
+    with closing(sqlite3.connect(path)) as blocker:
+        blocker.execute("BEGIN IMMEDIATE")
+        attempts = []
+
+        class Connection(sqlite3.Connection):
+            def execute(self, sql, parameters=()):
+                if sql == "BEGIN IMMEDIATE":
+                    attempts.append(sql)
+                try:
+                    return super().execute(sql, parameters)
+                except sqlite3.OperationalError:
+                    blocker.rollback()
+                    raise
+
+        def connection():
+            conn = sqlite3.connect(path, timeout=0.01, factory=Connection)
+            conn.row_factory = sqlite3.Row
+            return conn
+        monkeypatch.setattr(service, "_conn", connection)
+        claimed = service.claim(remote["principal"], environment_id="linux")
+        assert claimed["task"] is not None
+        assert claimed["fence"]["lease_epoch"] == 1
+        assert len(attempts) == 2
+        assert service.claim(remote["principal"], environment_id="linux")["task"] is None
+        with closing(sqlite3.connect(path)) as conn:
+            assert conn.execute("SELECT count(*) FROM remote_execution_tasks WHERE state='leased' AND lease_epoch=1").fetchone()[0] == 1
 
 
 def test_busy_response_is_temporary_without_implicit_operation_retry(tmp_path):

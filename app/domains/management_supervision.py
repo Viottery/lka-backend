@@ -42,6 +42,16 @@ class ManagementSupervisionService:
         stamp = instant.isoformat()
         upcoming = (instant + timedelta(seconds=self.config.attention_sweep_interval_seconds)).isoformat()
         captured = 0
+        with closing(self._conn()) as probe:
+            due_exists = probe.execute(
+                "SELECT 1 FROM manager_controllers c JOIN agent_sessions s ON s.session_id=c.session_id "
+                "LEFT JOIN manager_attention_sweep_state p ON p.session_id=c.session_id "
+                "WHERE s.kind='manager' AND s.status!='deleted' "
+                "AND (p.next_due_at IS NULL OR p.next_due_at<=?)" + self._top_level(probe) + " LIMIT 1",
+                (stamp,),
+            ).fetchone() is not None
+        if not due_exists:
+            return 0
         with closing(self._conn()) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
             managers = conn.execute(

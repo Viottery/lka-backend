@@ -196,7 +196,7 @@ class ManagementAttentionService:
                             "AND (e.status='completed' OR d.delivery_id IS NOT NULL) LIMIT 1",
                             (session_id, matter_id, phase, facts_hash)).fetchone() is not None
 
-    def _scan(self, conn, session_id, now, *, horizon_days=None, limit=50, offset=0):
+    def _scan(self, conn, session_id, now, *, horizon_days=None, limit=50, offset=0, capture=True):
         if type(limit) is not int or not 1 <= limit <= 100 or type(offset) is not int or offset < 0:
             raise ValueError("limit must be 1..100 and offset non-negative")
         policy = self._policy(conn, session_id)
@@ -212,9 +212,13 @@ class ManagementAttentionService:
                 if self._delivered(conn, session_id, matter.matter_id, phase, facts_hash):
                     continue
                 key = "attention:" + _digest([session_id, matter.matter_id, phase, facts_hash]) + ":" + str(policy["revision"])
+                if conn.execute("SELECT 1 FROM manager_inbox WHERE session_id=? AND dedup_key=?",
+                                (session_id, key)).fetchone():
+                    continue
                 payload = {"attention_policy_revision": policy["revision"], "matter_id": matter.matter_id,
                            "matter_revision": matter.revision, "phase": phase, "facts_hash": facts_hash}
-                captured += self.goals._event(conn, session_id, key, "timer", payload, now.isoformat())
+                captured += (self.goals._event(conn, session_id, key, "timer", payload, now.isoformat())
+                             if capture else 1)
         return {"captured": captured, "scanned": len(page.matters), "next_offset": page.next_offset}
 
     def scan(self, session_id, now, horizon_days=None, limit=50, offset=0):
@@ -230,6 +234,18 @@ class ManagementAttentionService:
         captured = 0
         for session_id in ids:
             with closing(self._conn()) as conn, conn:
+                conn.execute("BEGIN")
+                policy = self._policy(conn, session_id)
+                try:
+                    active = self._manager(conn, session_id) == "active"
+                except KeyError:
+                    continue
+                if not active or not policy or not policy["enabled"]:
+                    continue
+                preview = self._scan(conn, session_id, instant, offset=policy["scan_offset"], capture=False)
+                if preview["captured"] == 0 and (preview["next_offset"] or 0) == policy["scan_offset"]:
+                    continue
+            with closing(self._conn()) as conn, conn:
                 conn.execute("BEGIN IMMEDIATE")
                 policy = self._policy(conn, session_id)
                 # A deleted or paused controller retains its policy but does not advance the scan.
@@ -240,8 +256,9 @@ class ManagementAttentionService:
                 if not active or not policy or not policy["enabled"]:
                     continue
                 result = self._scan(conn, session_id, instant, offset=policy["scan_offset"])
-                conn.execute("UPDATE manager_attention_policies SET scan_offset=? WHERE session_id=? AND revision=?",
-                             (result["next_offset"] or 0, session_id, policy["revision"]))
+                if (result["next_offset"] or 0) != policy["scan_offset"]:
+                    conn.execute("UPDATE manager_attention_policies SET scan_offset=? WHERE session_id=? AND revision=?",
+                                 (result["next_offset"] or 0, session_id, policy["revision"]))
                 captured += result["captured"]
         return captured
 

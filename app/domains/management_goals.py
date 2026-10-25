@@ -311,42 +311,62 @@ class ManagementGoalService:
         instant = _instant(now)
         stamp = instant.isoformat()
         count = 0
+        # Discover only rows that could produce a new event. This keeps the
+        # common empty poll read-only, even when the inbox has a long history.
         with closing(self._conn()) as conn, conn:
-            conn.execute("BEGIN IMMEDIATE")
             managers = [r[0] for r in conn.execute("SELECT c.session_id FROM manager_controllers c JOIN agent_sessions s "
                                                  "ON s.session_id=c.session_id WHERE s.kind='manager' AND s.status!='deleted'")]
+            if not managers:
+                return 0
+            linked_exists = self._has_table(conn, "managed_session_links")
+            candidates = []
             for sid in managers:
-                due = conn.execute("SELECT * FROM manager_goals WHERE session_id=? AND status IN ('active','waiting') "
-                                   "AND next_wake_at IS NOT NULL AND next_wake_at<=?", (sid, stamp)).fetchall()
+                due = conn.execute("SELECT g.* FROM manager_goals g WHERE g.session_id=? AND g.status IN ('active','waiting') "
+                                   "AND g.next_wake_at IS NOT NULL AND g.next_wake_at<=? AND NOT EXISTS "
+                                   "(SELECT 1 FROM manager_inbox i WHERE i.session_id=g.session_id "
+                                   "AND i.dedup_key='timer:'||g.goal_id||':'||g.timer_generation) "
+                                   "AND NOT EXISTS (SELECT 1 FROM manager_inbox i WHERE i.session_id=g.session_id "
+                                   "AND i.goal_id=g.goal_id AND i.goal_revision=g.revision AND i.kind='timer' "
+                                   "AND json_extract(i.payload,'$.timer_generation')=g.timer_generation)", (sid, stamp)).fetchall()
                 for goal in due:
                     if not self.enabled_in_transaction(conn, goal["goal_id"]):
                         continue
-                    count += self._event(conn, sid, f"timer:{goal['goal_id']}:{goal['timer_generation']}", "timer",
-                                         {"timer_generation": goal["timer_generation"]}, stamp,
-                                         goal["goal_id"], goal["revision"])
-                    conn.execute("UPDATE manager_goals SET next_wake_at=NULL WHERE goal_id=?", (goal["goal_id"],))
+                    candidates.append((sid, "timer", goal["goal_id"], goal["revision"],
+                                       {"timer_generation": goal["timer_generation"]},
+                                       f"timer:{goal['goal_id']}:{goal['timer_generation']}", goal["goal_id"], goal["timer_generation"]))
                 waiting = conn.execute("SELECT goal_id,revision,wait_run_id FROM manager_goals WHERE session_id=? "
                                        "AND status IN ('active','waiting') AND wait_run_id IS NOT NULL", (sid,)).fetchall()
+                if not linked_exists and not waiting:
+                    continue
                 waiting = [goal for goal in waiting if self.enabled_in_transaction(conn, goal["goal_id"])]
                 linked = set()
-                if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='managed_session_links'").fetchone():
-                    linked.update(row[0] for row in conn.execute("SELECT run_id FROM managed_session_links WHERE manager_session_id=?", (sid,)))
+                if linked_exists:
+                    linked.update(row[0] for row in conn.execute("SELECT l.run_id FROM managed_session_links l "
+                                      "WHERE l.manager_session_id=? AND EXISTS (SELECT 1 FROM agent_runs r "
+                                      "WHERE r.run_id=l.run_id AND (r.status IN ('waiting_user','waiting_confirmation') "
+                                      "OR (r.status IN ('completed','failed','cancelled','timed_out') AND NOT EXISTS "
+                                      "(SELECT 1 FROM manager_inbox i WHERE i.session_id=l.manager_session_id "
+                                      "AND i.dedup_key='task:'||r.run_id||':'||r.status))))", (sid,)))
                 tracked = linked | {row["wait_run_id"] for row in waiting}
                 for run_id in sorted(tracked):
-                    row = conn.execute("SELECT r.record_payload FROM agent_runs r JOIN agent_sessions s ON s.session_id=r.session_id "
-                                       "WHERE r.run_id=? AND s.kind='ordinary' AND s.status!='deleted'", (run_id,)).fetchone()
+                    row = conn.execute("SELECT r.record_payload,r.status FROM agent_runs r JOIN agent_sessions s ON s.session_id=r.session_id "
+                                       "WHERE r.run_id=? AND s.kind='ordinary' AND s.status!='deleted' AND "
+                                       "(r.status IN ('waiting_user','waiting_confirmation','completed','failed','cancelled','timed_out') "
+                                       "OR EXISTS (SELECT 1 FROM manager_goals g WHERE g.session_id=? AND g.wait_run_id=r.run_id "
+                                       "AND g.status IN ('active','waiting'))) ", (run_id, sid)).fetchone()
                     if row is None:
                         continue
                     record = json.loads(row[0])
                     if record.get("parent_run_id") is not None:
                         continue
-                    if run_id in linked:
+                    if run_id in linked and record.get("status") in {"waiting_user", "waiting_confirmation"}:
                         pending = self._waiting_payload(conn, record)
                         if pending is not None:
                             reference = {key: pending[key] for key in ("question_id", "review_id") if key in pending}
                             reference_key = sha256(json.dumps(reference, sort_keys=True).encode()).hexdigest()[:32]
-                            count += self._event(conn, sid, f"waiting:{run_id}:{record['status']}:{reference_key}",
-                                                 "timer", pending, stamp)
+                            key = f"waiting:{run_id}:{record['status']}:{reference_key}"
+                            if not conn.execute("SELECT 1 FROM manager_inbox WHERE session_id=? AND dedup_key=?", (sid, key)).fetchone():
+                                candidates.append((sid, "timer", None, None, pending, key, None, None))
                     if record.get("status") not in _TERMINAL:
                         continue
                     goals = [goal for goal in waiting if goal["wait_run_id"] == run_id]
@@ -354,11 +374,69 @@ class ManagementGoalService:
                     payload = {"run_id": run_id, "status": record["status"],
                                "error_type": str(error_type)[:80] if error_type is not None else None}
                     if run_id in linked:
-                        count += self._event(conn, sid, f"task:{run_id}:{record['status']}", "task_terminal", payload, stamp)
+                        key = f"task:{run_id}:{record['status']}"
+                        if not conn.execute("SELECT 1 FROM manager_inbox WHERE session_id=? AND dedup_key=?", (sid, key)).fetchone():
+                            candidates.append((sid, "task_terminal", None, None, payload, key, None, None))
                     for goal in goals:
                         key = f"task:{run_id}:{record['status']}:{goal['goal_id']}:{goal['revision']}"
-                        count += self._event(conn, sid, key, "task_terminal", payload, stamp,
-                                             goal["goal_id"], goal["revision"])
+                        if not conn.execute("SELECT 1 FROM manager_inbox WHERE session_id=? AND dedup_key=?", (sid, key)).fetchone():
+                            candidates.append((sid, "task_terminal", goal["goal_id"], goal["revision"], payload, key, None, None))
+            if not candidates:
+                return 0
+            # Recheck candidate dedup keys under the short write lock. Timer
+            # wake clearing is coupled to successful insertion.
+            conn.execute("BEGIN IMMEDIATE")
+            for sid, kind, goal_id, revision, value, key, clear_goal, generation in candidates:
+                if conn.execute("SELECT 1 FROM manager_controllers c JOIN agent_sessions s ON s.session_id=c.session_id "
+                                "WHERE c.session_id=? AND s.kind='manager' AND s.status!='deleted'", (sid,)).fetchone() is None:
+                    continue
+                if conn.execute("SELECT 1 FROM manager_inbox WHERE session_id=? AND dedup_key=?", (sid, key)).fetchone():
+                    continue
+                if kind == "timer" and goal_id is not None:
+                    current = conn.execute("SELECT revision,timer_generation,status,next_wake_at FROM manager_goals "
+                                           "WHERE goal_id=? AND session_id=?", (goal_id, sid)).fetchone()
+                    if (current is None or current["revision"] != revision or current["timer_generation"] != generation
+                            or current["status"] not in {"active", "waiting"} or current["next_wake_at"] is None
+                            or current["next_wake_at"] > stamp or not self.enabled_in_transaction(conn, goal_id)):
+                        continue
+                elif kind == "timer":
+                    if conn.execute("SELECT 1 FROM managed_session_links WHERE manager_session_id=? AND run_id=?",
+                                    (sid, value.get("run_id"))).fetchone() is None:
+                        continue
+                    current = conn.execute("SELECT r.record_payload,r.status FROM agent_runs r JOIN agent_sessions s "
+                                            "ON s.session_id=r.session_id WHERE r.run_id=? AND s.kind='ordinary' "
+                                            "AND s.status!='deleted'", (value.get("run_id"),)).fetchone()
+                    if current is None:
+                        continue
+                    record = json.loads(current["record_payload"])
+                    pending = self._waiting_payload(conn, record)
+                    if (record.get("parent_run_id") is not None or pending is None or pending != value
+                            or current["status"] != value.get("status")):
+                        continue
+                else:
+                    current = conn.execute("SELECT r.record_payload,r.status FROM agent_runs r JOIN agent_sessions s "
+                                            "ON s.session_id=r.session_id WHERE r.run_id=? AND s.kind='ordinary' "
+                                            "AND s.status!='deleted'", (value.get("run_id"),)).fetchone()
+                    if current is None or current["status"] != value.get("status") or current["status"] not in _TERMINAL:
+                        continue
+                    record = json.loads(current["record_payload"])
+                    if record.get("parent_run_id") is not None:
+                        continue
+                    if goal_id is None and conn.execute(
+                        "SELECT 1 FROM managed_session_links WHERE manager_session_id=? AND run_id=?",
+                        (sid, value.get("run_id")),
+                    ).fetchone() is None:
+                        continue
+                    if goal_id is not None:
+                        goal = conn.execute("SELECT revision,status,wait_run_id FROM manager_goals WHERE goal_id=? AND session_id=?",
+                                            (goal_id, sid)).fetchone()
+                        if (goal is None or goal["revision"] != revision or goal["status"] not in {"active", "waiting"}
+                                or goal["wait_run_id"] != value.get("run_id") or not self.enabled_in_transaction(conn, goal_id)):
+                            continue
+                count += self._event(conn, sid, key, kind, value, stamp, goal_id, revision)
+                if clear_goal is not None and conn.execute("SELECT changes()").fetchone()[0]:
+                    conn.execute("UPDATE manager_goals SET next_wake_at=NULL WHERE goal_id=? AND timer_generation=? AND next_wake_at<=?",
+                                 (clear_goal, generation, stamp))
         return count
 
     def list_events(self, session_id, *, after=0, limit=50):
