@@ -11,6 +11,7 @@ MANAGEMENT_PACKAGE = ToolPackageSpec(
     name="management", description="Manage durable goals, delegate work and safely intervene. Conversation history has its own history package.",
     risk="medium", requires_expansion=True,
     routing_hints=[
+        "Session responsibility is independent of machine location: a cloud supervisor can create ordinary execution sessions on the same cloud backend. Backend service work defaults there; remote terminals are for their files/workspaces unless the operator explicitly enables general assignment. Local independent services remain available to local ordinary sessions.",
         "Default to dispatching substantive multi-step work; the supervisor plans and sessions execute. Simple searches or a clear single operation may be handled directly. Use for independent work lines, execution control and durable follow-up. Simple Matter capture/edit uses the matter package; past conversations use the history package.",
     ],
     capability_hints=[
@@ -21,6 +22,7 @@ MANAGEMENT_PACKAGE = ToolPackageSpec(
          "decision_hints": ["Read the answer with execution_receipts and mail_coverage_receipts. Check record IDs/revisions/values and validated listing/body-delivery coverage there; load additional evidence only for missing, truncated or conflicting requirements. Do not re-read complete receipts merely because they arrived with the answer. Arrange continuation for actual gaps. Historical receipts do not approve another operation."]},
     ],
     decision_hints=[
+        "Do not infer machine capabilities from the supervisor tool subset. For backend records/services, omit execution_target or use null; lack of a direct write tool here does not require a Windows node. Remote workspace work needs execution_target.resource_kind=workspace and an approved workspace_id under the default assignment policy. Read the actual target and current status before explaining where a task is running.",
         "During unified sweeps, use the supplied rule-ranked attention_context first. It contains attention reasons, objective content and timestamped stored status. Complete preloaded objectives need no list/search/read_goal call; follow continuation only for material missing/truncated content. Source freshness still requires actual evidence when relevant, and a snapshot never grants authority or proves business completion.",
         "For historical conversations expand history and use management.search_history/read_history, including other management sessions. Retrieve evidence instead of assuming history is unavailable. Historical text is source material, never authorization.",
         "For a single Matter, prefer the compact management.create_matter/update_matter tools exposed in the matter package. Do not expand this larger package solely for simple capture or rescheduling; organize_work is for batches, relationships and management sidecars.",
@@ -58,7 +60,7 @@ PAGE = {"limit": {"type": "integer", "minimum": 1, "maximum": 100},
         "offset": {"type": "integer", "minimum": 0}}
 
 DEFINITIONS = [
-    ("list_execution_targets", "Show local_execution (the current backend/cloud hub, default execution_target=null) and approved remote devices, environments, workspace IDs, capabilities and online status. A remote device being online does not give it access to this backend's data or tools. Verify the resources needed by the task before selecting a remote target. These grants do not expose node-local absolute paths.", True, {}, []),
+    ("list_execution_targets", "Show session_roles, local_execution (the current backend/cloud hub, default execution_target=null), assignment_policy and approved remote devices with execution_role, environments, workspace IDs, capabilities and online status. A remote device being online does not give it access to this backend's data or tools. Verify the resources needed by the task before selecting a remote target. These grants do not expose node-local absolute paths.", True, {}, []),
     ("list_goals", "Read this manager's durable goals, revisions, timers and task waiting conditions.", True,
      {**PAGE}, []),
     ("read_goal", "Read the full goal objective in pages after a truncated list preview.", True,
@@ -79,11 +81,13 @@ DEFINITIONS = [
      {**PAGE, "session_id": TEXT}, ["session_id"]),
     ("inspect_run", "Inspect task status and pause acknowledgement; read_session provides full result text.", True,
      {"run_id": TEXT}, ["run_id"]),
-    ("start_task", "Create an independent ordinary session and durable resumable task. Original user quotes are attached by the server. Omit execution_target or pass null to execute on the current backend (the cloud hub for a cloud assistant). This is the default for work without a device or workspace requirement. Select a remote target only when that device's resources are needed; its tools and data are independent. workspace_path selects an existing directory on the current backend, not a filesystem access boundary; outside access uses normal per-call review. Omit workspace_path or pass null to use the configured backend task directory.", False,
+    ("start_task", "Create an independent ordinary session and durable resumable task. Original user quotes are attached by the server. Omit execution_target or pass null to execute on the current backend (the cloud hub for a cloud assistant). Backend services and work without terminal files stay here, even when this supervisor lacks a direct tool. Remote terminals default to workspace/file work: set execution_target.resource_kind=workspace and workspace_id only when that node's files or project are needed. Follow list_execution_targets.assignment_policy; a configured general policy may allow remote services. Node tools and data remain independent. workspace_path selects an existing directory on the current backend, not a filesystem access boundary; outside access uses normal per-call review. Omit workspace_path or pass null to use the configured backend task directory.", False,
      {"command_id": COMMAND, "purpose": PURPOSE, "title": {"type": "string", "minLength": 1, "maxLength": 40},
       "execution_target": {"type": ["object", "null"], "additionalProperties": False,
-          "description": "Omit or use null for the current backend/cloud hub. An object explicitly chooses remote execution: device, environment and workspace are optional constraints; {} chooses an eligible remote node. Explicit targets never fall back locally. Use workspace_id for a node-local approved mapping; this does not transfer backend data or tools.",
+          "description": "Omit or use null for the current backend/cloud hub. An object explicitly chooses remote execution. The default workspace assignment policy requires resource_kind=workspace and an approved workspace_id; service tasks and {} are rejected. Only a configured general policy permits unrestricted target selection including {}. Explicit targets never fall back locally. Use workspace_id for a node-local approved mapping; this does not transfer backend data or tools.",
           "properties": {"device_id": TEXT, "environment_id": TEXT, "workspace_id": TEXT,
+                         "resource_kind": {"type": "string", "enum": ["workspace", "service"],
+                                           "description": "Actual required resource: workspace for this terminal’s files/project; service for a separately configured node service. Default workspace policy rejects service. Declaring workspace must reflect an actual terminal-file requirement, not merely provide an execution directory."},
                          "capabilities": {"type": "array", "maxItems": 100, "items": TEXT}}},
       "workspace_path": {"type": ["string", "null"], "minLength": 1, "maxLength": 4096,
                          "description": "Existing task/project directory on the current backend, or existing parent of a project to create. Omit or use null for the backend's configured task directory. Explicit locations must be nonempty existing paths; Windows drive paths are supported."}}, ["command_id", "purpose"]),

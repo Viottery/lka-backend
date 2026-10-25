@@ -617,10 +617,15 @@ class ManagedTaskService:
         remote = getattr(self, "remote_execution", None)
         local = {"name": "Cloud hub" if remote is not None else "Current backend",
                  "execution_target": None, "default": True,
-                 "available": bool(self.durable_execution()), "workspace_required": False}
+                 "available": bool(self.durable_execution()), "workspace_required": False,
+                 "execution_role": "backend_executor",
+                 "responsibilities": ["backend_services", "tasks_without_terminal_files", "backend_workspace_tasks"]}
+        roles = {"supervisor": "Plans, dispatches, verifies and reports; can create execution sessions on this same backend.",
+                 "delegate": "Manages an independent work line; its session role does not select a machine.",
+                 "execution": "Runs tools on the selected backend or approved terminal workspace; ordinary local services remain independent."}
         if remote is None:
-            return {"items": [], "enabled": False, "local_execution": local}
-        return {"enabled": True, **remote.execution_targets(), "local_execution": local}
+            return {"items": [], "enabled": False, "local_execution": local, "session_roles": roles}
+        return {"enabled": True, **remote.execution_targets(), "local_execution": local, "session_roles": roles}
 
     def send_instruction(self, context, *, command_id, session_id, expected_run_id, purpose):
         caller = self.caller(context, mutate=True)

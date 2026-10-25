@@ -1198,6 +1198,7 @@ class LocalKnowledgeAgentRuntime:
                     managed_tasks=self.managed_tasks, sessions=self.session_service,
                     run_store=self.agent_run_store, run_manager=self.agent_run_manager,
                     tool_executor=self.tool_executor, lease_seconds=execution_config.lease_seconds,
+                    assignment_scope=execution_config.assignment_scope,
                 )
                 self.remote_execution_service.ensure_schema()
                 self.managed_tasks.remote_execution = self.remote_execution_service

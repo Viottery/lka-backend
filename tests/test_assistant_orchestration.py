@@ -41,6 +41,13 @@ def test_supervisor_role_precedes_route_and_does_not_enter_task_policy(runtime, 
     assert 'mail.search' in runtime._session_run_policy(sid).allowed_tools
     assert 'matter.update' not in runtime._session_run_policy(sid).allowed_tools
     assert 'mail.search' in runtime._session_run_policy(sid).read_only_tools
+    # Session responsibility is not a machine capability restriction: the
+    # supervisor cannot update a Matter directly, while its same-backend task can.
+    assert task.metadata.get('remote_execution') is None
+    assert runtime.tool_registry.get_tool('mail.search') is not None
+    task_tools = task.metadata['session_policy']['allowed_tools']
+    assert task_tools is None or 'matter.update' in task_tools
+    assert runtime.tool_registry.get_tool('matter.update') is not None
     # User metadata cannot turn an ordinary session into the trusted supervisor.
     normal = runtime.session_service.create_session(metadata={'role_instructions': SUPERVISOR_INSTRUCTIONS}).session
     assert runtime._session_run_policy(normal.session_id).role_instructions is None

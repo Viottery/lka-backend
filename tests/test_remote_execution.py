@@ -37,7 +37,7 @@ def setup_remote(hub, tmp_path, monkeypatch):
     devices.heartbeat(principal)
     service = RemoteExecutionService(hub._conn, devices, hub_id="test-hub", managed_tasks=hub.managed_tasks,
         sessions=hub.session_service, run_store=hub.agent_run_store,
-        run_manager=hub.agent_run_manager, tool_executor=hub.tool_executor)
+        run_manager=hub.agent_run_manager, tool_executor=hub.tool_executor, assignment_scope="general")
     service.ensure_schema()
     hub.managed_tasks.remote_execution = service
     sid = hub.management_service.create()["session"]["session_id"]
@@ -85,14 +85,113 @@ def start(env, command_id="task", **target):
 def test_management_discovery_includes_local_hub_without_changing_remote_items(setup_remote):
     e = setup_remote
     targets = e["hub"].managed_tasks.list_execution_targets(e["context"])
-    assert targets["local_execution"] == {"name": "Cloud hub", "execution_target": None,
-        "default": True, "available": True, "workspace_required": False}
+    assert targets["local_execution"]["name"] == "Cloud hub"
+    assert targets["local_execution"]["execution_target"] is None
+    assert targets["local_execution"]["default"]
+    assert targets["local_execution"]["available"]
     assert [item["device_id"] for item in targets["items"]] == ["pc"]
+    assert targets["assignment_policy"]["scope"] == "general"
+    assert targets["items"][0]["execution_role"] == "general_executor"
     e["hub"].managed_tasks.remote_execution = None
     local_only = e["hub"].managed_tasks.list_execution_targets(e["context"])
     assert local_only["local_execution"]["available"]
     assert local_only["local_execution"]["execution_target"] is None
     assert local_only["items"] == [] and not local_only["enabled"]
+
+
+def test_default_workspace_policy_rejects_untyped_and_service_targets_before_admission(setup_remote):
+    e = setup_remote
+    service = RemoteExecutionService(e["hub"]._conn, e["devices"], hub_id="test-hub",
+        managed_tasks=e["hub"].managed_tasks, sessions=e["hub"].session_service,
+        run_store=e["hub"].agent_run_store, run_manager=e["hub"].agent_run_manager,
+        tool_executor=e["hub"].tool_executor)
+    e["hub"].managed_tasks.remote_execution = service
+    targets = service.execution_targets()
+    assert targets["assignment_policy"] == {
+        "scope": "workspace", "default_execution_target": None,
+        "required_remote_target_fields": ["workspace_id", "resource_kind"],
+        "remote_resource_kind": "workspace",
+    }
+    assert targets["items"][0]["execution_role"] == "workspace_executor"
+    with e["hub"]._conn() as conn:
+        before = conn.execute("SELECT count(*) FROM agent_sessions").fetchone()[0]
+    for target in ({}, {"resource_kind": "service"},
+                   {"resource_kind": "workspace"}, {"resource_kind": "service", "workspace_id": "project"}):
+        with pytest.raises(RemoteExecutionConflict, match="omit execution_target"):
+            start(e, command_id="invalid-" + str(len(target)) + str(target), **target)
+    with e["hub"]._conn() as conn:
+        after = conn.execute("SELECT count(*) FROM agent_sessions").fetchone()[0]
+    assert after == before
+    with e["hub"]._conn() as conn:
+        assert conn.execute("SELECT count(*) FROM remote_execution_tasks").fetchone()[0] == 0
+
+
+def test_workspace_policy_accepts_explicit_workspace_and_preserves_retry_receipt(setup_remote):
+    e = setup_remote
+    service = RemoteExecutionService(e["hub"]._conn, e["devices"], hub_id="test-hub",
+        managed_tasks=e["hub"].managed_tasks, sessions=e["hub"].session_service,
+        run_store=e["hub"].agent_run_store, run_manager=e["hub"].agent_run_manager,
+        tool_executor=e["hub"].tool_executor)
+    e["hub"].managed_tasks.remote_execution = service
+    first = start(e, command_id="workspace", resource_kind="workspace", workspace_id="project")
+    assert start(e, command_id="workspace", resource_kind="workspace", workspace_id="project") == first
+    stored = service.get(first["remote_execution"]["task_id"])
+    assert stored["workspace_id"] == "project"
+    e["node"].agent_turn_loop.llm_client = ScriptedClient([
+        operation("final_answer", reason="Workspace checked"), "Workspace result."])
+    e["worker"].run_once()
+    assert e["node"].agent_dispatch.run_one("workspace-task")
+    e["worker"].run_once()
+    assert service.get(first["remote_execution"]["task_id"])["state"] == "completed"
+
+
+def test_concurrent_identical_remote_admissions_return_one_receipt(setup_remote, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    e = setup_remote
+    barrier = Barrier(2)
+    prepare = e["hub"].managed_tasks.prepare_task
+
+    def synchronized_prepare(*args, **kwargs):
+        barrier.wait(timeout=5)
+        return prepare(*args, **kwargs)
+
+    monkeypatch.setattr(e["hub"].managed_tasks, "prepare_task", synchronized_prepare)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(start, e, command_id="concurrent",
+                               resource_kind="workspace", workspace_id="project")
+                   for _ in range(2)]
+        first, second = [future.result(timeout=10) for future in futures]
+    assert first == second
+    with e["hub"]._conn() as conn:
+        assert conn.execute("SELECT count(*) FROM remote_execution_tasks").fetchone()[0] == 1
+
+
+def test_workspace_policy_rejects_legacy_remote_followup_but_keeps_prior_receipt(setup_remote):
+    e = setup_remote
+    receipt = start(e, command_id="legacy-session")
+    e["node"].agent_turn_loop.llm_client = ScriptedClient([
+        operation("final_answer", reason="Done"), "Result."])
+    e["worker"].run_once()
+    assert e["node"].agent_dispatch.run_one("legacy-initial")
+    e["worker"].run_once()
+    args = {"command_id": "legacy-followup", "session_id": receipt["session_id"],
+            "expected_run_id": receipt["run_id"], "purpose": "Explain the existing result"}
+    followup = e["hub"].managed_tasks.send_instruction(e["context"], **args)
+    e["node"].agent_turn_loop.llm_client = ScriptedClient([
+        operation("final_answer", reason="Done"), "Followup result."])
+    e["worker"].run_once()
+    e["worker"].run_once()
+    assert e["node"].agent_dispatch.run_one("legacy-followup")
+    e["worker"].run_once()
+    e["service"].assignment_scope = "workspace"
+    assert start(e, command_id="legacy-session") == receipt
+    assert e["hub"].managed_tasks.send_instruction(e["context"], **args) == followup
+    with pytest.raises(RemoteExecutionConflict, match="outside the current workspace-only policy"):
+        e["hub"].managed_tasks.send_instruction(e["context"],
+            command_id="new-legacy-followup", session_id=receipt["session_id"],
+            expected_run_id=followup["run_id"], purpose="Continue the service task")
 
 
 @pytest.mark.parametrize("explicit_null", [False, True])

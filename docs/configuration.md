@@ -153,6 +153,8 @@ workspace_roots = { work = "/home/me/work" }
 
 [remote_execution]
 enabled = true
+# Hub assignment policy: remote nodes serve their files/workspaces by default.
+assignment_scope = "workspace"
 environment_id = "linux"
 workspace_mappings = { work = "/home/me/work" }
 allowed_tools = ["filesystem.read_file"]
@@ -176,10 +178,18 @@ Linux 路径不能直接复制到 Windows。节点已登记的环境必须批准
 本地 cookie 有效时新标签页可以从 `/connections/me` 恢复 CSRF；本机账户也可独立配置，
 不复制云端账户/密码数据库。新云端授权及助理任务派发仍需云端在线。
 
-助理派发时 execution_target 可包含 device_id、environment_id、workspace_id、capabilities，
-省略或显式设为 null 表示在当前后端执行；云端助理没有设备／工作区要求的任务默认留在云端。
+助理派发时 execution_target 可包含 device_id、environment_id、workspace_id、capabilities、resource_kind，
+省略或显式设为 null 表示在当前后端执行。主管与普通执行会话可以位于同一台云服务器，
+主管没有直接写工具不表示云端执行会话无法执行。云端邮件、事项、日程、知识与网页任务默认在云端运行。
+`remote_execution.assignment_scope="workspace"` 为默认派发职责：只有依赖终端文件／工作区的任务才选择终端，
+目标须显式包含 `resource_kind="workspace"` 和批准的 workspace_id；服务类目标、缺失字段和空对象被拒绝，
+且不新建任务或自动改换位置。声明工作区需求须与实际任务相符，后端不按自然文字关键词判断业务。
+本地普通会话仍可使用独立配置的完整服务；工具能力和云端派发职责分开。
+若旧接入确实需要不带工作区的通用远程执行，操作者可显式设 `assignment_scope="general"`，
+再使用旧空对象选择或 `resource_kind="service"` 等目标；这仍不迁移云端数据或授予额外工具。
+变更策略后旧任务的原回执可幂等读取，新续作按当前职责核验；不符合的新续作拒绝，不自动搬迁、扩大权限或重放。
 `management.list_execution_targets` 单独返回 `local_execution`，明确展示这个默认选项；`items` 仍是远程节点列表。
-`execution_target={}` 明确请求从远程节点中选择，不能用于表达“没有设备要求”。
+`execution_target={}` 在显式 general 策略中请求从远程节点中选择；默认 workspace 策略拒绝，不能用于表达“没有设备要求”。
 workspace_path 仅用于原本机执行，不能与远程 target 混用。远程任务会话从云端查看，
 普通会话及文件管理从节点 `/client` 访问。远程任务支持取消、审批、检查点暂停/继续和用户问答。
 节点 `[remote_execution].review_policy` 默认 `manual`，强制人工审批；明确设置为 `inherit` 后，

@@ -175,10 +175,14 @@ Content-Type: application/json
 
 `GET /remote-execution/targets` 提供批准的设备/系统/工作区与执行在线状态。
 实际派发由注册工具 `management.start_task` 执行：execution_target 省略为云端本机，
-`{}` 为自动选择，或指定 `{device_id,environment_id,workspace_id,capabilities}`。
+默认 `assignment_scope="workspace"`，远程目标须包含 `resource_kind="workspace"` 及 workspace_id，
+另可指定 device_id、environment_id、capabilities。默认策略拒绝 `{}` 和 service 目标；
+只有显式 general 策略才保留 `{}` 自动选择或不带工作区的服务任务。
 设备偏好 `/devices/selection` 的保存/解析不等于任务已经锁定；
 最终派发约束以受理的 execution_target 和任务回执为准。
 当前没有把浏览器任意工具参数直接执行的通用远程 RPC。
+主管负责派发和验收，普通执行会话负责工具执行，两者可在同一云服务器上运行。
+云端服务任务默认留云端，终端默认只接自身文件／工作区工作。节点本地普通会话仍可独立使用其完整服务。
 
 远程任务索引的 `session_id`、`title`、`node_id`、`environment_id` 与 `workspace_id` 用于按实际
 执行设备展示“真理派发”。云端保存管理记录不代表在云端执行；节点页面从云端读取该索引，

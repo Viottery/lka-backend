@@ -37,6 +37,7 @@ class RemoteExecutionConfig(BaseModel):
     tool_policy: Literal["allowlist", "local"] = "allowlist"
     shell_trust: Literal["disabled", "host_user"] = "disabled"
     review_policy: Literal["manual", "inherit"] = "manual"
+    assignment_scope: Literal["workspace", "general"] = "workspace"
     allowed_tools: list[str] = Field(default_factory=list, max_length=256)
     poll_seconds: float = Field(default=3, ge=0.25, le=3600)
     lease_seconds: int = Field(default=90, ge=10, le=3600)
@@ -49,6 +50,7 @@ class ExecutionTarget(BaseModel):
     environment_id: Identifier | None = None
     workspace_id: Identifier | None = None
     capabilities: list[Identifier] = Field(default_factory=list, max_length=100)
+    resource_kind: Literal["workspace", "service"] | None = None
 
 
 class ExecutionFence(BaseModel):
@@ -87,9 +89,12 @@ class RemoteExecutionConflict(ValueError):
 class RemoteExecutionService:
     def __init__(self, conn_factory, devices, *, hub_id, managed_tasks=None,
                  sessions=None, run_store=None, run_manager=None, tool_executor=None,
-                 lease_seconds=90):
+                 lease_seconds=90, assignment_scope="workspace"):
         self._conn = conn_factory
         self.devices, self.hub_id = devices, hub_id
+        if assignment_scope not in {"workspace", "general"}:
+            raise ValueError("invalid remote execution assignment scope")
+        self.assignment_scope = assignment_scope
         self.tasks, self.sessions = managed_tasks, sessions
         self.run_store, self.run_manager, self.executor = run_store, run_manager, tool_executor
         if not hub_id or not 10 <= lease_seconds <= 3600:
@@ -169,7 +174,25 @@ class RemoteExecutionService:
                     system["execution_online"] = bool(item["online"] and EXECUTION_SCOPES.issubset(item["scopes"])
                         and self._worker_online(conn, item["device_id"], system["environment_id"], device[0]))
                 item["execution_online"] = any(system["execution_online"] for system in item["systems"])
-        return {"items": items}
+                item["execution_role"] = ("workspace_executor" if self.assignment_scope == "workspace"
+                                          else "general_executor")
+                item["resource_requirement"] = (
+                    {"resource_kind": "workspace", "workspace_id": "required"}
+                    if self.assignment_scope == "workspace" else {"resource_kind": "optional"})
+        return {"items": items, "assignment_policy": {
+            "scope": self.assignment_scope, "default_execution_target": None,
+            "required_remote_target_fields": (["workspace_id", "resource_kind"]
+                                              if self.assignment_scope == "workspace" else []),
+            "remote_resource_kind": "workspace" if self.assignment_scope == "workspace" else None,
+        }}
+
+    def _validate_assignment_target(self, target):
+        if self.assignment_scope == "workspace" and (
+                target.get("resource_kind") != "workspace" or not target.get("workspace_id")):
+            raise RemoteExecutionConflict(
+                "Remote execution is limited to approved workspace file work; set "
+                "resource_kind='workspace' and workspace_id, or omit execution_target "
+                "to run backend service work on the cloud hub")
 
     def _select(self, conn, target):
         for row in conn.execute("SELECT * FROM cloud_devices WHERE revoked=0 ORDER BY device_id"):
@@ -194,6 +217,8 @@ class RemoteExecutionService:
         from app.core.context_driver import ToolView
 
         target = ExecutionTarget.model_validate(execution_target).model_dump(mode="json")
+        if target["resource_kind"] is None:
+            target.pop("resource_kind")
         caller = self.tasks.caller(context, mutate=True)
         # These allowances reference a cloud-local usage ledger. Moving them to a
         # different database would reset consumption, so unsupported transfer fails closed.
@@ -201,6 +226,20 @@ class RemoteExecutionService:
             raise RemoteExecutionConflict("remote execution cannot transfer cumulative background budgets")
         args = {"purpose": purpose, "title": title, "target": target}
         fingerprint = hashlib.sha256(_json(args).encode()).hexdigest()
+        # Preserve receipt replay if policy has changed since this command was accepted.
+        with self._connection() as conn:
+            previous = conn.execute("SELECT * FROM remote_execution_tasks WHERE owner_session_id=? AND command_id=?",
+                                    (context.session_id, command_id)).fetchone()
+            if previous:
+                if previous["fingerprint"] != fingerprint:
+                    raise RemoteExecutionConflict("command_id already accepted with different arguments")
+                receipt_row = conn.execute(
+                    "SELECT receipt FROM management_commands WHERE manager_session_id=? AND command_id=?",
+                    (context.session_id, command_id)).fetchone()
+                if receipt_row is None:
+                    raise RemoteExecutionConflict("accepted remote task receipt is unavailable")
+                return json.loads(receipt_row[0])
+        self._validate_assignment_target(target)
         prepared = self.tasks.prepare_task(context, command_id=command_id, purpose=purpose,
                                            title=title, create_workspace=False)
         constraints = self.executor.constraint_store.get(self.executor._constraint_subjects(context))
@@ -217,9 +256,12 @@ class RemoteExecutionService:
             if previous:
                 if previous["fingerprint"] != fingerprint:
                     raise RemoteExecutionConflict("command_id already accepted with different arguments")
-                receipt = json.loads(conn.execute("SELECT receipt FROM management_commands WHERE manager_session_id=? AND command_id=?",
-                                                  (context.session_id, command_id)).fetchone()[0])
-                return receipt
+                receipt_row = conn.execute(
+                    "SELECT receipt FROM management_commands WHERE manager_session_id=? AND command_id=?",
+                    (context.session_id, command_id)).fetchone()
+                if receipt_row is None:
+                    raise RemoteExecutionConflict("accepted remote task receipt is unavailable")
+                return json.loads(receipt_row[0])
             node_id, environment = self._select(conn, target)
             receipt, run = self.tasks.start_task_in_transaction(
                 conn, context, command_id=command_id, purpose=purpose, prepared=prepared,
@@ -231,6 +273,8 @@ class RemoteExecutionService:
             marker = {"hub_id": self.hub_id, "task_id": task_id,
                       "owner_session_id": context.session_id, "node_id": node_id,
                       "environment_id": environment, "workspace_id": target["workspace_id"]}
+            if target.get("resource_kind") is not None:
+                marker["resource_kind"] = target["resource_kind"]
             run.metadata["remote_execution"] = marker
             policy = run.metadata["session_policy"]
             policy.update(allow_default_workspace=False, allow_fork=False)
@@ -587,6 +631,13 @@ class RemoteExecutionService:
             if old is None or json.loads(old["payload"])["run"]["run_id"] != expected_run_id or latest[0] != expected_run_id:
                 raise RemoteExecutionConflict("expected_run_id does not identify the latest remote execution")
             self._continuation_authority(conn, old)
+            frozen_target = json.loads(old["target"])
+            if self.assignment_scope == "workspace" and (
+                    frozen_target.get("resource_kind") != "workspace"
+                    or not frozen_target.get("workspace_id")):
+                raise RemoteExecutionConflict(
+                    "This remote session is outside the current workspace-only policy; "
+                    "start a new backend service task without a remote target")
             if old["state"] not in {"completed", "failed", "cancelled"}:
                 raise RemoteExecutionConflict("followup requires a known terminal result; unknown effects cannot replay")
             confirmed = conn.execute("SELECT 1 FROM remote_execution_reports WHERE task_id=? AND json_extract(payload,'$.status') IN ('completed','failed','cancelled')", (old["task_id"],)).fetchone()

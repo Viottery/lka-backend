@@ -294,6 +294,10 @@ session_ttl_seconds = 2592000
 allow_native = true
 
 [remote_execution]
+# Hub assignment responsibility, separate from node tool_policy. Default remote
+# tasks require resource_kind="workspace" plus workspace_id for terminal files.
+# Explicit "general" retains legacy {} / node-service assignment when needed.
+assignment_scope = "workspace"
 enabled = false
 # Replica requires connections.enabled and a registered environment_id.
 # environment_id = "linux"

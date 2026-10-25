@@ -1592,9 +1592,18 @@ status(active/paused)、revision、llm_client_name、llm_model、llm_answer_clie
 此字段不赋予主管自身 session.workspace，也不是审批授权。
 
 `management.list_execution_targets` 返回远程 `items`，以及默认执行位置 `local_execution`：
-`{name,execution_target:null,default:true,available,workspace_required:false}`。
+`{name,execution_target:null,default:true,available,workspace_required:false,execution_role,responsibilities}`。
 这里的本机指当前助理所在后端，云端助理即云端 hub；不要求选择电脑或工作区。
 `management.start_task.execution_target` 省略或为 null 时在当前后端执行；对象（包括 `{}`）才请求远程执行。
+响应另含 `session_roles`，区分主管、事务线和普通执行；远程可用时还包含 `assignment_policy`
+（scope、default_execution_target、required_remote_target_fields、remote_resource_kind），
+远程 items 追加 execution_role 和 resource_requirement。会话角色不等于机器角色：
+云端主管可以在同一云端创建普通执行会话，后端服务任务默认在那里执行。
+默认 `remote_execution.assignment_scope="workspace"` 下，新远程目标须包含
+`resource_kind="workspace"` 与批准的 workspace_id，缺失或 service 目标拒绝；
+仅需云端服务的任务应省略 execution_target。字段是结构化需求声明，不是对任务文字的语义验证。
+显式配置 general 后保留旧通用选择，resource_kind 可省略或为 workspace/service。
+旧请求已受理回执保留幂等读取，旧远程会话的新续作须符合当前策略；不自动重定位任务。
 远程节点的工具及服务数据独立，设备在线不表示具备某项业务所需工具或数据源。
 新建时 paused；模型字段省略保持原值，显式 null 清除。未知 client 返回 422。
 `reasoning_level` 接受 off/low/high/max；省略保留偏好，null 清除并使用共享默认值。
@@ -3027,8 +3036,10 @@ replica 本机接口：`GET /sync/replica/status` 查看游标、错误类别和
 ### 助理跨设备任务与会话中转
 
 开启 remote_execution 后，management.list_execution_targets 提供已授权在线设备/环境/工作区。
-management.start_task 新增可选 execution_target：省略沿用云端本机，`{}` 自动选择获授权在线节点，
-或用 `{device_id,environment_id,workspace_id,capabilities}` 指定要求。
+management.start_task 的 execution_target 省略或为 null 时沿用云端本机。默认 workspace 策略下，
+远程目标须含 `{resource_kind:"workspace",workspace_id}`，另可用 device_id、environment_id、capabilities 限定设备；
+服务目标和 `{}` 拒绝。仅操作者显式配置 `remote_execution.assignment_scope="general"` 后，
+`{}` 才表示自动选择获授权在线节点，且可派发独立节点服务工作。
 与本机 workspace_path 不能混用。命令 ID 去重、目标、来源/工具范围、节点凭据代次及租约持久冻结。
 返回原任务 session_id/run_id 及 remote_execution.task_id；云端 shadow 不运行第二次执行。
 任务摘要含 `title`、`session_id`、`node_id`、`environment_id`、`workspace_id`，用于按实际执行设备归类。
@@ -3040,7 +3051,7 @@ management.start_task 新增可选 execution_target：省略沿用云端本机�
 | 接口 | 行为 |
 | --- | --- |
 | `GET /remote-execution/tasks?owner_session_id=&limit=100&offset=0` | 云端账号，分页摘要，next_offset；不返回任务输入快照 |
-| `GET /remote-execution/targets` | 云端账号，获授权的设备及各系统 execution_online；要求实际 worker 近期轮询 |
+| `GET /remote-execution/targets` | 云端账号，assignment_policy、设备 execution_role/resource_requirement 及各系统 execution_online；要求实际 worker 近期轮询 |
 | `GET /remote-execution/tasks/{task_id}?limit=20&offset=0` | 云端账号，状态及分页回报/会话内容，next_offset |
 | `POST /remote-execution/tasks/{task_id}/cancel` | 云端取消；节点后续执行/发布检查失效 |
 | `POST /remote-execution/tasks/{task_id}/pause`、`/resume` | `{command_id}`，持久命令，节点原检查点暂停/继续 |
