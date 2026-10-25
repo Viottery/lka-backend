@@ -34,6 +34,7 @@ class RemoteExecutionConfig(BaseModel):
     enabled: bool = False
     environment_id: Identifier | None = None
     workspace_mappings: dict[Identifier, str] = Field(default_factory=dict, max_length=100)
+    tool_policy: Literal["allowlist", "local"] = "allowlist"
     shell_trust: Literal["disabled", "host_user"] = "disabled"
     review_policy: Literal["manual", "inherit"] = "manual"
     allowed_tools: list[str] = Field(default_factory=list, max_length=256)

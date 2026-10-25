@@ -99,11 +99,16 @@ class BackgroundJobStore:
         conn = connect_sqlite(self.db_path, timeout=10, isolation_level=None)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=10000")
-        conn.execute("PRAGMA journal_mode=WAL")
         return conn
 
     def ensure_schema(self) -> None:
         with self._connect() as conn:
+            # journal_mode is persistent database state and changing it needs
+            # an exclusive lock. Check it during schema setup only; doing the
+            # assignment on every short-lived connection needlessly contends
+            # with active write transactions.
+            if conn.execute("PRAGMA journal_mode").fetchone()[0].lower() != "wal":
+                conn.execute("PRAGMA journal_mode=WAL")
             conn.execute(
                 """CREATE TABLE IF NOT EXISTS background_jobs (
                     job_id TEXT PRIMARY KEY,

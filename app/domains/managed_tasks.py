@@ -615,9 +615,12 @@ class ManagedTaskService:
     def list_execution_targets(self, context):
         self.caller(context)
         remote = getattr(self, "remote_execution", None)
+        local = {"name": "Cloud hub" if remote is not None else "Current backend",
+                 "execution_target": None, "default": True,
+                 "available": bool(self.durable_execution()), "workspace_required": False}
         if remote is None:
-            return {"items": [], "enabled": False}
-        return {"enabled": True, **remote.execution_targets()}
+            return {"items": [], "enabled": False, "local_execution": local}
+        return {"enabled": True, **remote.execution_targets(), "local_execution": local}
 
     def send_instruction(self, context, *, command_id, session_id, expected_run_id, purpose):
         caller = self.caller(context, mutate=True)

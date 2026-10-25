@@ -142,7 +142,12 @@ class RemoteExecutionNode:
             policy["safety_review_policy"] = "standard"
         review_source = "request" if self.config.review_policy == "inherit" else "node_policy"
         tools = {s.name: s for s in self.runtime.tool_registry.list_tools()}
-        approved = set(self.config.allowed_tools)
+        approved = (
+            {name for name, spec in tools.items()
+             if spec.package != "management" and not name.startswith("management.")}
+            if self.config.tool_policy == "local"
+            else set(self.config.allowed_tools)
+        )
         requested = set(policy.get("allowed_tools") or ())
         if predecessor:
             requested &= set(predecessor.metadata["session_policy"].get("allowed_tools") or ())

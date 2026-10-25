@@ -298,7 +298,8 @@ enabled = false
 # Replica requires connections.enabled and a registered environment_id.
 # environment_id = "linux"
 workspace_mappings = {} # Same workspace ID must match connections.workspace_roots.
-allowed_tools = [] # Explicit node-local execution grant. Empty grants no tools.
+tool_policy = "allowlist" # "local" offers ordinary locally registered tools, within the delegated grant.
+allowed_tools = [] # Explicit grant in allowlist mode; empty grants no tools.
 shell_trust = "disabled" # "host_user" acknowledges native OS-user access; bash.run + manual approval required.
 review_policy = "manual" # Node policy: "inherit" uses the task's frozen skip/llm/manual; native host execution still requires manual.
 poll_seconds = 3

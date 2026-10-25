@@ -129,7 +129,7 @@ def test_explicit_resume_requires_original_waiting_workflow(dispatch_state, stat
     assert calls == ([run.run_id] if status == "paused" else [])
 
 
-def test_guard_loss_prevents_later_effect_and_requests_durable_cancel(dispatch_state):
+def test_guard_loss_prevents_later_effect_without_cancelling_run(dispatch_state):
     _, sid, manager, queue, make = dispatch_state
     run = manager.create_run(session_id=sid, user_input="Task")
     effects = []
@@ -145,8 +145,8 @@ def test_guard_loss_prevents_later_effect_and_requests_durable_cancel(dispatch_s
     dispatcher.enqueue(run.run_id)
     assert dispatcher.run_one()
     assert effects == ["before"]
-    assert manager.is_cancel_requested(run.run_id)
-    assert manager.get_run(run.run_id).metadata["cancel_reason"] == "dispatch_lease_lost"
+    assert not manager.is_cancel_requested(run.run_id)
+    assert manager.get_run(run.run_id).status == AgentRunStatus.RUNNING
     assert dispatcher.guards == {}
     dispatcher.check_run("unrelated-http-run")
 
@@ -168,7 +168,7 @@ def test_heartbeat_loss_fences_inflight_callback(dispatch_state, monkeypatch):
     dispatcher.enqueue(run.run_id)
     assert dispatcher.run_one()
     assert lost == [True]
-    assert manager.is_cancel_requested(run.run_id)
+    assert not manager.is_cancel_requested(run.run_id)
 
 
 @pytest.mark.parametrize("pool", [False, True])
@@ -244,7 +244,7 @@ def test_real_harness_guard_blocks_late_model_result_before_publication(tmp_path
     monkeypatch.setattr(client, "complete_text", lose_lease_after_response)
     try:
         assert dispatcher.run_one()
-        assert runtime.agent_run_manager.is_cancel_requested(run.run_id)
+        assert not runtime.agent_run_manager.is_cancel_requested(run.run_id)
         assert not any(message.role == "agent" for message in runtime.session_service.get_session(
             session_id=run.session_id).messages)
         assert not any(event.type in {"final_answer", "run_completed"}
@@ -356,7 +356,7 @@ def test_child_inherits_ancestor_dispatch_guard_in_and_outside_transaction(dispa
     dispatcher.enqueue(root.run_id)
     assert dispatcher.run_one()
     assert checked == [True]
-    assert manager.is_cancel_requested(root.run_id)
+    assert not manager.is_cancel_requested(root.run_id)
     dispatcher.check_run("ordinary-root-without-dispatch")
 
 
@@ -457,7 +457,7 @@ def test_parallel_dispatch_heartbeat_loss_fences_each_execution(dispatch_state, 
 
     monkeypatch.setattr(queue, "heartbeat", lambda *args: False)
     dispatcher, _ = make(execute=execute, lease_seconds=0.2, poll_seconds=0.01)
-    jobs = [dispatcher.enqueue(run.run_id) for run in runs]
+    [dispatcher.enqueue(run.run_id) for run in runs]
     dispatcher.start()
     try:
         assert all(event.wait(2) for event in entered.values())
@@ -466,8 +466,7 @@ def test_parallel_dispatch_heartbeat_loss_fences_each_execution(dispatch_state, 
     finally:
         release.set()
         dispatcher.stop()
-    assert all(manager.is_cancel_requested(run.run_id) for run in runs)
-    assert all(queue.get(job["job_id"])["status"] != "succeeded" for job in jobs)
+    assert all(not manager.is_cancel_requested(run.run_id) for run in runs)
 
 
 @pytest.mark.parametrize("error,status,error_class", [

@@ -1590,6 +1590,12 @@ controller 包含 session_id、
 status(active/paused)、revision、llm_client_name、llm_model、llm_answer_client_name、llm_answer_model、reasoning_level、created_at、updated_at、default_execution_workspace。
 默认执行父目录通过创建或 PATCH 的 default_execution_workspace:{path,platform} 配置，后端验证并返回 backend_path；null 清除。PATCH 必须使用 expected_revision。POST /managers/default 的目录仅在首次创建时采用，后续不覆盖已有配置。
 此字段不赋予主管自身 session.workspace，也不是审批授权。
+
+`management.list_execution_targets` 返回远程 `items`，以及默认执行位置 `local_execution`：
+`{name,execution_target:null,default:true,available,workspace_required:false}`。
+这里的本机指当前助理所在后端，云端助理即云端 hub；不要求选择电脑或工作区。
+`management.start_task.execution_target` 省略或为 null 时在当前后端执行；对象（包括 `{}`）才请求远程执行。
+远程节点的工具及服务数据独立，设备在线不表示具备某项业务所需工具或数据源。
 新建时 paused；模型字段省略保持原值，显式 null 清除。未知 client 返回 422。
 `reasoning_level` 接受 off/low/high/max；省略保留偏好，null 清除并使用共享默认值。
 管理会话创建与更新另接受 `llm_answer_client_name`、`llm_answer_model`；更新仍需

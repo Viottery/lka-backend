@@ -455,6 +455,9 @@ def init_db(db_path: Path) -> None:
             CREATE INDEX IF NOT EXISTS idx_agent_runs_session_created
                 ON agent_runs(session_id, created_at);
 
+            CREATE INDEX IF NOT EXISTS idx_agent_runs_parent_run_id
+                ON agent_runs(json_extract(record_payload, '$.parent_run_id'));
+
             CREATE TABLE IF NOT EXISTS agent_run_events (
                 run_id TEXT NOT NULL,
                 sequence INTEGER NOT NULL,

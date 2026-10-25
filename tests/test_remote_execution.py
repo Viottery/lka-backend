@@ -6,6 +6,7 @@ import pytest
 from app.core.agent_runs import AgentRunCancelled
 from app.core.config import Settings
 from app.core.runtime import LocalKnowledgeAgentRuntime
+from app.core.safety import SafetyReviewDecision, SafetyReviewRequest
 from app.core.tools import ToolContext
 from app.domains.devices import DeviceConfig, DeviceService, DeviceUnavailableError
 from app.domains.remote_execution import (
@@ -79,6 +80,45 @@ def setup_remote(hub, tmp_path, monkeypatch):
 def start(env, command_id="task", **target):
     return env["hub"].managed_tasks.start_task(env["context"], command_id=command_id,
         purpose="Read the project and report evidence", execution_target=target)
+
+
+def test_management_discovery_includes_local_hub_without_changing_remote_items(setup_remote):
+    e = setup_remote
+    targets = e["hub"].managed_tasks.list_execution_targets(e["context"])
+    assert targets["local_execution"] == {"name": "Cloud hub", "execution_target": None,
+        "default": True, "available": True, "workspace_required": False}
+    assert [item["device_id"] for item in targets["items"]] == ["pc"]
+    e["hub"].managed_tasks.remote_execution = None
+    local_only = e["hub"].managed_tasks.list_execution_targets(e["context"])
+    assert local_only["local_execution"]["available"]
+    assert local_only["local_execution"]["execution_target"] is None
+    assert local_only["items"] == [] and not local_only["enabled"]
+
+
+@pytest.mark.parametrize("explicit_null", [False, True])
+def test_tool_dispatch_without_device_requirement_stays_on_hub(setup_remote, explicit_null):
+    e = setup_remote
+    inputs = {"command_id": "backend-task", "purpose": "Inspect records stored on this backend"}
+    if explicit_null:
+        inputs["execution_target"] = None
+    context = e["context"]
+    review = e["hub"].agent_run_manager.create_safety_review(SafetyReviewRequest(
+        review_id="local-choice-review", invocation_id="local-choice", tool_name="management.start_task",
+        tool_input=inputs, run_id=context.run_id, session_id=context.session_id, trace_id=context.trace_id,
+        user_request=inputs["purpose"], mode="skip", reason="Synthetic dispatch authorization",
+        created_at=e["hub"].agent_run_manager.get_run(context.run_id).created_at,
+    ))
+    e["hub"].agent_run_manager.decide_safety_review(review_id=review.review_id,
+        decision=SafetyReviewDecision.APPROVE, decided_by="test", reason="Synthetic dispatch authorization")
+    context = context.model_copy(update={"safety_review_id": review.review_id})
+    result = e["hub"].tool_executor.execute(invocation_id="local-choice",
+        tool_name="management.start_task", tool_input=inputs, context=context)
+    assert result.status == "completed", result.error
+    run = e["hub"].agent_run_manager.get_run(result.output["run_id"])
+    assert run.metadata.get("remote_execution") is None
+    with e["hub"]._conn() as conn:
+        assert conn.execute("SELECT count(*) FROM remote_execution_tasks").fetchone()[0] == 0
+    assert e["node"].agent_run_manager.get_run(run.run_id) is None
 
 
 def test_real_dispatch_round_trip_and_immutable_command(setup_remote):

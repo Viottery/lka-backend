@@ -161,7 +161,11 @@ poll_seconds = 3
 
 同一 workspace_id 在两个映射中必须指向相同本机路径，并包含于该节点的 LKA_WORKSPACE_ROOTS；
 Linux 路径不能直接复制到 Windows。节点已登记的环境必须批准该 workspace_id。
-allowed_tools 是节点操作者明确授予远程任务的工具；空列表不提供工具，不因云端任务要求扩大。
+`tool_policy="allowlist"`（默认）下，allowed_tools 是节点操作者明确授予远程任务的工具；空列表不提供工具。
+明确设置 `tool_policy="local"` 后，远程任务可使用本机注册的普通会话工具，仍与派发范围、来源授权及续作原权限取交集，
+不开放管理助理工具，不代替 `shell_trust` 的主机执行授权。各调用仍经过安全审查。
+节点可独立配置邮件、事项、知识库等完整服务；工具可用不等于对应账号、数据源或模型已配置。
+这些本机服务使用本机数据，选择远程设备不会把云端邮箱或事项库一并传过去。
 远程任务使用原安全审查，节点默认强制 manual；明确允许 inherit 后按下文的节点策略执行。
 权限、租约和审批不用脏缓存判断。
 跨机累计后台预算尚不能转移，带该类预算的委派明确拒绝；不重置额度。
@@ -173,6 +177,9 @@ allowed_tools 是节点操作者明确授予远程任务的工具；空列表不
 不复制云端账户/密码数据库。新云端授权及助理任务派发仍需云端在线。
 
 助理派发时 execution_target 可包含 device_id、environment_id、workspace_id、capabilities，
+省略或显式设为 null 表示在当前后端执行；云端助理没有设备／工作区要求的任务默认留在云端。
+`management.list_execution_targets` 单独返回 `local_execution`，明确展示这个默认选项；`items` 仍是远程节点列表。
+`execution_target={}` 明确请求从远程节点中选择，不能用于表达“没有设备要求”。
 workspace_path 仅用于原本机执行，不能与远程 target 混用。远程任务会话从云端查看，
 普通会话及文件管理从节点 `/client` 访问。远程任务支持取消、审批、检查点暂停/继续和用户问答。
 节点 `[remote_execution].review_policy` 默认 `manual`，强制人工审批；明确设置为 `inherit` 后，

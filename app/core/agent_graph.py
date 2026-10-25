@@ -6,6 +6,7 @@ import asyncio
 import json
 import queue
 import threading
+import time
 from contextlib import nullcontext
 from contextvars import copy_context
 from datetime import UTC, datetime
@@ -18,7 +19,8 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
 from app.core.agent_checkpoints import SqliteCheckpointRuntime
-from app.core.agent_runs import AgentRunCancelled, AgentRunRecord
+from app.core.agent_dispatch import AgentDispatchFenced
+from app.core.agent_runs import AgentRunCancelled, AgentRunRecord, AgentRunStatus
 from app.core.agent_storage import SqliteAgentRunStore
 from app.core.agent_turn import (
     AgentTurnDecisionEvent,
@@ -48,6 +50,17 @@ from app.core.llm import LLMResponseMode
 from app.core.runtime_context import current_time_payload
 from app.core.safety import SafetyReviewMode, SafetyReviewRecord, SafetyReviewStatus
 from app.core.tools import ToolContext, ToolResult
+from app.storage.sqlite_retry import is_sqlite_busy
+from app.storage.sqlite_write_queue import SqliteWriteQueueError
+
+
+def _is_temporary_sqlite_error(exc: BaseException) -> bool:
+    current: BaseException | None = exc
+    while current is not None:
+        if isinstance(current, SqliteWriteQueueError) or is_sqlite_busy(current):
+            return True
+        current = current.__cause__
+    return False
 
 
 class AgentGraphState(TypedDict, total=False):
@@ -2020,7 +2033,23 @@ class AgentGraphRunner:
 
     def _fail(self, run_id: str, exc: Exception) -> None:
         manager = self.turn_loop.run_manager
-        persisted = manager.durable_store.load_run(run_id) if manager.durable_store is not None else None
+        if isinstance(exc, AgentDispatchFenced):
+            # A lease owner may have been replaced while this graph was blocked
+            # in I/O. Fence this execution only; the current owner or a later
+            # lease recovery owns run status and checkpoint continuation.
+            with self._lock:
+                self._errors[run_id] = exc
+            return
+        persisted = None
+        if manager.durable_store is not None:
+            for attempt in range(3):
+                try:
+                    persisted = manager.durable_store.load_run(run_id)
+                    break
+                except Exception as read_exc:
+                    if not _is_temporary_sqlite_error(read_exc) or attempt == 2:
+                        raise
+                    time.sleep(0.05 * (attempt + 1))
         if persisted is not None and persisted.get("status") == "completed":
             # Business publication may commit before the independent graph
             # checkpoint. A checkpoint failure cannot undo that terminal result.
@@ -2032,10 +2061,59 @@ class AgentGraphRunner:
                 else:
                     self._errors[run_id] = exc
             return
-        if isinstance(exc, AgentRunCancelled):
-            self.turn_loop._mark_current_run_cancelled(str(exc))
-        else:
-            self.turn_loop._mark_current_run_failed(type(exc).__name__, str(exc), exc=exc)
+        for attempt in range(3):
+            try:
+                if isinstance(exc, AgentRunCancelled):
+                    manager.cancel_run(run_id, reason=str(exc))
+                else:
+                    if attempt == 0:
+                        # This emits the single run_failed event and attempts the
+                        # terminal record write.
+                        self.turn_loop._mark_current_run_failed(type(exc).__name__, str(exc), exc=exc)
+                    else:
+                        # Retry only the status write; do not duplicate the event.
+                        current = manager.get_run(run_id)
+                        if current is not None and current.parent_run_id is not None:
+                            manager.fail_child_run(run_id, error_type=type(exc).__name__, error=str(exc))
+                        else:
+                            manager.fail_run(run_id, error_type=type(exc).__name__, error=str(exc))
+                break
+            except Exception as write_exc:
+                if not _is_temporary_sqlite_error(write_exc):
+                    raise
+                # Queue admission and SQLITE_BUSY failures are transient.
+                # Preserve terminal state if a prior attempt committed before
+                # its caller observed the error.
+                latest = None
+                if manager.durable_store is not None:
+                    for read_attempt in range(3):
+                        try:
+                            latest = manager.durable_store.load_run(run_id)
+                            break
+                        except Exception as read_exc:
+                            if not _is_temporary_sqlite_error(read_exc) or read_attempt == 2:
+                                raise
+                            time.sleep(0.05 * (read_attempt + 1))
+                status = latest.get("status") if latest is not None else None
+                if status in {"completed", "failed", "cancelled", "timed_out", "paused",
+                              "waiting_user", "waiting_confirmation"}:
+                    if latest is not None:
+                        manager.refresh_after_transaction(latest)
+                    break
+                if attempt == 2:
+                    if isinstance(exc, AgentRunCancelled):
+                        current = manager.get_run(run_id)
+                        if current is not None and current.status in {AgentRunStatus.QUEUED, AgentRunStatus.RUNNING}:
+                            manager._update_run(
+                                run_id,
+                                status=AgentRunStatus.CANCELLED,
+                                cancelled_at=datetime.now(UTC).isoformat(),
+                                error_type="cancelled",
+                                error=str(exc),
+                            )
+                            break
+                    raise
+                time.sleep(0.05 * (attempt + 1))
         with self._lock:
             self._errors[run_id] = exc
 

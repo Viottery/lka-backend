@@ -138,6 +138,118 @@ class SqliteAgentRunStore:
         )
         SessionAdmissionStore.release_if_terminal(conn, record)
 
+    def reconcile_failed_dispatch_runs(self, *, limit: int = 20) -> list[dict[str, Any]]:
+        """Terminalize orphaned running roots whose latest dispatch job failed.
+
+        The job/run check, terminal record, event, and admission-slot release are
+        committed together. No work is replayed by this recovery path.
+        """
+        if not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100")
+        now = datetime.now(UTC).isoformat()
+        reconciled: list[dict[str, Any]] = []
+        with connect(self.db_path) as conn:
+            candidates = self._failed_dispatch_candidates(conn, limit)
+            if not candidates:
+                return []
+            conn.execute("BEGIN IMMEDIATE")
+            # Re-select after obtaining the writer slot so job/run ownership and
+            # ordering decisions are based on one transaction snapshot.
+            candidates = self._failed_dispatch_candidates(conn, limit)
+            visited: set[str] = set()
+            for job in candidates:
+                run_id = job["run_id"]
+                if not isinstance(run_id, str) or run_id in visited:
+                    continue
+                visited.add(run_id)
+                row = conn.execute(
+                    "SELECT record_payload FROM agent_runs WHERE run_id=? AND status='running'",
+                    (run_id,),
+                ).fetchone()
+                if row is None:
+                    continue
+                record = _json_load(row["record_payload"])
+                metadata = record.get("metadata") or {}
+                if (record.get("status") != "running" or record.get("parent_run_id") is not None
+                        or record.get("result_snapshot") is not None
+                        or metadata.get("completion_claimed") is True
+                        or metadata.get("pause_requested") is True):
+                    continue
+                latest = conn.execute(
+                    """SELECT job_id,status,error_class FROM background_jobs
+                       WHERE kind='agent_dispatch' AND scope_id=?
+                         AND json_extract(payload_json,'$.run_id')=?
+                       ORDER BY created_at DESC,updated_at DESC,job_id DESC LIMIT 1""",
+                    (job["scope_id"], run_id),
+                ).fetchone()
+                if latest is None or latest["job_id"] != job["job_id"] or latest["status"] != "failed":
+                    continue
+                active = conn.execute(
+                    """SELECT 1 FROM background_jobs
+                       WHERE kind='agent_dispatch' AND scope_id=?
+                         AND json_extract(payload_json,'$.run_id')=?
+                         AND status IN ('queued','running','retry_wait') LIMIT 1""",
+                    (job["scope_id"], run_id),
+                ).fetchone()
+                if active is not None:
+                    continue
+                error_class = latest["error_class"] or "dispatch_failed"
+                record = {
+                    **record,
+                    "status": "failed",
+                    "failed_at": now,
+                    "error_type": "dispatch_job_failed",
+                    "error": f"Dispatch job failed ({error_class}).",
+                    "metadata": {
+                        **metadata,
+                        "dispatch_failure_job_id": latest["job_id"],
+                        "dispatch_failure_error_class": error_class,
+                        "dispatch_failure_reconciled_at": now,
+                    },
+                }
+                event = {
+                    "event_id": f"{run_id}_event_reconcile_{latest['job_id']}",
+                    "run_id": run_id,
+                    "sequence": int(conn.execute(
+                        "SELECT COALESCE(MAX(sequence),0)+1 FROM agent_run_events WHERE run_id=?",
+                        (run_id,),
+                    ).fetchone()[0]),
+                    "type": "run_failed",
+                    "stage": "run",
+                    "message": record["error"],
+                    "payload": {"error_type": "dispatch_job_failed", "job_id": latest["job_id"],
+                                "error_class": error_class},
+                    "created_at": now,
+                }
+                self.save_run_in_transaction(conn, record, updated_at=now)
+                conn.execute(
+                    "INSERT INTO agent_run_events(run_id,sequence,event_payload,created_at) VALUES (?,?,?,?)",
+                    (run_id, event["sequence"], _json_dump(self._event_for_storage(event)), now),
+                )
+                reconciled.append(record)
+                if len(reconciled) >= limit:
+                    break
+            conn.commit()
+        return reconciled
+
+    @staticmethod
+    def _failed_dispatch_candidates(conn, limit: int):
+        return conn.execute(
+            """SELECT j.job_id,j.scope_id,json_extract(j.payload_json,'$.run_id') AS run_id,
+                      j.error_class
+               FROM background_jobs j JOIN agent_runs r
+                 ON r.run_id=json_extract(j.payload_json,'$.run_id')
+               WHERE j.kind='agent_dispatch' AND j.status='failed' AND r.status='running'
+                 AND j.job_id=(
+                   SELECT latest.job_id FROM background_jobs latest
+                   WHERE latest.kind='agent_dispatch' AND latest.scope_id=j.scope_id
+                     AND json_extract(latest.payload_json,'$.run_id')=r.run_id
+                   ORDER BY latest.created_at DESC,latest.updated_at DESC,latest.job_id DESC LIMIT 1
+                 )
+               ORDER BY j.updated_at DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+
     def complete_run_in_transaction(
         self, conn, run_id: str, *, result_snapshot: dict[str, Any],
         log_path: str | None = None, event_payload: dict[str, Any] | None = None,

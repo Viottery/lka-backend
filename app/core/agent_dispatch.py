@@ -2,19 +2,27 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import sqlite3
 import threading
+import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any, Literal
 
-from app.core.agent_runs import AgentRunCancelled, AgentRunRecord, InMemoryAgentRunManager
+from app.core.agent_runs import AgentRunRecord, InMemoryAgentRunManager
 from app.core.background_jobs import BackgroundJobFailure, BackgroundJobStore, BackgroundJobWorker
 
+_logger = logging.getLogger(__name__)
 
-class AgentDispatchLeaseLost(AgentRunCancelled):
-    """A dispatched run no longer owns its durable job lease."""
+
+class AgentDispatchFenced(RuntimeError):
+    """This dispatcher lost its lease and must stop without changing run state."""
+
+
+# Compatibility name for callers/tests that only need to identify the fence.
+AgentDispatchLeaseLost = AgentDispatchFenced
 
 
 class DispatchGuard:
@@ -31,35 +39,48 @@ class DispatchGuard:
             if self.lost.is_set():
                 return
             self.lost.set()
-            # The existing run/tool guards fence subsequent effects. An already
-            # dispatched external operation cannot be undone by this request.
-            self.dispatcher.run_manager.request_cancel(self.run_id, reason="dispatch_lease_lost")
 
     def check(self, conn: sqlite3.Connection | None = None):
         if self.lost.is_set():
-            raise AgentDispatchLeaseLost("dispatch_lease_lost")
-        try:
-            if conn is not None:
+            raise AgentDispatchFenced("dispatch_lease_lost")
+        if conn is not None:
+            try:
                 row = conn.execute("SELECT status,lease_owner,lease_epoch,lease_expires_at,deadline "
                                    "FROM background_jobs WHERE job_id=?", (self.job["job_id"],)).fetchone()
                 current = dict(zip(("status", "lease_owner", "lease_epoch", "lease_expires_at", "deadline"), row, strict=True)) if row else None
-            else:
-                current = self.dispatcher.store.get(self.job["job_id"])
+            except Exception:  # noqa: BLE001 - caller transaction cannot safely open another connection.
+                current = None
+        else:
+            current = None
+            while True:
+                try:
+                    current = self.dispatcher.store.get(self.job["job_id"])
+                except Exception:  # noqa: BLE001 - allow brief read contention within persisted lease.
+                    current = None
+                if current is not None:
+                    break
+                expires = self.job.get("lease_expires_at")
+                remaining = ((datetime.fromisoformat(expires) - datetime.now(UTC)).total_seconds()
+                             if expires else 0)
+                if remaining <= 0:
+                    break
+                threading.Event().wait(min(0.05, remaining))
+        try:
             valid = (current is not None and current["status"] == "running"
                      and current["lease_owner"] == self.job["lease_owner"]
                      and current["lease_epoch"] == self.job["lease_epoch"]
                      and current["lease_expires_at"] is not None
                      and datetime.fromisoformat(current["lease_expires_at"]) > datetime.now(UTC)
                      and (current["deadline"] is None or datetime.fromisoformat(current["deadline"]) > datetime.now(UTC)))
-        except Exception:  # noqa: BLE001 - inability to validate ownership fails closed.
+        except Exception:  # noqa: BLE001 - malformed or missing lease fails closed.
             valid = False
         if not valid:
-            # Never acquire the manager lock or request a write on another
-            # connection while the caller holds its SQLite write transaction.
-            # Let it roll back; an outer check/heartbeat persists cancellation.
+            # A transaction-local observation may include uncommitted changes.
+            # Fence that operation, but do not poison the shared guard unless
+            # the committed lease check outside the transaction also fails.
             if conn is None:
                 self._lose()
-            raise AgentDispatchLeaseLost("dispatch_lease_lost")
+            raise AgentDispatchFenced("dispatch_lease_lost")
 
 
 class _ClaimedJobStore:
@@ -79,8 +100,9 @@ class _ClaimedJobStore:
 class _DispatchWorker(BackgroundJobWorker):
     """Claim durable jobs continuously, with an independent thread per lease."""
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, reconcile=None, **kwargs):
         super().__init__(*args, **kwargs)
+        self.reconcile = reconcile
         self._executions: set[threading.Thread] = set()
         self._executions_lock = threading.Lock()
 
@@ -94,8 +116,14 @@ class _DispatchWorker(BackgroundJobWorker):
         thread.start()
 
     def _loop(self):
+        next_reconcile = 0.0
         while not self._stop.is_set():
             try:
+                if self.reconcile is not None:
+                    current_time = time.monotonic()
+                    if current_time >= next_reconcile:
+                        self.reconcile()
+                        next_reconcile = current_time + 30
                 job = self.store.claim(self._owner, self.lease_seconds, kinds=tuple(self.handlers))
                 if job is None:
                     self._stop.wait(self.poll_seconds)
@@ -122,6 +150,11 @@ class _DispatchWorker(BackgroundJobWorker):
                                          lease_seconds=self.lease_seconds)
             worker.run_one(job["lease_owner"])
         finally:
+            if self.reconcile is not None:
+                try:
+                    self.reconcile()
+                except Exception as exc:  # noqa: BLE001 - a later pump pass retries reconciliation.
+                    _logger.warning("Dispatch reconciliation failed type=%s", type(exc).__name__)
             with self._executions_lock:
                 self._executions.discard(threading.current_thread())
 
@@ -165,8 +198,18 @@ class AgentDispatcher:
         self._manual_calls = 0
         self.worker = _DispatchWorker(store, {"agent_dispatch": self._handle},
                                       lease_seconds=lease_seconds, poll_seconds=poll_seconds,
+                                      reconcile=self.reconcile_failed_runs,
                                       # Deprecated compatibility argument; dispatch has no worker pool.
                                       worker_count=1)
+
+    def reconcile_failed_runs(self, *, limit: int = 20) -> int:
+        durable_store = self.run_manager.durable_store
+        if durable_store is None:
+            return 0
+        records = durable_store.reconcile_failed_dispatch_runs(limit=limit)
+        for record in records:
+            self.run_manager.refresh_after_transaction(record)
+        return len(records)
 
     def enqueue(self, run_id: str, *, mode: Literal["execute", "resume"] = "execute",
                 command_id: str | None = None, conn: sqlite3.Connection | None = None):
@@ -213,6 +256,10 @@ class AgentDispatcher:
         try:
             return self.worker.run_one(owner)
         finally:
+            try:
+                self.reconcile_failed_runs()
+            except Exception as exc:  # noqa: BLE001 - later invocation retries durable reconciliation.
+                _logger.warning("Dispatch reconciliation failed type=%s", type(exc).__name__)
             with self._condition:
                 self._manual_calls -= 1
                 self._condition.notify_all()
@@ -258,14 +305,54 @@ class AgentDispatcher:
 
     def _heartbeat(self, guard: DispatchGuard, finished: threading.Event):
         while not finished.wait(max(0.01, self.lease_seconds / 3)):
-            try:
-                valid = self.store.heartbeat(guard.job["job_id"], guard.job["lease_owner"],
-                                             guard.job["lease_epoch"], self.lease_seconds)
-            except Exception:  # noqa: BLE001 - lost ownership must not silently continue.
-                valid = False
-            if not valid:
-                guard._lose()
-                return
+            while not finished.is_set():
+                try:
+                    renewed = self.store.heartbeat(
+                        guard.job["job_id"], guard.job["lease_owner"],
+                        guard.job["lease_epoch"], self.lease_seconds,
+                    )
+                except Exception:  # noqa: BLE001 - distinguish DB pressure from lease revocation.
+                    renewed = False
+                if renewed:
+                    try:
+                        persisted = self.store.get(guard.job["job_id"])
+                        if (persisted is not None
+                                and persisted.get("lease_owner") == guard.job["lease_owner"]
+                                and persisted.get("lease_epoch") == guard.job["lease_epoch"]
+                                and persisted.get("status") == "running"):
+                            guard.job["lease_expires_at"] = persisted["lease_expires_at"]
+                    except Exception as exc:  # noqa: BLE001 - keep only the last confirmed expiry.
+                        _logger.debug("Could not refresh cached dispatch lease type=%s", type(exc).__name__)
+                    break
+                read_failed = False
+                try:
+                    current = self.store.get(guard.job["job_id"])
+                except Exception:  # noqa: BLE001 - distinguish read contention from revoked ownership.
+                    current = None
+                    read_failed = True
+                now = datetime.now(UTC)
+                if read_failed:
+                    expiry = datetime.fromisoformat(guard.job["lease_expires_at"])
+                    remaining = (expiry - now).total_seconds()
+                    if remaining > 0:
+                        if finished.wait(min(0.05, remaining)):
+                            return
+                        continue
+                same_owner = (current is not None and current.get("status") == "running"
+                              and current.get("lease_owner") == guard.job["lease_owner"]
+                              and current.get("lease_epoch") == guard.job["lease_epoch"])
+                unexpired = bool(same_owner and current.get("lease_expires_at")
+                                 and datetime.fromisoformat(current["lease_expires_at"]) > now
+                                 and (not current.get("deadline")
+                                      or datetime.fromisoformat(current["deadline"]) > now))
+                if not unexpired:
+                    guard._lose()
+                    return
+                # Do not assume a renewal that SQLite did not commit. Retry only
+                # until the already-persisted lease expires.
+                remaining = (datetime.fromisoformat(current["lease_expires_at"]) - now).total_seconds()
+                if finished.wait(min(0.1, max(0.01, remaining / 4))):
+                    return
 
     def _handle(self, job):
         with self._condition:
