@@ -12,6 +12,7 @@ from app.core.agent_storage import SqliteAgentRunStore
 from app.core.agent_tool_graph import AgentToolLifecycleGraph
 from app.core.session_progress_cache import SessionProgressCacheService
 from app.core.tools import ToolContext, ToolExecutor, ToolRegistry, ToolResult, ToolSpec
+from app.storage.sqlite_write_queue import SqliteWriteQueueError
 
 
 @pytest.fixture
@@ -167,3 +168,14 @@ def test_busy_derived_index_is_deferred_with_warning_and_other_errors_surface(st
     monkeypatch.setattr(service, "_record", bug)
     with pytest.raises(sqlite3.OperationalError, match="syntax"):
         service.record(context=ToolContext(session_id="session", run_id="run"), tool_events=[])
+
+
+def test_write_queue_wait_failure_defers_derived_index(store, monkeypatch, caplog):
+    service = object.__new__(SessionProgressCacheService)
+
+    def queue_timeout(**_):
+        raise SqliteWriteQueueError("SQLite write queue wait timed out")
+
+    monkeypatch.setattr(service, "_record", queue_timeout)
+    service.record(context=ToolContext(session_id="session", run_id="run"), tool_events=[])
+    assert "indexing deferred" in caplog.text

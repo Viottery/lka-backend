@@ -15,6 +15,7 @@ from typing import Any
 from app.core.answer_evidence import cached_result_read_routes
 from app.core.tools import ToolContext, effective_tool_read_only, tool_scope_discovery_denial
 from app.storage.sqlite_retry import is_sqlite_busy
+from app.storage.sqlite_write_queue import SqliteWriteQueueError
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +92,7 @@ class SessionProgressCacheService:
         try:
             self._record(context=context, tool_events=tool_events, working_state=working_state)
         except Exception as exc:
-            if not is_sqlite_busy(exc):
+            if not isinstance(exc, SqliteWriteQueueError) and not is_sqlite_busy(exc):
                 raise
             # This derived index can be rebuilt from durable tool artifacts and
             # runtime state; a later graph save retries it using that state.
