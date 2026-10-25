@@ -21,18 +21,19 @@ def test_existing_database_migration_indexes_parent_lookup_and_guards_completion
         assert index is not None
         assert "json_extract(record_payload, '$.parent_run_id')" in index[0]
 
-        seed_plan = conn.execute(
-            "EXPLAIN QUERY PLAN SELECT run_id,status FROM agent_runs "
-            "WHERE json_extract(record_payload,'$.parent_run_id')=?",
+        recursive_plan = conn.execute(
+            "EXPLAIN QUERY PLAN WITH RECURSIVE descendants(run_id,status) AS ("
+            "SELECT run_id,status FROM agent_runs "
+            "WHERE json_extract(record_payload,'$.parent_run_id')=? UNION ALL "
+            "SELECT child.run_id,child.status FROM agent_runs child JOIN descendants parent "
+            "ON json_extract(child.record_payload,'$.parent_run_id')=+parent.run_id) "
+            "SELECT 1 FROM descendants "
+            "WHERE status NOT IN ('completed','failed','cancelled','timed_out') LIMIT 1",
             ("root",),
         ).fetchall()
-        recursive_plan = conn.execute(
-            "EXPLAIN QUERY PLAN SELECT child.run_id,child.status FROM agent_runs child "
-            "JOIN (SELECT 'root' AS run_id) parent "
-            "ON json_extract(child.record_payload,'$.parent_run_id')=parent.run_id"
-        ).fetchall()
-        assert any("SEARCH agent_runs USING INDEX idx_agent_runs_parent_run_id" in row[3] for row in seed_plan)
-        assert any("SEARCH child USING INDEX idx_agent_runs_parent_run_id" in row[3] for row in recursive_plan)
+        plan_text = " ".join(row[3] for row in recursive_plan)
+        assert "SEARCH agent_runs USING INDEX idx_agent_runs_parent_run_id" in plan_text
+        assert "SEARCH child USING INDEX idx_agent_runs_parent_run_id" in plan_text
 
     sessions = SessionService(lambda: connect(db_path))
     sessions.ensure_session(session_id="parent-lookup-session")
@@ -44,6 +45,11 @@ def test_existing_database_migration_indexes_parent_lookup_and_guards_completion
         user_input="child",
     )
     manager.mark_child_running(child.run_id)
+    grandchild = manager.create_child_run(
+        parent_run_id=child.run_id, plan_id="plan", step_id="grandchild", attempt=1,
+        user_input="grandchild",
+    )
+    manager.mark_child_running(grandchild.run_id)
 
     with connect(db_path) as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -51,6 +57,7 @@ def test_existing_database_migration_indexes_parent_lookup_and_guards_completion
             store.complete_run_in_transaction(conn, root.run_id, result_snapshot={"answer": "done"})
         conn.rollback()
 
+    manager.complete_child_run(grandchild.run_id, result_snapshot={"answer": "grandchild done"})
     manager.complete_child_run(child.run_id, result_snapshot={"answer": "child done"})
     completed = manager.complete_run(root.run_id, result_snapshot={"answer": "done"})
     assert completed.status.value == "completed"

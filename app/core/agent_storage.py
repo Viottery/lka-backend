@@ -282,11 +282,14 @@ class SqliteAgentRunStore:
             raise ValueError("Only a running, non-cancelled and non-pausing run can publish")
         if record.get("parent_run_id") is not None:
             raise ValueError("Atomic publication currently requires a root run")
+        # Unary + preserves run ID values but removes the CTE column's TEXT
+        # affinity, allowing SQLite to use the JSON expression index in the
+        # recursive step as well as the seed lookup.
         active = conn.execute(
             "WITH RECURSIVE descendants(run_id,status) AS ("
             "SELECT run_id,status FROM agent_runs WHERE json_extract(record_payload,'$.parent_run_id')=? UNION ALL "
             "SELECT child.run_id,child.status FROM agent_runs child JOIN descendants parent "
-            "ON json_extract(child.record_payload,'$.parent_run_id')=parent.run_id) "
+            "ON json_extract(child.record_payload,'$.parent_run_id')=+parent.run_id) "
             "SELECT 1 FROM descendants WHERE status NOT IN ('completed','failed','cancelled','timed_out') LIMIT 1",
             (run_id,),
         ).fetchone()
