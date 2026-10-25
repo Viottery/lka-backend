@@ -16,6 +16,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 from app.core.prompt_tokens import PromptTokenCounter
+from app.storage.commit_signals import notify_after_commit
 
 SessionRole = Literal["user", "agent", "system", "tool"]
 SessionCreationSource = Literal["user", "assistant", "system", "unknown"]
@@ -554,6 +555,7 @@ class SessionService:
 
         return self.get_session(session_id=session_id)
 
+    @notify_after_commit
     def delete_session(self, *, session_id: str) -> bool:
         """Soft delete a session while retaining its local audit and run data."""
 
@@ -578,6 +580,7 @@ class SessionService:
         finally:
             conn.close()
 
+    @notify_after_commit
     def restore_session(self, *, session_id: str) -> bool:
         """Restore a soft-deleted session without changing its associated data."""
 
@@ -616,6 +619,7 @@ class SessionService:
             conn.close()
         return self._session_from_row(row) if row else None
 
+    @notify_after_commit
     def set_workspace(
         self,
         *,

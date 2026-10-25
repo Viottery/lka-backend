@@ -6,6 +6,8 @@ from contextlib import closing
 from datetime import UTC, datetime
 from uuid import uuid4
 
+from app.storage.commit_signals import notify_after_commit
+
 
 class ManagementConflictError(ValueError):
     """The requested transition conflicts with persisted management state."""
@@ -127,6 +129,7 @@ class ManagementService:
                          "ON CONFLICT(slot) DO UPDATE SET session_id=excluded.session_id", (session_id,))
         return session_id
 
+    @notify_after_commit
     def create(self, title=None, make_default=False, llm_client_name=None, llm_model=None, reasoning_level=None, default_execution_workspace=None,
                llm_answer_client_name=None, llm_answer_model=None):
         workspace = self.resolve_execution_workspace(default_execution_workspace)
@@ -186,6 +189,7 @@ class ManagementService:
                                 "ORDER BY s.updated_at DESC,s.session_id LIMIT ? OFFSET ?", (limit, offset)).fetchall()
         return [self.get(row["session_id"]) for row in rows]
 
+    @notify_after_commit
     def update(self, session_id, expected_revision, status=None, llm_client_name=_UNSET, llm_model=_UNSET, reasoning_level=_UNSET,
                default_execution_workspace=_UNSET, llm_answer_client_name=_UNSET, llm_answer_model=_UNSET):
         if status is not None and status not in {"active", "paused"}:

@@ -8,6 +8,7 @@ from hashlib import sha256
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.domains.management import ManagementConflictError
+from app.storage.commit_signals import notify_after_commit
 
 
 def _instant(value=None):
@@ -56,6 +57,7 @@ class ManagementAttentionService:
             raise ValueError("horizon_days must be 1..90")
         return value
 
+    @notify_after_commit
     def configure(self, session_id, expected_revision, enabled, timezone="Asia/Shanghai", horizon_days=7, *, authority_check=None):
         if type(expected_revision) is not int or expected_revision < 0:
             raise ValueError("expected_revision must be non-negative; use 0 for a new policy")

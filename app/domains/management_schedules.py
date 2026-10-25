@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from app.domains.management import ManagementConflictError
 from app.domains.management_goals import _instant
+from app.storage.commit_signals import notify_after_commit
 
 
 def _json(value):
@@ -153,6 +154,7 @@ class ManagementScheduleService:
         result["enabled"] = bool(result["enabled"])
         return result
 
+    @notify_after_commit
     def configure(self, session_id, command_id, *, now=None, authority_check=None, **fields):
         """Explicit configuration only; caller owns authorization and tool review."""
         if not isinstance(command_id, str) or not command_id.strip() or len(command_id) > 128:

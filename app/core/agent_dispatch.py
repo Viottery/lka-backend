@@ -100,9 +100,12 @@ class _ClaimedJobStore:
 class _DispatchWorker(BackgroundJobWorker):
     """Claim durable jobs continuously, with an independent thread per lease."""
 
-    def __init__(self, *args, reconcile=None, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, *args, reconcile=None, scheduling_mode="event", reconcile_seconds=30, **kwargs):
+        super().__init__(*args, scheduling_mode=scheduling_mode,
+                         reconcile_seconds=reconcile_seconds, **kwargs)
         self.reconcile = reconcile
+        self.scheduling_mode = scheduling_mode
+        self.reconcile_seconds = reconcile_seconds
         self._executions: set[threading.Thread] = set()
         self._executions_lock = threading.Lock()
 
@@ -118,15 +121,23 @@ class _DispatchWorker(BackgroundJobWorker):
     def _loop(self):
         next_reconcile = 0.0
         while not self._stop.is_set():
+            with self._wake_condition:
+                generation = self._wake_generation
             try:
                 if self.reconcile is not None:
                     current_time = time.monotonic()
                     if current_time >= next_reconcile:
                         self.reconcile()
-                        next_reconcile = current_time + 30
+                        next_reconcile = current_time + self.reconcile_seconds
+                if self.scheduling_mode == "event" and not self.store.has_ready(kinds=tuple(self.handlers)):
+                    self._wait_event(generation)
+                    continue
                 job = self.store.claim(self._owner, self.lease_seconds, kinds=tuple(self.handlers))
                 if job is None:
-                    self._stop.wait(self.poll_seconds)
+                    if self.scheduling_mode == "event":
+                        self._wait_event(generation)
+                    else:
+                        self._stop.wait(self.poll_seconds)
                     continue
                 # Claiming and launching belong to the same pump. Shutdown joins
                 # it before draining executions, including its final claim.
@@ -142,13 +153,17 @@ class _DispatchWorker(BackgroundJobWorker):
                     # The same lease still gets the standard failure/retry path.
                     self._execute_claimed(job)
             except Exception:  # noqa: BLE001 - keep claiming after transient store errors.
-                self._stop.wait(self.poll_seconds)
+                if self.scheduling_mode == "event":
+                    self._wait_event(generation)
+                else:
+                    self._stop.wait(self.poll_seconds)
 
     def _execute_claimed(self, job):
         try:
             worker = BackgroundJobWorker(_ClaimedJobStore(self.store, job), self.handlers,
                                          lease_seconds=self.lease_seconds)
             worker.run_one(job["lease_owner"])
+            self.notify()
         finally:
             if self.reconcile is not None:
                 try:
@@ -161,17 +176,24 @@ class _DispatchWorker(BackgroundJobWorker):
     def stop(self, timeout=None):
         """Wait for claims and every active handler before stores may close."""
         self._stop.set()
+        self.notify()
         with self._executions_lock:
             executions = list(self._executions)
         if threading.current_thread() in [*self._threads, *executions]:
             raise RuntimeError("Dispatcher cannot stop from its own execution callback")
+        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
         for thread in self._threads:
-            thread.join()
-        self._threads = []
+            thread.join(None if deadline is None else max(0.0, deadline - time.monotonic()))
+        self._threads = [thread for thread in self._threads if thread.is_alive()]
+        if self._threads:
+            return False
         with self._executions_lock:
             executions = list(self._executions)
         for thread in executions:
-            thread.join()
+            thread.join(None if deadline is None else max(0.0, deadline - time.monotonic()))
+
+        with self._executions_lock:
+            return not self._executions
 
 
 class AgentDispatcher:
@@ -182,7 +204,8 @@ class AgentDispatcher:
                  resume: Callable[[AgentRunRecord, DispatchGuard], Any],
                  has_checkpoint: Callable[[str], bool],
                  request_pause: Callable[[AgentRunRecord], Any] | None = None,
-                 lease_seconds: float = 60, poll_seconds: float = 1, worker_count: int = 1):
+                 lease_seconds: float = 60, poll_seconds: float = 1, worker_count: int = 1,
+                 scheduling_mode: str = "event", reconcile_seconds: float = 30):
         if not math.isfinite(lease_seconds) or lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
         self.store, self.run_manager = store, run_manager
@@ -199,8 +222,17 @@ class AgentDispatcher:
         self.worker = _DispatchWorker(store, {"agent_dispatch": self._handle},
                                       lease_seconds=lease_seconds, poll_seconds=poll_seconds,
                                       reconcile=self.reconcile_failed_runs,
+                                      scheduling_mode=scheduling_mode, reconcile_seconds=reconcile_seconds,
                                       # Deprecated compatibility argument; dispatch has no worker pool.
                                       worker_count=1)
+
+    def notify(self) -> None:
+        self.worker.notify()
+
+    wake = notify
+
+    def configure_scheduling(self, mode: str, reconcile_seconds: float | None = None) -> None:
+        self.worker.configure_scheduling(mode, reconcile_seconds)
 
     def reconcile_failed_runs(self, *, limit: int = 20) -> int:
         durable_store = self.run_manager.durable_store
@@ -222,6 +254,8 @@ class AgentDispatcher:
         key = command_id if command_id is not None else f"{mode}:{run_id}"
         payload = {"run_id": run_id, "mode": mode}
         job = self.store.enqueue("agent_dispatch", run.session_id, key, payload, conn=conn)
+        if conn is None:
+            self.notify()
         if conn is not None:
             row = conn.execute("SELECT payload_json FROM background_jobs WHERE job_id=?", (job["job_id"],)).fetchone()
             previous = json.loads(row[0])
@@ -273,17 +307,19 @@ class AgentDispatcher:
         with self._lifecycle_lock:
             self._stopping.set()
             self.worker._stop.set()
+            self.worker.notify()
             with self._guards_lock:
                 guards = list(self.guards.values())
             try:
                 for guard in guards:
                     self._pause_for_shutdown(guard)
             finally:
-                self.worker.stop()
+                drained = self.worker.stop()
                 # Also drain synchronous run_one calls, including an in-flight
                 # claim that has not entered its handler yet.
                 with self._condition:
                     self._condition.wait_for(lambda: self._active_handlers == 0 and self._manual_calls == 0)
+            return drained
 
     def _pause_for_shutdown(self, guard):
         if self.request_pause is None:

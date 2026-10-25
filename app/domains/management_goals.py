@@ -8,6 +8,7 @@ from hashlib import sha256
 from uuid import uuid4
 
 from app.domains.management import ManagementConflictError
+from app.storage.commit_signals import notify_after_commit
 
 UNSET = object()
 _UNSET = UNSET
@@ -154,6 +155,7 @@ class ManagementGoalService:
         if type(limit) is not int or not 1 <= limit <= 100 or type(offset) is not int or offset < 0:
             raise ValueError("limit must be 1..100 and cursor/offset non-negative")
 
+    @notify_after_commit
     def create_goal(self, session_id, *, objective, status="active", next_wake_at=None, wait_run_id=None):
         with closing(self._conn()) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -198,6 +200,7 @@ class ManagementGoalService:
             return {"goals": [self._project(conn, row) for row in rows[:limit]],
                     "next_offset": offset + limit if len(rows) > limit else None}
 
+    @notify_after_commit
     def update_goal(self, session_id, goal_id, *, expected_revision, objective=_UNSET, status=_UNSET,
                     next_wake_at=_UNSET, wait_run_id=_UNSET):
         with closing(self._conn()) as conn, conn:
@@ -307,15 +310,26 @@ class ManagementGoalService:
         return current is not None and all(current.get(key) == payload.get(key)
                                            for key in ("run_id", "status", "question_id", "review_id"))
 
-    def capture_events(self, now=None):
+    def capture_events(self, now=None, *, session_ids=None):
         instant = _instant(now)
         stamp = instant.isoformat()
         count = 0
         # Discover only rows that could produce a new event. This keeps the
         # common empty poll read-only, even when the inbox has a long history.
         with closing(self._conn()) as conn, conn:
-            managers = [r[0] for r in conn.execute("SELECT c.session_id FROM manager_controllers c JOIN agent_sessions s "
-                                                 "ON s.session_id=c.session_id WHERE s.kind='manager' AND s.status!='deleted'")]
+            filter_sql = ""
+            filter_params = ()
+            if session_ids is not None:
+                session_ids = tuple(dict.fromkeys(session_ids))
+                if not session_ids:
+                    return 0
+                filter_sql = " AND c.session_id IN (" + ",".join("?" for _ in session_ids) + ")"
+                filter_params = session_ids
+            managers = [r[0] for r in conn.execute(
+                "SELECT c.session_id FROM manager_controllers c JOIN agent_sessions s "
+                "ON s.session_id=c.session_id WHERE s.kind='manager' AND s.status!='deleted'" + filter_sql,
+                filter_params,
+            )]
             if not managers:
                 return 0
             linked_exists = self._has_table(conn, "managed_session_links")

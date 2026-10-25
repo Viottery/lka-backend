@@ -15,6 +15,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, field_validator
 
 from app.domains.mail_knowledge import MailKnowledgeMirror
+from app.storage.commit_signals import notify_after_commit
 
 
 def _now_iso() -> str:
@@ -395,6 +396,7 @@ class MatterService:
         return {"total": len(rows), "done": sum(row["status"] == "done" for row in rows),
                 "cancelled": sum(row["status"] == "cancelled" for row in rows)}
 
+    @notify_after_commit
     def create_matter(
         self,
         payload: MatterCreateInput,
@@ -910,6 +912,7 @@ class MatterService:
             ],
         )
 
+    @notify_after_commit
     def update_matter(
         self,
         *,
@@ -1080,6 +1083,7 @@ class MatterService:
             )
             return self.get_matter(matter_id=matter_id, conn=transaction, source_ids=source_ids, account_ids=account_ids, allow_unattributed=allow_unattributed)
 
+    @notify_after_commit
     def delete_matter(
         self, *, matter_id: str, expected_revision: int | None = None,
         conn: sqlite3.Connection | None = None, _receipt: Any = None,
@@ -1108,6 +1112,7 @@ class MatterService:
             transaction.execute("DELETE FROM matters_fts WHERE matter_id = ?", (matter_id,))
             return self.get_matter(matter_id=matter_id, conn=transaction, include_deleted=True)
 
+    @notify_after_commit
     def restore_matter(
         self, *, matter_id: str, conn: sqlite3.Connection | None = None, _receipt: Any = None,
     ) -> MatterRecord:

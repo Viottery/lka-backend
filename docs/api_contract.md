@@ -2422,6 +2422,13 @@ JSON字符。反馈不是当前事实证据或工具权限，仍需本轮用户�
 
 后台健康另含 `pending_watermark_count`，统计满容量/运行中等待续作的最新压缩水位，与待提取输入数分开。根 `recalled_memories.items` 的代表来源有 `source_count/sources_omitted`、`content_truncated/read_ref`；child MemoryReference 增加可选 `source_count` 和默认false的 `content_truncated`，旧快照缺字段时按默认值兼容。完整来源通过本地来源API查看，不由来源数量挤满prompt。
 
+`GET /background/health` 另含可选 `scheduling`：`mode` 为 `event`、`shadow` 或
+`poll`，`started/stopping` 表示调度线程生命周期，`ready/inflight/timer_count`
+为内存提示计数，`needs_rescan/rescan_generation/rescan_namespaces/recovery_in_progress`
+描述持久恢复进度，`timer_overflow/timer_overflow_pending` 描述容量溢出。
+`handler_failures/recovery_failures` 为本进程累计失败次数，`last_error_type` 仅返回异常类型。
+这些计数不等同于数据库中的作业数，不包含会话 ID 或内容；接口沿用后台控制鉴权。
+
 Agent 读取使用只读 `memory.search` / `memory.read`；`memory.remember(content?, evidence?)`
 提供即时保存回执（非只读，经过安全审查），两个参数至少提供一个。`content` 可描述目标偏好，
 `evidence` 兼容旧调用；模型会结合近期对话解析“记住刚才这个要求”，不再要求特定句式。

@@ -8,6 +8,7 @@ separately and use the lease epoch as its compare-and-swap fence.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import random
 import sqlite3
@@ -30,6 +31,7 @@ from app.core.llm_workloads import BackgroundBudgetDeferred, BackgroundTaskBudge
 from app.storage.sqlite_timing import connect_sqlite
 
 STATUSES = ("queued", "running", "retry_wait", "succeeded", "failed", "cancelled")
+_logger = logging.getLogger(__name__)
 _TERMINAL = {"succeeded", "failed", "cancelled"}
 _MAX_PAYLOAD_BYTES = 4096
 _ID_KEYS = frozenset({
@@ -94,6 +96,103 @@ class BackgroundJobStore:
     def __init__(self, db_path: Path | str, *, max_pending_jobs: int = 1024) -> None:
         self.db_path = str(db_path)
         self.max_pending_jobs = max(1, max_pending_jobs)
+        self._notify_lock = threading.Lock()
+        self._notifiers: set[Callable[[], None]] = set()
+
+    def add_notifier(self, callback: Callable[[], None]) -> None:
+        with self._notify_lock:
+            self._notifiers.add(callback)
+
+    def remove_notifier(self, callback: Callable[[], None]) -> None:
+        with self._notify_lock:
+            self._notifiers.discard(callback)
+
+    def notify_committed(self) -> None:
+        """Wake registered workers after a caller-owned transaction commits."""
+        with self._notify_lock:
+            callbacks = tuple(self._notifiers)
+        for callback in callbacks:
+            try:
+                callback()
+            except Exception as exc:  # noqa: BLE001 - a committed job remains accepted.
+                _logger.warning('Background scheduling notification failed type=%s', type(exc).__name__)
+
+    def next_due(self, *, kinds: tuple[str, ...] | None = None) -> datetime | None:
+        """Read the next queued availability or lease expiry without a write lock."""
+        kind_filter = ""
+        params: list[Any] = []
+        if kinds is not None:
+            if not kinds:
+                return None
+            kind_filter = " AND j.kind IN (" + ",".join("?" for _ in kinds) + ")"
+            params.extend(kinds)
+        stamp = _stamp(datetime.now(UTC))
+        blocker = """NOT EXISTS (SELECT 1 FROM background_jobs active
+            WHERE active.kind=j.kind AND active.scope_id=j.scope_id
+              AND active.job_id!=j.job_id AND active.status='running'
+              AND active.lease_expires_at>?)"""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT MIN(due) FROM ("
+                "SELECT j.available_at AS due FROM background_jobs j "
+                "WHERE j.status IN ('queued','retry_wait') AND " + blocker + kind_filter + " UNION ALL "
+                "SELECT j.lease_expires_at AS due FROM background_jobs j WHERE j.status='running' "
+                "AND j.lease_expires_at>?" + kind_filter + " UNION ALL "
+                "SELECT j.lease_expires_at AS due FROM background_jobs j WHERE j.status='running' "
+                "AND j.lease_expires_at<=? AND " + blocker + kind_filter + " UNION ALL "
+                "SELECT j.deadline AS due FROM background_jobs j WHERE j.status IN ('queued','running','retry_wait') "
+                "AND j.deadline IS NOT NULL" + kind_filter + " UNION ALL "
+                "SELECT w.available_at AS due FROM background_pending_watermarks w WHERE "
+                "(SELECT count(*) FROM background_jobs WHERE status IN ('queued','running','retry_wait'))<?"
+                " AND NOT EXISTS (SELECT 1 FROM background_jobs active WHERE active.kind=w.kind "
+                "AND active.scope_id=w.scope_id AND active.status='running')" +
+                (" AND w.kind IN (" + ",".join("?" for _ in kinds) + ")" if kinds is not None else "") +
+                " UNION ALL SELECT deadline AS due FROM background_pending_watermarks WHERE deadline IS NOT NULL" +
+                (" AND kind IN (" + ",".join("?" for _ in kinds) + ")" if kinds is not None else "") + ")",
+                [stamp, *params, stamp, *params, stamp, stamp, *params, *params,
+                 self.max_pending_jobs, *params, *params],
+            ).fetchone()
+        return _utc(row[0]) if row and row[0] else None
+
+    def has_ready(self, *, kinds: tuple[str, ...] | None = None) -> bool:
+        kind_filter = ""
+        now = _stamp(datetime.now(UTC))
+        params: list[Any] = [now, now, now]
+        if kinds is not None:
+            if not kinds:
+                return False
+            kind_filter = " AND j.kind IN (" + ",".join("?" for _ in kinds) + ")"
+            params.extend(kinds)
+        with self._connect() as conn:
+            ready = conn.execute(
+                "SELECT 1 FROM background_jobs j WHERE ((j.status IN ('queued','retry_wait') AND j.available_at<=?) "
+                "OR (j.status='running' AND j.lease_expires_at<=?)) "
+                "AND NOT EXISTS ("
+                "SELECT 1 FROM background_jobs active WHERE active.kind=j.kind AND active.scope_id=j.scope_id "
+                "AND active.job_id!=j.job_id AND active.status='running' AND active.lease_expires_at>?)" +
+                kind_filter + " LIMIT 1", params,
+            ).fetchone() is not None
+            if ready:
+                return True
+            # Claim performs terminal cleanup for expired deadlines even when
+            # normal availability or a same-scope lease blocks execution.
+            if conn.execute(
+                "SELECT 1 FROM background_jobs WHERE status IN ('queued','running','retry_wait') "
+                "AND deadline IS NOT NULL AND deadline<=? LIMIT 1", (now,),
+            ).fetchone() is not None:
+                return True
+            # Backpressured watermarks are durable work too. Once capacity is
+            # released, the claim transaction must be allowed to materialize
+            # them even when no ordinary job remains queued.
+            return conn.execute(
+                "SELECT 1 FROM background_pending_watermarks w WHERE (w.available_at<=? OR w.deadline<=?)" +
+                (" AND w.kind IN (" + ",".join("?" for _ in kinds) + ")" if kinds is not None else "") +
+                " AND (((SELECT count(*) FROM background_jobs WHERE status IN ('queued','running','retry_wait'))<? "
+                "AND NOT EXISTS (SELECT 1 FROM background_jobs active WHERE active.kind=w.kind "
+                "AND active.scope_id=w.scope_id AND active.status='running')) "
+                "OR (w.deadline IS NOT NULL AND w.deadline<=?)) LIMIT 1",
+                [now, now, *(kinds or ()), self.max_pending_jobs, now],
+            ).fetchone() is not None
 
     def _connect(self) -> sqlite3.Connection:
         conn = connect_sqlite(self.db_path, timeout=10, isolation_level=None)
@@ -433,6 +532,7 @@ class BackgroundJobStore:
             ).fetchone()
             if own:
                 db.commit()
+                self.notify_committed()
             return self._public(row)
         except Exception:
             if own:
@@ -819,7 +919,8 @@ class BackgroundJobWorker:
     """Small bounded thread pool runner; handlers run outside queue transactions."""
 
     def __init__(self, store: BackgroundJobStore, handlers: Mapping[str, Callable[[dict[str, Any]], None]],
-                 *, worker_count: int = 1, lease_seconds: float = 60, poll_seconds: float = 1) -> None:
+                 *, worker_count: int = 1, lease_seconds: float = 60, poll_seconds: float = 1,
+                 scheduling_mode: str = "poll", reconcile_seconds: float = 30) -> None:
         if worker_count < 1 or worker_count > 32:
             raise ValueError("worker_count must be between 1 and 32")
         self.store = store
@@ -827,6 +928,15 @@ class BackgroundJobWorker:
         self.worker_count = worker_count
         self.lease_seconds = lease_seconds
         self.poll_seconds = poll_seconds
+        if scheduling_mode not in {"event", "poll", "shadow"}:
+            raise ValueError("scheduling_mode must be event, poll, or shadow")
+        self.scheduling_mode = scheduling_mode
+        self.reconcile_seconds = max(0.1, reconcile_seconds)
+        self._wake_condition = threading.Condition()
+        self._wake_generation = 0
+        self._next_reconcile = 0.0
+        if scheduling_mode == "event":
+            self.store.add_notifier(self.notify)
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
         self._owner = f"background-{uuid4().hex}"
@@ -871,16 +981,67 @@ class BackgroundJobWorker:
             thread.start()
             self._threads.append(thread)
 
+    def notify(self) -> None:
+        with self._wake_condition:
+            self._wake_generation += 1
+            self._wake_condition.notify_all()
+
+    wake = notify
+
+    def configure_scheduling(self, mode: str, reconcile_seconds: float | None = None) -> None:
+        if mode not in {"event", "poll", "shadow"}:
+            raise ValueError("scheduling_mode must be event, poll, or shadow")
+        was_event = self.scheduling_mode == "event"
+        self.scheduling_mode = mode
+        if reconcile_seconds is not None:
+            self.reconcile_seconds = max(0.1, reconcile_seconds)
+        if was_event and mode != "event":
+            self.store.remove_notifier(self.notify)
+        elif not was_event and mode == "event":
+            self.store.add_notifier(self.notify)
+        self.notify()
+
+    def _wait_event(self, generation: int, *, error: bool = False) -> None:
+        if error:
+            delay = 0.25
+        else:
+            try:
+                due = self.store.next_due(kinds=tuple(self.handlers))
+            except Exception:  # noqa: BLE001 - store failures use a bounded retry delay.
+                delay = 0.25
+            else:
+                reconcile_delay = self.reconcile_seconds * random.uniform(0.9, 1.1)
+                if due is None:
+                    delay = reconcile_delay
+                else:
+                    remaining = (due - datetime.now(UTC)).total_seconds()
+                    delay = min(reconcile_delay, max(0.05, remaining))
+        with self._wake_condition:
+            if generation == self._wake_generation and not self._stop.is_set():
+                self._wake_condition.wait(timeout=delay)
+
     def _loop(self, owner: str) -> None:
         while not self._stop.is_set():
+            with self._wake_condition:
+                generation = self._wake_generation
             try:
+                if self.scheduling_mode == "event" and not self.store.has_ready(kinds=tuple(self.handlers)):
+                    self._wait_event(generation)
+                    continue
                 if not self.run_one(owner):
-                    self._stop.wait(self.poll_seconds)
+                    if self.scheduling_mode == "event":
+                        self._wait_event(generation)
+                    else:
+                        self._stop.wait(self.poll_seconds)
             except Exception:  # noqa: BLE001 - keep worker alive after unexpected errors.
-                self._stop.wait(self.poll_seconds)
+                if self.scheduling_mode == "event":
+                    self._wait_event(generation, error=True)
+                else:
+                    self._stop.wait(self.poll_seconds)
 
-    def stop(self, timeout: float | None = 5) -> None:
+    def stop(self, timeout: float | None = 5) -> bool:
         self._stop.set()
+        self.notify()
         for thread in self._threads:
             if timeout is None:
                 thread.join()
@@ -889,6 +1050,7 @@ class BackgroundJobWorker:
         # A timed-out handler cannot be killed safely. Retain its thread and
         # stop event so an immediate start cannot revive it beside a new pool.
         self._threads = [thread for thread in self._threads if thread.is_alive()]
+        return not self._threads
 
 
 def _classify_worker_error(exc: Exception) -> tuple[str, bool]:

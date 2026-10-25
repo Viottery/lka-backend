@@ -12,6 +12,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, Field
 
+from app.storage.commit_signals import notify_after_commit
+
 
 def _now() -> datetime:
     return datetime.now(UTC)
@@ -566,6 +568,7 @@ class WatchService:
         finally:
             conn.close()
 
+    @notify_after_commit
     def complete_with_briefing(
         self,
         occurrence_id: str,
@@ -631,6 +634,7 @@ class WatchService:
             conn.close()
         return self.get_briefing(briefing_id)
 
+    @notify_after_commit
     def finish_occurrence(
         self,
         occurrence_id: str,

@@ -7,6 +7,7 @@ Write reservations intentionally survive waits/pauses until that root terminates
 from __future__ import annotations
 
 import json
+import logging
 from contextlib import closing
 from datetime import UTC, datetime
 from typing import Literal
@@ -15,6 +16,9 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.domains.management import ManagementConflictError
+from app.storage.commit_signals import notify_after_commit
+
+_logger = logging.getLogger(__name__)
 
 TERMINAL = {"completed", "failed", "cancelled", "timed_out"}
 PRIORITY = {"low": 0, "normal": 1, "high": 2, "urgent": 3}
@@ -107,6 +111,7 @@ class ManagementQueueService:
         return {key: row[key] for key in ("queue_id", "manager_session_id", "command_id", "run_id", "matter_id",
                 "matter_revision", "priority", "deadline", "state", "revision", "issue", "created_at", "updated_at")}
 
+    @notify_after_commit
     def queue_work(self, context, **kwargs):
         args = QueueWorkInput.model_validate(kwargs)
         prepared = self.tasks.prepare_task(context, command_id=args.command_id, purpose=args.purpose,
@@ -298,6 +303,11 @@ class ManagementQueueService:
                              "DO UPDATE SET last_served=excluded.last_served", (sid, sequence))
                 served[sid] = sequence
                 released += 1
+        if released:
+            try:
+                self.dispatcher.notify()
+            except Exception as exc:  # noqa: BLE001 - committed queue release remains accepted
+                _logger.warning("Management queue dispatcher signal failed (%s)", type(exc).__name__)
         return released
 
     def guard_replacement(self, run_id):
@@ -337,6 +347,7 @@ class ManagementQueueService:
             return {"items": [self._view(r) for r in rows[:limit]],
                     "next_offset": offset + limit if len(rows) > limit else None}
 
+    @notify_after_commit
     def control_queue(self, context, *, command_id, queue_id, expected_revision, action):
         if (not isinstance(command_id, str) or not 1 <= len(command_id) <= 128
                 or not isinstance(queue_id, str) or not 1 <= len(queue_id) <= 256

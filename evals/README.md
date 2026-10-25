@@ -1,5 +1,53 @@
 # Local Knowledge Agent OS Eval Benchmarks
 
+## Event scheduling transport benchmark
+
+`scripts/benchmark_event_scheduling.py` starts an isolated loopback HTTP backend
+with disposable SQLite data and a fixed 50 ms execution stub. It never loads
+private configuration or calls a model or tool. Output must use an ignored
+`docs/_engineering/` directory. The default protocol deliberately bypasses
+`freeze_for_dispatch` and runs one accepted input per run as a single-input
+worst-case scheduling load; keep its pass/fail report even if batching performs
+better. The explicit `--production-batches` opt-in runs the production freeze
+path and audits ordered batch membership, per-input content fingerprints,
+same-session binding, one-time input assignment, and exact run-to-dispatch-job
+coverage. Its run count can be lower than its accepted input count. These
+protocols measure different loads and must not be presented as interchangeable.
+Eligible-to-bind latency samples only each run's lowest-sequence (primary)
+input, because later batch members may be accepted after that run was created;
+batch membership/width is reported separately and does not imply per-input
+binding latency.
+
+```bash
+.venv/bin/python scripts/benchmark_event_scheduling.py --mode event \
+  --sessions 100 --concurrency 8 --rate 20 --requests 10000 --seed 42 \
+  --output docs/_engineering/event-scheduling/event-10000.json
+```
+
+To separately measure real input-batch freezing, opt in explicitly and save a
+distinct report. Do not replace or discard the single-input worst-case result:
+
+```bash
+.venv/bin/python scripts/benchmark_event_scheduling.py --mode event \
+  --sessions 100 --concurrency 8 --rate 20 --requests 10000 --seed 42 \
+  --production-batches \
+  --output docs/_engineering/event-scheduling/event-10000-production-batches.json
+```
+
+The workload includes 10% duplicate submissions and verifies durable receipts,
+terminal completion and no unbound inputs. The default protocol verifies one run
+per unique input; production-batches verifies each input appears in exactly one
+ordered run batch, where run count may be lower than input count. Each manager
+accepts its phase while it is the default manager; accepted earlier queues keep
+draining. This respects the API's default-manager restriction and does not claim
+100 managers submitting simultaneously. Reported bind latency starts when the
+primary input is eligible after its previous root completes, separately from HTTP
+latency; later members' freeze/batch correctness is reported without claiming
+per-input bind latency.
+`--mode poll` measures the compatibility consumer; `shadow` keeps that consumer
+as the only writer and adds read-only recovery observation. These results measure
+scheduling correctness and latency, not real-model quality or production capacity.
+
 ## Repository-level software engineering
 
 The [software engineering adapter](datasets/software_engineering/README.md) adds

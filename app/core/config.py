@@ -2,6 +2,7 @@
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -33,6 +34,16 @@ class Settings(BaseSettings):
     )
     db_write_transaction_seconds: float = Field(
         default=30, alias="LKA_DB_WRITE_TRANSACTION_SECONDS", gt=0, le=3600, allow_inf_nan=False,
+    )
+    scheduling_mode: Literal["poll", "shadow", "event"] = Field(default="event", alias="LKA_SCHEDULING_MODE")
+    scheduling_reconcile_seconds: float = Field(
+        default=30, alias="LKA_SCHEDULING_RECONCILE_SECONDS", ge=1, le=300, allow_inf_nan=False,
+    )
+    scheduling_capacity: int = Field(default=1024, alias="LKA_SCHEDULING_CAPACITY", ge=8, le=100000)
+    scheduling_workers: int = Field(default=2, alias="LKA_SCHEDULING_WORKERS", ge=1, le=8)
+    scheduling_recovery_page_size: int = Field(default=128, alias="LKA_SCHEDULING_RECOVERY_PAGE_SIZE", ge=1, le=1024)
+    scheduling_stop_seconds: float = Field(
+        default=45, alias="LKA_SCHEDULING_STOP_SECONDS", ge=1, le=120, allow_inf_nan=False,
     )
     messages_media_cache_dir: Path | None = Field(
         default=None, alias="LKA_MESSAGES_MEDIA_CACHE_DIR"

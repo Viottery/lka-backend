@@ -18,6 +18,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.domains.management import ManagementConflictError
+from app.storage.commit_signals import notify_after_commit
 
 
 def _json(value):
@@ -272,6 +273,7 @@ class ManagementAssignmentService:
                          (context.session_id, args.command_id, fingerprint, action, _json(receipt), datetime.now(UTC).isoformat()))
             return receipt
 
+    @notify_after_commit
     def start_work(self, context, **kwargs):
         """Atomically accept one ready business task; no worker sees a partial bind.
 
@@ -310,9 +312,11 @@ class ManagementAssignmentService:
             self.tasks.run_manager.get_run(run.run_id)
         return receipt
 
+    @notify_after_commit
     def assign_existing(self, context, **kwargs):
         return self._mutate(context, AssignmentInput.model_validate(kwargs), "assign_work")
 
+    @notify_after_commit
     def review(self, context, **kwargs):
         return self._mutate(context, ReviewInput.model_validate(kwargs), "review_work")
 

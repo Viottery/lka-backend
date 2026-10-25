@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.domains.management import ManagementConflictError
 from app.domains.matters import MatterCreateInput, MatterUpdateInput
+from app.storage.commit_signals import notify_after_commit
 
 
 def _json(value):
@@ -317,6 +318,7 @@ class ManagementWorkService:
             self.tasks.caller(SimpleNamespace(run_id=row["run_id"], session_id=session_id), mutate=True, conn=conn)
         return row
 
+    @notify_after_commit
     def create_matter(self, context, *, command_id, title, summary="", **fields):
         """Compact capture entry using the existing proposal/publication path."""
         self.tasks.caller(context, mutate=True, supervisor_only=True)
@@ -326,6 +328,7 @@ class ManagementWorkService:
             },
         }])
 
+    @notify_after_commit
     def update_matter(self, context, *, command_id, matter_id, expected_revision, changes):
         self.tasks.caller(context, mutate=True, supervisor_only=True)
         if not isinstance(changes, dict) or not changes:
@@ -335,6 +338,7 @@ class ManagementWorkService:
             "changes": changes,
         }])
 
+    @notify_after_commit
     def organize_work(self, context, command_id, operations):
         args = OrganizeWorkInput.model_validate({"command_id": command_id, "operations": operations})
         normalized = args.model_dump(mode="json", exclude_unset=True)["operations"]

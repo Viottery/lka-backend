@@ -167,16 +167,26 @@ def _leading_sql_words(sql, count=2):
     return words
 
 
+@dataclass(slots=True)
+class _WriteTicket:
+    condition: threading.Condition
+
+
 class _DatabaseQueue:
     def __init__(self, key, capacity):
         self.key = key
         self.capacity = capacity
-        self.condition = threading.Condition()
+        self._lock = threading.RLock()
+        self.condition = threading.Condition(self._lock)
         self.waiters = deque()
         self.owner = None
         self.owner_thread = None
         self.owner_started = None
         self.owner_details = {}
+
+    def _notify_head_locked(self):
+        if self.waiters:
+            self.waiters[0].condition.notify()
 
     def acquire(self, conn):
         with self.condition:
@@ -186,7 +196,7 @@ class _DatabaseQueue:
             held = _thread_holds.get(threading.get_ident(), set())
             if self.key in held:
                 raise SqliteWriteQueueError("nested SQLite write on another connection would deadlock")
-        ticket = object()
+        ticket = _WriteTicket(threading.Condition(self._lock))
         with self.condition:
             if len(self.waiters) >= self.capacity:
                 _log_queue_failure(conn, "full")
@@ -202,7 +212,7 @@ class _DatabaseQueue:
                     if remaining <= 0:
                         _log_queue_failure(conn, "wait_timeout")
                         raise SqliteWriteQueueError("SQLite write queue wait timed out")
-                    self.condition.wait(remaining)
+                    ticket.condition.wait(remaining)
                 self.waiters.popleft()
                 self.owner = conn
                 self.owner_thread = threading.get_ident()
@@ -218,11 +228,13 @@ class _DatabaseQueue:
             _observe(conn, "queue_wait", (time.monotonic() - started) * 1000, details=details)
         except BaseException as exc:
             with self.condition:
+                was_head = bool(self.waiters and self.waiters[0] is ticket)
                 try:
                     self.waiters.remove(ticket)
                 except ValueError:
                     pass
-                self.condition.notify_all()
+                if was_head and self.owner is None:
+                    self._notify_head_locked()
             _observe(conn, "queue_wait", (time.monotonic() - started) * 1000, error=exc,
                      details=details)
             raise
@@ -244,7 +256,7 @@ class _DatabaseQueue:
                                 _thread_holds.pop(self.owner_thread, None)
                 self.owner_thread = None
                 conn._progress_deadline = None
-                self.condition.notify_all()
+                self._notify_head_locked()
         if observed is not None:
             error = SqliteTransactionTimeoutError("expired") if conn._poisoned else None
             _observe(conn, "transaction", observed[0], error=error, details=observed[1])

@@ -44,6 +44,179 @@ class ManagementCoordinator:
         self._stop = threading.Event()
         self._thread = None
         self.last_error = None
+        self._scheduler = None
+        self._scheduling_mode = "poll"
+
+    def attach_scheduler(self, scheduler, mode="event"):
+        """Attach the shared keyed scheduler for event or shadow operation."""
+        if mode not in {"event", "shadow", "poll"}:
+            raise ValueError("mode must be event, shadow, or poll")
+        self._scheduler, self._scheduling_mode = scheduler, mode
+        scheduler.register("management", self._handle_scheduled_key)
+        for service in (self.management, self.goals, getattr(self, "schedules", None),
+                        getattr(self, "attention", None), getattr(self, "delivery", None),
+                        getattr(self, "delegates", None), getattr(self, "work_queue", None),
+                        getattr(self, "work_service", None), getattr(self, "assignments", None),
+                        getattr(self, "watch_subscriptions", None)):
+            if service is not None and mode == "event":
+                try:
+                    service.on_change = lambda: scheduler.notify("management", "*")
+                except (AttributeError, TypeError):
+                    pass
+        if mode == "event":
+            self.worker.configure_scheduling("event", scheduler.reconcile_seconds)
+
+    def _shadow_observe(self):
+        """Read-only comparison hook; the poll path remains the only writer."""
+        with closing(self._conn()) as conn:
+            pending = conn.execute(
+                "SELECT count(DISTINCT session_id) FROM manager_inbox "
+                "WHERE consumed_execution_id IS NULL"
+            ).fetchone()[0]
+            future = self._future_management_due(conn, datetime.now(UTC))
+        self.last_shadow_observation = {"pending_sessions": pending, "next_due": future}
+
+    def notify_run_state(self, record):
+        """Enqueue a run identity only; callers may hold the run manager lock."""
+        if self._scheduler is not None and self._scheduling_mode == "event":
+            run_id = getattr(record, "run_id", None)
+            if run_id:
+                self._scheduler.notify("management", "run:" + run_id)
+
+    @staticmethod
+    def _table_exists(conn, table):
+        return conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone() is not None
+
+    def _affected_management_sessions(self, run_id):
+        """Resolve only manager sessions connected to one committed run state."""
+        affected = set()
+        with closing(self._conn()) as conn:
+            row = conn.execute(
+                "SELECT r.session_id,s.kind FROM agent_runs r JOIN agent_sessions s ON s.session_id=r.session_id "
+                "WHERE r.run_id=? AND s.status!='deleted'", (run_id,),
+            ).fetchone()
+            if row is None:
+                return affected
+            run_session_id, kind = row["session_id"], row["kind"]
+            if kind == "manager":
+                pending = conn.execute(
+                    "SELECT 1 FROM manager_inbox WHERE session_id=? AND consumed_execution_id IS NULL LIMIT 1",
+                    (run_session_id,),
+                ).fetchone()
+                bound = conn.execute(
+                    "SELECT 1 FROM manager_executions WHERE run_id=? AND status='bound' LIMIT 1", (run_id,),
+                ).fetchone()
+                if pending or bound:
+                    affected.add(run_session_id)
+            if self._table_exists(conn, "managed_session_links"):
+                affected.update(r[0] for r in conn.execute(
+                    "SELECT DISTINCT manager_session_id FROM managed_session_links "
+                    "WHERE run_id=? OR task_session_id=?", (run_id, run_session_id),
+                ))
+            if self._table_exists(conn, "manager_goals"):
+                affected.update(r[0] for r in conn.execute(
+                    "SELECT DISTINCT session_id FROM manager_goals WHERE wait_run_id=? "
+                    "AND status IN ('active','waiting')", (run_id,),
+                ))
+            if self._table_exists(conn, "manager_delegates"):
+                if kind == "manager" and conn.execute(
+                    "SELECT 1 FROM manager_delegates WHERE parent_session_id=? AND state='active' LIMIT 1",
+                    (run_session_id,),
+                ).fetchone():
+                    affected.add(run_session_id)
+                affected.update(r[0] for r in conn.execute(
+                    "SELECT DISTINCT parent_session_id FROM manager_delegates "
+                    "WHERE session_id=? AND state='active'", (run_session_id,),
+                ))
+        return affected
+
+    def _handle_scheduled_key(self, key):
+        if self._scheduling_mode == "shadow":
+            self._shadow_observe()
+        elif self._scheduling_mode != "event" or key == "*":
+            self.tick()
+        elif key.startswith("run:"):
+            self._handle_run_state(key[4:])
+
+    def _handle_run_state(self, run_id):
+        now = datetime.now(UTC)
+        sessions = self._affected_management_sessions(run_id)
+        if not sessions:
+            return
+        queue = getattr(self, "work_queue", None)
+        if queue is not None:
+            queue.tick(now=now)
+        self.goals.capture_events(now=now, session_ids=sessions)
+        delegates = getattr(self, "delegates", None)
+        if delegates is not None:
+            delegates.capture_events(session_ids=sessions)
+        self.reconcile(session_ids=sessions)
+        scheduled = self._enqueue_pending_sessions(sessions, now)
+        if scheduled:
+            self.worker.notify()
+
+    def _schedule_next_due(self, now):
+        if self._scheduler is None or self._scheduling_mode != "event":
+            return
+        with closing(self._conn()) as conn:
+            due = self._future_management_due(conn, now)
+        if due is not None:
+            self._scheduler.schedule("management", "*", max(0.01, (due - now).total_seconds()))
+
+    def _future_management_due(self, conn, now):
+        due_values = []
+        now_stamp = now.astimezone(UTC).isoformat()
+        if self.goals._has_table(conn, "manager_goals"):
+            row = conn.execute(
+                "SELECT next_wake_at FROM manager_goals WHERE status IN ('active','waiting') "
+                "AND next_wake_at IS NOT NULL AND julianday(next_wake_at)>julianday(?) "
+                "ORDER BY julianday(next_wake_at) LIMIT 1", (now_stamp,)
+            ).fetchone()
+            due_values.append(row[0] if row else None)
+        for table, query in (
+            ("manager_schedules", "SELECT next_run_at FROM manager_schedules WHERE enabled=1 AND next_run_at IS NOT NULL AND julianday(next_run_at)>julianday(?) ORDER BY julianday(next_run_at) LIMIT 1"),
+            ("manager_attention_sweep_state", "SELECT next_due_at FROM manager_attention_sweep_state WHERE julianday(next_due_at)>julianday(?) ORDER BY julianday(next_due_at) LIMIT 1"),
+        ):
+            if self.goals._has_table(conn, table):
+                row = conn.execute(query, (now_stamp,)).fetchone()
+                due_values.append(row[0] if row else None)
+        if self.goals._has_table(conn, "manager_executions"):
+            cooldown = max(0, int(getattr(self.config, "min_wake_interval_seconds", 0)))
+            day_start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+            managers = conn.execute(
+                "SELECT c.session_id,MAX(e.created_at) AS latest FROM manager_controllers c "
+                "JOIN agent_sessions s ON s.session_id=c.session_id LEFT JOIN manager_executions e "
+                "ON e.session_id=c.session_id WHERE c.status='active' AND s.status!='deleted' "
+                "GROUP BY c.session_id"
+            ).fetchall()
+            for manager in managers:
+                latest = manager["latest"]
+                if latest and cooldown:
+                    instant = datetime.fromisoformat(latest)
+                    if instant.tzinfo is None:
+                        instant = instant.replace(tzinfo=UTC)
+                    due_values.append((instant.astimezone(UTC) + timedelta(seconds=cooldown)).isoformat())
+                limit = getattr(self.config, "max_daily_rounds", None)
+                if limit is not None:
+                    count = conn.execute(
+                        "SELECT count(*) FROM manager_executions WHERE session_id=? AND created_at>=?",
+                        (manager["session_id"], day_start),
+                    ).fetchone()[0]
+                    if count >= limit:
+                        due_values.append((now.replace(hour=0, minute=0, second=0, microsecond=0)
+                                           + timedelta(days=1)).isoformat())
+        parsed = []
+        for value in due_values:
+            if value:
+                instant = datetime.fromisoformat(value)
+                if instant.tzinfo is None:
+                    instant = instant.replace(tzinfo=UTC)
+                instant = instant.astimezone(UTC)
+                # A still-due row can be ineligible, muted, paused, or waiting
+                # for user input. Do not turn that fact into a hot timer loop.
+                if instant > now:
+                    parsed.append(instant)
+        return min(parsed) if parsed else None
 
     def ensure_schema(self):
         self.notifications.ensure_schema()
@@ -307,6 +480,14 @@ class ManagementCoordinator:
         return selected, context
 
     def tick(self, now=None):
+        now = now or datetime.now(UTC)
+        result = self._tick_impl(now)
+        if result.get("scheduled"):
+            self.worker.notify()
+        self._schedule_next_due(now)
+        return result
+
+    def _tick_impl(self, now=None):
         """Capture continues while paused; eligibility controls model work only."""
         now = now or datetime.now(UTC)
         queue = getattr(self, "work_queue", None)
@@ -322,10 +503,17 @@ class ManagementCoordinator:
             if service is not None:
                 captured += service.tick(now=now)
         self.reconcile()
+        scheduled = self._enqueue_pending_sessions(None, now)
+        return {"captured": captured, "scheduled": scheduled}
+
+    def _enqueue_pending_sessions(self, session_ids, now):
         scheduled = 0
         with closing(self._conn()) as conn, conn:
-            ids = [r[0] for r in conn.execute("SELECT DISTINCT session_id FROM manager_inbox "
-                                            "WHERE consumed_execution_id IS NULL")]
+            if session_ids is None:
+                ids = [r[0] for r in conn.execute("SELECT DISTINCT session_id FROM manager_inbox "
+                                                "WHERE consumed_execution_id IS NULL")]
+            else:
+                ids = sorted(set(session_ids))
             candidates = []
             for sid in ids:
                 # _pending can mark stale evidence obsolete, so run it inside
@@ -337,7 +525,7 @@ class ManagementCoordinator:
                     continue
                 candidates.append(sid)
             if not candidates:
-                return {"captured": captured, "scheduled": 0}
+                return 0
             conn.execute("BEGIN IMMEDIATE")
             for sid in candidates:
                 if not self._eligible(conn, sid, now) or not self._pending(conn, sid):
@@ -353,7 +541,7 @@ class ManagementCoordinator:
                     conn=conn, watermark_order=generation,
                 )
                 scheduled += 1
-        return {"captured": captured, "scheduled": scheduled}
+        return scheduled
 
     def _bind(self, job):
         sid = job["payload"]["session_id"]
@@ -487,6 +675,10 @@ class ManagementCoordinator:
             return
         if run is not None:
             self.run_manager.get_run(run.run_id)
+            try:
+                self.dispatcher.notify()
+            except Exception as exc:  # noqa: BLE001 - dispatch is already durable.
+                _logger.warning("Management dispatch notification failed type=%s", type(exc).__name__)
 
     def _budget_scopes(self, sid, execution_id, revisions):
         return [
@@ -699,12 +891,21 @@ class ManagementCoordinator:
         self.run_manager.refresh_after_transaction(completed)
         return True
 
-    def reconcile(self):
+    def reconcile(self, session_ids=None):
         """Release failed bindings without consuming evidence or replaying writes."""
         with closing(self._conn()) as conn, conn:
+            filter_sql = ""
+            params = []
+            if session_ids is not None:
+                session_ids = tuple(dict.fromkeys(session_ids))
+                if not session_ids:
+                    return
+                filter_sql = " AND e.session_id IN (" + ",".join("?" for _ in session_ids) + ")"
+                params.extend(session_ids)
             rows = conn.execute("SELECT e.execution_id "
                                 "FROM manager_executions e JOIN agent_runs r ON r.run_id=e.run_id WHERE e.status='bound' "
-                                "AND r.status IN ('completed','failed','cancelled','timed_out')").fetchall()
+                                "AND r.status IN ('completed','failed','cancelled','timed_out')" + filter_sql,
+                                params).fetchall()
             if not rows:
                 return
             conn.execute("BEGIN IMMEDIATE")
@@ -732,6 +933,12 @@ class ManagementCoordinator:
             return
         self._stop.clear()
         self.worker.start()
+        if self._scheduler is not None and self._scheduling_mode == "event":
+            self._schedule_next_due(datetime.now(UTC))
+            self._scheduler.notify("management", "*")
+            return
+        if self._scheduler is not None and self._scheduling_mode == "shadow":
+            self._scheduler.notify("management", "*")
         self._thread = threading.Thread(target=self._scan, daemon=True, name="lka-management-scan")
         self._thread.start()
 

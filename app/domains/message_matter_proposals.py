@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator,
 
 from app.domains.matters import MatterCreateInput, MatterService, MatterSourceLinkInput
 from app.domains.message_history import _now
+from app.storage.commit_signals import notify_after_commit
 
 
 def _json(value: Any) -> str:
@@ -580,6 +581,7 @@ class MessageMatterProposalService:
                     return False
         return True
 
+    @notify_after_commit
     def decide(
         self,
         proposal_id,

@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.domains.management import ManagementConflictError
 from app.domains.management_goals import ManagementGoalService, _instant
+from app.storage.commit_signals import notify_after_commit
 
 
 class DeliveryPolicyInput(BaseModel):
@@ -48,6 +49,7 @@ class ManagementDeliveryService:
             ManagementGoalService._manager(conn, session_id)
             return self._get(conn, session_id)
 
+    @notify_after_commit
     def configure(self, session_id, expected_revision, muted=False, snooze_until=None,
                   allow_decisions=True, *, authority_check=None):
         args = DeliveryPolicyInput.model_validate({"expected_revision": expected_revision, "muted": muted,

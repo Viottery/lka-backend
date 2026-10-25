@@ -89,6 +89,9 @@ def _health(request: Request) -> dict:
     snapshot["config_revision"] = config["revision"]
     snapshot["config_restart_required"] = config["restart_required"]
     snapshot["llm_workloads"] = request.app.state.runtime.llm_workloads.health()
+    runtime = request.app.state.runtime
+    if hasattr(runtime, "scheduler"):
+        snapshot["scheduling"] = {"mode": runtime.settings.scheduling_mode, **runtime.scheduler.status()}
     return snapshot
 
 

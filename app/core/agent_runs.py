@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import queue
 import threading
 import time
@@ -26,6 +27,8 @@ from app.core.safety import (
     SafetyReviewRequest,
     SafetyReviewStatus,
 )
+
+_logger = logging.getLogger(__name__)
 
 
 def _now_iso() -> str:
@@ -111,6 +114,7 @@ class InMemoryAgentRunManager:
         self._event_writer: threading.Thread | None = None
         self._event_writer_error: BaseException | None = None
         self._closed = False
+        self.on_state_change: Callable[[AgentRunRecord], None] | None = None
         if durable_store is not None:
             self._pending_delta_events = queue.Queue(maxsize=2048)
             self._event_writer = threading.Thread(
@@ -543,6 +547,7 @@ class InMemoryAgentRunManager:
                     merged = self._load_events(record.run_id)
                 self._events[record.run_id] = merged
             self._restore_cancel_request(record)
+        self._notify_state_change(record)
         return record
 
     def mark_running(self, run_id: str) -> AgentRunRecord:
@@ -1704,6 +1709,8 @@ class InMemoryAgentRunManager:
                 self._cancel_requests[record.run_id] = record.metadata.get("cancel_reason")
         for event in events:
             self._events[event.run_id].append(event)
+        for record in [*(created or []), *updated]:
+            self._notify_state_change(record)
 
     def is_cancel_requested(self, run_id: str) -> bool:
         with self._lock:
@@ -1748,6 +1755,21 @@ class InMemoryAgentRunManager:
     def _persist_run(self, record: AgentRunRecord) -> None:
         if self.durable_store is not None:
             self.durable_store.save_run(record.model_dump(mode="json"), updated_at=_now_iso())
+        previous = self._runs.get(record.run_id)
+        if previous is None or previous.status != record.status or any(
+            previous.metadata.get(key) != record.metadata.get(key)
+            for key in ("pause_requested", "cancel_requested")
+        ):
+            self._notify_state_change(record)
+
+    def _notify_state_change(self, record: AgentRunRecord) -> None:
+        if self.on_state_change is not None:
+            try:
+                # Callbacks may only enqueue IDs. Persistence has completed;
+                # notification failure cannot invalidate the committed state.
+                self.on_state_change(record)
+            except Exception as exc:  # noqa: BLE001 - reconciliation recovers missed hints.
+                _logger.warning("Run state notification failed type=%s", type(exc).__name__)
 
     def _persist_event(self, event: AgentRunEvent) -> None:
         if self.durable_store is not None:

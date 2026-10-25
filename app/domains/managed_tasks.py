@@ -14,6 +14,7 @@ from uuid import uuid4
 from app.core.agent_runs import AgentRunRecord, AgentRunStatus
 from app.core.turn_input import TurnInputEnvelope
 from app.domains.management import ManagementConflictError, ManagementPausedError
+from app.storage.commit_signals import notify_after_commit
 
 TERMINAL = {"completed", "failed", "cancelled", "timed_out"}
 
@@ -442,6 +443,7 @@ class ManagedTaskService:
         self.caller(context)
         return self.goals.list_events(context.session_id, after=after, limit=limit)
 
+    @notify_after_commit
     def set_goal(self, context, *, command_id, objective=None, goal_id=None, expected_revision=None,
                  **changes):
         """Foreground changes commit now; autonomous proposals publish with the answer."""
@@ -551,6 +553,7 @@ class ManagedTaskService:
         return {"title": self.management._title(title),
                 "envelope": self._envelope(context, caller, command_id, purpose), "workspace": workspace}
 
+    @notify_after_commit
     def start_task(self, context, *, command_id, purpose, title="管理任务", workspace_path=None,
                    execution_target=None):
         if execution_target is not None:
@@ -627,6 +630,7 @@ class ManagedTaskService:
             return {"items": [], "enabled": False, "local_execution": local, "session_roles": roles}
         return {"enabled": True, **remote.execution_targets(), "local_execution": local, "session_roles": roles}
 
+    @notify_after_commit
     def send_instruction(self, context, *, command_id, session_id, expected_run_id, purpose):
         caller = self.caller(context, mutate=True)
         target_session = self.sessions.get_session_or_none(session_id=session_id)
@@ -704,6 +708,7 @@ class ManagedTaskService:
             self.run_manager.get_run(run.run_id)
         return result
 
+    @notify_after_commit
     def control_run(self, context, *, command_id, run_id, action):
         self.caller(context, mutate=True)
         if action not in {"pause", "resume", "cancel"}:

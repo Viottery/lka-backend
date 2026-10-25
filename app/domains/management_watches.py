@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.domains.management import ManagementConflictError
 from app.domains.management_goals import _instant
+from app.storage.commit_signals import notify_after_commit
 
 
 def _json(value):
@@ -97,6 +98,7 @@ class ManagementWatchService:
                               "daily_time": watch["daily_time"]})
             return {"watches": items, "next_offset": offset + limit if len(rows) > limit else None}
 
+    @notify_after_commit
     def configure(self, session_id, command_id, watch_id, expected_revision=0, enabled=True,
                   condition="published", goal_id=None, *, authority_check=None):
         args = WatchSubscriptionInput.model_validate({"watch_id": watch_id, "expected_revision": expected_revision,

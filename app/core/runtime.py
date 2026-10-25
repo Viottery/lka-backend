@@ -67,6 +67,7 @@ from app.core.prompt_tokens import PromptTokenCounter
 from app.core.retrieval import LocalDebugRetrievalProvider
 from app.core.runtime_loop import RuntimeDebugRun, RuntimeLoop
 from app.core.safety import SafetyReviewMode
+from app.core.scheduling_signals import KeyedScheduler
 from app.core.sessions import (
     AgentSessionDetail,
     AgentSessionList,
@@ -242,20 +243,40 @@ class LocalKnowledgeAgentRuntime:
     """Lightweight runtime used by the current API layer."""
 
     def __init__(self, settings: Settings) -> None:
-        self.settings = settings
-        configure_write_queue_defaults(WriteQueuePolicy(
-            capacity=settings.db_write_queue_capacity,
-            wait_seconds=settings.db_write_queue_wait_seconds,
-            transaction_seconds=settings.db_write_transaction_seconds,
-        ))
+        from app.platform.runtime_owner import RuntimeOwner
+
         self.local_app_config = settings.load_local_config()
-        # SQLite and durable checkpoints must remain local even when a node
-        # maps remote file workspaces. Validate before creating any data files.
+        # Validate before the ownership lock creates any data-directory files.
         local_data = settings.data_dir.expanduser().resolve(strict=False)
         for identity in self.local_app_config.connections.workspace_mounts:
             mount_root = Path(self.local_app_config.connections.workspace_roots[identity]).expanduser().resolve(strict=False)
             if local_data.is_relative_to(mount_root) or mount_root.is_relative_to(local_data):
                 raise ValueError("Mounted workspaces must not overlap the local data directory")
+        self._runtime_owner = RuntimeOwner(settings.data_dir)
+        if not self._runtime_owner.acquire():
+            raise RuntimeError("Runtime data directory is already owned by another backend")
+        try:
+            # Schema setup and recovery baselines can write too. A running
+            # backend must fence those before a second runtime is constructed.
+            self._initialize(settings)
+        finally:
+            self._runtime_owner.release()
+
+    def _initialize(self, settings: Settings) -> None:
+        self.settings = settings
+        self._runtime_started = False
+        self._runtime_closed = False
+        self._lifecycle_lock = threading.RLock()
+        self.scheduler = KeyedScheduler(
+            capacity=settings.scheduling_capacity, workers=settings.scheduling_workers,
+            reconcile_seconds=settings.scheduling_reconcile_seconds,
+            recovery_page_size=settings.scheduling_recovery_page_size,
+        )
+        configure_write_queue_defaults(WriteQueuePolicy(
+            capacity=settings.db_write_queue_capacity,
+            wait_seconds=settings.db_write_queue_wait_seconds,
+            transaction_seconds=settings.db_write_transaction_seconds,
+        ))
         self.db_path = get_db_path(settings.data_dir)
         init_db(self.db_path)
         self.memory_settings_base = self.local_app_config.model_copy(deep=True)
@@ -884,6 +905,8 @@ class LocalKnowledgeAgentRuntime:
             resume=lambda run, guard: self._execute_dispatched_agent_run(run, guard, resume=True),
             has_checkpoint=lambda run_id: bool(self._runner_for_turn(existing_run_id=run_id).get_state(run_id).values),
             request_pause=lambda run: self.interrupt_agent_run(run.run_id),
+            scheduling_mode=settings.scheduling_mode,
+            reconcile_seconds=settings.scheduling_reconcile_seconds,
         )
         self.agent_turn_loop.execution_guard = self.agent_dispatch.check_run
         self.managed_tasks = ManagedTaskService(
@@ -1210,6 +1233,39 @@ class LocalKnowledgeAgentRuntime:
             self._local_execution_guard = self.agent_turn_loop.execution_guard
             self.agent_turn_loop.execution_guard = self._check_distributed_execution
 
+        self.session_inputs.attach_scheduler(self.scheduler, mode=settings.scheduling_mode)
+        self.management_coordinator.attach_scheduler(self.scheduler, mode=settings.scheduling_mode)
+        self.management_coordinator.worker.configure_scheduling(
+            settings.scheduling_mode, settings.scheduling_reconcile_seconds,
+        )
+        self.agent_run_manager.on_state_change = self._run_state_committed
+        self.managed_tasks.on_change = self._task_state_committed
+        self.session_service.on_change = self._session_state_committed
+        self.matter_service.on_change = self._management_state_committed
+        self.message_matter_proposals.on_change = self._management_state_committed
+        self.watch_service.on_change = self._management_state_committed
+
+    def _management_state_committed(self):
+        if self.local_app_config.management.enabled and self.settings.scheduling_mode != "poll":
+            self.scheduler.notify("management", "*")
+
+    def _task_state_committed(self):
+        self.agent_dispatch.notify()
+        self._management_state_committed()
+
+    def _session_state_committed(self):
+        if self.settings.scheduling_mode != "poll":
+            self.scheduler.request_rescan("inputs")
+        self._management_state_committed()
+
+    def _run_state_committed(self, record):
+        self.session_inputs.notify(record.session_id)
+        self.agent_dispatch.notify()
+        if (self.local_app_config.management.enabled and self.settings.scheduling_mode != "poll"
+                and record.status.value in {"waiting_user", "waiting_confirmation", "completed", "failed",
+                                            "cancelled", "timed_out"}):
+            self.management_coordinator.notify_run_state(record)
+
     def _check_remote_host_execution(self, context):
         """Revalidate the node operator's live grant and original task lease."""
         worker = self.remote_execution_worker
@@ -1529,6 +1585,34 @@ class LocalKnowledgeAgentRuntime:
 
     def start(self) -> None:
         """Start runtime services that should run while the API process is alive."""
+        with self._lifecycle_lock:
+            if self._runtime_started:
+                return
+            if self._runtime_closed:
+                raise RuntimeError("A closed runtime cannot be restarted")
+            if not self._runtime_owner.acquire():
+                raise RuntimeError("Runtime data directory is already owned by another backend")
+            try:
+                self._start_services()
+            except BaseException:
+                # Never serve a partially started runtime or release ownership
+                # while a scheduling transaction may still be running.
+                self._stop_services()
+                self._runtime_owner.release()
+                self._runtime_closed = True
+                raise
+            self._runtime_started = True
+
+    def _start_services(self) -> None:
+        if self.local_app_config.management.enabled and self.settings.scheduling_mode != "poll":
+            # Seed only one bounded page, then interleave further recovery with
+            # consumption. Large backlogs never need to fit in memory at once.
+            page = self.session_inputs._recover_inputs(None, min(
+                self.settings.scheduling_recovery_page_size, self.settings.scheduling_capacity,
+            ))
+            for key in page.keys:
+                self.scheduler.notify("inputs", key)
+            self.scheduler.start()
 
         if self.cloud_replica_sync is not None:
             self.cloud_replica_sync.start()
@@ -1552,6 +1636,17 @@ class LocalKnowledgeAgentRuntime:
 
     def stop(self) -> None:
         """Stop runtime background services."""
+        with self._lifecycle_lock:
+            if self._runtime_closed:
+                return
+            self._stop_services()
+            self._runtime_started = False
+            self._runtime_closed = True
+            self._runtime_owner.release()
+
+    def _stop_services(self) -> None:
+        if not self.scheduler.stop(timeout=self.settings.scheduling_stop_seconds):
+            raise RuntimeError("Scheduling transactions did not drain; runtime ownership retained")
 
         self.session_inputs.stop()
         self.management_coordinator.stop()

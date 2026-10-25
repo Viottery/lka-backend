@@ -105,6 +105,114 @@ def test_fifo_writer_admission_and_implicit_cte_and_cursor_writes(tmp_path):
     third.close()
 
 
+def test_releasing_writer_notifies_only_fifo_head(tmp_path):
+    path = tmp_path / "head-wakeup.db"
+    owner = db(path)
+    owner.execute("CREATE TABLE t(value INTEGER)").close()
+    owner.execute("BEGIN IMMEDIATE")
+    first, second = db(path), db(path)
+    first_acquired, finish_first, second_acquired = (
+        threading.Event(), threading.Event(), threading.Event(),
+    )
+    errors = []
+
+    def write_and_hold(conn, value, acquired, finish=None):
+        try:
+            conn.execute("INSERT INTO t VALUES (?)", (value,)).close()
+            acquired.set()
+            if finish is not None:
+                finish.wait(2)
+            conn.commit()
+        except Exception as exc:  # noqa: BLE001 - report thread failure to the test.
+            errors.append(exc)
+
+    first_thread = threading.Thread(
+        target=write_and_hold, args=(first, 1, first_acquired, finish_first),
+    )
+    first_thread.start()
+    deadline = time.monotonic() + 1
+    while len(owner._write_queue.waiters) < 1 and time.monotonic() < deadline:
+        time.sleep(.002)
+    assert len(owner._write_queue.waiters) == 1
+
+    second_thread = threading.Thread(target=write_and_hold, args=(second, 2, second_acquired))
+    second_thread.start()
+    deadline = time.monotonic() + 1
+    while len(owner._write_queue.waiters) < 2 and time.monotonic() < deadline:
+        time.sleep(.002)
+    assert len(owner._write_queue.waiters) == 2
+    second_ticket = owner._write_queue.waiters[1]
+    notified = []
+    original_notify = second_ticket.condition.notify
+
+    def record_notify(n=1):
+        notified.append(n)
+        return original_notify(n)
+
+    second_ticket.condition.notify = record_notify
+    owner.rollback()
+    assert first_acquired.wait(1)
+    assert not second_acquired.is_set()
+    assert notified == []
+
+    finish_first.set()
+    assert second_acquired.wait(1)
+    first_thread.join(1)
+    second_thread.join(1)
+    assert not first_thread.is_alive() and not second_thread.is_alive()
+    assert errors == []
+    assert notified == [1]
+    for conn in (owner, first, second):
+        conn.close()
+
+
+def test_timed_out_fifo_head_removal_wakes_next_writer(tmp_path):
+    path = tmp_path / "timeout-head-wakeup.db"
+    owner = db(path)
+    owner.execute("CREATE TABLE t(value INTEGER)").close()
+    owner.execute("BEGIN IMMEDIATE")
+    head = db(path, wait_seconds=.1)
+    next_writer = db(path, wait_seconds=1)
+    head_result, next_acquired = [], threading.Event()
+
+    def time_out_head():
+        try:
+            head.execute("INSERT INTO t VALUES (1)").close()
+        except sqlite3.Error as exc:
+            head_result.append(exc)
+
+    def write_next():
+        next_writer.execute("INSERT INTO t VALUES (2)").close()
+        next_acquired.set()
+        next_writer.commit()
+
+    head_thread = threading.Thread(target=time_out_head)
+    head_thread.start()
+    deadline = time.monotonic() + 1
+    while len(owner._write_queue.waiters) < 1 and time.monotonic() < deadline:
+        time.sleep(.002)
+    assert len(owner._write_queue.waiters) == 1
+    next_thread = threading.Thread(target=write_next)
+    next_thread.start()
+    deadline = time.monotonic() + 1
+    while len(owner._write_queue.waiters) < 2 and time.monotonic() < deadline:
+        time.sleep(.002)
+    assert len(owner._write_queue.waiters) == 2
+
+    head_thread.join(1)
+    assert not head_thread.is_alive()
+    assert len(head_result) == 1
+    assert isinstance(head_result[0], SqliteWriteQueueError)
+    assert not next_acquired.is_set()
+    owner.rollback()
+    assert next_acquired.wait(1)
+    next_thread.join(1)
+    assert not next_thread.is_alive()
+    assert owner.execute("SELECT value FROM t").fetchall() == [(2,)]
+    for conn in (owner, head, next_writer):
+        conn.close()
+
+
 @pytest.mark.parametrize("sql", [
     "-- leading line comment\nBEGIN IMMEDIATE",
     "/* leading block comment */ BEGIN IMMEDIATE",

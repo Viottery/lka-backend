@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from app.domains.managed_tasks import TERMINAL, _json
 from app.domains.management import ManagementConflictError
+from app.storage.commit_signals import notify_after_commit
 
 
 class ManagementDelegateService:
@@ -139,6 +140,7 @@ class ManagementDelegateService:
             raise ValueError('allowed_tools must contain registered non-management tool names')
         return sorted(set(allowed_tools))
 
+    @notify_after_commit
     def delegate_work(self, context, *, command_id, objective, title='事务线', workspace_path=None, allowed_tools=None):
         if not isinstance(objective, str) or not objective.strip() or len(objective) > 16000:
             raise ValueError('objective must contain 1..16000 characters')
@@ -194,6 +196,7 @@ class ManagementDelegateService:
                          (context.session_id, command_id, fingerprint, 'delegate_work', _json(receipt), stamp))
             return receipt
 
+    @notify_after_commit
     def instruct_delegate(self, context, *, command_id, delegate_id, expected_revision, instruction):
         if not isinstance(instruction, str) or not instruction.strip() or len(instruction) > 16000:
             raise ValueError('instruction must contain 1..16000 characters')
@@ -244,6 +247,7 @@ class ManagementDelegateService:
                          (context.session_id, command_id, fingerprint, 'instruct_delegate', _json(receipt), stamp))
             return receipt
 
+    @notify_after_commit
     def control_delegate(self, context, *, command_id, delegate_id, expected_revision, action):
         """Fence a line before best-effort, repeatable cancellation of its roots."""
         if action not in ('pause', 'cancel'):
@@ -385,6 +389,7 @@ class ManagementDelegateService:
                 'may support blocked/needs_decision reports. Do not repeat execution or infer references from prose.'
             )
 
+    @notify_after_commit
     def report_delegate(self, context, *, command_id, kind, summary, evidence=None):
         if kind not in ('progress', 'completed', 'needs_decision', 'blocked'):
             raise ValueError('Invalid delegate report kind')
@@ -445,14 +450,23 @@ class ManagementDelegateService:
                 conn.execute("UPDATE manager_delegates SET state='completed',revision=revision+1,updated_at=? WHERE delegate_id=?",
                              (stamp, row['delegate_id']))
 
-    def _capture_candidates(self, conn):
+    def _capture_candidates(self, conn, session_ids=None):
         """Build currently actionable events using reads only."""
         candidates = []
+        filter_sql = ""
+        params = ()
+        if session_ids is not None:
+            session_ids = tuple(dict.fromkeys(session_ids))
+            if not session_ids:
+                return candidates
+            filter_sql = " AND d.parent_session_id IN (" + ",".join("?" for _ in session_ids) + ")"
+            params = session_ids
         rows = conn.execute("SELECT d.delegate_id,d.parent_session_id,d.session_id,d.revision,r.record_payload "
                             "FROM manager_delegates d JOIN agent_runs r ON r.run_id=("
                             "SELECT a.run_id FROM agent_runs a WHERE a.session_id=d.session_id "
                             "AND json_extract(a.record_payload,'$.parent_run_id') IS NULL "
-                            "ORDER BY a.created_at DESC,a.run_id DESC LIMIT 1) WHERE d.state='active'").fetchall()
+                            "ORDER BY a.created_at DESC,a.run_id DESC LIMIT 1) WHERE d.state='active'" + filter_sql,
+                            params).fetchall()
         for row in rows:
             record = json.loads(row['record_payload'])
             status = record['status']
@@ -494,12 +508,12 @@ class ManagementDelegateService:
             candidates.append((row, dedup, payload))
         return candidates
 
-    def capture_events(self):
+    def capture_events(self, session_ids=None):
         """Surface execution failure or a missing handoff without interpreting results."""
         read_conn = self._conn()
         try:
             read_conn.execute('BEGIN')
-            candidates = self._capture_candidates(read_conn)
+            candidates = self._capture_candidates(read_conn, session_ids)
             read_conn.commit()
         finally:
             read_conn.close()
@@ -511,7 +525,7 @@ class ManagementDelegateService:
             conn.execute('BEGIN IMMEDIATE')
             # Rebuild candidates under the writer lock so latest-run, delegate
             # ownership/state, waits, reports, task status and dedup are current.
-            candidates = self._capture_candidates(conn)
+            candidates = self._capture_candidates(conn, session_ids)
             for row, dedup, payload in candidates:
                 captured += self.goals._event(conn, row['parent_session_id'], dedup, 'timer', payload,
                                                datetime.now(UTC).isoformat())

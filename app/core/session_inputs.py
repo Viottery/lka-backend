@@ -3,13 +3,28 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import threading
 from contextlib import closing
 from datetime import UTC, datetime
+from functools import wraps
 from uuid import uuid4
 
 from app.core.agent_runs import AgentRunRecord, AgentRunStatus
 from app.core.session_admission import TERMINAL_RUN_STATUSES
+
+_logger = logging.getLogger(__name__)
+
+
+def _notify_input_after_commit(method):
+    @wraps(method)
+    def wrapped(self, session_id, *args, **kwargs):
+        result = method(self, session_id, *args, **kwargs)
+        # A returned receipt already committed. A failed hint must never turn
+        # that durable acceptance into a failed HTTP response.
+        self.notify(session_id)
+        return result
+    return wrapped
 
 
 class SessionInputConflict(ValueError):
@@ -38,6 +53,48 @@ class SessionInputQueue:
         self._stop = threading.Event()
         self._thread = None
         self.last_error = None
+        self._scheduler = None
+        self._scheduling_mode = 'poll'
+        self._owns_scheduler = False
+        self.on_change = None
+
+    def attach_scheduler(self, scheduler, *, mode='event'):
+        if mode not in {'event', 'shadow', 'poll'}:
+            raise ValueError('Invalid input scheduling mode')
+        self._scheduler, self._scheduling_mode = scheduler, mode
+        scheduler.register('inputs', self._scheduled_input, recover=self._recover_inputs)
+
+    def notify(self, session_id):
+        try:
+            if self._scheduler is not None and not self._stop.is_set():
+                self._scheduler.notify('inputs', session_id)
+            if self.on_change is not None:
+                self.on_change()
+        except Exception as exc:  # noqa: BLE001 - durable state is recovered by reconciliation.
+            _logger.warning('Input scheduling notification failed type=%s', type(exc).__name__)
+
+    def _recover_inputs(self, cursor, limit):
+        from app.core.scheduling_signals import RecoveryPage
+
+        with closing(self._conn()) as conn:
+            conn.execute('BEGIN')
+            after, upper = cursor if cursor is not None else ('', conn.execute(
+                'SELECT coalesce(max(session_id),\'\') FROM session_input_queues').fetchone()[0])
+            keys = self._candidate_ids(conn, after=after, upper=upper, limit=limit)
+        return RecoveryPage(keys, (keys[-1], upper) if keys else cursor, len(keys) < limit)
+
+    def _scheduled_input(self, sid):
+        try:
+            with closing(self._conn()) as conn:
+                eligible = self._candidate_ids(conn, session_id=sid, limit=1)
+            if eligible and self._scheduling_mode == 'event':
+                self._bind(sid)
+            self.last_error = None
+        except (KeyError, SessionInputConflict):
+            return  # Deleted/revoked candidates remain inert.
+        except Exception as exc:
+            self.last_error = type(exc).__name__
+            raise
 
     def ensure_schema(self):
         with closing(self._conn()) as conn, conn:
@@ -75,6 +132,10 @@ class SessionInputQueue:
                     for statement in indexes:
                         conn.execute(statement)
             conn.execute('CREATE INDEX IF NOT EXISTS session_inputs_pending ON session_inputs(session_id,run_id)')
+            # The sequence index otherwise walks completed receipts from the
+            # beginning of a long session before finding its next unbound item.
+            conn.execute('CREATE INDEX IF NOT EXISTS session_inputs_ready ON session_inputs(session_id,sequence) '
+                         'WHERE run_id IS NULL AND cancelled=0')
 
     @staticmethod
     def _active(conn, sid):
@@ -131,6 +192,7 @@ class SessionInputQueue:
             self.authorize(conn, session_id)
             return self._snapshot(conn, session_id)
 
+    @_notify_input_after_commit
     def submit(self, session_id, *, client_message_id, user_input, attachment_ids,
                safety_review_mode=None, llm=None, replace_run_id=None):
         if not 1 <= len(client_message_id) <= 128 or not client_message_id.strip():
@@ -276,6 +338,7 @@ class SessionInputQueue:
                 raise SessionInputConflict('replacement_receipt_unavailable')
             return self._receipt(conn, session_id, row)
 
+    @_notify_input_after_commit
     def resume(self, session_id, *, input_id=None, answer_client_name=None, answer_model=None):
         if input_id is None and (answer_client_name is not None or answer_model is not None):
             raise ValueError('Answer model recovery requires input_id')
@@ -322,38 +385,51 @@ class SessionInputQueue:
         conn.execute('UPDATE session_inputs SET cancelled=1 WHERE session_id=? AND run_id IS NULL', (session_id,))
         conn.execute('UPDATE session_input_queues SET paused=1 WHERE session_id=?', (session_id,))
 
+    def _candidate_ids(self, conn, *, session_id=None, after='', upper=None, limit=None):
+        # Keep the polling read-only and avoid opening a write transaction for
+        # idle queues. Include queues needing failed-watch reconciliation,
+        # even when they have no pending input.
+        sql = """
+            SELECT q.session_id
+            FROM session_input_queues q
+            WHERE (q.paused=0 AND q.watched_run_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM agent_runs w WHERE w.run_id=q.watched_run_id
+            )) OR (q.paused=0 AND q.watched_run_id IS NOT NULL AND EXISTS (
+                SELECT 1 FROM agent_runs w WHERE w.run_id=q.watched_run_id
+                  AND (coalesce(json_extract(w.record_payload,'$.metadata.session_input_id'),'')!=''
+                       OR coalesce(json_extract(w.record_payload,'$.metadata.input_envelope.origin'),'user')='user')
+                  AND w.status IN ('failed','cancelled','timed_out')
+            )) OR (q.paused=0 AND EXISTS (
+                SELECT 1 FROM agent_runs a WHERE a.session_id=q.session_id
+                  AND a.status NOT IN ('completed','failed','cancelled','timed_out')
+                  AND json_extract(a.record_payload,'$.parent_run_id') IS NULL
+                  AND a.run_id IS NOT q.watched_run_id
+                  AND (coalesce(json_extract(a.record_payload,'$.metadata.session_input_id'),'')!=''
+                       OR coalesce(json_extract(a.record_payload,'$.metadata.input_envelope.origin'),'user')='user')
+            )) OR (q.paused=0 AND NOT EXISTS (
+                SELECT 1 FROM agent_runs a WHERE a.session_id=q.session_id
+                  AND a.status NOT IN ('completed','failed','cancelled','timed_out')
+                  AND json_extract(a.record_payload,'$.parent_run_id') IS NULL
+            ) AND EXISTS (
+                SELECT 1 FROM session_inputs i WHERE i.session_id=q.session_id
+                  AND i.run_id IS NULL AND i.cancelled=0
+            ))
+            ORDER BY q.session_id
+        """
+        sql = 'SELECT session_id FROM (' + sql + ') WHERE session_id>?'
+        args = [after]
+        if upper is not None:
+            sql += ' AND session_id<=?'; args.append(upper)
+        if session_id is not None:
+            sql += ' AND session_id=?'; args.append(session_id)
+        sql += ' ORDER BY session_id'
+        if limit is not None:
+            sql += ' LIMIT ?'; args.append(limit)
+        return [row[0] for row in conn.execute(sql, args)]
+
     def tick(self):
         with closing(self._conn()) as conn:
-            # Keep the polling read-only and avoid opening a write transaction for
-            # idle queues. Include queues needing failed-watch reconciliation,
-            # even when they have no pending input.
-            session_ids = [row[0] for row in conn.execute("""
-                SELECT q.session_id
-                FROM session_input_queues q
-                WHERE (q.paused=0 AND q.watched_run_id IS NOT NULL AND NOT EXISTS (
-                    SELECT 1 FROM agent_runs w WHERE w.run_id=q.watched_run_id
-                )) OR (q.paused=0 AND q.watched_run_id IS NOT NULL AND EXISTS (
-                    SELECT 1 FROM agent_runs w WHERE w.run_id=q.watched_run_id
-                      AND (coalesce(json_extract(w.record_payload,'$.metadata.session_input_id'),'')!=''
-                           OR coalesce(json_extract(w.record_payload,'$.metadata.input_envelope.origin'),'user')='user')
-                      AND w.status IN ('failed','cancelled','timed_out')
-                )) OR (q.paused=0 AND EXISTS (
-                    SELECT 1 FROM agent_runs a WHERE a.session_id=q.session_id
-                      AND a.status NOT IN ('completed','failed','cancelled','timed_out')
-                      AND json_extract(a.record_payload,'$.parent_run_id') IS NULL
-                      AND a.run_id IS NOT q.watched_run_id
-                      AND (coalesce(json_extract(a.record_payload,'$.metadata.session_input_id'),'')!=''
-                           OR coalesce(json_extract(a.record_payload,'$.metadata.input_envelope.origin'),'user')='user')
-                )) OR (q.paused=0 AND NOT EXISTS (
-                    SELECT 1 FROM agent_runs a WHERE a.session_id=q.session_id
-                      AND a.status NOT IN ('completed','failed','cancelled','timed_out')
-                      AND json_extract(a.record_payload,'$.parent_run_id') IS NULL
-                ) AND EXISTS (
-                    SELECT 1 FROM session_inputs i WHERE i.session_id=q.session_id
-                      AND i.run_id IS NULL AND i.cancelled=0
-                ))
-                ORDER BY q.session_id
-            """)]
+            session_ids = self._candidate_ids(conn)
         for sid in session_ids:
             try:
                 self._bind(sid)
@@ -426,6 +502,13 @@ class SessionInputQueue:
             conn.execute('UPDATE session_inputs SET run_id=? WHERE input_id=?', (run.run_id, row['input_id']))
             conn.execute('UPDATE session_input_queues SET watched_run_id=? WHERE session_id=?', (run.run_id, sid))
             self.dispatcher.enqueue(run.run_id, conn=conn)
+        # Only the owner of the outer transaction can announce its outbox.
+        notifier = getattr(self.dispatcher, 'notify', None)
+        if notifier is not None:
+            try:
+                notifier()
+            except Exception as exc:  # noqa: BLE001 - the committed job remains recoverable.
+                _logger.warning('Dispatch scheduling notification failed type=%s', type(exc).__name__)
         # The manager lazily loads durable runs. Do not refresh a stale record:
         # the dispatcher may already have claimed it immediately after commit.
 
@@ -528,6 +611,12 @@ class SessionInputQueue:
             return manager.refresh_after_transaction(frozen)
 
     def start(self):
+        if self._scheduling_mode == 'event':
+            self._stop.clear()
+            if self._scheduler is not None:
+                self._owns_scheduler = not self._scheduler.status()['started']
+                self._scheduler.start()
+            return  # Shared keyed scheduler owns recovery and admission.
         if self._thread is not None and self._thread.is_alive():
             return
         self._stop.clear()
@@ -545,6 +634,10 @@ class SessionInputQueue:
 
     def stop(self):
         self._stop.set()
+        if self._owns_scheduler and self._scheduler is not None:
+            if not self._scheduler.stop():
+                raise RuntimeError('Input scheduler did not drain')
+            self._owns_scheduler = False
         if self._thread is not None:
             self._thread.join()
             self._thread = None

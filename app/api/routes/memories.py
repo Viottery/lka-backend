@@ -443,5 +443,8 @@ def background_health(request: Request):
     """Expose queue health without job payloads or source identifiers."""
 
     runtime = request.app.state.runtime
-    return {**runtime.background_job_store.health_metrics(),
-            "llm_workloads": runtime.llm_workloads.health()}
+    snapshot = {**runtime.background_job_store.health_metrics(),
+                "llm_workloads": runtime.llm_workloads.health()}
+    if hasattr(runtime, "scheduler"):
+        snapshot["scheduling"] = {"mode": runtime.settings.scheduling_mode, **runtime.scheduler.status()}
+    return snapshot
