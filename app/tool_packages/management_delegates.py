@@ -4,13 +4,13 @@ from app.tool_packages.management import COMMAND, PAGE, PURPOSE, TEXT, Managemen
 
 def management_delegate_tools(service):
     definitions = [
-        ('delegate_work', ('Create a durable child manager for a bounded objective. The child cannot delegate again. '
+        ('delegate_work', ('Create a durable child manager for a bounded objective on the current backend, not a remote machine. The child cannot delegate again. '
          'Default execution tools are a frozen read-only non-management whitelist; explicit names freeze another whitelist. '
          'workspace_path selects the default directory, not an access boundary; tasks may select their own directory. '
          'Outside-workspace access requires per-call review and the initiating approval preference is inherited; blacklisted destructive operations require user approval.'), False,
          {'command_id': COMMAND, 'objective': PURPOSE, 'title': {'type': 'string', 'minLength': 1, 'maxLength': 40},
           'workspace_path': {'type': 'string', 'minLength': 1, 'maxLength': 4096,
-                             'description': 'Existing default working directory; omit to inherit the frontend default independent workspace.'},
+                             'description': 'Existing default directory on the current backend; omit to inherit its configured independent workspace. This session role does not select a terminal; its tasks use start_task execution_target for approved remote workspace work.'},
           'allowed_tools': {'type': 'array', 'maxItems': 256, 'items': TEXT}}, ['command_id', 'objective']),
         ('instruct_delegate', ('Send a bounded follow-up to an owned delegate after its current manager root is terminal. '
          'Requires the observed delegate revision. Original approval/question control stays with the user.'), False,
