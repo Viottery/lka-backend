@@ -12,7 +12,7 @@ from app.core.agent_runs import AgentRunCancelled, AgentRunRecord
 from app.core.context_driver import ToolView
 from app.core.multi_agent import ContextSnapshot, RuntimeBudget, ScopeGrant
 from app.core.safety import SafetyReviewDecision
-from app.domains.remote_execution import _json, _now
+from app.domains.remote_execution import _json, _now, remote_progress_projection
 from app.domains.remote_shell import approve_host_execution_authority
 from app.integrations.cloud_sync import CloudReplicaSynchronizer, CloudSyncError
 
@@ -39,8 +39,15 @@ class RemoteExecutionNode:
                 hub_id TEXT NOT NULL, task_id TEXT NOT NULL, fingerprint TEXT NOT NULL,
                 fence TEXT NOT NULL, run_id TEXT NOT NULL UNIQUE, session_id TEXT NOT NULL,
                 state TEXT NOT NULL, message_cursor INTEGER NOT NULL DEFAULT 0,
+                event_cursor INTEGER NOT NULL DEFAULT 0,
                 last_snapshot TEXT, pending_report TEXT, pending_cursor INTEGER,
+                pending_event_cursor INTEGER,
                 PRIMARY KEY(hub_id,task_id))""")
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(remote_execution_node_tasks)")}
+            if "event_cursor" not in columns:
+                conn.execute("ALTER TABLE remote_execution_node_tasks ADD COLUMN event_cursor INTEGER NOT NULL DEFAULT 0")
+            if "pending_event_cursor" not in columns:
+                conn.execute("ALTER TABLE remote_execution_node_tasks ADD COLUMN pending_event_cursor INTEGER")
             conn.execute("""CREATE TABLE IF NOT EXISTS remote_execution_node_controls (
                 hub_id TEXT NOT NULL, task_id TEXT NOT NULL, command_id TEXT NOT NULL,
                 payload TEXT NOT NULL, PRIMARY KEY(hub_id,task_id,command_id))""")
@@ -309,11 +316,32 @@ class RemoteExecutionNode:
             raise PermissionError("delegated local run missing")
         pending = json.loads(row["pending_report"]) if row["pending_report"] else None
         cursor = row["pending_cursor"]
+        event_cursor = row["pending_event_cursor"] if row["pending_event_cursor"] is not None else row["event_cursor"]
         if pending is None:
             with closing(runtime._conn()) as conn:
-                messages = conn.execute("SELECT rowid,message_id,role,content,payload FROM agent_session_messages WHERE session_id=? AND rowid>? ORDER BY rowid LIMIT 100",
-                                        (row["session_id"], row["message_cursor"])).fetchall()
+                candidates = conn.execute("SELECT rowid,message_id,role,content,payload FROM agent_session_messages WHERE session_id=? AND rowid>? ORDER BY rowid LIMIT 101",
+                                          (row["session_id"], row["message_cursor"])).fetchall()
+            messages = []
+            message_bytes = 0
+            oversized_message = False
+            for message in candidates[:100]:
+                size = len(_json({"message_id": message["message_id"], "role": message["role"],
+                                  "content": message["content"], "payload": json.loads(message["payload"])}).encode())
+                if size > 384 * 1024:
+                    oversized_message = not messages
+                    break
+                if message_bytes + size > 384 * 1024:
+                    break
+                messages.append(message)
+                message_bytes += size
+            more_messages = len(candidates) > 100 or len(messages) < min(len(candidates), 100)
             cursor = messages[-1]["rowid"] if messages else row["message_cursor"]
+            source_events = runtime.agent_run_manager.list_events(row["run_id"], after_sequence=event_cursor, limit=65)
+            source_page = source_events[:64]
+            event_cursor = source_page[-1].sequence if source_page else event_cursor
+            progress_events = [projection for event in source_page
+                               if (projection := remote_progress_projection(event.model_dump(mode="json"))) is not None]
+            more_events = len(source_events) > len(source_page)
             status = "failed" if run.status.value == "timed_out" else run.status.value
             if status == "queued":
                 status = "running"
@@ -330,12 +358,19 @@ class RemoteExecutionNode:
                             "source": "legacy"},
                         "pending_user_question": run.metadata.get("pending_user_question") if status == "waiting_user" else None,
                         "paused_from_status": run.metadata.get("paused_from_status") if status == "paused" else None,
-                        "effect_constraints": effect_constraints, "status": status, "messages": [{"message_id": m["message_id"], "role": m["role"],
+                        "effect_constraints": effect_constraints, "progress_cursor": event_cursor,
+                        "progress_events": progress_events, "status": status, "messages": [{"message_id": m["message_id"], "role": m["role"],
                         "content": m["content"], "payload": json.loads(m["payload"])} for m in messages],
                         "reviews": reviews, "result": run.result_snapshot, "error_type": run.error_type}
             # Drain all message pages before publishing a terminal result.
-            if len(messages) == 100 and status in {"completed", "failed", "cancelled"}:
+            draining_terminal = (more_messages or more_events) and status in {"completed", "failed", "cancelled", "paused"}
+            if draining_terminal:
                 snapshot.update(status="running", result=None)
+            if oversized_message and not more_events:
+                snapshot.update(
+                    status="failed", error_type="remote_message_too_large",
+                    result={"answer": "A node session message exceeds the relay page limit; remaining source content is still on the execution node."},
+                )
             snapshot_hash = hashlib.sha256(_json(snapshot).encode()).hexdigest()
             if snapshot_hash == row["last_snapshot"]:
                 return
@@ -343,19 +378,24 @@ class RemoteExecutionNode:
                        **snapshot}
             if len(_json(pending).encode()) > 1048576:
                 pending = {**json.loads(row["fence"]), "report_id": "oversized_" + snapshot_hash,
-                           "status": "failed", "messages": [], "reviews": [],
+                           "status": "running" if draining_terminal else "failed",
+                           "messages": [{"message_id": m["message_id"], "role": m["role"],
+                                         "content": m["content"], "payload": json.loads(m["payload"])} for m in messages],
+                           "reviews": [], "progress_cursor": event_cursor,
+                           "progress_events": progress_events,
                            "effect_constraints": effect_constraints,
                            "error_type": "remote_result_too_large",
-                           "result": {"answer": "The delegated result exceeds the relay limit; complete evidence remains on its execution node. Do not repeat operations."}}
+                           "result": None if draining_terminal else {
+                               "answer": "The delegated result exceeds the relay limit; complete evidence remains on its execution node. Do not repeat operations."}}
             with closing(runtime._conn()) as conn, conn:
-                conn.execute("UPDATE remote_execution_node_tasks SET pending_report=?,pending_cursor=? WHERE hub_id=? AND task_id=?",
-                             (_json(pending), cursor, row["hub_id"], row["task_id"]))
+                conn.execute("UPDATE remote_execution_node_tasks SET pending_report=?,pending_cursor=?,pending_event_cursor=? WHERE hub_id=? AND task_id=?",
+                             (_json(pending), cursor, event_cursor, row["hub_id"], row["task_id"]))
         self._request("report", pending)
         snapshot_hash = pending["report_id"].removeprefix("report_")
         state = "complete" if pending["status"] in {"completed", "failed", "cancelled"} else "active"
         with closing(runtime._conn()) as conn, conn:
-            conn.execute("UPDATE remote_execution_node_tasks SET pending_report=NULL,pending_cursor=NULL,message_cursor=?,last_snapshot=?,state=? WHERE hub_id=? AND task_id=?",
-                         (cursor, snapshot_hash, state, row["hub_id"], row["task_id"]))
+            conn.execute("UPDATE remote_execution_node_tasks SET pending_report=NULL,pending_cursor=NULL,pending_event_cursor=NULL,message_cursor=?,event_cursor=?,last_snapshot=?,state=? WHERE hub_id=? AND task_id=?",
+                         (cursor, event_cursor, snapshot_hash, state, row["hub_id"], row["task_id"]))
 
     def run_once(self):
         if not self._lock.acquire(blocking=False):

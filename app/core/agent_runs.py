@@ -6,6 +6,7 @@ import json
 import queue
 import threading
 from collections.abc import Callable, Iterable
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from enum import Enum
 from hashlib import sha1
@@ -512,7 +513,10 @@ class InMemoryAgentRunManager:
             final_answer_event=final_answer_event,
         ))
 
-    def refresh_after_transaction(self, record: AgentRunRecord | dict[str, Any]) -> AgentRunRecord:
+    def refresh_after_transaction(
+        self, record: AgentRunRecord | dict[str, Any], *,
+        committed_events: list[dict[str, Any]] | None = None,
+    ) -> AgentRunRecord:
         """Load a committed record/events without writing a stale cache to SQLite."""
         record = AgentRunRecord.model_validate(record)
         if self.durable_store is None:
@@ -520,10 +524,23 @@ class InMemoryAgentRunManager:
         persisted = self.durable_store.load_run(record.run_id)
         if persisted is None or persisted != record.model_dump(mode="json"):
             raise ValueError("Run transaction has not committed or record has changed")
-        events = self._load_events(record.run_id)
+        events = self._load_events(record.run_id) if committed_events is None else [
+            AgentRunEvent.model_validate(event) for event in committed_events
+        ]
         with self._lock:
             self._runs[record.run_id] = record
-            self._events[record.run_id] = events
+            if committed_events is None or record.run_id not in self._events:
+                self._events[record.run_id] = events if committed_events is None else self._load_events(record.run_id)
+            else:
+                cached = self._events[record.run_id]
+                by_id = {event.event_id: event for event in cached}
+                by_id.update({event.event_id: event for event in events})
+                merged = sorted(by_id.values(), key=lambda event: event.sequence)
+                # A missing sequence means another committed writer was not in
+                # this cache; hydrate once to keep future local event numbering safe.
+                if merged and [event.sequence for event in merged] != list(range(1, merged[-1].sequence + 1)):
+                    merged = self._load_events(record.run_id)
+                self._events[record.run_id] = merged
             self._restore_cancel_request(record)
         return record
 
@@ -1120,6 +1137,12 @@ class InMemoryAgentRunManager:
             events.append(event)
             events.sort(key=lambda item: item.sequence)
 
+    @contextmanager
+    def serialize_event_writes(self):
+        """Serialize an external event transaction with local sequence allocation."""
+        with self._lock:
+            yield
+
     @staticmethod
     def _safety_review_decision_event(review: SafetyReviewRecord) -> AgentRunEvent:
         return AgentRunEvent(
@@ -1409,11 +1432,22 @@ class InMemoryAgentRunManager:
         self,
         run_id: str,
         after_sequence: int = 0,
+        limit: int | None = None,
     ) -> list[AgentRunEvent]:
         with self._lock:
-            return [
-                event for event in self._events.get(run_id, []) if event.sequence > after_sequence
-            ]
+            events = self._events.get(run_id, [])
+            low, high = 0, len(events)
+            while low < high:
+                middle = (low + high) // 2
+                if events[middle].sequence <= after_sequence:
+                    low = middle + 1
+                else:
+                    high = middle
+            if limit is not None:
+                if type(limit) is not int or limit < 1:
+                    raise ValueError("Event page limit must be a positive integer.")
+                return events[low:low + limit]
+            return events[low:]
 
     def request_pause(self, run_id: str) -> AgentRunRecord:
         """Persist intent; only the checkpoint owner may acknowledge a safe pause."""

@@ -3035,6 +3035,18 @@ replica 本机接口：`GET /sync/replica/status` 查看游标、错误类别和
 
 ### 助理跨设备任务与会话中转
 
+浏览器打开已有执行会话时，可直接通过 `GET /sessions/{session_id}/runs` 发现最新根运行，
+再连接 `GET /agent/runs/{run_id}/stream?after_sequence=0` 补读已有公开事件并继续订阅，
+无需发送用户消息、恢复任务或重新派发。重连使用已实际渲染的 sequence 去重；
+新页面仅有持久游标而没有过程视图时须补读历史。切换会话或身份时释放旧连接并隔离迟到事件。
+运行位置与 run/session 引用以服务端快照为准，订阅不会把云端 shadow 在云端再次执行。
+
+节点报告可增量携带最多 64 条 `progress_events` 和 `progress_cursor`；事件是受限生命周期／工具标签，
+不包含原始工具参数、结果、提示词或内部模型增量。节点持久保存待确认页与游标，云端复验节点及租约，
+在同一回报事务中去重并分配云端事件序号，通过原运行 events/stream 接口读取。
+普通会话使用其本机事件；远程任务从云端读取中转事件，不能据此绕过节点直连限制。
+旧节点不报告过程时，仍可读状态及结果，不能把没有过程事件推断为任务未执行。
+
 开启 remote_execution 后，management.list_execution_targets 提供已授权在线设备/环境/工作区。
 management.start_task 的 execution_target 省略或为 null 时沿用云端本机。默认 workspace 策略下，
 远程目标须含 `{resource_kind:"workspace",workspace_id}`，另可用 device_id、environment_id、capabilities 限定设备；

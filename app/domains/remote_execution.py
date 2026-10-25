@@ -10,7 +10,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Annotated, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
 from app.core.agent_runs import AgentRunRecord, AgentRunStatus
 from app.domains.devices import DeviceUnavailableError
@@ -68,6 +68,81 @@ class ExecutionApproval(BaseModel):
     source: Literal["request", "node_policy", "host_execution", "legacy"]
 
 
+_REMOTE_PROGRESS = {
+    "run_started": ("run", "Execution started."),
+    "llm_started": ("llm", "Assistant is processing a request."),
+    "llm_completed": ("llm", "Assistant finished a processing step."),
+    "llm_failed": ("llm", "Assistant encountered a processing error."),
+    "tool_started": ("tool", "A tool started."),
+    "tool_completed": ("tool", "A tool finished."),
+    "tool_feedback": ("tool", "A tool returned feedback."),
+    "tool_recovered": ("tool", "A prior tool result was recovered."),
+    "tool_execution_uncertain": ("tool", "A tool result is uncertain."),
+    "tool_duplicate_blocked": ("tool", "A repeated tool action was blocked."),
+    "task_progress_review_required": ("tool", "A tool action needs review."),
+    "run_resumed": ("control", "Execution resumed."),
+}
+_REMOTE_TOOL_EVENTS = {"tool_started", "tool_completed", "tool_feedback", "tool_recovered",
+                       "tool_execution_uncertain", "tool_duplicate_blocked",
+                       "task_progress_review_required"}
+
+
+class RemoteProgressEvent(BaseModel):
+    """Strict, content-free projection of one node-local Agent run event."""
+
+    model_config = ConfigDict(extra="forbid")
+    run_id: Identifier
+    source_sequence: int = Field(ge=1)
+    source_created_at: AwareDatetime
+    type: Literal[
+        "run_started", "llm_started", "llm_completed", "llm_failed",
+        "tool_started", "tool_completed", "tool_feedback", "tool_recovered",
+        "tool_execution_uncertain", "tool_duplicate_blocked",
+        "task_progress_review_required", "run_resumed",
+    ]
+    stage: Literal["run", "llm", "tool", "control"]
+    message: str = Field(min_length=1, max_length=120)
+    payload: dict[str, str] = Field(default_factory=dict, max_length=3)
+
+    @model_validator(mode="after")
+    def validate_projection(self):
+        stage, message = _REMOTE_PROGRESS[self.type]
+        if self.stage != stage or self.message != message:
+            raise ValueError("remote progress event is not a safe public projection")
+        if self.type not in _REMOTE_TOOL_EVENTS and self.payload:
+            raise ValueError("remote lifecycle progress cannot include payload fields")
+        if set(self.payload) - {"tool_name", "package_name", "status"}:
+            raise ValueError("remote progress payload contains private fields")
+        for key in ("tool_name", "package_name"):
+            value = self.payload.get(key)
+            if value is not None and (len(value) > 120 or not all(c.isalnum() or c in "_.-" for c in value)):
+                raise ValueError("remote progress label is invalid")
+        if self.payload.get("status") not in {None, "running", "completed", "failed", "uncertain", "rejected", "skipped", "cancelled"}:
+            raise ValueError("remote progress status is invalid")
+        return self
+
+
+def remote_progress_projection(event: dict) -> dict | None:
+    """Return only a bounded UI-safe lifecycle/tool label projection."""
+    event_type = event.get("type")
+    safe = _REMOTE_PROGRESS.get(event_type)
+    if safe is None:
+        return None
+    payload = {}
+    if event_type in _REMOTE_TOOL_EVENTS:
+        source = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        for key in ("tool_name", "package_name"):
+            value = source.get(key)
+            if isinstance(value, str) and len(value) <= 120 and value and all(c.isalnum() or c in "_.-" for c in value):
+                payload[key] = value
+        status = source.get("status")
+        if status in {"running", "completed", "failed", "uncertain", "rejected", "skipped", "cancelled"}:
+            payload["status"] = status
+    return {"run_id": event.get("run_id"), "source_sequence": event.get("sequence"),
+            "source_created_at": event.get("created_at"),
+            "type": event_type, "stage": safe[0], "message": safe[1], "payload": payload}
+
+
 class ExecutionReport(ExecutionFence):
     report_id: Identifier
     status: Literal["running", "waiting_confirmation", "waiting_user", "paused", "completed", "failed", "cancelled"]
@@ -80,6 +155,19 @@ class ExecutionReport(ExecutionFence):
     paused_from_status: str | None = None
     applied_commands: list[Annotated[str, Field(min_length=1, max_length=400)]] = Field(default_factory=list, max_length=100)
     approval: ExecutionApproval | None = None
+    progress_cursor: int | None = Field(default=None, ge=0)
+    progress_events: list[RemoteProgressEvent] = Field(default_factory=list, max_length=64)
+
+    @model_validator(mode="after")
+    def validate_progress_cursor(self):
+        if self.progress_events and self.progress_cursor is None:
+            raise ValueError("remote progress events require a page cursor")
+        sequences = [event.source_sequence for event in self.progress_events]
+        if sequences != sorted(set(sequences)):
+            raise ValueError("remote progress source sequences must be strictly increasing")
+        if sequences and sequences[-1] > self.progress_cursor:
+            raise ValueError("remote progress event exceeds its page cursor")
+        return self
 
 
 class RemoteExecutionConflict(ValueError):
@@ -147,6 +235,8 @@ class RemoteExecutionService:
                     task_id TEXT NOT NULL, command_id TEXT NOT NULL, payload TEXT NOT NULL,
                     applied INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL,
                     PRIMARY KEY(task_id,command_id));
+                CREATE TABLE IF NOT EXISTS remote_execution_progress_cursors (
+                    task_id TEXT PRIMARY KEY, source_sequence INTEGER NOT NULL DEFAULT 0);
                 CREATE INDEX IF NOT EXISTS remote_execution_pending ON remote_execution_tasks(node_id,state,created_at);
             """)
 
@@ -378,15 +468,31 @@ class RemoteExecutionService:
 
     def report(self, principal, report):
         report = ExecutionReport.model_validate(report)
-        report_data = report.model_dump(mode="json", exclude={"lease_token", "approval"})
+        if report.progress_cursor is not None and self.run_manager is not None:
+            # Event sequence allocation in the hub manager uses its in-memory
+            # stream. Hold that lock through commit and cache refresh so a
+            # simultaneous control event cannot reuse an imported sequence.
+            with self.run_manager.serialize_event_writes():
+                return self._report_transaction(principal, report)
+        return self._report_transaction(principal, report)
+
+    def _report_transaction(self, principal, report):
+        report_data = report.model_dump(mode="json", exclude={"lease_token", "approval", "progress_cursor", "progress_events"})
         # Keep pre-upgrade durable report fingerprints stable on retry.
         if report.approval is not None:
             report_data["approval"] = report.approval.model_dump(mode="json")
+        # Older nodes omit these optional fields. Do not change their historical
+        # report fingerprint when they retry a report after a hub upgrade.
+        if "progress_cursor" in report.model_fields_set:
+            report_data["progress_cursor"] = report.progress_cursor
+        if "progress_events" in report.model_fields_set:
+            report_data["progress_events"] = [event.model_dump(mode="json") for event in report.progress_events]
         encoded = _json(report_data)
         if len(encoded.encode()) > 1048576:
             raise ValueError("execution report exceeds 1 MiB")
         fingerprint = hashlib.sha256(encoded.encode()).hexdigest()
         updated = None
+        committed_progress_events = []
         with self._connection(write=True) as conn:
             # Exact result retries still authenticate and revalidate current scope;
             # they do not re-publish messages or mutate a completed run.
@@ -407,6 +513,44 @@ class RemoteExecutionService:
             if row["state"] == "leased":
                 raise RemoteExecutionConflict("task must start before reporting")
             payload = json.loads(row["payload"])
+            progress_cursor = report.progress_cursor
+            if progress_cursor is not None:
+                if any(event.run_id != payload["run"]["run_id"] for event in report.progress_events):
+                    raise PermissionError("remote progress run identity mismatch")
+                progress_row = conn.execute(
+                    "SELECT source_sequence FROM remote_execution_progress_cursors WHERE task_id=?",
+                    (report.task_id,),
+                ).fetchone()
+                prior_cursor = progress_row[0] if progress_row else 0
+                if progress_cursor < prior_cursor or any(event.source_sequence <= prior_cursor for event in report.progress_events):
+                    raise RemoteExecutionConflict("remote progress cursor moved backwards")
+                if any(event.source_sequence > progress_cursor for event in report.progress_events):
+                    raise ValueError("remote progress event exceeds its committed cursor")
+                for event in report.progress_events:
+                    sequence = conn.execute(
+                        "SELECT COALESCE(MAX(sequence),0)+1 FROM agent_run_events WHERE run_id=?",
+                        (payload["run"]["run_id"],),
+                    ).fetchone()[0]
+                    relayed_at = _now()
+                    event_payload = {"remote_origin": {"node_sequence": event.source_sequence,
+                                                         "relayed_at": relayed_at}}
+                    event_payload.update(event.payload)
+                    projected = {
+                        "event_id": f"{payload['run']['run_id']}_event_{sequence:06d}",
+                        "run_id": payload["run"]["run_id"], "sequence": sequence,
+                        "type": event.type, "stage": event.stage, "message": event.message,
+                        "payload": event_payload, "created_at": event.source_created_at.isoformat(),
+                    }
+                    conn.execute(
+                        "INSERT INTO agent_run_events(run_id,sequence,event_payload,created_at) VALUES(?,?,?,?)",
+                        (projected["run_id"], sequence, _json(projected), relayed_at),
+                    )
+                    committed_progress_events.append(projected)
+                conn.execute(
+                    "INSERT INTO remote_execution_progress_cursors(task_id,source_sequence) VALUES(?,?) "
+                    "ON CONFLICT(task_id) DO UPDATE SET source_sequence=excluded.source_sequence",
+                    (report.task_id, progress_cursor),
+                )
             if self.executor:
                 for constraint_id, expected in report.effect_constraints.items():
                     current = self.executor.registry.effect_constraints.get(constraint_id)
@@ -473,7 +617,9 @@ class RemoteExecutionService:
             conn.execute("INSERT INTO remote_execution_reports VALUES(?,?,?,?,?)", (report.task_id, report.report_id, fingerprint, encoded, _now()))
             conn.execute("UPDATE remote_execution_tasks SET state=?,updated_at=? WHERE task_id=?", (task_state, _now(), report.task_id))
         if updated is not None:
-            self.run_manager.refresh_after_transaction(updated)
+            self.run_manager.refresh_after_transaction(
+                updated, committed_events=(None if report.status == "completed" else committed_progress_events),
+            )
         return {"task_id": report.task_id, "report_id": report.report_id, "accepted": True}
 
     @staticmethod

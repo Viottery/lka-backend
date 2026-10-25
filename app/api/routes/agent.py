@@ -1068,6 +1068,12 @@ def _public_agent_event(event: AgentRunEvent) -> AgentRunEvent:
             for key in ("tool_name", "package_name", "status")
             if key in payload
         }
+        origin = event.payload.get("remote_origin")
+        if (isinstance(origin, dict) and type(origin.get("node_sequence")) is int
+                and origin["node_sequence"] > 0 and isinstance(origin.get("relayed_at"), str)
+                and len(origin["relayed_at"]) <= 64):
+            payload["remote_origin"] = {"node_sequence": origin["node_sequence"],
+                                         "relayed_at": origin["relayed_at"]}
     elif event.type == "subtask_result":
         raw_result = payload.get("task_result")
         if isinstance(raw_result, dict):

@@ -194,6 +194,216 @@ def test_workspace_policy_rejects_legacy_remote_followup_but_keeps_prior_receipt
             expected_run_id=followup["run_id"], purpose="Continue the service task")
 
 
+def test_node_progress_is_projected_into_hub_run_events(setup_remote, tmp_path):
+    import asyncio
+
+    from fastapi import FastAPI
+    from httpx import ASGITransport, AsyncClient
+
+    from app.api.routes.agent import router as agent_router
+
+    e = setup_remote
+    (tmp_path / "progress.txt").write_text("PRIVATE_FILE_BODY_9281", encoding="utf-8")
+    e["context"] = e["context"].model_copy(update={"safety_review_mode": "skip"})
+    e["worker"].config.review_policy = "inherit"
+    e["node"].agent_turn_loop.llm_client = ScriptedClient([
+        operation("expand_package", package_name="filesystem"),
+        operation("tool_call", tool_name="filesystem.read_file", tool_input={"path": str(tmp_path / "progress.txt")}),
+        operation("final_answer", reason="The file was read."), "Read complete.",
+    ])
+    receipt = start(e, command_id="progress", workspace_id="project")
+    e["worker"].run_once()
+    assert e["node"].agent_dispatch.run_one("progress")
+    assert e["node"].agent_run_manager.get_run(receipt["run_id"]).status.value == "completed"
+    e["worker"].run_once()
+
+    events = e["hub"].agent_run_manager.list_events(receipt["run_id"])
+    tool_events = [event for event in events if event.type in {"tool_started", "tool_completed"}]
+    assert [event.type for event in tool_events] == ["tool_started", "tool_completed"]
+    assert all(event.payload.get("remote_origin", {}).get("node_sequence") for event in tool_events)
+    assert all("PRIVATE_FILE_BODY_9281" not in str(event.model_dump(mode="json")) for event in events)
+    assert all("input" not in event.payload and "result" not in event.payload for event in tool_events)
+    assert events[-1].type == "run_completed"
+
+    app = FastAPI()
+    app.state.runtime = e["hub"]
+    app.include_router(agent_router)
+    async def read_events():
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            return await client.get(f"/agent/runs/{receipt['run_id']}/events")
+    response = asyncio.run(read_events())
+    assert response.status_code == 200
+    public_tools = [event for event in response.json()["events"] if event["type"] in {"tool_started", "tool_completed"}]
+    assert len(public_tools) == 2
+    assert public_tools[0]["payload"]["remote_origin"]["node_sequence"] == tool_events[0].payload["remote_origin"]["node_sequence"]
+    assert public_tools[0]["created_at"] <= public_tools[0]["payload"]["remote_origin"]["relayed_at"]
+
+
+def test_progress_report_retry_and_terminal_pages_are_durable(setup_remote, monkeypatch):
+    from app.domains.remote_execution import _REMOTE_PROGRESS, remote_progress_projection
+
+    e = setup_remote
+    e["node"].agent_turn_loop.llm_client = ScriptedClient([
+        operation("final_answer", reason="Done."), "Finished.",
+    ])
+    receipt = start(e, command_id="progress-pages", workspace_id="project")
+    e["worker"].run_once()
+    assert e["node"].agent_dispatch.run_one("progress-pages")
+    run_id = receipt["run_id"]
+    # Model a busy but content-free event stream; private deltas are cursor-drained too.
+    for index in range(70):
+        event_type = "llm_started" if index % 2 == 0 else "llm_delta"
+        e["node"].agent_run_manager.append_event(
+            run_id, event_type, "ignored node text", stage="answer" if event_type == "llm_delta" else "decision",
+            payload={"secret": "PRIVATE_CONTROL_OR_ANSWER", "audit_record": {"prompt": "private"}},
+        )
+    expected_source_sequences = [
+        event.sequence for event in e["node"].agent_run_manager.list_events(run_id)
+        if remote_progress_projection(event.model_dump(mode="json")) is not None
+    ]
+
+    original_transport = e["worker"]._transport
+    lost_once = {"value": True}
+    def lose_first_report_reply(method, path, payload, token):
+        response = original_transport(method, path, payload, token)
+        if path.endswith("/report") and lost_once["value"]:
+            lost_once["value"] = False
+            raise OSError("response lost after hub commit")
+        return response
+    monkeypatch.setattr(e["worker"], "_transport", lose_first_report_reply)
+
+    with pytest.raises(OSError):
+        e["worker"].run_once()
+    with closing(e["node"]._conn()) as conn:
+        pending = dict(conn.execute("SELECT event_cursor,pending_event_cursor,pending_report FROM remote_execution_node_tasks WHERE run_id=?", (run_id,)).fetchone())
+    first_page = __import__("json").loads(pending["pending_report"])
+    assert len(first_page["progress_events"]) <= 64
+    assert first_page["status"] == "running"
+    first_page_id = first_page["report_id"]
+    # The response retry is byte-identical and does not duplicate imported events.
+    restarted_worker = RemoteExecutionNode(
+        e["node"], e["worker"].config, e["worker"].sync_config, transport=original_transport,
+    )
+    restarted_worker.run_once()
+    with closing(e["node"]._conn()) as conn:
+        state = dict(conn.execute("SELECT event_cursor,pending_event_cursor,pending_report FROM remote_execution_node_tasks WHERE run_id=?", (run_id,)).fetchone())
+    assert state["pending_report"] is None
+    assert state["event_cursor"] > pending["pending_event_cursor"]
+    assert first_page_id
+
+    # The replacement worker drains the remaining source page before terminal publication.
+    task = e["service"].get(receipt["remote_execution"]["task_id"])
+    assert task["state"] == "completed"
+    assert any(report["status"] == "running" for report in task["reports"])
+    assert any(report["status"] == "completed" for report in task["reports"])
+    hub_events = e["hub"].agent_run_manager.list_events(run_id)
+    origins = [event.payload["remote_origin"]["node_sequence"] for event in hub_events if "remote_origin" in event.payload]
+    assert origins == expected_source_sequences
+    assert all(event.message == _REMOTE_PROGRESS[event.type][1] for event in hub_events if "remote_origin" in event.payload)
+    assert all("PRIVATE_CONTROL_OR_ANSWER" not in str(event.model_dump(mode="json")) for event in hub_events)
+    restarted_worker.stop()
+
+
+def test_progress_projection_rejects_wrong_run_spoof_and_oversize(setup_remote):
+    from app.domains.remote_execution import RemoteProgressEvent
+
+    e = setup_remote
+    receipt = start(e, command_id="progress-validation", workspace_id="project")
+    e["worker"].run_once()
+    with closing(e["node"]._conn()) as conn:
+        fence = __import__("json").loads(conn.execute(
+            "SELECT fence FROM remote_execution_node_tasks WHERE run_id=?", (receipt["run_id"],)
+        ).fetchone()[0])
+    event = {"run_id": "spoofed-run", "source_sequence": 1, "source_created_at": "2026-10-25T00:00:00Z",
+             "type": "tool_started",
+             "stage": "tool", "message": "A tool started.", "payload": {}}
+    with pytest.raises(PermissionError, match="run identity"):
+        e["service"].report(e["principal"], {**fence, "report_id": "wrong-run", "status": "running",
+            "progress_cursor": 1, "progress_events": [event]})
+    event["run_id"] = receipt["run_id"]
+    event["payload"] = {"input": "private"}
+    with pytest.raises(ValueError, match="private fields"):
+        RemoteProgressEvent.model_validate(event)
+    with pytest.raises(ValueError, match="1 MiB"):
+        e["service"].report(e["principal"], {**fence, "report_id": "oversize", "status": "running",
+            "result": {"answer": "x" * 1_100_000}})
+
+
+def test_legacy_node_report_without_progress_fields_remains_accepted(setup_remote):
+    e = setup_remote
+    receipt = start(e, command_id="legacy-report", workspace_id="project")
+    e["worker"].run_once()
+    with closing(e["node"]._conn()) as conn:
+        fence = __import__("json").loads(conn.execute(
+            "SELECT fence FROM remote_execution_node_tasks WHERE run_id=?", (receipt["run_id"],)
+        ).fetchone()[0])
+    report = {**fence, "report_id": "legacy-report", "status": "running"}
+    assert e["service"].report(e["principal"], report)["accepted"]
+    with closing(e["hub"]._conn()) as conn:
+        stored = __import__("json").loads(conn.execute(
+            "SELECT payload FROM remote_execution_reports WHERE report_id='legacy-report'"
+        ).fetchone()[0])
+    assert "progress_cursor" not in stored and "progress_events" not in stored
+
+
+def test_paused_node_run_drains_progress_before_hub_closes_stream(setup_remote):
+    e = setup_remote
+    receipt = start(e, command_id="paused-progress", workspace_id="project")
+    e["worker"].run_once()
+    run_id = receipt["run_id"]
+    for _ in range(70):
+        e["node"].agent_run_manager.append_event(
+            run_id, "llm_started", "private model details", stage="decision",
+            payload={"audit_record": {"prompt": "private"}},
+        )
+    e["node"].agent_run_manager.request_pause(run_id)
+    e["node"].agent_run_manager.acknowledge_pause(run_id)
+
+    e["worker"].run_once()
+    assert e["hub"].agent_run_manager.get_run(run_id).status.value == "running"
+    first_report = e["service"].get(receipt["remote_execution"]["task_id"])["reports"][-1]
+    assert first_report["status"] == "running"
+    assert e["worker"].status()["active_tasks"] == 1
+
+    e["worker"].run_once()
+    assert e["hub"].agent_run_manager.get_run(run_id).status.value == "paused"
+    task = e["service"].get(receipt["remote_execution"]["task_id"])
+    assert task["state"] == "paused"
+
+
+def test_oversized_session_message_does_not_advance_unsent_message_cursor(setup_remote):
+    e = setup_remote
+    e["node"].agent_turn_loop.llm_client = ScriptedClient([
+        operation("final_answer", reason="Done."), "Finished.",
+    ])
+    receipt = start(e, command_id="oversized-message", workspace_id="project")
+    e["worker"].run_once()
+    e["node"].session_service.append_message(
+        session_id=receipt["session_id"], role="agent", content="x" * (400 * 1024),
+        message_id="oversized-source-message",
+    )
+    assert e["node"].agent_dispatch.run_one("oversized-message")
+    captured = {}
+    def unavailable_report(method, path, payload, token):
+        captured.update(payload)
+        raise OSError("keep pending report for inspection")
+    e["worker"]._transport = unavailable_report
+    row = e["worker"]._active()[0]
+    with pytest.raises(OSError):
+        e["worker"]._relay(row)
+    with closing(e["node"]._conn()) as conn:
+        pending = dict(conn.execute(
+            "SELECT message_cursor,pending_cursor,pending_report FROM remote_execution_node_tasks WHERE run_id=?",
+            (receipt["run_id"],),
+        ).fetchone())
+    report = __import__("json").loads(pending["pending_report"])
+    assert report["status"] == "failed"
+    assert report["error_type"] == "remote_message_too_large"
+    assert "exceeds the relay page limit" in report["result"]["answer"]
+    assert pending["pending_cursor"] == pending["message_cursor"] == 0
+    assert captured == report
+
+
 @pytest.mark.parametrize("explicit_null", [False, True])
 def test_tool_dispatch_without_device_requirement_stays_on_hub(setup_remote, explicit_null):
     e = setup_remote
@@ -806,3 +1016,19 @@ def test_continuation_api_requires_account_and_rejects_wrong_question(setup_remo
     with pytest.raises(HTTPException) as error:
         resume_task(task_id, ControlCommand(command_id="resume"), request)
     assert error.value.status_code == 409
+
+
+def test_remote_progress_preserves_tool_rejection_without_exposing_review_data():
+    from app.domains.remote_execution import RemoteProgressEvent, remote_progress_projection
+
+    projection = remote_progress_projection({
+        "run_id": "synthetic_run", "sequence": 3, "created_at": "2026-10-25T14:00:00+00:00",
+        "type": "tool_completed", "payload": {
+            "tool_name": "filesystem.edit_file", "status": "rejected",
+            "metadata": {"result": {"private": "raw review arguments"}},
+        },
+    })
+    assert RemoteProgressEvent.model_validate(projection).payload == {
+        "tool_name": "filesystem.edit_file", "status": "rejected",
+    }
+    assert "raw review arguments" not in str(projection)
