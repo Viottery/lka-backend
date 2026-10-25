@@ -6,6 +6,7 @@ verdict, or an authorization grant. Raw results remain run-scoped artifacts.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -13,6 +14,9 @@ from typing import Any
 
 from app.core.answer_evidence import cached_result_read_routes
 from app.core.tools import ToolContext, effective_tool_read_only, tool_scope_discovery_denial
+from app.storage.sqlite_retry import is_sqlite_busy
+
+logger = logging.getLogger(__name__)
 
 
 def _digest(value: Any) -> str:
@@ -84,6 +88,17 @@ class SessionProgressCacheService:
 
     def record(self, *, context: ToolContext, tool_events: list[dict[str, Any]],
                working_state: dict[str, Any] | None = None) -> None:
+        try:
+            self._record(context=context, tool_events=tool_events, working_state=working_state)
+        except Exception as exc:
+            if not is_sqlite_busy(exc):
+                raise
+            # This derived index can be rebuilt from durable tool artifacts and
+            # runtime state; a later graph save retries it using that state.
+            logger.warning("Session progress indexing deferred by SQLite contention for run %s", context.run_id)
+
+    def _record(self, *, context: ToolContext, tool_events: list[dict[str, Any]],
+                working_state: dict[str, Any] | None = None) -> None:
         try:
             boundary = self._boundary(context)
         except (ValueError, KeyError):

@@ -1,0 +1,14 @@
+{
+  "backend": "/opt/lka-backend",
+  "frontend": "/opt/lka-desktop",
+  "data": "/var/lib/lka/runtime",
+  "env_file": "/etc/lka/backend.env",
+  "config_file": "/etc/lka/local.toml",
+  "service": "lka-cloud.service",
+  "health_url": "http://127.0.0.1:8765",
+  "releases": "/opt/lka-releases",
+  "state": "/var/lib/lka-updates",
+  "uv": "/opt/lka-tools/uv",
+  "snapshot_script": "/opt/lka-tools/cloud_data_snapshot.py",
+  "guard_files": ["/etc/systemd/system/lka-cloud.service"]
+}

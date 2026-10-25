@@ -133,6 +133,99 @@ def test_queued_work_freezes_approval_at_acceptance(runtime):
     assert runtime.agent_run_manager.get_run(run.run_id).metadata["session_policy"]["safety_review_mode"] == "manual"
 
 
+def test_management_dispatch_default_overrides_request_for_new_local_work(runtime):
+    parent = context_fixture.__wrapped__(runtime)
+    parent.safety_review_mode = "manual"
+    runtime.managed_tasks.review_mode = lambda: "llm"
+
+    task = runtime.managed_tasks.start_task(parent, command_id="default-task", purpose="Inspect bounded state")
+    queued = runtime.management_queue.queue_work(
+        parent, command_id="default-queue", purpose="Queue bounded read", read_only_work=True,
+    )
+    matter = runtime.management_work.organize_work(
+        parent, "default-matter", [{"op": "create", "ref": "work", "fields": {
+            "title": "Bounded work", "visibility": "user",
+        }}],
+    )["refs"]["work"]
+    assigned = runtime.management_assignments.start_work(
+        parent, command_id="default-assignment", matter_id=matter, expected_revision=1,
+        purpose="Start assigned bounded work",
+    )
+
+    for receipt in (task, queued, assigned):
+        run = runtime.agent_run_manager.get_run(receipt["run_id"])
+        assert run.metadata["session_policy"]["safety_review_mode"] == "llm"
+
+
+def test_management_dispatch_default_overrides_request_for_delegate(runtime):
+    parent = context_fixture.__wrapped__(runtime)
+    parent.safety_review_mode = "manual"
+    runtime.managed_tasks.review_mode = lambda: "llm"
+
+    delegate = runtime.management_delegates.delegate_work(
+        parent, command_id="default-delegate", objective="A bounded delegated line",
+    )
+    with closing(runtime._conn()) as conn:
+        stored = runtime.management_delegates.get_for_session(conn, delegate["session_id"])
+    assert stored["safety_review_mode"] == "llm"
+    assert runtime._session_run_policy(delegate["session_id"]).safety_review_mode == "llm"
+
+    # Remote continuation resolves configured policy ahead of the caller and
+    # predecessor snapshots, while an unset policy keeps legacy precedence.
+    assert runtime.managed_tasks.dispatch_review_mode("manual", "skip") == "llm"
+    runtime.managed_tasks.review_mode = lambda: None
+    assert runtime.managed_tasks.dispatch_review_mode("manual", "skip") == "manual"
+    assert runtime.managed_tasks.dispatch_review_mode(None, "skip") == "skip"
+
+
+def test_remote_start_and_continuation_use_management_dispatch_default(runtime, tmp_path, monkeypatch):
+    from tests.test_remote_execution import setup_remote as remote_setup
+
+    generator = remote_setup.__wrapped__(runtime, tmp_path, monkeypatch)
+    env = next(generator)
+    try:
+        env["context"].safety_review_mode = "manual"
+        runtime.managed_tasks.review_mode = lambda: "llm"
+        env["worker"].config.review_policy = "inherit"
+        receipt = env["hub"].managed_tasks.start_task(
+            env["context"], command_id="review-default-remote", purpose="Read the project",
+            execution_target={"device_id": "pc", "environment_id": "linux", "workspace_id": "project"},
+        )
+        original = runtime.agent_run_manager.get_run(receipt["run_id"])
+        assert original.metadata["session_policy"]["safety_review_mode"] == "llm"
+        assert original.metadata["remote_approval_requested"] == "llm"
+
+        env["node"].agent_turn_loop.llm_client = ScriptedClient([
+            operation("final_answer", reason="Read complete"), "Project read.",
+        ])
+        env["worker"].run_once()
+        assert env["node"].agent_dispatch.run_one("review-default-first")
+        env["worker"].run_once()
+
+        continuation = runtime.managed_tasks.send_instruction(
+            env["context"], command_id="review-default-remote-next", session_id=receipt["session_id"],
+            expected_run_id=receipt["run_id"], purpose="Continue reading the project",
+        )
+        continued = runtime.agent_run_manager.get_run(continuation["run_id"])
+        assert continued.metadata["session_policy"]["safety_review_mode"] == "llm"
+        assert continued.metadata["remote_approval_requested"] == "llm"
+    finally:
+        try:
+            next(generator)
+        except StopIteration:
+            pass
+
+
+def test_dispatch_mode_default_none_preserves_explicit_manual(runtime):
+    parent = context_fixture.__wrapped__(runtime)
+    parent.safety_review_mode = "manual"
+    runtime.managed_tasks.review_mode = lambda: None
+    receipt = runtime.managed_tasks.start_task(parent, command_id="legacy-mode", purpose="Keep old policy")
+    run = runtime.agent_run_manager.get_run(receipt["run_id"])
+    assert run.metadata["session_policy"]["safety_review_mode"] == "manual"
+    assert runtime.agent_turn_loop.safety_review_mode == SafetyReviewMode.SKIP
+
+
 @pytest.mark.parametrize("mode", ["skip", "llm"])
 def test_ordinary_bash_write_uses_inherited_mode_without_manual_prompt(runtime, tmp_path, monkeypatch, mode):
     parent = context_fixture.__wrapped__(runtime)

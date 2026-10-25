@@ -20,6 +20,7 @@ from app.core.codex_app_server import ApprovalRequest, ServerNotification, Serve
 from app.core.context_driver import ContextViews
 from app.core.multi_agent import ContextSnapshot, FailureDetail, TaskResult, TaskResultStatus
 from app.core.safety import (
+    SafetyReviewDecision,
     SafetyReviewMode,
     SafetyReviewRequest,
     SafetyReviewStatus,
@@ -338,8 +339,9 @@ class CodexAppServerExpertExecutor:
                             "codex_event_scope_mismatch",
                             "Codex approval request did not match the active session and turn; it was declined.",
                         )
-                    if self.route_human_approvals:
-                        if (
+                    autonomous = child.metadata.get("session_policy", {}).get("safety_review_policy") == "autonomous"
+                    if self.route_human_approvals or autonomous:
+                        if not autonomous and (
                             self.approval_guard is None
                             or active.workspace_root is None
                             or not self.approval_guard(event, active.workspace_root)
@@ -355,6 +357,18 @@ class CodexAppServerExpertExecutor:
                         if decision is None:
                             return self.from_terminal(
                                 self.run_manager.get_run(child_run_id) or child, snapshot
+                            )
+                        # An older standard review can survive a policy change.
+                        # Its human acceptance still requires the original scope gate.
+                        if decision == "accept" and autonomous and (
+                            self.approval_guard is None or active.workspace_root is None
+                            or not self.approval_guard(event, active.workspace_root)
+                        ):
+                            await client.respond_to_approval(event.request_id, "decline")
+                            await self._best_effort_interrupt(active)
+                            return self._blocked(
+                                child, snapshot, code="codex_approval_out_of_scope",
+                                message="Codex approval could not be proven within the delegated scope.",
                             )
                         await client.respond_to_approval(event.request_id, decision)
                         self._record_native(
@@ -620,10 +634,27 @@ class CodexAppServerExpertExecutor:
             tool_risk="high",
             side_effects=["Codex external execution"],
             read_only=False,
+            safety_review_policy=child.metadata.get("session_policy", {}).get("safety_review_policy", "standard"),
             mode=SafetyReviewMode.MANUAL,
             reason=str(event.params.get("reason") or "Codex requests approval for an action."),
             created_at=datetime.now(UTC).isoformat(),
         ))
+        if review.safety_review_policy == "autonomous":
+            if review.status == SafetyReviewStatus.PENDING:
+                review = self.run_manager.decide_safety_review(
+                    review_id=review.review_id,
+                    decision=SafetyReviewDecision.REJECT,
+                    decided_by="system.autonomous_manual_unavailable",
+                    reason=("Codex requested manual authority unavailable to this autonomous run. "
+                            "The action was not approved; choose a safe alternative within the existing scope."),
+                )
+            self._record(child, "codex_approval_decided", "Autonomous Codex approval was declined.", {
+                "review_id": review.review_id, "decision": "decline",
+            })
+            current = self.run_manager.get_run(child.run_id)
+            if current is not None and current.status == AgentRunStatus.WAITING_CONFIRMATION:
+                self.run_manager.resume_running(child.run_id)
+            return "decline"
         self._record(child, "codex_approval_waiting", "Codex is waiting for user approval.", {
             "review_id": review.review_id,
             "request_id": event.request_id,

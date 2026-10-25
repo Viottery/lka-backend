@@ -123,6 +123,33 @@ def test_transaction_rollback_bootstrap_and_restart(sync):
         )
 
 
+def test_status_and_pull_read_while_wal_writer_is_held(sync, tmp_path):
+    service, _replica, connect = sync
+    populate(connect)
+    with connect() as conn:
+        assert conn.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower() == "wal"
+
+    path = tmp_path / "hub.sqlite3"
+
+    def fast_connect():
+        conn = sqlite3.connect(path, timeout=0.1)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    reader = SharedSyncService(fast_connect, service.config)
+    writer = fast_connect()
+    writer.execute("BEGIN IMMEDIATE")
+    insert(writer, "memory_projects", project_id="uncommitted")
+    try:
+        status = reader.status()
+        page = reader.pull(limit=500)
+        assert status["cursor"] == page["high_watermark"]
+        assert all(change["key"] != ["uncommitted"] for change in page["changes"])
+    finally:
+        writer.rollback()
+        writer.close()
+
+
 def test_existing_data_bootstrap_once(tmp_path):
     path = tmp_path / "existing.sqlite3"
 
@@ -301,6 +328,24 @@ def test_node_scope_rechecked_and_proposals_never_publish(sync):
     assert service.resolve_proposal("node", "one", "reviewed")["status"] == "reviewed"
     with connect() as conn:
         assert conn.execute("SELECT count(*) FROM memory_entries").fetchone()[0] == 0
+
+    class RevokedDuringRead:
+        def __init__(self):
+            self.calls = 0
+
+        def require_node(self, conn, principal, scope):
+            assert conn.in_transaction
+            self.calls += 1
+            if self.calls == 2:
+                raise PermissionError("revoked during sync page")
+
+    revocation = RevokedDuringRead()
+    service.devices = revocation
+    with pytest.raises(PermissionError, match="revoked during sync page"):
+        service.pull(principal=principal)
+    assert revocation.calls == 2
+
+    service.devices = devices
     devices.denied = True
     with pytest.raises(PermissionError):
         service.pull(principal=principal)

@@ -101,6 +101,7 @@ class SessionRunPolicy(BaseModel):
     llm_reasoning_level: Literal["off", "low", "high", "max"] | None = None
     llm_reasoning_source: Literal["request", "session", "controller", "ui_default", "default", "inherited"] | None = None
     safety_review_mode: Literal["skip", "llm", "manual"] | None = None
+    safety_review_policy: Literal["standard", "autonomous"] = "standard"
     allowed_tools: list[str] | None = None
     read_only_tools: list[str] = Field(default_factory=list)
     allowed_paths: list[str] | None = None
@@ -112,6 +113,14 @@ class SessionRunPolicy(BaseModel):
 class AgentSessionDetail(BaseModel):
     session: AgentSession
     messages: list[AgentSessionMessage]
+
+
+class SessionHistoryCursorError(ValueError):
+    """The requested message no longer belongs to this active history."""
+
+
+class AgentSessionMessagePage(AgentSessionDetail):
+    message_page: dict[str, Any]
 
 
 class SessionService:
@@ -397,6 +406,57 @@ class SessionService:
             session=session,
             messages=[self._message_from_row(row) for row in rows],
         )
+
+    def get_message_page(
+        self, *, session_id: str, limit: int = 30,
+        before_message_id: str | None = None, after_message_id: str | None = None,
+    ) -> AgentSessionMessagePage:
+        """Read a bounded history page in one snapshot, with session-bound cursors."""
+        if not 1 <= limit <= 100 or before_message_id and after_message_id:
+            raise ValueError("Use one message cursor and a limit from 1 to 100")
+        conn = self._conn_factory()
+        try:
+            conn.execute("BEGIN")
+            row = conn.execute(
+                "SELECT * FROM agent_sessions WHERE session_id=? AND status!='deleted'", (session_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Session not found: {session_id}")
+            session = self._session_from_row(row)
+            cursor = before_message_id or after_message_id
+            clause, params = "", [session_id]
+            if cursor:
+                anchor = conn.execute(
+                    "SELECT rowid,created_at FROM agent_session_messages WHERE session_id=? AND message_id=?",
+                    (session_id, cursor),
+                ).fetchone()
+                if anchor is None:
+                    raise SessionHistoryCursorError("history_cursor_invalid")
+                op = ">" if after_message_id else "<"
+                clause = f" AND (created_at,rowid) {op} (?,?)"
+                params.extend((anchor["created_at"], anchor["rowid"]))
+            direction = "ASC" if after_message_id else "DESC"
+            rows = conn.execute(
+                "SELECT message_id,session_id,role,content,payload,created_at FROM agent_session_messages "
+                f"WHERE session_id=?{clause} ORDER BY created_at {direction},rowid {direction} LIMIT ?",
+                [*params, limit + 1],
+            ).fetchall()
+            has_more = len(rows) > limit
+            rows = rows[:limit]
+            if not after_message_id:
+                rows.reverse()
+            return AgentSessionMessagePage(
+                session=session, messages=[self._message_from_row(item) for item in rows],
+                message_page={
+                    "direction": "after" if after_message_id else "before",
+                    "has_more": has_more,
+                    "first_message_id": rows[0]["message_id"] if rows else None,
+                    "last_message_id": rows[-1]["message_id"] if rows else None,
+                    "history_reset_at": session.metadata.get("history_reset_at"),
+                },
+            )
+        finally:
+            conn.close()
 
     def get_latest_turn_attachment_ids(self, *, session_id: str) -> list[str]:
         """Read the last persisted foreground input selection without loading history."""

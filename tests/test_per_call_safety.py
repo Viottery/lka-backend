@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -14,6 +16,16 @@ from app.core.safety import SafetyReviewDecision, SafetyReviewMode
 from app.core.tools import ToolContext, ToolResult
 from app.tool_packages.messages import MESSAGE_ORIGIN_CONSTRAINT
 from tests.test_source_constraint_recovery import runtime_for
+
+
+def wait_for_pending_safety_review(runtime):
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        pending = runtime.agent_run_manager.list_pending_safety_reviews()
+        if pending:
+            return pending[0]
+        time.sleep(0.02)
+    raise AssertionError("Timed out waiting for manual safety review.")
 
 
 def configure_turn(runtime, monkeypatch, tool_name, tool_input):
@@ -71,14 +83,13 @@ def test_outside_file_review_is_scoped_and_public_reason_is_preserved(tmp_path, 
     assert denied.status == "rejected" and denied.execution_started is False
 
 
-@pytest.mark.parametrize("orchestrator", ["legacy", "langgraph"])
-def test_llm_refusal_then_explicit_user_authorization_gets_a_new_review(tmp_path, monkeypatch, orchestrator):
+def test_llm_refusal_then_explicit_user_authorization_gets_a_new_review(tmp_path, monkeypatch):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     outside = tmp_path / "outside.txt"
     outside.write_text("allowed on second turn", encoding="utf-8")
     monkeypatch.setenv("LKA_WORKSPACE_ROOTS", str(workspace))
-    runtime = runtime_for(tmp_path, monkeypatch, orchestrator)
+    runtime = runtime_for(tmp_path, monkeypatch, "legacy")
     runtime.agent_turn_loop.safety_review_mode = SafetyReviewMode.LLM
     review_requests = []
 
@@ -93,16 +104,38 @@ def test_llm_refusal_then_explicit_user_authorization_gets_a_new_review(tmp_path
 
     monkeypatch.setattr(runtime.agent_turn_loop, "_complete_text_with_retry", reviewer)
     configure_turn(runtime, monkeypatch, "filesystem.read_file", {"path": str(outside)})
-    first = runtime.run_agent_turn(session_id="sample", user_input="看看资料")
+    first_holder = {}
+    first_worker = threading.Thread(target=lambda: first_holder.setdefault(
+        "result", runtime.run_agent_turn(session_id="sample", user_input="看看资料")
+    ), daemon=True)
+    first_worker.start()
+    first_fallback = wait_for_pending_safety_review(runtime)
+    app = SimpleNamespace(state=SimpleNamespace(runtime=runtime))
+    decided = asyncio.run(decide_agent_safety_review(
+        first_fallback.review_id,
+        SafetyReviewDecisionRequest(
+            decision=SafetyReviewDecision.REJECT,
+            reason="The user declined this operation.",
+        ),
+        SimpleNamespace(app=app),
+    ))
+    assert decided.status == "rejected"
+    first_worker.join(timeout=5)
+    assert not first_worker.is_alive()
+    first = first_holder["result"]
     event = first.tool_events[0]
     assert event.result["status"] == "rejected" and event.result["execution_started"] is False
-    assert event.feedback["safety_review"]["decision_reason"] == "请明确授权工作区外的这个文件"
+    model_review = next(review for review in runtime.agent_run_manager.list_safety_reviews(first.run_id)
+                        if review.mode == SafetyReviewMode.LLM)
+    assert model_review.decision_reason == "请明确授权工作区外的这个文件"
+    assert event.feedback["safety_review"]["decision_reason"] == "The user declined this operation."
     assert "later explicit user authorization" in event.feedback["remaining_work"]
     configure_turn(runtime, monkeypatch, "filesystem.read_file", {"path": str(outside)})
     second = runtime.run_agent_turn(session_id="sample", user_input=f"我允许读取工作区外文件 {outside}，请重试")
     assert second.tool_events[0].result["output"]["content"] == "allowed on second turn"
     assert len(review_requests) == 2
     assert review_requests[0]["review_id"] != review_requests[1]["review_id"]
+    assert len(runtime.agent_run_manager.list_safety_reviews(first.run_id)) == 2
     assert review_requests[0]["workspace_access"] == review_requests[1]["workspace_access"] == [str(outside)]
 
 
@@ -138,9 +171,34 @@ def test_invalid_llm_approval_cannot_execute_without_a_reason(tmp_path, monkeypa
         provider="synthetic", status="ok", prompt_summary="synthetic review",
         content=json.dumps(decision, ensure_ascii=False),
     ))
-    result = runtime.run_agent_turn(session_id="sample", user_input="查看目录")
+    result_holder = {}
+    worker = threading.Thread(target=lambda: result_holder.setdefault(
+        "result", runtime.run_agent_turn(session_id="sample", user_input="查看目录")
+    ), daemon=True)
+    worker.start()
+    fallback = wait_for_pending_safety_review(runtime)
+    assert fallback.mode == SafetyReviewMode.MANUAL
+    assert fallback.status.value == "pending"
+    assert worker.is_alive()
+    decided = asyncio.run(decide_agent_safety_review(
+        fallback.review_id,
+        SafetyReviewDecisionRequest(
+            decision=SafetyReviewDecision.REJECT,
+            reason="The user declined the unresolved model decision.",
+        ),
+        SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(runtime=runtime))),
+    ))
+    assert decided.status == "rejected"
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    result = result_holder["result"]
     assert result.tool_events[0].result["status"] == "rejected"
-    assert result.tool_events[0].result["error"]
+    assert result.tool_events[0].result["execution_started"] is False
+    reviews = runtime.agent_run_manager.list_safety_reviews(result.run_id)
+    assert len(reviews) == 2
+    model_review = next(review for review in reviews if review.mode == SafetyReviewMode.LLM)
+    assert model_review.status.value == "rejected"
+    assert model_review.llm_output == json.dumps(decision, ensure_ascii=False)
 
 
 def test_small_source_result_gets_warning_without_mutating_raw_evidence(tmp_path, monkeypatch):

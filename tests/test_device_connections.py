@@ -307,3 +307,75 @@ def test_reviews_and_resumed_runs_keep_frozen_scope(connections):
                 assert (await client.post(f"/agent/safety-reviews/{identity}/decision", json={})).status_code == 403
 
     asyncio.run(asyncio.wait_for(exercise(), timeout=8))
+
+
+def test_product_node_gzip_filters_json_and_preserves_stream_revocation(connections, monkeypatch):
+    """Exercise the product middleware order, real session routes and SQLite."""
+    from starlette.responses import StreamingResponse
+
+    from app.api.main import create_app
+    from app.core.config import get_settings
+
+    f = connections
+    monkeypatch.setenv("LKA_DATA_DIR", str(f.root / "runtime"))
+    monkeypatch.setenv("LKA_LOCAL_CONFIG", str(f.root / "missing.toml"))
+    get_settings.cache_clear()
+    try:
+        app = create_app()
+        app.state.device_connection_service = f.node
+        store = app.state.runtime.session_service
+        ordinary = store.create_session(title="Visible", metadata={"padding": "ordinary " * 1000}).session
+        manager = store.create_session(title="Manager secret").session
+        with store._conn_factory() as conn:
+            conn.execute("UPDATE agent_sessions SET kind='manager' WHERE session_id=?", (manager.session_id,))
+        hidden = [manager.session_id]
+        hidden.append(store.create_session(title="Assistant secret", creation_source="assistant",
+                                            creator_session_id=manager.session_id).session.session_id)
+        hidden.append(store.create_session(title="Cloud secret", metadata={"remote_execution": {"hub_id": "hub"}}).session.session_id)
+        hidden.append(store.create_session(title="Outside secret", metadata={"workspace": {
+            "path": "/unapproved", "backend_path": "/unapproved", "platform": "linux"}}).session.session_id)
+        grant, _ = install(f)
+        connection = f.node.redeem(grant["grant"])
+        first = "data: " + "synthetic " * 1000 + "\n\n"
+        produced = []
+
+        @app.get(f"/sessions/{ordinary.session_id}/compression-stream")
+        async def stream():
+            async def events():
+                produced.append("first")
+                yield first
+                f.node.revoke(connection["session_id"])
+                produced.append("revoked")
+                yield "data: must not be delivered\n\n"
+                produced.append("must not continue")
+            return StreamingResponse(events(), media_type="text/event-stream")
+
+        async def exercise():
+            headers = {"Accept-Encoding": "gzip", "X-LKA-Client": "native",
+                       "X-LKA-Connection-Token": connection["token"]}
+            async with AsyncClient(transport=ASGITransport(app=app, client=("100.80.1.2", 5000)),
+                                   base_url="https://pc.test.ts.net", headers=headers) as client:
+                listed = await client.get("/sessions")
+                assert listed.status_code == 200
+                assert listed.headers["content-encoding"] == "gzip"
+                assert [item["session_id"] for item in listed.json()["sessions"]] == [ordinary.session_id]
+                assert all(identity not in listed.text for identity in hidden)
+                for identity in hidden:
+                    assert (await client.get(f"/sessions/{identity}")).status_code == 403
+                created = await client.post("/sessions", json={"title": "Large creation",
+                    "metadata": {"padding": "synthetic " * 1000}, "initial_message": "synthetic " * 2000})
+                assert created.status_code == 200
+                assert created.headers["content-encoding"] == "gzip"
+                created_id = created.json()["session"]["session_id"]
+                assert created.json()["messages"][0]["content"] == "synthetic " * 2000
+                assert f.node.session_policy(created_id)["safety_review_mode"] == "manual"
+                response = await client.get(f"/sessions/{ordinary.session_id}/compression-stream")
+                assert response.status_code == 200
+                assert "content-encoding" not in response.headers
+                assert response.text == first
+                assert produced == ["first", "revoked"]
+                assert (await client.get("/sessions")).status_code == 401
+
+        asyncio.run(asyncio.wait_for(exercise(), timeout=15))
+    finally:
+        get_settings.cache_clear()

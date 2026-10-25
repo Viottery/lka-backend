@@ -161,3 +161,91 @@ def test_oversized_manual_view_is_preserved_and_rejected_before_parsing(tmp_path
     with pytest.raises(MemoryFileError, match="8 MiB"):
         files.preview_import(scope="global")
     assert path.stat().st_size == 8 * 1024 * 1024 + 1
+
+
+def _legacy_baseline(service, old_path, digest):
+    from app.storage.sqlite_timing import connect_sqlite
+
+    with connect_sqlite(service.db_path) as conn:
+        conn.execute("DELETE FROM memory_file_hashes")
+        conn.execute("INSERT INTO memory_file_hashes(path,digest) VALUES(?,?)", (str(old_path), digest))
+        conn.commit()
+
+
+@pytest.mark.parametrize("scope", ["global", "project"])
+@pytest.mark.parametrize("legacy_windows", [False, True])
+def test_moved_legacy_view_rebinds_only_verified_baseline(tmp_path, scope, legacy_windows):
+    import hashlib
+    import shutil
+
+    service, files, record = _setup(tmp_path)
+    project_id = service.resolve_project("/workspace/a") if scope == "project" else None
+    args = {"scope": scope, "project_id": project_id}
+    path = files.generate(**args)
+    raw = path.read_bytes()
+    relative = path.relative_to(files.data_dir)
+    old_path = "D:\\old-data\\" + str(relative).replace("/", "\\") if legacy_windows else str(path.resolve())
+    _legacy_baseline(service, old_path, hashlib.sha256(raw).hexdigest())
+    moved = tmp_path / "moved-data"
+    shutil.move(str(files.data_dir), moved)
+    migrated = MemoryFiles(service, moved)
+    # Preview also performs a safe, persisted migration before regeneration.
+    assert migrated.preview_import(**args).edits == ()
+    if scope == "global":
+        service.correct(record.memory_id, content="Updated after migration", expected_version=1)
+    migrated_path = migrated.generate(**args)
+    assert migrated_path.exists()
+    if scope == "global":
+        assert b"Updated after migration" in migrated_path.read_bytes()
+    # A subsequent move needs no legacy path discovery.
+    again = tmp_path / "again-data"
+    shutil.move(str(moved), again)
+    assert MemoryFiles(service, again).generate(**args).exists()
+
+
+@pytest.mark.parametrize("failure", ["edited", "wrong_project", "wrong_header", "filename_only"])
+def test_migration_never_adopts_unverified_file(tmp_path, failure):
+    import hashlib
+
+    service, files, _record = _setup(tmp_path)
+    project_id = service.resolve_project("/workspace/a")
+    args = {"scope": "project", "project_id": project_id}
+    path = files.generate(**args)
+    raw = path.read_bytes()
+    legacy = f"/old-data/memory/projects/{project_id}/MEMORY.md"
+    if failure == "edited":
+        path.write_bytes(raw + b"manual note\n")
+    elif failure == "wrong_project":
+        legacy = "/old-data/memory/projects/another-project/MEMORY.md"
+    elif failure == "wrong_header":
+        raw = raw.replace(f"project_id={project_id}".encode(), b"project_id=another-project")
+        path.write_bytes(raw)
+    elif failure == "filename_only":
+        legacy = "/old-data/notes/MEMORY.md"
+    _legacy_baseline(service, legacy, hashlib.sha256(raw).hexdigest())
+    preserved = path.read_bytes()
+    with pytest.raises(MemoryFileConflictError):
+        files.generate(**args)
+    with pytest.raises(MemoryFileConflictError):
+        files.preview_import(**args)
+    assert path.read_bytes() == preserved
+
+
+def test_local_legacy_baseline_conflict_cannot_fall_back_to_matching_historical_hash(tmp_path):
+    import hashlib
+
+    from app.storage.sqlite_timing import connect_sqlite
+
+    service, files, _record = _setup(tmp_path)
+    path = files.generate(scope="global")
+    baseline = hashlib.sha256(path.read_bytes()).hexdigest()
+    _legacy_baseline(service, path.resolve(), baseline)
+    edited = path.read_bytes() + b"manual note\n"
+    path.write_bytes(edited)
+    with connect_sqlite(service.db_path) as conn:
+        conn.execute("INSERT INTO memory_file_hashes(path,digest) VALUES(?,?)",
+                     ("/historical/memory/global/MEMORY.md", hashlib.sha256(edited).hexdigest()))
+        conn.commit()
+    with pytest.raises(MemoryFileConflictError):
+        files.generate(scope="global")
+    assert path.read_bytes() == edited

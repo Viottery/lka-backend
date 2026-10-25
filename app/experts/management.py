@@ -474,7 +474,7 @@ class ManagementCoordinator:
             # tick creates another short wake job after the session is free.
             return
         if run is not None:
-            self.run_manager.restore_run(run)
+            self.run_manager.get_run(run.run_id)
 
     def _budget_scopes(self, sid, execution_id, revisions):
         return [
@@ -545,7 +545,9 @@ class ManagementCoordinator:
                 and not record.get("metadata", {}).get("manager_explicit_delegation")) or controller is None
                 or controller[0] != "active" or controller[1] != execution["controller_revision"]
                 or controller[2] == "deleted" or record.get("metadata", {}).get("cancel_requested")
-                or record["status"] not in {"queued", "running"}):
+                # A parked run still owns its execution and frozen authority.
+                # Graph review/user interrupts recheck this guard after parking.
+                or record["status"] not in {"queued", "running", "waiting_confirmation", "waiting_user"}):
             raise ManagementExecutionFenced("manager_controller_changed")
         for gid, revision in json.loads(execution["goal_revisions"]).items():
             goal = conn.execute("SELECT revision,status FROM manager_goals WHERE goal_id=? AND session_id=?",

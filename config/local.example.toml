@@ -16,6 +16,13 @@ enabled = false
 # Wake the assistant in the background when a task finishes or a goal is due.
 # Separate from the UI's "启用管理", which only allows organizing and dispatch.
 autonomous_enabled = false
+# Optional default for management and newly delegated tasks; omitted inherits
+# the global policy. Existing runs/reviews retain their frozen preference.
+# safety_review_mode = "llm"
+# Optional: permit routine scoped work through model review; rejected calls
+# become Agent feedback without human escalation. Mandatory manual calls are
+# blocked, not automatically approved. Existing runs/reviews keep their policy.
+# safety_review_policy = "autonomous"
 # Absolute directory on THIS host for assistant tasks run here when the
 # assistant has no default_execution_workspace (e.g. a cloud hub). Each task
 # gets its own child directory; empty keeps file/shell tools unavailable.
@@ -81,7 +88,7 @@ max_attempts = 2
 # Every Agent tool call, including read-only calls, enters the safety review step.
 # Modes:
 # - skip: record the review and auto-approve it.
-# - llm: ask the configured LLM to approve/reject.
+# - llm: ask the configured LLM; non-approval or review errors fall back to manual.
 # - manual: wait for frontend/user approval through /agent/safety-reviews/{id}/decision.
 tool_review_mode = "skip"
 manual_wait_poll_seconds = 0.5

@@ -5,7 +5,7 @@ from __future__ import annotations
 import threading
 from enum import Enum
 from hashlib import sha1
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -49,6 +49,7 @@ class SafetyReviewRequest(BaseModel):
     tool_risk: str = "low"
     side_effects: list[str] = Field(default_factory=list)
     read_only: bool | None = None
+    safety_review_policy: Literal["standard", "autonomous"] = "standard"
     mode: SafetyReviewMode
     reason: str
     created_at: str
@@ -196,13 +197,19 @@ class InMemorySafetyReviewStore:
         timeout_seconds: float | None = None,
         cancel_check: Any | None = None,
     ) -> SafetyReviewRecord:
-        with self._condition:
-            while True:
+        while True:
+            # Decision routes acquire the run-manager lock before this store's
+            # lock; check cancellation outside the store lock to avoid inversion.
+            if cancel_check is not None and cancel_check():
+                with self._condition:
+                    current = self._reviews.get(review_id)
+                    if current is None:
+                        raise KeyError(f"Safety review not found: {review_id}")
+                    return current
+            with self._condition:
                 current = self._reviews.get(review_id)
                 if current is None:
                     raise KeyError(f"Safety review not found: {review_id}")
                 if current.status != SafetyReviewStatus.PENDING:
-                    return current
-                if cancel_check is not None and cancel_check():
                     return current
                 self._condition.wait(timeout=timeout_seconds or 0.5)

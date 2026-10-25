@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import json
+import re
+import sqlite3
+import time
 from contextlib import closing
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -33,7 +36,8 @@ class ManagedTaskRunMismatchError(ManagementConflictError):
 
 class ManagedTaskService:
     def __init__(self, conn_factory, *, sessions, management, run_store, run_manager,
-                 policy, workspace, enqueue, replace, interrupt, enabled, guard, durable_execution):
+                 policy, workspace, enqueue, replace, interrupt, enabled, guard, durable_execution,
+                 review_mode=None, review_policy=None):
         self._conn = conn_factory
         self.sessions, self.management = sessions, management
         self.run_store, self.run_manager = run_store, run_manager
@@ -41,12 +45,32 @@ class ManagedTaskService:
         self.replace, self.interrupt, self.enabled = replace, interrupt, enabled
         self.guard = guard
         self.durable_execution = durable_execution
+        self.review_mode = review_mode or (lambda: None)
+        self.review_policy = review_policy or (lambda: "standard")
         # Optional {path, platform} configured by the operator; set by the runtime.
         self.default_task_parent = None
+
+    def dispatch_review_mode(self, requested=None, inherited=None):
+        """Resolve the server's dispatch default before caller and inherited modes."""
+        configured = self.review_mode()
+        return configured if configured is not None else (requested or inherited)
 
     def require_durable_execution(self):
         if not self.durable_execution():
             raise ManagementConflictError("Management dispatch requires agent.checkpoint_backend=sqlite")
+
+    @staticmethod
+    def begin_task_transaction(conn):
+        """Bounded admission retry before any task rows or effects exist."""
+        for attempt in range(2):
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                return
+            except sqlite3.OperationalError as exc:
+                code = getattr(exc, "sqlite_errorcode", None)
+                if attempt or conn.in_transaction or code is None or code & 0xff != sqlite3.SQLITE_BUSY:
+                    raise
+                time.sleep(0.05)
 
     def ensure_schema(self):
         with closing(self._conn()) as conn, conn:
@@ -193,7 +217,7 @@ class ManagedTaskService:
                 "observed_at": datetime.now(UTC).isoformat(),
                 "next_offset": offset + limit if message_id is None and len(rows) > limit else None}
 
-    def list_runs(self, session_id, *, limit=30, offset=0, context=None):
+    def list_runs(self, session_id, *, limit=30, offset=0, context=None, client_request_id=None):
         self._page(limit, offset)
         with closing(self._conn()) as conn:
             if context is not None:
@@ -202,10 +226,13 @@ class ManagedTaskService:
             row = conn.execute("SELECT 1 FROM agent_sessions WHERE session_id=? AND status!='deleted'", (session_id,)).fetchone()
             if row is None:
                 raise KeyError(session_id)
+            correlation_sql = ("AND json_extract(record_payload,'$.metadata.client_request_id')=? "
+                               if client_request_id is not None else "")
+            correlation_args = (client_request_id,) if client_request_id is not None else ()
             rows = conn.execute("SELECT record_payload FROM agent_runs WHERE session_id=? "
                                 "AND json_extract(record_payload,'$.parent_run_id') IS NULL "
-                                "ORDER BY created_at DESC,run_id DESC LIMIT ? OFFSET ?",
-                                (session_id, limit + 1, offset)).fetchall()
+                                + correlation_sql + "ORDER BY created_at DESC,run_id DESC LIMIT ? OFFSET ?",
+                                (session_id, *correlation_args, limit + 1, offset)).fetchall()
         return {"session_id": session_id, "runs": [self._run_view(json.loads(r[0])) for r in rows[:limit]],
                 "next_offset": offset + limit if len(rows) > limit else None}
 
@@ -217,6 +244,9 @@ class ManagedTaskService:
         )}
         metadata = record.get("metadata")
         metadata = metadata if isinstance(metadata, dict) else {}
+        client_request_id = metadata.get("client_request_id")
+        if isinstance(client_request_id, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", client_request_id):
+            result["client_request_id"] = client_request_id
         unfinished = record.get("status") not in TERMINAL
         result.update(pause_requested=unfinished and metadata.get("pause_requested") is True,
                       cancel_requested=unfinished and metadata.get("cancel_requested") is True,
@@ -314,12 +344,16 @@ class ManagedTaskService:
     def _new_run(self, session_id, envelope, source=None, *, workspace=None, safety_review_mode=None,
                  reasoning_level=None, reasoning_source=None):
         policy = self.policy(session_id).model_dump(mode="json")
+        policy["safety_review_policy"] = self.review_policy()
         if source is not None:
             inherited = source.metadata.get("session_policy", {})
             for name in ("llm_answer_client_name", "llm_answer_model"):
                 if name in inherited:
                     policy[name] = inherited[name]
-        if policy.get("safety_review_mode") is None:
+        configured_review_mode = self.review_mode()
+        if configured_review_mode is not None:
+            policy["safety_review_mode"] = configured_review_mode
+        elif policy.get("safety_review_mode") is None:
             policy["safety_review_mode"] = safety_review_mode or (
                 source.metadata.get("session_policy", {}).get("safety_review_mode") if source else None
             )
@@ -362,6 +396,7 @@ class ManagedTaskService:
             "llm_reasoning_level": run.metadata.get("llm_reasoning_level") or controller[2] or run.metadata.get("session_policy", {}).get("llm_reasoning_level"),
             "llm_reasoning_source": run.metadata.get("llm_reasoning_source") or ("inherited" if controller[2] else run.metadata.get("session_policy", {}).get("llm_reasoning_source")),
             "safety_review_mode": run.metadata["session_policy"].get("safety_review_mode"),
+            "safety_review_policy": run.metadata["session_policy"].get("safety_review_policy", "standard"),
         }
         frozen_level = run.metadata["session_policy"].get("llm_reasoning_level")
         if frozen_level in {"off", "low", "high", "max"}:
@@ -528,13 +563,13 @@ class ManagedTaskService:
                                              title=title, execution_target=execution_target)
         prepared = self.prepare_task(context, command_id=command_id, purpose=purpose, title=title, workspace_path=workspace_path)
         with closing(self._conn()) as conn, conn:
-            conn.execute("BEGIN IMMEDIATE")
+            self.begin_task_transaction(conn)
             result, run = self.start_task_in_transaction(
                 conn, context, command_id=command_id, purpose=purpose, prepared=prepared,
             )
             self.caller(context, mutate=True, conn=conn)
         if run is not None:
-            self.run_manager.restore_run(run)
+            self.run_manager.get_run(run.run_id)
         return result
 
     def start_task_in_transaction(self, conn, context, *, command_id, purpose, title="管理任务",
@@ -625,8 +660,10 @@ class ManagedTaskService:
                 # Later user/model configuration cannot widen accepted tools.
                 if old and old.get("metadata", {}).get("delegate_session_id"):
                     preference = run.metadata["session_policy"].get("safety_review_mode")
+                    review_policy = run.metadata["session_policy"]["safety_review_policy"]
                     run.metadata["session_policy"] = {**old["metadata"]["session_policy"],
-                                                      "safety_review_mode": preference}
+                                                      "safety_review_mode": preference,
+                                                      "safety_review_policy": review_policy}
                 if old:
                     run.metadata.update(self.budget_metadata(old.get("metadata", {}), caller.metadata))
                 self.run_store.save_run_in_transaction(conn, run.model_dump(mode="json"), updated_at=run.created_at)
@@ -656,7 +693,7 @@ class ManagedTaskService:
             if result is None:
                 raise ManagementConflictError("Replacement receipt is unavailable")
         else:
-            self.run_manager.restore_run(run)
+            self.run_manager.get_run(run.run_id)
         return result
 
     def control_run(self, context, *, command_id, run_id, action):

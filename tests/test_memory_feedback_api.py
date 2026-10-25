@@ -203,3 +203,57 @@ def test_delete_accepts_reason_body_without_new_native_bridge_query_keys(tmp_pat
         assert call(app, "DELETE", url, json=body).status_code == 422
     assert call(app, "GET", f"/memories/{other['memory_id']}").json()["status"] == "active"
     assert len(call(app, "GET", "/memories/feedback").json()["feedback"]) == 1
+
+
+def test_memory_mutations_report_applied_when_sidecar_has_manual_conflict(tmp_path, monkeypatch):
+    app, _workspace = make_app(tmp_path, monkeypatch)
+    first = create_memory(app, "最初的偏好")
+    path = app.state.runtime.memory_files.path_for(scope="global")
+    preserved = path.read_bytes() + b"manual note\n"
+    path.write_bytes(preserved)
+
+    created = call(app, "POST", "/memories", json={"content": "另外的偏好"})
+    assert created.status_code == 201, created.text
+    corrected = call(app, "PATCH", f"/memories/{first['memory_id']}", json={
+        "content": "修正后的偏好", "expected_version": first["version"],
+    })
+    assert corrected.status_code == 200, corrected.text
+    corrected_item = corrected.json()
+    deleted = call(app, "DELETE", f"/memories/{corrected_item['memory_id']}", params={
+        "expected_version": corrected_item["version"],
+    })
+    assert deleted.status_code == 200, deleted.text
+    for response in (created, corrected, deleted):
+        assert response.json()["mutation_status"] == "applied"
+        assert response.json()["memory_file_status"] == "conflict_or_unavailable"
+    service = app.state.runtime.memory_service
+    assert service.get(created.json()["memory_id"]).status == "active"
+    assert service.get(first["memory_id"]).status == "superseded"
+    assert service.get(deleted.json()["memory_id"]).status == "retracted"
+    assert path.read_bytes() == preserved
+    # Explicit generation still has a 409 contract; the CRUD write succeeded.
+    assert call(app, "POST", "/memories/file/generate").status_code == 409
+
+
+def test_import_reports_applied_when_refresh_conflicts_after_database_correction(tmp_path, monkeypatch):
+    from app.core.memory_files import MemoryFileConflictError
+
+    app, _workspace = make_app(tmp_path, monkeypatch)
+    original = create_memory(app, "导入前的偏好")
+    files = app.state.runtime.memory_files
+    path = files.path_for(scope="global")
+    path.write_text(path.read_text(encoding="utf-8").replace("导入前的偏好", "文件纠正后的偏好"),
+                    encoding="utf-8")
+
+    def conflicting_refresh(**kwargs):
+        raise MemoryFileConflictError("concurrent manual edit")
+
+    monkeypatch.setattr(files, "generate", conflicting_refresh)
+    response = call(app, "POST", "/memories/file/import")
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["mutation_status"] == "applied"
+    assert result["memory_file_status"] == "conflict_or_unavailable"
+    assert result["changed"][0]["content"] == "文件纠正后的偏好"
+    assert app.state.runtime.memory_service.get(original["memory_id"]).status == "superseded"
+    assert call(app, "GET", "/memories").json()["memories"][0]["content"] == "文件纠正后的偏好"

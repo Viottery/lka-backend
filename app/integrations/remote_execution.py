@@ -137,6 +137,9 @@ class RemoteExecutionNode:
         policy = dict(original.metadata.get("session_policy", {}))
         requested_review = policy.get("safety_review_mode") or "manual"
         effective_review = requested_review if self.config.review_policy == "inherit" else "manual"
+        # Nodes that mandate manual review retain their own authority boundary.
+        if self.config.review_policy != "inherit":
+            policy["safety_review_policy"] = "standard"
         review_source = "request" if self.config.review_policy == "inherit" else "node_policy"
         tools = {s.name: s for s in self.runtime.tool_registry.list_tools()}
         approved = set(self.config.allowed_tools)

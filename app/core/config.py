@@ -27,6 +27,13 @@ class Settings(BaseSettings):
     db_timing_slow_ms: float = Field(
         default=50, alias="LKA_DB_TIMING_SLOW_MS", ge=0, allow_inf_nan=False,
     )
+    db_write_queue_capacity: int = Field(default=128, alias="LKA_DB_WRITE_QUEUE_CAPACITY", ge=1, le=10000)
+    db_write_queue_wait_seconds: float = Field(
+        default=5, alias="LKA_DB_WRITE_QUEUE_WAIT_SECONDS", gt=0, le=300, allow_inf_nan=False,
+    )
+    db_write_transaction_seconds: float = Field(
+        default=30, alias="LKA_DB_WRITE_TRANSACTION_SECONDS", gt=0, le=3600, allow_inf_nan=False,
+    )
     messages_media_cache_dir: Path | None = Field(
         default=None, alias="LKA_MESSAGES_MEDIA_CACHE_DIR"
     )

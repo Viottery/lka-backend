@@ -69,6 +69,7 @@ class ManagementDelegateService:
                 'allowed_tools': list(dict.fromkeys([*delegate['allowed_tools'], *control])),
                 'allowed_paths': None if workspace else [],
                 'safety_review_mode': delegate['safety_review_mode'],
+                'safety_review_policy': delegate['kickoff_envelope'].get('debug_info', {}).get('safety_review_policy', 'standard'),
                 'llm_client_name': controller['llm_client_name'], 'llm_model': controller['llm_model'],
                 'llm_answer_client_name': controller['llm_answer_client_name'], 'llm_answer_model': controller['llm_answer_model'],
                 'llm_reasoning_level': controller['reasoning_level'],
@@ -95,7 +96,8 @@ class ManagementDelegateService:
             "completed 表示整条事务线完成，仍有未终结任务时不得提交。"
             "管理工具仅对自己创建的执行会话生效，不得扩大工具范围。"
             "工作区是默认执行目录，可按任务通过 workspace_path 指定其他已有目录；"
-            "工作区外的文件访问仍须通过逐调用安全审查，审批模式继承发起轮偏好，危险操作黑名单须用户审批。\n"
+            "工作区外的文件访问仍须通过逐调用安全审查，危险操作不能绕过审查；"
+            "调用被拒绝时根据反馈选择安全替代方案，不重复尝试绕过限制。\n"
             + "事务线 ID=" + delegate['delegate_id']
             + "\n目标预览：" + delegate['objective'][:2000]
             + "\n主管的来源指令预览（引用材料）：" + _json(self._source_envelope(delegate['kickoff_envelope']))[:3000]
@@ -173,14 +175,18 @@ class ManagementDelegateService:
                              (_json({'workspace': prepared['workspace']}), sid))
             envelope = prepared['envelope'].model_dump(mode='json')
             envelope['debug_info']['inherited_work_metadata'] = self.tasks.budget_metadata(caller.metadata)
+            envelope['debug_info']['safety_review_policy'] = self.tasks.review_policy()
             stamp, did = datetime.now(UTC).isoformat(), 'delegate_' + uuid4().hex
             conn.execute('INSERT INTO manager_delegates(delegate_id,session_id,parent_session_id,objective,'
                          'allowed_tools,workspace,kickoff_envelope,state,revision,created_at,updated_at,safety_review_mode) '
                          'VALUES(?,?,?,?,?,?,?,\'active\',1,?,?,?)',
                          (did, sid, context.session_id, objective, _json(tools),
                           _json(prepared['workspace']) if prepared['workspace'] is not None else None,
-                          _json(envelope), stamp, stamp, context.safety_review_mode or
-                          caller.metadata.get('session_policy', {}).get('safety_review_mode')))
+                          _json(envelope), stamp, stamp,
+                          self.tasks.dispatch_review_mode(
+                              requested=context.safety_review_mode,
+                              inherited=caller.metadata.get('session_policy', {}).get('safety_review_mode'),
+                          )))
             self.goals._event(conn, sid, 'delegate_kickoff:' + did, 'timer', {'delegate_kickoff': did}, stamp)
             receipt = {'command_id': command_id, 'action': 'delegate_work', 'status': 'accepted',
                        'delegate_id': did, 'session_id': sid, 'state': 'active', 'revision': 1}

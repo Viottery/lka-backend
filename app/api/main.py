@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 
 from app.api.account_auth import AccountAuthMiddleware
@@ -54,6 +55,7 @@ from app.storage.sqlite_timing import (
     close_sqlite_timing,
     configure_sqlite_timing,
 )
+from app.storage.sqlite_write_queue import SqliteWriteQueueError
 
 
 def create_app() -> FastAPI:
@@ -92,12 +94,20 @@ def create_app() -> FastAPI:
     app.add_middleware(RemoteSessionBoundaryMiddleware)
     app.add_middleware(AccountAuthMiddleware)
     app.add_middleware(DeviceConnectionAuthMiddleware)
+    # Compress after node admission has filtered JSON; SSE remains uncompressed.
+    app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
 
     @app.exception_handler(SessionBusyError)
     async def session_busy(request, exc):
         return JSONResponse(status_code=409, content={
             "detail": str(exc), "session_id": exc.session_id, "run_id": exc.run_id,
         })
+
+    @app.exception_handler(SqliteWriteQueueError)
+    async def sqlite_write_unavailable(request, exc):
+        # An error is not authority to replay an operation with possible effects.
+        return JSONResponse(status_code=503, content={"detail": "database_write_unavailable"},
+                            headers={"Retry-After": "1"})
     cors_origins = settings.parsed_cors_origins()
     if runtime.local_app_config.auth.enabled:
         cors_origins = list(dict.fromkeys([

@@ -12,6 +12,7 @@ from pydantic import ValidationError
 from app.core.agent_checkpoints import SqliteCheckpointRuntime
 from app.core.config import Settings
 from app.storage import sqlite_timing as timing
+from app.storage.sqlite_write_queue import QueuedConnection
 
 
 @pytest.fixture
@@ -63,7 +64,9 @@ def test_cursor_reads_context_transactions_and_private_data(recorded, tmp_path):
 
 def test_write_lock_timeout_remains_an_error_and_is_timed(recorded, tmp_path):
     _, path = recorded
-    first = timing.connect_sqlite(tmp_path / "lka.sqlite3", isolation_level=None)
+    # Keep the competing lock outside the in-process managed queue so this
+    # continues to verify SQLite's real SQLITE_BUSY timing path.
+    first = sqlite3.connect(tmp_path / "lka.sqlite3", isolation_level=None)
     second = timing.connect_sqlite(tmp_path / "lka.sqlite3", timeout=0.03, isolation_level=None)
     try:
         first.execute("CREATE TABLE entries(id INTEGER)")
@@ -79,6 +82,10 @@ def test_write_lock_timeout_remains_an_error_and_is_timed(recorded, tmp_path):
     failed = [r for r in records(path, "sqlite") if r["phase"] == "acquire_write" and not r["success"]]
     assert len(failed) == 1
     assert failed[0]["sqlite_error"] == "SQLITE_BUSY"
+    assert failed[0]["sqlite_errorcode"] == sqlite3.SQLITE_BUSY
+    assert isinstance(failed[0]["thread_id"], int)
+    assert failed[0]["error_callsite"]["file"] == "tests/test_sqlite_timing.py"
+    assert failed[0]["error_callsite"]["function"] == "test_write_lock_timeout_remains_an_error_and_is_timed"
     assert failed[0]["elapsed_ms"] >= 15
 
 
@@ -127,7 +134,8 @@ def test_shutdown_flushes_remaining_statistics_and_disables_instrumentation(reco
     recorder.write({"kind": "should-not-reopen"})
     assert path.read_text() == before
     conn = timing.connect_sqlite(":memory:")
-    assert type(conn) is sqlite3.Connection
+    assert isinstance(conn, QueuedConnection)
+    assert timing._recorder is None
     conn.close()
 
 
@@ -143,7 +151,8 @@ def test_disabled_and_logging_failure_do_not_change_database_results(recorded, t
     conn.close()
     timing.configure_sqlite_timing(path, enabled=False)
     conn = timing.connect_sqlite(":memory:", isolation_level=None)
-    assert type(conn) is sqlite3.Connection and conn.isolation_level is None
+    assert isinstance(conn, QueuedConnection) and conn.isolation_level is None
+    assert timing._recorder is None
     conn.close()
 
 

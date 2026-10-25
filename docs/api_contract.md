@@ -507,6 +507,19 @@ POST /agent/turn
 后端代码写死。`/agent/turn` 返回用户可见结果和脱敏审计摘要；`POST /agent/turn/stream`
 提供用户可见的 SSE token-delta 输出。
 
+两个接口均接受可选 `client_request_id`，格式为 1–128 个字母、数字、`_`、`.`、`:` 或 `-`。
+客户端每次新提交使用独立标识，服务端在受理运行的首次持久化中冻结它。
+该字段只用于断连后的关联查询，不授予权限，也不是重复 POST 的幂等保证。
+发送后尚未收到首条事件或最终响应时，应先查询当前会话的运行摘要核对，不能自动重发：
+
+```http
+GET /sessions/{session_id}/runs?client_request_id=input-unique-id&limit=2
+```
+
+筛选在分页之前执行；只有返回的单一根运行同时匹配会话 ID 和 `client_request_id`，
+才可恢复该运行的状态或事件流。无结果、结果不唯一、旧服务端未返回关联字段或网络仍不可用时，
+保留“结果待确认”，不能改用另一设备最近的运行。服务端真实的失败／取消／超时终态仍须展示。
+
 可在 `llm` 中另外指定 `answer_client_name` 和 `answer_model`，用于最终用户回答，
 其他步骤继续使用 `client_name` / `model`。未配置回答模型时沿用推理模型；仅指定
 回答客户端时使用该客户端默认模型。普通与 SSE 请求均支持，回答恢复沿用同一选择。
@@ -1380,6 +1393,27 @@ GET /sessions/session_xxx
   "messages": []
 }
 ```
+
+不带分页参数时维持完整历史响应。新客户端应显式读取近期页：
+
+```http
+GET /sessions/session_xxx?message_limit=30
+GET /sessions/session_xxx?message_limit=30&before_message_id=message_first
+GET /sessions/session_xxx?message_limit=30&after_message_id=message_last
+```
+
+`message_limit` 为 1–100；`before_message_id` 和 `after_message_id` 只能二选一，
+且需要同时提供 `message_limit`。默认返回最近一页；before 读取更早页，after 从游标
+之后增量读取。每页消息均按 `created_at` 和数据库写入顺序升序返回，时间相同时仍稳定。
+响应额外包含 `message_page`：`direction`（before/after）、`has_more`（对应方向是否还有页）、
+`first_message_id`、`last_message_id`（空页为 null）及 `history_reset_at`。
+客户端保存最近消息游标，按需继续 after；用户翻阅更早记录时使用 before。
+游标不属于本会话或历史已清空时返回 `409 history_cursor_invalid`，客户端应丢弃旧页并
+重新读取最近页。`history_reset_at` 变化时也必须替换缓存，不能拼接旧历史。
+消息和会话信息在同一 SQLite 读快照中获取；后续追加不会改变已读取页的游标边界。
+
+支持 gzip 的客户端可发送 `Accept-Encoding: gzip`，后端自动压缩大于 1 KiB 的响应；
+`text/event-stream` 保持逐块传输，不压缩或等待流结束。
 
 ### 10.4 Rename Session
 
@@ -2338,6 +2372,14 @@ query string 传递 token；它们不暴露 LLM 密钥、原始 prompt、记忆�
 可选值为 `factual_error`、`wording`、`outdated`、`duplicate`、`not_worth_remembering`、
 `do_not_store`；`wording` 仅适用纠正，`do_not_store` 仅适用撤回，非法组合返回422。
 明确用户操作与反馈在同一版本检查事务中提交，冲突不产生反馈；自动维护不记作用户操作。
+
+创建、纠正、撤回、文件导入和撤销合并成功时，保留原响应字段并返回
+`mutation_status="applied"` 与 `memory_file_status`。前者表示数据库操作已完成
+（文件导入无编辑时也表示请求已成功处理）；后者为 `synced` 或兼容值
+`conflict_or_unavailable`。文件手改冲突或不可用不会把已完成的数据库写入变成
+HTTP 500；客户端应保留成功结果，核对／处理文件后单独调用生成接口，不应重试业务写入。
+显式 `POST /memories/file/generate` 的文件冲突仍返回409。
+
 `GET /memories/feedback?scope=global&limit=100&offset=0` 返回 `{feedback:[...],next_offset}`，
 `limit` 为1..100，`offset` 为0..1,000,000。项目范围须提供允许的 `workspace_path`，
 只返回匹配项目记录；采用记忆管理认证，不接受消息凭据。
@@ -2354,6 +2396,10 @@ JSON字符。反馈不是当前事实证据或工具权限，仍需本轮用户�
 `GET /memories` 支持 `limit`（1..500）和 `offset`（0..1,000,000），返回 `next_offset`；`GET /memories/export` 使用同样的 scope/分页参数，返回带版本/导出时间的 JSON 页，需按 `next_offset` 继续读取。分页不是跨请求冻结数据库快照；并发编辑时应重新导出，完整备份使用 SQLite backup。`GET /memories/{memory_id}/sources` 返回来源 ID/type/ref/checksum/status/expiry/时间，不返原文正文。每页及精确来源查询重新检查项目作用域。
 
 冲突条目可在详情 `metadata.needs_review/conflict_ids/conflict_hints` 查看；待审条目不注入根/child 上下文。新模型候选不得屏蔽旧确认偏好。明确日期期限来自用户原文而非模型凭空指定；仅新确认来源可延长已存期限。同源重试不会增加版本，撤回不自动恢复。
+
+生成基线按全局／稳定项目身份保存，不依赖数据目录的绝对路径。旧版本绝对路径基线
+首次重绑定时要求完整范围／项目路径、文件头和原始字节哈希全部匹配；不会凭同名文件
+认领手改内容。迁移后已手改且没有当前位置基线的文件仍报告冲突，需保留文件并人工核对。
 
 `GET /memories/file` 读取生成的全局或项目 `MEMORY.md`；`POST /memories/file/generate` 在文件未被手改时同步生成；`GET /memories/file/preview` 返回可导入编辑；`POST /memories/file/import` 一次导入一个带原 ID/版本的内容块。未知 ID、丢失条目、元数据改动和版本冲突不会被默默覆盖。所有记忆/后台状态接口默认仅接受 loopback 客户端；需要远程访问时配置 `LKA_MEMORY_API_TOKEN` 并发送 Bearer token，配置后 loopback 也必须带 token。此保护不代表旧 API 已具有同等鉴权。
 

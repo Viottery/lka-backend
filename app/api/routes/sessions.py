@@ -14,7 +14,11 @@ from app.api.schemas import (
     SessionWorkspaceResponse,
     SessionWorkspaceUpdateRequest,
 )
-from app.core.sessions import SessionCreationSource
+from app.core.sessions import (
+    AgentSessionMessagePage,
+    SessionCreationSource,
+    SessionHistoryCursorError,
+)
 
 router = APIRouter(prefix="/sessions", tags=["sessions"])
 
@@ -101,22 +105,46 @@ def restore_session(session_id: str, request: Request) -> SessionDetailResponse:
     return SessionDetailResponse(**result.model_dump())
 
 
-@router.get("/{session_id}", response_model=SessionDetailResponse)
-def get_session(session_id: str, request: Request) -> SessionDetailResponse:
+@router.get("/{session_id}", response_model=AgentSessionMessagePage | SessionDetailResponse)
+def get_session(
+    session_id: str, request: Request,
+    message_limit: Annotated[int | None, Query(ge=1, le=100)] = None,
+    before_message_id: Annotated[str | None, Query(min_length=1, max_length=256)] = None,
+    after_message_id: Annotated[str | None, Query(min_length=1, max_length=256)] = None,
+) -> SessionDetailResponse | AgentSessionMessagePage:
     try:
+        if (before_message_id or after_message_id) and (
+            message_limit is None or before_message_id and after_message_id
+        ):
+            raise HTTPException(422, detail="Use message_limit and at most one message cursor")
+        if message_limit is not None:
+            return request.app.state.runtime.session_service.get_message_page(
+                session_id=session_id, limit=message_limit,
+                before_message_id=before_message_id, after_message_id=after_message_id,
+            )
         result = request.app.state.runtime.get_session(session_id=session_id)
+    except SessionHistoryCursorError as exc:
+        raise HTTPException(409, detail=str(exc)) from exc
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return SessionDetailResponse(**result.model_dump())
 
 
 @router.get("/{session_id}/runs")
-def list_session_runs(session_id: str, request: Request,
-                      limit: int = Query(default=30, ge=1, le=100),
-                      offset: int = Query(default=0, ge=0)) -> dict:
+def list_session_runs(
+    session_id: str, request: Request,
+    limit: int = Query(default=30, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    client_request_id: Annotated[
+        str | None, Query(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$")
+    ] = None,
+) -> dict:
     """Server-side run discovery, independent of a device's SSE cursor."""
     try:
-        return request.app.state.runtime.managed_tasks.list_runs(session_id, limit=limit, offset=offset)
+        return request.app.state.runtime.managed_tasks.list_runs(
+            session_id, limit=limit, offset=offset,
+            **({"client_request_id": client_request_id} if client_request_id is not None else {}),
+        )
     except KeyError as exc:
         raise HTTPException(404, detail="Session not found") from exc
 

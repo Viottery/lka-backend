@@ -7,6 +7,7 @@ import json
 import logging
 import random
 import sqlite3
+import sys
 import threading
 import time
 from collections import Counter
@@ -16,6 +17,8 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from uuid import uuid4
 
+from app.storage.sqlite_write_queue import QueuedConnection, QueuedCursor
+
 _BOUNDS = (0.1, 0.5, 1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000)
 _OPERATIONS = frozenset({
     "SELECT", "INSERT", "UPDATE", "DELETE", "REPLACE", "WITH", "PRAGMA", "BEGIN",
@@ -23,6 +26,30 @@ _OPERATIONS = frozenset({
 })
 _request: ContextVar[RequestTiming | None] = ContextVar("sqlite_request_timing", default=None)
 _recorder: TimingRecorder | None = None
+_SOURCE_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _error_callsite():
+    """Code coordinates only; never capture locals, SQL, arguments or messages."""
+    frame = sys._getframe(1)
+    try:
+        for _ in range(24):
+            if frame is None:
+                break
+            try:
+                path = Path(frame.f_code.co_filename).resolve().relative_to(_SOURCE_ROOT)
+            except (OSError, ValueError):
+                path = None
+            if path is not None and path.as_posix() not in {
+                "app/storage/sqlite_timing.py", "app/storage/sqlite_retry.py",
+                "app/storage/sqlite_write_queue.py",
+            }:
+                return {"file": path.as_posix(), "function": frame.f_code.co_name,
+                        "line": frame.f_lineno}
+            frame = frame.f_back
+    finally:
+        del frame
+    return None
 
 
 class RequestTiming:
@@ -89,6 +116,9 @@ class TimingRecorder:
                 "operation": operation, "statement_id": statement_id,
                 "elapsed_ms": round(elapsed_ms, 4), "success": error is None,
                 "sqlite_error": getattr(error, "sqlite_errorname", None),
+                "sqlite_errorcode": getattr(error, "sqlite_errorcode", None),
+                "thread_id": threading.get_ident(),
+                "error_callsite": _error_callsite() if error is not None else None,
                 "request_id": context.request_id if context else None,
                 "sampled": sampled,
             })
@@ -187,7 +217,7 @@ def _measure(database, phase, operation, statement_id, call):
             pass
 
 
-class TimedCursor(sqlite3.Cursor):
+class TimedCursor(QueuedCursor):
     _operation = "OTHER"
     _statement_id = None
 
@@ -224,7 +254,7 @@ class TimedCursor(sqlite3.Cursor):
         return self._fetch(super().__next__)
 
 
-class TimedConnection(sqlite3.Connection):
+class TimedConnection(QueuedConnection):
     _timing_database = "other"
 
     def cursor(self, factory=None):
@@ -246,7 +276,8 @@ class TimedConnection(sqlite3.Connection):
         return _measure(self._timing_database, "rollback", "ROLLBACK", None, super().rollback)
 
     def __exit__(self, exc_type, exc_value, traceback):
-        # sqlite3's C context manager bypasses the Python commit/rollback methods.
+        # Measure the managed context exit, including native commit/rollback.
+        self._check_live()
         call = lambda: super(TimedConnection, self).__exit__(exc_type, exc_value, traceback)
         if not self.in_transaction:
             return call()
@@ -255,13 +286,37 @@ class TimedConnection(sqlite3.Connection):
 
 
 def connect_sqlite(database, *args, **kwargs):
-    """Preserve caller transaction/timeout settings; never patch sqlite3 globally."""
+    """Coordinate application writes even when diagnostic timing is disabled.
+
+    The watchdog needs serialized cross-thread cleanup. Statement caching is
+    disabled so SQLite's authorizer sees every write, including repeated CTEs.
+    Native sqlite3 itself is never patched; external writers still use its locks.
+    """
+    policy = kwargs.pop("write_policy", None)
+    positional = list(args)
+
+    def option(name, index, value):
+        if len(positional) > index:
+            positional[index] = value
+            kwargs.pop(name, None)
+        else:
+            kwargs[name] = value
+
+    factory = positional[4] if len(positional) > 4 else kwargs.get("factory", TimedConnection)
+    if not isinstance(factory, type) or not issubclass(factory, QueuedConnection):
+        raise TypeError("SQLite connection factory must subclass QueuedConnection")
+    option("factory", 4, factory)
+    option("check_same_thread", 3, False)
+    option("cached_statements", 5, 0)
     name = Path(str(database).split("?", 1)[0]).name
     role = {"lka.sqlite3": "main", "agent_checkpoints.sqlite3": "checkpoints"}.get(name, "other")
-    if _recorder is not None and "factory" not in kwargs and len(args) < 5:
-        kwargs["factory"] = TimedConnection
     conn = _measure(role, "connect", "CONNECT", None,
-                    lambda: sqlite3.connect(database, *args, **kwargs))
+                    lambda: sqlite3.connect(database, *positional, **kwargs))
+    try:
+        conn.configure_write_queue(database, policy=policy)
+    except BaseException:
+        sqlite3.Connection.close(conn)
+        raise
     if isinstance(conn, TimedConnection):
         conn._timing_database = role
     return conn

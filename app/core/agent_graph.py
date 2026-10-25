@@ -193,10 +193,8 @@ class AgentGraphRunner:
             close()
 
     def create_run_for_turn(self, **kwargs: Any) -> AgentRunRecord:
-        run = self.turn_loop.create_run_for_turn(**kwargs)
-        return self.turn_loop.run_manager._update_run(
-            run.run_id, status=run.status, metadata_patch={"orchestrator": "langgraph"},
-        )
+        metadata = {**(kwargs.pop("initial_metadata", None) or {}), "orchestrator": "langgraph"}
+        return self.turn_loop.create_run_for_turn(**kwargs, initial_metadata=metadata)
 
     def run(self, **kwargs: Any) -> AgentTurnResult:
         run_id = self._resolve_run_id(**kwargs)

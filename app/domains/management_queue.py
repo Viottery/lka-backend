@@ -132,7 +132,7 @@ class ManagementQueueService:
                     raise ManagementConflictError("Terminal work cannot be queued")
 
         with closing(self._conn()) as conn, conn:
-            conn.execute("BEGIN IMMEDIATE")
+            self.tasks.begin_task_transaction(conn)
             receipt, run = self.tasks.start_task_in_transaction(
                 conn, context, command_id=args.command_id, purpose=args.purpose, title=args.title,
                 workspace_path=args.workspace_path, command_action="queue_work", command_context=details,
@@ -158,7 +158,7 @@ class ManagementQueueService:
                              (_json(receipt), context.session_id, args.command_id))
             self.tasks.caller(context, mutate=True, conn=conn)
         if run is not None:
-            self.tasks.run_manager.restore_run(run)
+            self.tasks.run_manager.get_run(run.run_id)
         return receipt
 
     @staticmethod

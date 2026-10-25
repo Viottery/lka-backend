@@ -190,6 +190,10 @@ class InMemoryAgentRunManager:
                     "agent_id": agent_id,
                     "agent_version": agent_version,
                     "executor_kind": executor_kind,
+                    **({"session_policy": {
+                        "safety_review_policy": "autonomous",
+                        "safety_review_mode": parent.metadata["session_policy"].get("safety_review_mode"),
+                    }} if parent.metadata.get("session_policy", {}).get("safety_review_policy") == "autonomous" else {}),
                     **({"orchestrator": "langgraph"}
                        if executor_kind == "react" and parent.metadata.get("orchestrator") == "langgraph" else {}),
                 },
@@ -492,10 +496,7 @@ class InMemoryAgentRunManager:
                         **record.metadata, "answer_timeout_fallback": fallback,
                     }})
             self._persist_run(record)
-            self._runs[record.run_id] = record
-            self._events[record.run_id] = self._load_events(record.run_id)
-            self._restore_reviews(record.run_id)
-            self._restore_cancel_request(record)
+            self._hydrate_run(record)
         return record
 
     def complete_run_in_transaction(
@@ -1381,11 +1382,12 @@ class InMemoryAgentRunManager:
                 step_id=step_id,
                 attempt=attempt,
             )
-            self._events[run_id].append(event)
             if type == "llm_delta":
+                self._events[run_id].append(event)
                 self._queue_delta_event(event)
             else:
                 self._persist_event(event)
+                self._events[run_id].append(event)
             return event
 
     def get_run(self, run_id: str) -> AgentRunRecord | None:
@@ -1396,7 +1398,12 @@ class InMemoryAgentRunManager:
             payload = self.durable_store.load_run(run_id)
             if payload is None:
                 return None
-            return self.restore_run(AgentRunRecord.model_validate(payload))
+            # A cold read must not rewrite a durable run. In particular, page
+            # polling can happen while another request owns SQLite's write
+            # lock, and the stored record is authoritative over checkpoints.
+            record = AgentRunRecord.model_validate(payload)
+            self._hydrate_run(record)
+            return record
 
     def list_events(
         self,
@@ -1765,6 +1772,17 @@ class InMemoryAgentRunManager:
         if record.metadata.get("cancel_requested") is True:
             reason = record.metadata.get("cancel_reason")
             self._cancel_requests[record.run_id] = reason if isinstance(reason, str) else None
+
+    def _hydrate_run(self, record: AgentRunRecord) -> None:
+        """Populate process-local state from a record without persisting it.
+
+        Callers hold ``_lock``. Explicit checkpoint restoration persists before
+        using this helper; ordinary cache misses only read durable state.
+        """
+        self._runs[record.run_id] = record
+        self._events[record.run_id] = self._load_events(record.run_id)
+        self._restore_reviews(record.run_id)
+        self._restore_cancel_request(record)
 
     def _persist_review(self, review: SafetyReviewRecord) -> None:
         if self.durable_store is not None:

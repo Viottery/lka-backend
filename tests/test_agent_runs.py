@@ -22,6 +22,7 @@ from app.core.tools import (
     ToolResult,
     ToolSpec,
 )
+from app.storage.db import connect
 
 
 def test_agent_run_manager_tracks_status_and_event_sequence():
@@ -561,6 +562,59 @@ def test_agent_run_manager_can_decide_rehydrated_review_without_preloading_run(t
     assert decided.status.value == "approved"
     assert second.get_run(run.run_id) is not None
     assert second.list_events(run.run_id)[-1].type == "safety_review_decided"
+
+
+def test_cold_get_run_hydrates_without_writing_while_wal_writer_is_held(tmp_path):
+    store = SqliteAgentRunStore(tmp_path / "cold-read.sqlite3")
+    first = InMemoryAgentRunManager(durable_store=store)
+    run = first.create_run(
+        session_id="session_cold_read", user_input="durable run", trace_id="trace_cold_read"
+    )
+    first.mark_running(run.run_id)
+    review = first.create_safety_review(SafetyReviewRequest(
+        review_id="review_cold_read",
+        run_id=run.run_id,
+        session_id=run.session_id,
+        trace_id=run.trace_id,
+        invocation_id="invocation_cold_read",
+        tool_name="filesystem.edit_file",
+        mode=SafetyReviewMode.MANUAL,
+        reason="Write requires confirmation.",
+        created_at=run.created_at,
+    ))
+    first.decide_safety_review(
+        review_id=review.review_id,
+        decision=SafetyReviewDecision.APPROVE,
+        decided_by="test",
+        reason="approved",
+    )
+    first.request_cancel(run.run_id, reason="cancel after approval")
+    first.close()
+
+    reader = InMemoryAgentRunManager(durable_store=store)
+    with connect(store.db_path) as conn:
+        before = conn.execute(
+            "SELECT status, record_payload, updated_at FROM agent_runs WHERE run_id = ?",
+            (run.run_id,),
+        ).fetchone()
+    with connect(store.db_path) as writer:
+        writer.execute("BEGIN IMMEDIATE")
+        restored = reader.get_run(run.run_id)
+        assert restored is not None
+        assert restored.status == AgentRunStatus.RUNNING
+        assert restored.metadata["cancel_requested"] is True
+        assert reader.cancel_reason(run.run_id) == "cancel after approval"
+        assert reader.get_safety_review(review.review_id).status.value == "approved"
+        event_types = [event.type for event in reader.list_events(run.run_id)]
+        assert "safety_review_decided" in event_types
+        assert "run_cancel_requested" in event_types
+        after = writer.execute(
+            "SELECT status, record_payload, updated_at FROM agent_runs WHERE run_id = ?",
+            (run.run_id,),
+        ).fetchone()
+        assert tuple(after) == tuple(before)
+        writer.rollback()
+    reader.close()
 
 
 def test_manual_review_queue_is_global_fifo_and_only_head_can_be_decided(tmp_path):

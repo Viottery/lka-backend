@@ -135,6 +135,7 @@ from app.integrations.web_search import BraveSearchQuota
 from app.platform import FilesystemScanner, PathResolver, ScanOptions, detect_platform
 from app.platform.python_environment import ManagedPythonEnvironment
 from app.storage.db import connect, get_db_path, init_db
+from app.storage.sqlite_write_queue import WriteQueuePolicy, configure_write_queue_defaults
 from app.tool_packages.attachments import ATTACHMENTS_PACKAGE, create_attachment_tools
 from app.tool_packages.bash import (
     BASH_PACKAGE,
@@ -242,6 +243,11 @@ class LocalKnowledgeAgentRuntime:
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        configure_write_queue_defaults(WriteQueuePolicy(
+            capacity=settings.db_write_queue_capacity,
+            wait_seconds=settings.db_write_queue_wait_seconds,
+            transaction_seconds=settings.db_write_transaction_seconds,
+        ))
         self.local_app_config = settings.load_local_config()
         # SQLite and durable checkpoints must remain local even when a node
         # maps remote file workspaces. Validate before creating any data files.
@@ -892,6 +898,8 @@ class LocalKnowledgeAgentRuntime:
             enabled=lambda: self.local_app_config.management.enabled,
             guard=self.agent_dispatch.check_run,
             durable_execution=lambda: self.local_app_config.agent.checkpoint_backend == "sqlite",
+            review_mode=lambda: self.local_app_config.management.safety_review_mode,
+            review_policy=lambda: self.local_app_config.management.safety_review_policy,
         )
         self.managed_tasks.ensure_schema()
         task_parent = self.local_app_config.management.default_task_parent
@@ -1447,6 +1455,8 @@ class LocalKnowledgeAgentRuntime:
             llm_answer_model=controller.get("llm_answer_model"),
             llm_reasoning_level=controller.get("reasoning_level") or ui_reasoning_level,
             llm_reasoning_source="controller" if controller.get("reasoning_level") else ui_reasoning_source,
+            safety_review_mode=self.local_app_config.management.safety_review_mode,
+            safety_review_policy=self.local_app_config.management.safety_review_policy,
         )
 
     def _backfill_session_projects(self) -> None:
@@ -1999,6 +2009,7 @@ class LocalKnowledgeAgentRuntime:
         *,
         session_id: str | None,
         user_input: str,
+        client_request_id: str | None = None,
         attachment_ids: list[str] | None = None,
         llm_client_name: str | None = None,
         llm_model: str | None = None,
@@ -2023,6 +2034,14 @@ class LocalKnowledgeAgentRuntime:
             self.validate_agent_reasoning_selection(session_id=session_id, requested=llm_reasoning_level,
                                                     attachment_ids=attachment_ids,
                                                     llm_client_name=llm_client_name, llm_model=llm_model)
+        if client_request_id is not None and existing_run_id is None:
+            correlated_run = self.create_agent_run(
+                session_id=session_id, user_input=user_input, attachment_ids=attachment_ids,
+                llm_client_name=llm_client_name, llm_answer_client_name=llm_answer_client_name,
+                llm_answer_model=llm_answer_model, llm_reasoning_level=llm_reasoning_level,
+                resumable=resumable, client_request_id=client_request_id,
+            )
+            existing_run_id = correlated_run.run_id
         llm_reasoning_level, llm_reasoning_source = self.resolve_agent_reasoning_level(
             session_id=session_id, requested=llm_reasoning_level, existing_run_id=existing_run_id,
         )
@@ -2048,6 +2067,7 @@ class LocalKnowledgeAgentRuntime:
         *,
         session_id: str | None,
         user_input: str,
+        client_request_id: str | None = None,
         attachment_ids: list[str] | None = None,
         llm_client_name: str | None = None,
         llm_model: str | None = None,
@@ -2073,12 +2093,21 @@ class LocalKnowledgeAgentRuntime:
             await asyncio.to_thread(self.validate_agent_reasoning_selection, session_id=session_id,
                                     requested=llm_reasoning_level, attachment_ids=attachment_ids,
                                     llm_client_name=llm_client_name, llm_model=llm_model)
+        if client_request_id is not None and existing_run_id is None:
+            correlated_run = await asyncio.to_thread(self.create_agent_run,
+                session_id=session_id, user_input=user_input, attachment_ids=attachment_ids,
+                llm_client_name=llm_client_name, llm_answer_client_name=llm_answer_client_name,
+                llm_answer_model=llm_answer_model, llm_reasoning_level=llm_reasoning_level,
+                resumable=resumable, client_request_id=client_request_id,
+            )
+            existing_run_id = correlated_run.run_id
         llm_reasoning_level, llm_reasoning_source = await asyncio.to_thread(
             self.resolve_agent_reasoning_level, session_id=session_id, requested=llm_reasoning_level,
             existing_run_id=existing_run_id,
         )
         runner = await asyncio.to_thread(self._runner_for_turn, existing_run_id=existing_run_id, resumable=resumable)
-        with self._management_workload_for_run(existing_run_id):
+        workload = await asyncio.to_thread(self._management_workload_for_run, existing_run_id)
+        with workload:
             return await runner.run_async(
                 attachment_ids=attachment_ids,
                 session_id=session_id,
@@ -2745,6 +2774,7 @@ class LocalKnowledgeAgentRuntime:
         *,
         session_id: str | None,
         user_input: str,
+        client_request_id: str | None = None,
         attachment_ids: list[str] | None = None,
         llm_client_name: str | None = None,
         llm_answer_client_name: str | None = None,
@@ -2754,6 +2784,11 @@ class LocalKnowledgeAgentRuntime:
         resumable: bool = False,
     ) -> AgentRunRecord:
         """Create a queued run before an HTTP stream starts consuming events."""
+
+        if client_request_id is not None:
+            import re
+            if not isinstance(client_request_id, str) or re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", client_request_id) is None:
+                raise ValueError("Invalid client_request_id.")
 
         policy = (self.session_service.run_policy(session_id) if session_id
                   else self._session_run_policy("__new_ordinary_session__"))
@@ -2774,30 +2809,23 @@ class LocalKnowledgeAgentRuntime:
                                              llm_answer_model=answer_model,
                                              attachment_ids=attachment_ids,
                                              primary_client_name=llm_client_name)
+        model_metadata = {
+            "llm_reasoning_level": level, "llm_reasoning_source": source,
+            "llm_answer_client_name": answer_client, "llm_answer_model": answer_model,
+        }
         try:
             run = self._runner_for_turn(resumable=resumable).create_run_for_turn(
                 session_id=session_id,
                 user_input=user_input,
                 parent_run_id=parent_run_id,
+                initial_metadata={**model_metadata, "session_policy": model_metadata},
+                **({"client_request_id": client_request_id} if client_request_id is not None else {}),
             )
         except KeyError as exc:
             if "Session is deleted" in str(exc):
                 raise ValueError("Cannot create a run for a deleted session.") from exc
             raise
-        run.metadata.update(llm_reasoning_level=level, llm_reasoning_source=source,
-                            llm_answer_client_name=answer_client,
-                            llm_answer_model=answer_model)
-        run.metadata.setdefault("session_policy", {}).update(
-            llm_reasoning_level=level, llm_reasoning_source=source,
-            llm_answer_client_name=answer_client, llm_answer_model=answer_model,
-        )
-        self.agent_run_manager._update_run(run.run_id, status=run.status, metadata_patch={
-            "llm_reasoning_level": level, "llm_reasoning_source": source,
-            "llm_answer_client_name": answer_client, "llm_answer_model": answer_model,
-            "session_policy": {**run.metadata.get("session_policy", {}),
-                               "llm_reasoning_level": level, "llm_reasoning_source": source},
-        })
-        return self.agent_run_manager.get_run(run.run_id)
+        return run
 
     def resolve_agent_answer_model(self, *, session_id: str | None,
                                    requested_client: str | None = None,

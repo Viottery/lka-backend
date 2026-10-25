@@ -289,7 +289,7 @@ class ManagementAssignmentService:
                 raise ManagementConflictError("Work dependencies are not verified complete or work is terminal")
 
         with closing(self._conn()) as conn, conn:
-            conn.execute("BEGIN IMMEDIATE")
+            self.tasks.begin_task_transaction(conn)
             receipt, run = self.tasks.start_task_in_transaction(
                 conn, context, command_id=args.command_id, purpose=args.purpose, title=args.title,
                 workspace_path=args.workspace_path, command_action="start_work",
@@ -307,7 +307,7 @@ class ManagementAssignmentService:
                              (_json(receipt), context.session_id, args.command_id))
             self.tasks.caller(context, mutate=True, conn=conn)
         if run is not None:
-            self.tasks.run_manager.restore_run(run)
+            self.tasks.run_manager.get_run(run.run_id)
         return receipt
 
     def assign_existing(self, context, **kwargs):

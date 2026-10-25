@@ -5,6 +5,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.api.routes.devices import _owner
 from app.domains.devices import DeviceUnavailableError
 from app.domains.remote_execution import ExecutionFence, ExecutionReport, RemoteExecutionConflict
+from app.storage.sqlite_retry import is_sqlite_busy
 
 router = APIRouter(prefix="/remote-execution", tags=["remote-execution"])
 node_router = APIRouter(prefix="/node/execution", tags=["remote-execution"])
@@ -61,6 +62,10 @@ def _call(method, *args, **kwargs):
         raise HTTPException(409, str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
+    except Exception as exc:
+        if not is_sqlite_busy(exc):
+            raise
+        raise HTTPException(503, "execution_storage_busy", headers={"Retry-After": "1"}) from exc
 
 
 @router.get("/targets")

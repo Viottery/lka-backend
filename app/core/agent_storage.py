@@ -12,6 +12,7 @@ from typing import Any
 
 from app.core.session_admission import TERMINAL_RUN_STATUSES, SessionAdmissionStore
 from app.storage.db import connect, init_db
+from app.storage.sqlite_retry import persist_sqlite
 
 _artifact_read_stack: ContextVar[tuple[tuple[str, str, str], ...]] = ContextVar("artifact_read_stack", default=())
 _MAX_ARTIFACT_LINEAGE_DEPTH = 16
@@ -364,7 +365,7 @@ class SqliteAgentRunStore:
     def save_events(self, events: list[dict[str, Any]]) -> None:
         if not events:
             return
-        with connect(self.db_path) as conn:
+        def persist(conn):
             conn.executemany(
                 """
                 INSERT INTO agent_run_events(run_id, sequence, event_payload, created_at)
@@ -381,6 +382,7 @@ class SqliteAgentRunStore:
                     for event in events
                 ],
             )
+        persist_sqlite(lambda: connect(self.db_path), persist)
 
     def save_waiting_user_question(
         self,
@@ -923,7 +925,7 @@ class SqliteAgentRunStore:
     ) -> dict[str, Any]:
         serialized = _json_dump(payload)
         content_hash = sha256(serialized.encode("utf-8")).hexdigest()
-        with connect(self.db_path) as conn:
+        def persist(conn):
             if source_artifact is not None and (
                 kind != "tool_result" or source_artifact.get("run_id") != run_id
                 or not isinstance(source_artifact.get("artifact_id"), str)
@@ -964,6 +966,7 @@ class SqliteAgentRunStore:
                     source_hash=excluded.source_hash""",
                     (artifact_id, run_id, content_hash, source_artifact["artifact_id"],
                      source_artifact["run_id"], source_artifact["content_hash"]))
+        persist_sqlite(lambda: connect(self.db_path), persist)
         return {
             "artifact_id": artifact_id,
             "kind": kind,
@@ -1075,7 +1078,7 @@ class SqliteAgentRunStore:
         with connect(self.db_path) as conn:
             rows = conn.execute(
                 "SELECT a.payload FROM agent_run_artifacts a JOIN agent_runs r ON r.run_id=a.run_id "
-                "WHERE a.kind='session_progress' AND json_extract(r.record_payload,'$.session_id')=? "
+                "WHERE a.kind='session_progress' AND r.session_id=? "
                 "ORDER BY a.updated_at DESC, a.artifact_id DESC LIMIT ?",
                 (session_id, min(64, max(1, limit))),
             ).fetchall()
@@ -1093,10 +1096,11 @@ class SqliteAgentRunStore:
         """Claim one tool effect, or return its completed/uncertain prior state."""
 
         input_hash = sha256(_json_dump(tool_input).encode("utf-8")).hexdigest()
-        with connect(self.db_path) as conn:
+        def persist(conn):
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 """
-                SELECT tool_name, input_hash, status, result_payload
+                SELECT run_id, tool_name, input_hash, status, result_payload
                 FROM agent_tool_invocations WHERE invocation_id = ?
                 """,
                 (invocation_id,),
@@ -1111,11 +1115,12 @@ class SqliteAgentRunStore:
                     (invocation_id, run_id, tool_name, input_hash, claimed_at, claimed_at),
                 )
                 return {"status": "claimed"}
-        if row["tool_name"] != tool_name or row["input_hash"] != input_hash:
-            return {"status": "conflict"}
-        if row["status"] == "completed" and row["result_payload"] is not None:
-            return {"status": "completed", "result": _json_load(row["result_payload"])}
-        return {"status": "uncertain"}
+            if row["run_id"] != run_id or row["tool_name"] != tool_name or row["input_hash"] != input_hash:
+                return {"status": "conflict"}
+            if row["status"] == "completed" and row["result_payload"] is not None:
+                return {"status": "completed", "result": _json_load(row["result_payload"])}
+            return {"status": "uncertain"}
+        return persist_sqlite(lambda: connect(self.db_path), persist)
 
     def complete_tool_invocation(
         self,
@@ -1124,17 +1129,27 @@ class SqliteAgentRunStore:
         result: dict[str, Any],
         completed_at: str,
     ) -> None:
-        with connect(self.db_path) as conn:
+        serialized = _json_dump(result)
+        def persist(conn):
+            conn.execute("BEGIN IMMEDIATE")
             updated = conn.execute(
                 """
                 UPDATE agent_tool_invocations
                 SET status = 'completed', result_payload = ?, updated_at = ?
                 WHERE invocation_id = ? AND status = 'executing'
                 """,
-                (_json_dump(result), completed_at, invocation_id),
+                (serialized, completed_at, invocation_id),
             )
-        if updated.rowcount != 1:
-            raise RuntimeError(f"Tool invocation is not claimable for completion: {invocation_id}")
+            if updated.rowcount != 1:
+                prior = conn.execute(
+                    "SELECT status,result_payload FROM agent_tool_invocations WHERE invocation_id=?",
+                    (invocation_id,),
+                ).fetchone()
+                if (prior is not None and prior["status"] == "completed" and prior["result_payload"] is not None
+                        and _json_dump(_json_load(prior["result_payload"])) == serialized):
+                    return
+                raise RuntimeError(f"Tool invocation is not claimable for completion: {invocation_id}")
+        persist_sqlite(lambda: connect(self.db_path), persist)
 
     def list_completed_tool_results(
         self, *, run_id: str, tool_names: tuple[str, ...], limit: int = 32

@@ -126,11 +126,14 @@ class SharedSyncService:
             self.ensure_schema()
 
     @contextmanager
-    def _connection(self):
+    def _connection(self, *, readonly=False):
         conn = self._conn_factory()
         conn.row_factory = sqlite3.Row
         try:
-            conn.execute("BEGIN IMMEDIATE")
+            # Read endpoints use a deferred transaction so SQLite establishes
+            # a consistent snapshot without reserving the single writer slot.
+            # Schema, proposal, and publication paths retain the write lock.
+            conn.execute("BEGIN" if readonly else "BEGIN IMMEDIATE")
             yield conn
             conn.commit()
         except Exception:
@@ -148,6 +151,13 @@ class SharedSyncService:
             if self.devices is None:
                 raise PermissionError("device authentication unavailable")
             self.devices.require_node(conn, principal, scope)
+
+    def _reauthorize_current(self, principal, scope="sync.read"):
+        # A read transaction pins its data snapshot. Recheck on a fresh
+        # connection so a revocation committed during a long page read is seen.
+        if principal is not None:
+            with self._connection(readonly=True) as conn:
+                self._authorize(conn, principal, scope)
 
     def ensure_schema(self):
         with self._connection() as conn:
@@ -401,7 +411,7 @@ class SharedSyncService:
 
     def status(self, principal=None):
         self._enabled()
-        with self._connection() as conn:
+        with self._connection(readonly=True) as conn:
             self._authorize(conn, principal)
             result = {
                 "hub_id": conn.execute(
@@ -411,14 +421,14 @@ class SharedSyncService:
                     "SELECT coalesce(max(sequence),0) FROM shared_sync_journal"
                 ).fetchone()[0],
             }
-            self._authorize(conn, principal)
+            self._reauthorize_current(principal)
             return result
 
     def pull(self, after=0, limit=100, principal=None):
         self._enabled()
         if type(after) is not int or after < 0 or type(limit) is not int or not 1 <= limit <= 500:
             raise ValueError("invalid sync cursor or limit")
-        with self._connection() as conn:
+        with self._connection(readonly=True) as conn:
             self._authorize(conn, principal)
             high = conn.execute(
                 "SELECT coalesce(max(sequence),0) FROM shared_sync_journal"
@@ -479,7 +489,7 @@ class SharedSyncService:
                 result["cursor"] = event["sequence"]
                 size += length
             result["has_more"] = result["cursor"] < high
-            self._authorize(conn, principal)
+            self._reauthorize_current(principal)
             return result
 
     def propose(self, principal, payload):
@@ -510,7 +520,7 @@ class SharedSyncService:
         self._enabled()
         if not 1 <= limit <= 500:
             raise ValueError("invalid limit")
-        with self._connection() as conn:
+        with self._connection(readonly=True) as conn:
             return {
                 "items": [
                     {**dict(row), "payload": json.loads(row["payload"])}

@@ -562,6 +562,8 @@ class ManagementConfig(BaseModel):
 
     enabled: bool = False
     autonomous_enabled: bool = False
+    safety_review_mode: Literal["skip", "llm", "manual"] | None = None
+    safety_review_policy: Literal["standard", "autonomous"] = "standard"
     # Server-approved parent for assistant tasks run on this backend when the
     # assistant has no default_execution_workspace (e.g. a cloud hub whose
     # browsers cannot name a server directory). Absolute path on this host.

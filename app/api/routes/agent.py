@@ -116,6 +116,8 @@ def _answer_model_kwargs(payload: AgentTurnRequest) -> dict:
 
 def _replacement_request_fingerprint(payload: ReplaceAgentRunRequest) -> str:
     body = payload.model_dump(mode="json")
+    if body.get("client_request_id") is None:
+        body.pop("client_request_id", None)
     llm = body.get("llm")
     if isinstance(llm, dict) and llm.get("reasoning_level") is None:
         # Keep retry hashes compatible with payloads serialized before this option existed.
@@ -138,6 +140,7 @@ async def run_agent_turn_endpoint(
     try:
         result = await request.app.state.runtime.run_agent_turn_async(
             session_id=payload.session_id,
+            **({"client_request_id": payload.client_request_id} if payload.client_request_id is not None else {}),
             user_input=payload.user_input,
             llm_client_name=llm_options.client_name if llm_options else None,
             llm_model=llm_options.model if llm_options else None,
@@ -170,6 +173,7 @@ def run_agent_turn(payload: AgentTurnRequest, request: Request) -> AgentTurnResu
     llm_options = payload.llm
     result = request.app.state.runtime.run_agent_turn(
         session_id=payload.session_id,
+        **({"client_request_id": payload.client_request_id} if payload.client_request_id is not None else {}),
         user_input=payload.user_input,
         llm_client_name=llm_options.client_name if llm_options else None,
         llm_model=llm_options.model if llm_options else None,
@@ -190,17 +194,21 @@ async def stream_agent_turn(
 ) -> StreamingResponse:
     payload = await asyncio.to_thread(_prepare_image_payload, payload, request.app.state.runtime)
     await asyncio.to_thread(_preflight_reasoning, payload, request.app.state.runtime)
-    run = request.app.state.runtime.create_agent_run(
-        session_id=payload.session_id,
-        user_input=payload.user_input,
-        attachment_ids=payload.attachment_ids,
-        llm_client_name=payload.llm.client_name if payload.llm else None,
-        llm_reasoning_level=payload.llm.reasoning_level if payload.llm else None,
-        **_answer_model_kwargs(payload),
-        **({"resumable": True} if payload.resumable else {}),
-    )
+    if payload.client_request_id is not None:
+        admission = asyncio.create_task(_admit_and_start_agent_turn(runtime=request.app.state.runtime, payload=payload))
+        admissions = getattr(request.app.state.runtime, "_agent_admission_tasks", None)
+        if admissions is None:
+            admissions = set()
+            request.app.state.runtime._agent_admission_tasks = admissions
+        admissions.add(admission)
+        admission.add_done_callback(admissions.discard)
+        admission.add_done_callback(_consume_task_exception)
+        run = await asyncio.shield(admission)
+    else:
+        run = await _admit_agent_turn(runtime=request.app.state.runtime, payload=payload)
     return StreamingResponse(
-        _agent_turn_event_stream(request=request, run_id=run.run_id, start_payload=payload),
+        _agent_turn_event_stream(request=request, run_id=run.run_id,
+                                 start_payload=payload if payload.client_request_id is None else None),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -210,9 +218,29 @@ async def stream_agent_turn(
     )
 
 
+async def _admit_agent_turn(*, runtime, payload: AgentTurnRequest):
+    return await asyncio.to_thread(
+        runtime.create_agent_run,
+        session_id=payload.session_id,
+        user_input=payload.user_input,
+        attachment_ids=payload.attachment_ids,
+        llm_client_name=payload.llm.client_name if payload.llm else None,
+        llm_reasoning_level=payload.llm.reasoning_level if payload.llm else None,
+        **_answer_model_kwargs(payload),
+        **({"resumable": True} if payload.resumable else {}),
+        **({"client_request_id": payload.client_request_id} if payload.client_request_id is not None else {}),
+    )
+
+
+async def _admit_and_start_agent_turn(*, runtime, payload: AgentTurnRequest):
+    run = await _admit_agent_turn(runtime=runtime, payload=payload)
+    _start_agent_turn_task(runtime=runtime, payload=payload, run_id=run.run_id)
+    return run
+
+
 @router.get("/runs/{run_id}", response_model=AgentRunResponse)
 async def get_agent_run(run_id: str, request: Request) -> AgentRunResponse:
-    run = request.app.state.runtime.agent_run_manager.get_run(run_id)
+    run = await asyncio.to_thread(request.app.state.runtime.agent_run_manager.get_run, run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Agent run not found.")
     return AgentRunResponse.from_record(run)
@@ -220,6 +248,10 @@ async def get_agent_run(run_id: str, request: Request) -> AgentRunResponse:
 
 @router.get("/runs/{run_id}/snapshot", response_model=AgentRunSnapshotResponse)
 async def get_agent_run_snapshot(run_id: str, request: Request) -> AgentRunSnapshotResponse:
+    return await asyncio.to_thread(_get_agent_run_snapshot, run_id, request)
+
+
+def _get_agent_run_snapshot(run_id: str, request: Request) -> AgentRunSnapshotResponse:
     """Return validated plan state and safe, durable child result summaries."""
     runtime = request.app.state.runtime
     run_manager = runtime.agent_run_manager
@@ -308,6 +340,15 @@ async def cancel_agent_child_run(
     request: Request,
 ) -> AgentRunResponse:
     """Cancel one child through the scheduler's ownership-checked control path."""
+    cancelled, resume_parent = await asyncio.to_thread(
+        _cancel_agent_child_run, parent_run_id, child_run_id, request,
+    )
+    if resume_parent:
+        _start_parent_scheduler_resume_task(runtime=request.app.state.runtime, parent_run_id=parent_run_id)
+    return AgentRunResponse.from_record(cancelled)
+
+
+def _cancel_agent_child_run(parent_run_id, child_run_id, request):
     runtime = request.app.state.runtime
     run_manager = runtime.agent_run_manager
     parent = run_manager.get_run(parent_run_id)
@@ -335,8 +376,8 @@ async def cancel_agent_child_run(
         AgentRunStatus.QUEUED, AgentRunStatus.RUNNING,
         AgentRunStatus.WAITING_CONFIRMATION, AgentRunStatus.WAITING_USER,
     } and cancelled.status == AgentRunStatus.CANCELLED:
-        _start_parent_scheduler_resume_task(runtime=runtime, parent_run_id=parent_run_id)
-    return AgentRunResponse.from_record(cancelled)
+        return cancelled, True
+    return cancelled, False
 
 
 @router.post(
@@ -351,10 +392,10 @@ async def retry_agent_child_run(
     """Retry one failed child attempt through the scheduler control path."""
     runtime = request.app.state.runtime
     run_manager = runtime.agent_run_manager
-    parent = run_manager.get_run(parent_run_id)
+    parent = await asyncio.to_thread(run_manager.get_run, parent_run_id)
     if parent is None:
         raise HTTPException(status_code=404, detail="Parent Agent run not found.")
-    child = run_manager.get_run(child_run_id)
+    child = await asyncio.to_thread(run_manager.get_run, child_run_id)
     if child is None or child.parent_run_id != parent_run_id:
         raise HTTPException(status_code=404, detail="Child Agent run not found under this parent.")
     retry = getattr(runtime, "retry_multi_agent_child", None)
@@ -378,6 +419,14 @@ async def list_agent_run_events(
     request: Request,
     after_sequence: int = 0,
 ) -> AgentRunEventsResponse:
+    return await asyncio.to_thread(_list_agent_run_events, run_id, request, after_sequence)
+
+
+def _list_agent_run_events(
+    run_id: str,
+    request: Request,
+    after_sequence: int = 0,
+) -> AgentRunEventsResponse:
     run_manager = request.app.state.runtime.agent_run_manager
     if run_manager.get_run(run_id) is None:
         raise HTTPException(status_code=404, detail="Agent run not found.")
@@ -397,7 +446,7 @@ async def reconnect_agent_turn_stream(
     after_sequence: int = 0,
 ) -> StreamingResponse:
     run_manager = request.app.state.runtime.agent_run_manager
-    if run_manager.get_run(run_id) is None:
+    if await asyncio.to_thread(run_manager.get_run, run_id) is None:
         raise HTTPException(status_code=404, detail="Agent run not found.")
     return StreamingResponse(
         _agent_turn_event_stream(request=request, run_id=run_id, after_sequence=after_sequence),
@@ -412,6 +461,10 @@ async def reconnect_agent_turn_stream(
 
 @router.post("/runs/{run_id}/cancel", response_model=AgentRunResponse)
 async def cancel_agent_run(run_id: str, request: Request) -> AgentRunResponse:
+    return await asyncio.to_thread(_cancel_agent_run, run_id, request)
+
+
+def _cancel_agent_run(run_id: str, request: Request) -> AgentRunResponse:
     run_manager = request.app.state.runtime.agent_run_manager
     run = run_manager.get_run(run_id)
     if run is None:
@@ -429,7 +482,7 @@ async def cancel_agent_run(run_id: str, request: Request) -> AgentRunResponse:
 @router.post("/runs/{run_id}/interrupt", response_model=AgentRunResponse, status_code=202)
 async def interrupt_agent_run(run_id: str, request: Request) -> AgentRunResponse:
     runtime = request.app.state.runtime
-    if runtime.agent_run_manager.get_run(run_id) is None:
+    if await asyncio.to_thread(runtime.agent_run_manager.get_run, run_id) is None:
         raise HTTPException(404, "Agent run not found.")
     try:
         run = await asyncio.to_thread(runtime.interrupt_agent_run, run_id)
@@ -443,7 +496,7 @@ async def interrupt_agent_run(run_id: str, request: Request) -> AgentRunResponse
 @router.post("/runs/{run_id}/replace", response_model=AgentRunResponse, status_code=202)
 async def replace_agent_run(run_id: str, payload: ReplaceAgentRunRequest, request: Request) -> AgentRunResponse:
     runtime = request.app.state.runtime
-    previous = runtime.agent_run_manager.get_run(run_id)
+    previous = await asyncio.to_thread(runtime.agent_run_manager.get_run, run_id)
     if previous is None:
         raise HTTPException(404, "Agent run not found.")
     if previous.status != AgentRunStatus.PAUSED and not previous.metadata.get("replacement_command_id"):
@@ -473,6 +526,25 @@ async def resume_agent_run(run_id: str, request: Request) -> AgentRunResponse:
 
     runtime = request.app.state.runtime
     run_manager = runtime.agent_run_manager
+    run = await asyncio.to_thread(_validate_agent_resume, run_manager, run_id)
+    if run.status == AgentRunStatus.RUNNING and run.metadata.get("pause_requested"):
+        # A restart may retain pause intent without a live worker to acknowledge
+        # it. The checkpoint owner can safely acknowledge an idle lease here.
+        run = await asyncio.to_thread(runtime.interrupt_agent_run, run_id)
+        if run.status != AgentRunStatus.PAUSED:
+            raise HTTPException(status_code=409, detail="Wait for run_paused before resuming.")
+    selected_orchestrator = await asyncio.to_thread(_agent_run_orchestrator, runtime, run_id)
+    if selected_orchestrator != "langgraph":
+        raise HTTPException(status_code=409, detail="Run recovery requires the LangGraph orchestrator.")
+    # ChildAgentExecutor and the scheduler share this runtime runner instance.
+    # Keep HTTP recovery on that same path so AgentGraphRunner's per-run lease
+    # serializes it with any in-flight scheduler execution of this child.
+    await _schedule_agent_resume_task(runtime=runtime, run_id=run_id)
+    latest = await asyncio.to_thread(run_manager.get_run, run_id)
+    return AgentRunResponse.from_record(latest or run)
+
+
+def _validate_agent_resume(run_manager, run_id):
     run = run_manager.get_run(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Agent run not found.")
@@ -501,22 +573,12 @@ async def resume_agent_run(run_id: str, request: Request) -> AgentRunResponse:
         if ancestor is None or ancestor.status in {AgentRunStatus.PAUSED, AgentRunStatus.CANCELLED} or ancestor.metadata.get("pause_requested"):
             raise HTTPException(status_code=409, detail="Resume the task tree root before resuming a child.")
         ancestor_id = ancestor.parent_run_id
-    if run.status == AgentRunStatus.RUNNING and run.metadata.get("pause_requested"):
-        # A restart may retain pause intent without a live worker to acknowledge
-        # it. The checkpoint owner can safely acknowledge an idle lease here.
-        run = await asyncio.to_thread(runtime.interrupt_agent_run, run_id)
-        if run.status != AgentRunStatus.PAUSED:
-            raise HTTPException(status_code=409, detail="Wait for run_paused before resuming.")
-    selected_orchestrator = (runtime.agent_run_orchestrator(run_id)
-                            if callable(getattr(runtime, "agent_run_orchestrator", None))
-                            else getattr(runtime.agent_turn_runner, "orchestrator_name", None))
-    if selected_orchestrator != "langgraph":
-        raise HTTPException(status_code=409, detail="Run recovery requires the LangGraph orchestrator.")
-    # ChildAgentExecutor and the scheduler share this runtime runner instance.
-    # Keep HTTP recovery on that same path so AgentGraphRunner's per-run lease
-    # serializes it with any in-flight scheduler execution of this child.
-    _start_agent_resume_task(runtime=runtime, run_id=run_id)
-    return AgentRunResponse.from_record(run_manager.get_run(run_id) or run)
+    return run
+
+
+def _agent_run_orchestrator(runtime, run_id):
+    resolver = getattr(runtime, "agent_run_orchestrator", None)
+    return resolver(run_id) if callable(resolver) else getattr(runtime.agent_turn_runner, "orchestrator_name", None)
 
 
 @router.post(
@@ -534,7 +596,7 @@ async def continue_agent_run(
     runtime = request.app.state.runtime
     run_manager = runtime.agent_run_manager
     try:
-        run, question_id, replayed = run_manager.continue_user_question(
+        run, question_id, replayed = await asyncio.to_thread(run_manager.continue_user_question,
             run_id=run_id,
             command_id=payload.command_id,
             answer=payload.answer,
@@ -572,11 +634,12 @@ async def continue_agent_run(
     response_model=SafetyReviewQueueResponse,
 )
 async def list_agent_safety_review_queue(request: Request) -> SafetyReviewQueueResponse:
+    return await asyncio.to_thread(_list_agent_safety_review_queue, request)
+
+
+def _list_agent_safety_review_queue(request: Request) -> SafetyReviewQueueResponse:
     """Return actionable manual reviews in global FIFO order."""
     run_manager = request.app.state.runtime.agent_run_manager
-    # This query reads the indexed local SQLite queue and materializes only
-    # compact summaries. It is intentionally kept on the request thread so the
-    # endpoint remains compatible with synchronous in-process consumers.
     reviews = run_manager.list_pending_safety_reviews()
     return SafetyReviewQueueResponse(
         reviews=[_public_safety_review(review, run_manager) for review in reviews]
@@ -588,6 +651,13 @@ async def list_agent_safety_review_queue(request: Request) -> SafetyReviewQueueR
     response_model=SafetyReviewListResponse,
 )
 async def list_agent_run_safety_reviews(
+    run_id: str,
+    request: Request,
+) -> SafetyReviewListResponse:
+    return await asyncio.to_thread(_list_agent_run_safety_reviews, run_id, request)
+
+
+def _list_agent_run_safety_reviews(
     run_id: str,
     request: Request,
 ) -> SafetyReviewListResponse:
@@ -611,6 +681,13 @@ async def get_agent_safety_review(
     review_id: str,
     request: Request,
 ) -> SafetyReviewResponse:
+    return await asyncio.to_thread(_get_agent_safety_review, review_id, request)
+
+
+def _get_agent_safety_review(
+    review_id: str,
+    request: Request,
+) -> SafetyReviewResponse:
     run_manager = request.app.state.runtime.agent_run_manager
     review = run_manager.get_safety_review(review_id)
     if review is None:
@@ -628,7 +705,7 @@ async def decide_agent_safety_review(
     request: Request,
 ) -> SafetyReviewResponse:
     run_manager = request.app.state.runtime.agent_run_manager
-    pending = run_manager.get_safety_review(review_id)
+    pending = await asyncio.to_thread(run_manager.get_safety_review, review_id)
     if pending is not None and pending.status.value == "pending" and pending.tool_name.startswith("codex."):
         executor = getattr(request.app.state.runtime, "codex_expert_executor", None)
         if executor is None or not await executor.is_active(pending.run_id):
@@ -637,7 +714,7 @@ async def decide_agent_safety_review(
                 detail="Codex execution is no longer active; this approval cannot be replayed.",
             )
     try:
-        review, _ = run_manager.decide_safety_review_with_transition(
+        review, _ = await asyncio.to_thread(run_manager.decide_safety_review_with_transition,
             review_id=review_id,
             decision=payload.decision,
             decided_by=payload.decided_by,
@@ -651,7 +728,7 @@ async def decide_agent_safety_review(
             detail={"message": str(exc), "head_review_id": exc.head_review_id},
         ) from exc
     runtime = request.app.state.runtime
-    run = run_manager.get_run(review.run_id)
+    run = await asyncio.to_thread(run_manager.get_run, review.run_id)
     if (
         review.status.value in {"approved", "rejected"}
         and run is not None
@@ -661,8 +738,8 @@ async def decide_agent_safety_review(
         # Replaying a native Agent decision recovers its graph continuation.
         # Codex approvals are consumed by the active external executor; they
         # must never be routed into a LangGraph checkpoint.
-        _start_agent_resume_task(runtime=runtime, run_id=review.run_id)
-    return _public_safety_review(review, run_manager)
+        await _schedule_agent_resume_task(runtime=runtime, run_id=review.run_id)
+    return await asyncio.to_thread(_public_safety_review, review, run_manager)
 
 
 def _public_safety_review(review, run_manager) -> SafetyReviewResponse:
@@ -745,13 +822,13 @@ async def _agent_turn_event_stream(
             # background task and durable event log allow reconnection by ID.
             break
 
-        events = run_manager.list_events(run_id, after_sequence=last_sequence)
+        events = await asyncio.to_thread(run_manager.list_events, run_id, after_sequence=last_sequence)
         for event in events:
             last_sequence = event.sequence
             last_sent_at = time.monotonic()
             yield _sse_event_frame(_public_agent_event(event))
 
-        run = run_manager.get_run(run_id)
+        run = await asyncio.to_thread(run_manager.get_run, run_id)
         if run and run.status in {
             AgentRunStatus.COMPLETED,
             AgentRunStatus.FAILED,
@@ -762,7 +839,7 @@ async def _agent_turn_event_stream(
             # Completion may publish its final events after the first read.
             # Once terminal status is visible, drain that durable tail before
             # closing so this stream and a reconnect see the same sequence.
-            for event in run_manager.list_events(run_id, after_sequence=last_sequence):
+            for event in await asyncio.to_thread(run_manager.list_events, run_id, after_sequence=last_sequence):
                 last_sequence = event.sequence
                 yield _sse_event_frame(_public_agent_event(event))
             break
@@ -809,7 +886,7 @@ def _start_agent_turn_task(*, runtime, payload: AgentTurnRequest, run_id: str) -
     return task
 
 
-def _start_agent_resume_task(*, runtime, run_id: str) -> asyncio.Task:
+async def _schedule_agent_resume_task(*, runtime, run_id: str) -> asyncio.Task:
     """Schedule at most one in-process resume for a durable graph thread."""
 
     tasks = getattr(runtime, "_agent_turn_tasks", None)
@@ -818,9 +895,21 @@ def _start_agent_resume_task(*, runtime, run_id: str) -> asyncio.Task:
         runtime._agent_turn_tasks = tasks
     existing = tasks.get(run_id)
     if existing is not None and not existing.done():
-        run = runtime.agent_run_manager.get_run(run_id)
+        run = await asyncio.to_thread(runtime.agent_run_manager.get_run, run_id)
+        current = tasks.get(run_id)
+        if current is not existing and current is not None and not current.done():
+            return current
         if run is None or run.status != AgentRunStatus.PAUSED or getattr(existing, "_lka_resuming", False):
             return existing
+    return _start_agent_resume_task(runtime=runtime, run_id=run_id)
+
+
+def _start_agent_resume_task(*, runtime, run_id: str) -> asyncio.Task:
+    """Start recovery after the asynchronous scheduler checked active work."""
+    tasks = getattr(runtime, "_agent_turn_tasks", None)
+    if tasks is None:
+        tasks = {}
+        runtime._agent_turn_tasks = tasks
     task = asyncio.create_task(_resume_agent_and_parent(runtime=runtime, run_id=run_id))
     task._lka_resuming = True
     tasks[run_id] = task
@@ -884,7 +973,7 @@ def _start_parent_scheduler_resume_task(*, runtime, parent_run_id: str) -> async
 async def _resume_agent_and_parent(*, runtime, run_id: str) -> None:
     await runtime.resume_agent_run_async(run_id)
     run_manager = runtime.agent_run_manager
-    resumed = run_manager.get_run(run_id)
+    resumed = await asyncio.to_thread(run_manager.get_run, run_id)
     parent_run_id = resumed.parent_run_id if resumed is not None else None
     if (
         parent_run_id
@@ -896,7 +985,7 @@ async def _resume_agent_and_parent(*, runtime, run_id: str) -> None:
         }
         and callable(getattr(runtime, "resume_multi_agent_parent_async", None))
     ):
-        descendants = run_manager.child_tree(parent_run_id)
+        descendants = await asyncio.to_thread(run_manager.child_tree, parent_run_id)
         if not any(
             child.status in {AgentRunStatus.WAITING_CONFIRMATION, AgentRunStatus.WAITING_USER}
             for child in descendants

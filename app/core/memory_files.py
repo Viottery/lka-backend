@@ -122,10 +122,8 @@ class MemoryFiles:
             conn.execute("CREATE TABLE IF NOT EXISTS memory_file_hashes "
                          "(path TEXT PRIMARY KEY, digest TEXT NOT NULL)")
             conn.execute("BEGIN IMMEDIATE")
-            key = str(path.resolve(strict=False))
-            row = conn.execute("SELECT digest FROM memory_file_hashes WHERE path=?",
-                               (key,)).fetchone()
-            previous = str(row[0]) if row else None
+            key = self._view_key(path)
+            previous = self._baseline(conn, path)
             if path.exists():
                 try:
                     existing = self._read_view(path)
@@ -271,13 +269,50 @@ class MemoryFiles:
                 pass
             raise
 
+    def _view_key(self, path: Path) -> str:
+        # Scope/project identity survives moving the entire data directory.
+        return path.relative_to(self.data_dir).as_posix()
+
+    def _baseline(self, conn, path: Path) -> str | None:
+        key = self._view_key(path)
+        for candidate in (key, str(path.resolve(strict=False))):
+            row = conn.execute("SELECT digest FROM memory_file_hashes WHERE path=?",
+                               (candidate,)).fetchone()
+            if row:
+                # An existing local baseline remains authoritative even if the
+                # file no longer matches. Never fall back to another digest.
+                digest = str(row[0])
+                if candidate != key:
+                    conn.execute("INSERT INTO memory_file_hashes(path,digest) VALUES(?,?)",
+                                 (key, digest))
+                return digest
+        if not path.exists():
+            return None
+        raw = self._read_view(path)
+        digest = _hash(raw)
+        parts = key.split("/")
+        scope = "global" if parts[1] == "global" else "project"
+        project_id = "-" if scope == "global" else parts[2]
+        header = _HEADER.format(scope=scope, project_id=project_id).encode("utf-8") + b"\n"
+        if not raw.startswith(header):
+            return None
+        # Legacy installations keyed baselines by absolute OS paths. Require
+        # both exact bytes and the complete view identity, including project ID;
+        # a matching filename alone never authorizes replacing a file.
+        rows = conn.execute("SELECT path FROM memory_file_hashes WHERE digest=?", (digest,))
+        if any(str(row[0]).replace("\\", "/").endswith("/" + key) for row in rows):
+            conn.execute("INSERT INTO memory_file_hashes(path,digest) VALUES(?,?)", (key, digest))
+            return digest
+        return None
+
     def _last_hash(self, path: Path) -> str | None:
         with connect_sqlite(self.memory.db_path, timeout=10) as conn:
             conn.execute("CREATE TABLE IF NOT EXISTS memory_file_hashes "
                          "(path TEXT PRIMARY KEY, digest TEXT NOT NULL)")
-            row = conn.execute("SELECT digest FROM memory_file_hashes WHERE path=?",
-                               (str(path.resolve(strict=False)),)).fetchone()
-            return str(row[0]) if row else None
+            conn.execute("BEGIN IMMEDIATE")
+            digest = self._baseline(conn, path)
+            conn.commit()
+            return digest
 
     def _set_last_hash(self, path: Path, digest: str) -> None:
         with connect_sqlite(self.memory.db_path, timeout=10) as conn:
@@ -285,7 +320,7 @@ class MemoryFiles:
                          "(path TEXT PRIMARY KEY, digest TEXT NOT NULL)")
             conn.execute("INSERT INTO memory_file_hashes(path,digest) VALUES(?,?) "
                          "ON CONFLICT(path) DO UPDATE SET digest=excluded.digest",
-                         (str(path.resolve(strict=False)), digest))
+                         (self._view_key(path), digest))
             conn.commit()
 
 

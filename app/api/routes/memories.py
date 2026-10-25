@@ -138,6 +138,7 @@ def undo_memory_merge(merge_id: str, payload: UndoMemoryMergeRequest, request: R
     except (ValueError, KeyError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return {"memories": [record.model_dump(mode="json") for record in records],
+            "mutation_status": "applied",
             "memory_file_status": _refresh_file(request, current.scope, current.project_id)}
 
 
@@ -189,7 +190,7 @@ def _refresh_file(request: Request, scope: str, project_id: str | None) -> str:
     try:
         request.app.state.runtime.memory_files.generate(scope=scope, project_id=project_id)
         return "synced"
-    except (MemoryFileError, OSError):
+    except (MemoryFileConflictError, MemoryFileError, OSError):
         return "conflict_or_unavailable"
 
 
@@ -245,6 +246,7 @@ def create_memory(payload: CreateMemoryRequest, request: Request):
         sensitivity=payload.sensitivity, user_confirmed=True,
     ))
     return {**item.model_dump(mode="json"),
+            "mutation_status": "applied",
             "memory_file_status": _refresh_file(request, item.scope, item.project_id)}
 
 
@@ -343,7 +345,7 @@ def import_memory_file(
     except MemoryFileError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return {"changed": [item.model_dump(mode="json") for item in changed],
-            "memory_file_status": status}
+            "mutation_status": "applied", "memory_file_status": status}
 
 
 @router.get("/memories/feedback")
@@ -391,6 +393,7 @@ def correct_memory(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return {**updated.model_dump(mode="json"),
+            "mutation_status": "applied",
             "memory_file_status": _refresh_file(request, updated.scope, updated.project_id)}
 
 
@@ -416,6 +419,7 @@ def forget_memory(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return {**updated.model_dump(mode="json"),
+            "mutation_status": "applied",
             "memory_file_status": _refresh_file(request, updated.scope, updated.project_id)}
 
 

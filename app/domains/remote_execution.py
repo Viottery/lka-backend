@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.core.agent_runs import AgentRunRecord, AgentRunStatus
 from app.domains.devices import DeviceUnavailableError
+from app.storage.sqlite_retry import begin_sqlite_write
 
 Identifier = Annotated[str, Field(min_length=1, max_length=200, pattern=r"^[\w.-]+$")]
 EXECUTION_SCOPES = {"execution.poll", "execution.run", "execution.result"}
@@ -97,12 +98,15 @@ class RemoteExecutionService:
         self._thread = None
 
     @contextmanager
-    def _connection(self, *, write=False):
+    def _connection(self, *, write=False, task_admission=False):
         conn = self._conn()
         conn.row_factory = sqlite3.Row
         try:
             if write:
-                conn.execute("BEGIN IMMEDIATE")
+                if task_admission:
+                    self.tasks.begin_task_transaction(conn)
+                else:
+                    begin_sqlite_write(conn)
             yield conn
             conn.commit()
         except Exception:
@@ -205,7 +209,7 @@ class RemoteExecutionService:
             if policy is None:
                 raise PermissionError("unknown source authority cannot cross execution boundary")
             policies[key] = policy
-        with self._connection(write=True) as conn:
+        with self._connection(write=True, task_admission=True) as conn:
             self.tasks.caller(context, mutate=True, conn=conn)
             previous = conn.execute("SELECT * FROM remote_execution_tasks WHERE owner_session_id=? AND command_id=?",
                                     (context.session_id, command_id)).fetchone()
@@ -597,8 +601,12 @@ class RemoteExecutionService:
             # The new instruction does not grant new tools, sources, paths or budgets.
             run = self.tasks._new_run(session_id, envelope, caller)
             previous_policy = previous["run"]["metadata"]["session_policy"]
-            requested_mode = (getattr(context, "safety_review_mode", None) if caller else None) or previous_policy.get("safety_review_mode") or "manual"
-            run.metadata["session_policy"] = {**previous_policy, "safety_review_mode": requested_mode}
+            requested_mode = (self.tasks.dispatch_review_mode(
+                requested=getattr(context, "safety_review_mode", None) if caller else None,
+                inherited=previous_policy.get("safety_review_mode"),
+            ) or "manual")
+            run.metadata["session_policy"] = {**previous_policy, "safety_review_mode": requested_mode,
+                                              "safety_review_policy": self.tasks.review_policy()}
             run.metadata["remote_approval_requested"] = requested_mode
             task_id = "remote_task_" + uuid4().hex
             marker = {**previous["target"], "task_id": task_id}
@@ -648,6 +656,14 @@ class RemoteExecutionService:
 
     def reconcile(self):
         """Fence unknown effects and cancelled targets; never resubmit a run."""
+        # Idle workers poll frequently. With no unfinished remote work there is
+        # nothing to fence; don't compete with foreground writers for that read.
+        # A newly admitted task is rechecked on its next claim/check, and the
+        # mutating path below always rereads authority inside its transaction.
+        with self._connection() as conn:
+            if conn.execute("SELECT 1 FROM remote_execution_tasks WHERE state NOT IN "
+                            "('completed','failed','cancelled','unknown') LIMIT 1").fetchone() is None:
+                return 0
         changed = []
         with self._connection(write=True) as conn:
             rows = conn.execute("SELECT * FROM remote_execution_tasks WHERE state NOT IN ('completed','failed','cancelled','unknown')").fetchall()
