@@ -4,6 +4,7 @@ from scripts.benchmark_event_scheduling import (
     _audit_batch_membership,
     _parser,
     build_attempts,
+    summarize_response_failures,
     validate_output_path,
 )
 
@@ -98,3 +99,27 @@ def test_batch_audit_rejects_corrupt_or_cross_session_membership():
     audit = _audit_batch_membership(inputs, runs, jobs, production_batches=True)
     assert audit["passed"] is False
     assert audit["batch_same_session"] is False
+
+
+def test_response_failure_summary_is_bounded_and_body_free():
+    responses = [
+        {
+            "status": 503, "detail": "sensitive response body", "session_id": "session-a",
+            "client_message_id": "message-a",
+        },
+        {
+            "status": "error", "error": "ReadTimeout", "detail": "must not leak",
+            "session_id": "session-b", "client_message_id": "message-b",
+        },
+        *[
+            {"status": 500, "session_id": f"session-{index}", "client_message_id": f"message-{index}"}
+            for index in range(25)
+        ],
+    ]
+    summary = summarize_response_failures(responses, [12.5, 45.25])
+    assert len(summary["failure_samples"]) == 20
+    assert summary["transport_error_counts"] == {"ReadTimeout": 1}
+    assert summary["http_status_errors"] == {"503": 1, "500": 25}
+    assert summary["request_latency_max_ms"] == 45.25
+    assert all("detail" not in sample for sample in summary["failure_samples"])
+    assert summary["failure_samples"][1]["error_type"] == "ReadTimeout"

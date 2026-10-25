@@ -201,6 +201,38 @@ def _percentile(values: list[float], fraction: float) -> float | None:
     return round(ordered[min(len(ordered) - 1, int((len(ordered) - 1) * fraction))], 3)
 
 
+def summarize_response_failures(
+    responses: list[dict[str, Any]], request_latencies: list[float], *, sample_limit: int = 20,
+) -> dict[str, Any]:
+    """Return bounded, body-free diagnostics for non-202 HTTP attempts."""
+    transport_errors = Counter(
+        str(item.get("error") or "unknown") for item in responses if item.get("status") == "error"
+    )
+    http_errors = Counter(
+        str(item["status"]) for item in responses
+        if isinstance(item.get("status"), int) and item["status"] != 202
+    )
+    failures = [item for item in responses if item.get("status") != 202]
+    samples = []
+    for item in failures[:max(0, sample_limit)]:
+        status = item.get("status")
+        samples.append({
+            "status": status,
+            "error_type": (
+                str(item.get("error") or "transport_error")[:80]
+                if status == "error" else f"http_status_{status}"
+            ),
+            "session_id": str(item.get("session_id", ""))[:128],
+            "client_message_id": str(item.get("client_message_id", ""))[:128],
+        })
+    return {
+        "failure_samples": samples,
+        "transport_error_counts": dict(transport_errors),
+        "http_status_errors": dict(http_errors),
+        "request_latency_max_ms": round(max(request_latencies), 3) if request_latencies else None,
+    }
+
+
 def _audit_batch_membership(
     inputs: list[dict[str, Any]], runs: list[dict[str, Any]], dispatch_jobs: list[dict[str, Any]],
     *, production_batches: bool = False,
@@ -534,6 +566,7 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                         attempt_index += len(batch)
                     elapsed_seconds = time.monotonic() - start
                 acceptance = Counter(str(item["status"]) for item in responses)
+                failure_summary = summarize_response_failures(responses, request_latencies)
                 receipts: dict[tuple[str, str], set[str]] = defaultdict(set)
                 accepted_keys: set[tuple[str, str]] = set()
                 for item in responses:
@@ -581,6 +614,7 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                         "elapsed_seconds": round(elapsed_seconds, 3),
                         "actual_rate_rps": round(len(responses) / elapsed_seconds, 3),
                         "status_counts": dict(acceptance),
+                        **failure_summary,
                         "request_latency_ms": {
                             "samples": len(request_latencies),
                             "p50": _percentile(request_latencies, 0.50),

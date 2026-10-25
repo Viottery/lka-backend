@@ -13,6 +13,9 @@ path and audits ordered batch membership, per-input content fingerprints,
 same-session binding, one-time input assignment, and exact run-to-dispatch-job
 coverage. Its run count can be lower than its accepted input count. These
 protocols measure different loads and must not be presented as interchangeable.
+Reports retain up to 20 body-free failure samples, error-type/status counts and
+maximum HTTP latency. Any request failure or missed bind-latency target
+(p95 < 100 ms, p99 < 500 ms) makes the command exit unsuccessfully.
 Eligible-to-bind latency samples only each run's lowest-sequence (primary)
 input, because later batch members may be accepted after that run was created;
 batch membership/width is reported separately and does not imply per-input
