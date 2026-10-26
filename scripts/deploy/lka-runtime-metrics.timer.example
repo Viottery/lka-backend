@@ -1,0 +1,12 @@
+[Unit]
+Description=Sample LKA runtime metrics every five minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=15s
+RandomizedDelaySec=15s
+Unit=lka-runtime-metrics.service
+
+[Install]
+WantedBy=timers.target

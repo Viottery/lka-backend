@@ -1,0 +1,23 @@
+[Unit]
+Description=LKA read-only runtime metrics snapshot
+After=network.target
+
+[Service]
+Type=oneshot
+User=lka
+Group=lka
+UMask=0077
+StateDirectory=lka-monitoring
+StateDirectoryMode=0700
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/lka-backend/.venv/bin/python /opt/lka-tools/runtime_metrics.py --data-dir /var/lib/lka/runtime --window-seconds 300 --database-state --health-url http://127.0.0.1:8765/health --output /var/lib/lka-monitoring/latest.json --history /var/lib/lka-monitoring/history.jsonl
+TimeoutStartSec=45
+Nice=10
+CPUQuota=20%
+MemoryMax=256M
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths=/var/lib/lka/runtime
+ReadWritePaths=/var/lib/lka-monitoring

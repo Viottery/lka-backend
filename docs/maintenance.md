@@ -417,6 +417,43 @@ SQL 明细只记录操作类别与语句哈希 `statement_id`，不保存 SQL �
 独立消息连接器和 Windows 前端不在 SQL 计时范围内；
 前端发往后端的请求可通过后端 HTTP 记录排查。日志写入失败不改变业务结果。
 
+### 定期记录运行指标
+
+`scripts/runtime_metrics.py` 可以独立运行，不加载 Agent 或调用模型。它读取现有轮转日志，
+按数据库和阶段统计调用次数、错误、观测区间内每秒次数、最大耗时和分桶分位数上界。
+每份日志最多读取 10 MiB，最多读取 4 份；截断、缺失、无效记录和跨窗口区间会明确标记。
+每秒次数的分母是接纳的完整 summary 区间，不代表日志缺口或窗口边界也已覆盖；
+明显重叠的同组区间不提供速率。HTTP 明细偏向慢请求，只报告记录样本，不能视为全部请求量或 RPS。
+
+```bash
+python scripts/runtime_metrics.py --data-dir /var/lib/lka/runtime \
+  --window-seconds 300 --database-state \
+  --health-url http://127.0.0.1:8765/health \
+  --output /var/lib/lka-monitoring/latest.json \
+  --history /var/lib/lka-monitoring/history.jsonl
+```
+
+`--database-state` 使用一个只读快照连接汇总运行状态、未绑定输入和暂停队列，
+锁等待最多 1 秒，查询设有约 2 秒的执行期限。缺表或读取失败显示 unavailable，不以零代替。
+结果包含主库、WAL 大小及磁盘可用空间，不包含消息、SQL、凭据或会话 ID。
+健康检查只允许回环 HTTP `/health`，禁止代理和跳转，不需要账号令牌。
+
+输出必须位于数据目录外。最新 JSON 原子替换，历史 JSONL 单文件最多 10 MiB、保留 3 份轮转，
+POSIX 文件权限设为 `0600`，Windows 沿用目录的访问权限；同一历史文件只运行一个采集进程。
+监测记录留在部署机器，不提交 Git。
+Ubuntu 可将脚本安装到 `/opt/lka-tools/runtime_metrics.py`，根据实际路径调整
+[采样服务示例](../scripts/deploy/lka-runtime-metrics.service.example)与
+[五分钟定时器](../scripts/deploy/lka-runtime-metrics.timer.example)，再启用该 timer。
+该服务独立于后端，启动采样不需要重启后端。
+
+### 清理旧部署备份
+
+先盘点实际数据目录、活动进程和代码链接，保留最近至少两份已验证的完整快照，
+以及当前代码和可用回退代码。原始迁移数据、唯一交付包、私人配置和不同节点的独立数据库
+不能仅凭目录名或相似大小判断为重复。删除旧部署快照前保存清单与 manifest，
+核对保留快照的校验记录、归档大小和存在性，确认待删目录没有进程引用。
+仅清理明确列出的旧快照；不在运行数据目录内执行批量删除，也不将清理与数据库恢复混用。
+
 ## 常见情况
 
 | 现象 | 先检查 |
