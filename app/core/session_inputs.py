@@ -40,7 +40,7 @@ class SessionInputQueue:
 
     def __init__(self, conn_factory, *, sessions, run_store, dispatcher,
                  authorize, policy, validate_attachments, replace=None, batch_attachments_fit=None,
-                 validate_answer_selection=None,
+                 validate_answer_selection=None, accepted_answer_selection=None,
                  capacity=100, poll_seconds=0.25):
         self._conn = conn_factory
         self.sessions, self.run_store, self.dispatcher = sessions, run_store, dispatcher
@@ -49,6 +49,7 @@ class SessionInputQueue:
         self.replace = replace
         self.batch_attachments_fit = batch_attachments_fit
         self.validate_answer_selection = validate_answer_selection
+        self.accepted_answer_selection = accepted_answer_selection
         self.capacity, self.poll_seconds = capacity, poll_seconds
         self._stop = threading.Event()
         self._thread = None
@@ -163,8 +164,16 @@ class SessionInputQueue:
         row = conn.execute('SELECT record_payload FROM agent_runs WHERE run_id=?', (active[0],)).fetchone()
         return active[0] if row is not None and cls._is_user_run(row) else None
 
-    def _snapshot(self, conn, sid):
+    def _queue_summary(self, conn, sid):
         state = conn.execute('SELECT * FROM session_input_queues WHERE session_id=?', (sid,)).fetchone()
+        active = self._active(conn, sid)
+        pending = conn.execute("SELECT count(*) FROM session_inputs i LEFT JOIN agent_runs r ON r.run_id=i.run_id "
+                               "WHERE i.session_id=? AND i.cancelled=0 AND (i.run_id IS NULL OR r.status NOT IN "
+                               "('completed','failed','cancelled','timed_out'))", (sid,)).fetchone()[0]
+        return {'paused': bool(state and (state['paused'] or self._failed_watch(conn, state))),
+                'pending_count': pending, 'active_run_id': active[0] if active else None}
+
+    def _snapshot(self, conn, sid):
         # Retain every pending receipt and a bounded tail of completed receipts.
         rows = conn.execute("SELECT i.*,r.status AS run_status FROM session_inputs i "
                             "LEFT JOIN agent_runs r ON r.run_id=i.run_id WHERE i.session_id=? "
@@ -179,12 +188,7 @@ class SessionInputQueue:
                       status if status in TERMINAL_RUN_STATUSES or status == 'queued' else 'running')
             inputs.append({key: row[key] for key in (
                 'input_id', 'client_message_id', 'message_id', 'sequence', 'run_id') } | {'status': status})
-        active = self._active(conn, sid)
-        pending = conn.execute("SELECT count(*) FROM session_inputs i LEFT JOIN agent_runs r ON r.run_id=i.run_id "
-                               "WHERE i.session_id=? AND i.cancelled=0 AND (i.run_id IS NULL OR r.status NOT IN "
-                               "('completed','failed','cancelled','timed_out'))", (sid,)).fetchone()[0]
-        return {'inputs': inputs, 'paused': bool(state and (state['paused'] or self._failed_watch(conn, state))),
-                'pending_count': pending, 'active_run_id': active[0] if active else None}
+        return {'inputs': inputs, **self._queue_summary(conn, sid)}
 
     def snapshot(self, session_id):
         with closing(self._conn()) as conn:
@@ -215,9 +219,14 @@ class SessionInputQueue:
         encoded = json.dumps(request, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
         # Exact retries bypass mutable attachment/model validation.
         with closing(self._conn()) as conn:
+            conn.execute('BEGIN')
             self.authorize(conn, session_id)
-            previous = conn.execute('SELECT request_json FROM session_inputs WHERE session_id=? AND client_message_id=?',
+            previous = conn.execute('SELECT * FROM session_inputs WHERE session_id=? AND client_message_id=?',
                                     (session_id, client_message_id)).fetchone()
+            if previous is not None:
+                if previous['request_json'] != encoded:
+                    raise SessionInputConflict('client_message_id_conflict')
+                return self._receipt(conn, session_id, previous)
         if previous is None:
             self.validate_attachments(session_id=session_id, attachment_ids=list(attachment_ids))
             if replace_run_id is not None:
@@ -231,11 +240,14 @@ class SessionInputQueue:
                 self.authorize(conn, session_id, accepting=True)
                 # The write reservation also serializes this read-only policy
                 # snapshot with controller preference updates.
-                accepted_policy = self.policy(session_id)
-                answer_selection = {
-                    'llm_answer_client_name': accepted_policy.llm_answer_client_name,
-                    'llm_answer_model': accepted_policy.llm_answer_model,
-                }
+                if self.accepted_answer_selection is not None:
+                    answer_selection = self.accepted_answer_selection(conn, session_id)
+                else:
+                    accepted_policy = self.policy(session_id)
+                    answer_selection = {
+                        'llm_answer_client_name': accepted_policy.llm_answer_client_name,
+                        'llm_answer_model': accepted_policy.llm_answer_model,
+                    }
                 if llm_options.get('answer_client_name') is not None or llm_options.get('answer_model') is not None:
                     answer_selection = {'llm_answer_client_name': llm_options.get('answer_client_name'),
                                         'llm_answer_model': llm_options.get('answer_model')}
@@ -244,7 +256,7 @@ class SessionInputQueue:
                     raise SessionInputConflict('client_message_id_conflict')
                 return self._receipt(conn, session_id, previous)
             else:
-                receipt = self._snapshot(conn, session_id)
+                receipt = self._queue_summary(conn, session_id)
                 if receipt['pending_count'] >= self.capacity:
                     raise SessionInputConflict('session_input_queue_full')
                 conn.execute('INSERT OR IGNORE INTO session_input_queues(session_id) VALUES(?)', (session_id,))
@@ -266,11 +278,13 @@ class SessionInputQueue:
                     payload={'entrypoint': 'agent.turn', 'input_id': input_id, 'client_message_id': client_message_id,
                              'attachment_ids': list(attachment_ids), 'answer_model_selection': answer_selection},
                 )
-                receipt = self._snapshot(conn, session_id)
+                # Our write reservation excludes concurrent queue/run changes.
+                # The only new pending item is the row just inserted above.
+                receipt['pending_count'] += 1
             return {'input': item, 'queue': {key: receipt[key] for key in ('paused', 'pending_count', 'active_run_id')}}
 
     def _receipt(self, conn, session_id, row):
-        receipt = self._snapshot(conn, session_id)
+        receipt = self._queue_summary(conn, session_id)
         # Old exact retries remain available even outside the recent tail.
         status = conn.execute('SELECT status FROM agent_runs WHERE run_id=?', (row['run_id'],)).fetchone()
         item = {key: row[key] for key in ('input_id', 'client_message_id', 'message_id', 'sequence', 'run_id')}

@@ -373,7 +373,12 @@ class KeyedScheduler:
         self._rescan_namespaces.add(namespace)
         if space.recover and not space.recovery_active:
             space.cursor = None
-        if not space.recovery_active:
+        # A non-recovery namespace uses its wildcard handler as the durable
+        # scan. Keep the request generation from when that handler started so
+        # a rescan arriving during the scan remains pending for another pass.
+        if not space.recovery_active and not (
+            not space.recover and "*" in space.inflight
+        ):
             space.scan_generation = space.rescan_requested
         space.recovery_due = min(space.recovery_due, self._clock())
 

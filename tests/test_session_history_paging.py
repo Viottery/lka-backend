@@ -68,6 +68,61 @@ def test_cursor_never_crosses_session_or_survives_cleared_history(store):
         service.get_message_page(session_id=sid)
 
 
+def test_conversation_pages_count_visible_messages_before_limit(store):
+    service, sid, path = store
+    with connect(path) as conn:
+        conn.execute("DELETE FROM agent_session_messages WHERE session_id=?", (sid,))
+    for n in range(35):
+        service.append_message(session_id=sid, role="agent" if n % 2 else "user",
+                               content=f"conversation {n}", message_id=f"visible_{n}")
+        service.append_message(session_id=sid, role="tool", content="internal wakeup",
+                               payload={"input_origin": "background"}, message_id=f"hidden_{n}")
+    for n in range(200):
+        service.append_message(session_id=sid, role="tool", content="internal event",
+                               payload={"input_origin": "background"}, message_id=f"tail_{n}")
+    # Match the real failure: the raw latest page contains only internal inputs.
+    assert all(item.role == "tool" for item in service.get_message_page(session_id=sid).messages)
+    recent = service.get_message_page(session_id=sid, message_view="conversation")
+    assert ids(recent) == [f"visible_{n}" for n in range(5, 35)]
+    assert recent.message_page["view"] == "conversation"
+    assert recent.message_page["has_more"]
+    older = service.get_message_page(session_id=sid, message_view="conversation",
+                                     before_message_id=recent.message_page["first_message_id"])
+    assert ids(older) == [f"visible_{n}" for n in range(5)]
+    assert not older.message_page["has_more"]
+    assert not service.get_message_page(session_id=sid, message_view="conversation",
+                                        after_message_id="visible_34").message_page["has_more"]
+    service.append_message(session_id=sid, role="agent", content="new answer", message_id="new")
+    assert ids(service.get_message_page(session_id=sid, message_view="conversation",
+                                       after_message_id="visible_34")) == ["new"]
+    # Audit/full history and the context source retain every internal input.
+    assert len(service.get_session(session_id=sid).messages) == 271
+
+
+@pytest.mark.parametrize(("role", "payload", "visible"), [
+    ("agent", {"input_origin": "background"}, True),
+    ("agent", {"user_visible": False}, False),
+    ("user", {"metadata": {"user_visible": False}}, False),
+    ("agent", {"user_visible": 0}, True),
+    ("tool", {"input_origin": "background"}, False),
+    ("user", {"input_origin": "background"}, False),
+    ("tool", {"input_envelope": {"origin": "background"}}, False),
+    ("tool", {"input_origin": "user"}, True),
+    ("tool", {}, True),
+    ("system", {}, False),
+    ("tool", {"input_origin": "manager"}, False),
+    ("tool", {"input_envelope": {"origin": "manager", "purpose": "do the task"}}, True),
+    ("tool", {"input_envelope": {"origin": "manager", "purpose": " "}}, False),
+    ("tool", {"input_envelope": {"origin": "manager", "purpose": 123}}, False),
+    ("tool", {"input_origin": "background", "input_envelope": {"origin": "manager", "purpose": "task"}}, False),
+])
+def test_conversation_projection_preserves_visibility_and_provenance(store, role, payload, visible):
+    service, sid, _ = store
+    service.append_message(session_id=sid, role=role, content="synthetic", payload=payload, message_id="probe")
+    page = service.get_message_page(session_id=sid, message_view="conversation", after_message_id="m_84")
+    assert ids(page) == (["probe"] if visible else [])
+
+
 def test_http_pagination_is_opt_in_and_validates_bounds(store):
     service, sid, _ = store
     app = FastAPI()
@@ -80,8 +135,12 @@ def test_http_pagination_is_opt_in_and_validates_bounds(store):
         recent = client.get(url, params={"message_limit": 3})
         assert recent.status_code == 200 and len(recent.json()["messages"]) == 3
         assert recent.json()["message_page"]["last_message_id"] == "m_84"
+        conversation = client.get(url, params={"message_limit": 3, "message_view": "conversation"})
+        assert conversation.status_code == 200
+        assert conversation.json()["message_page"]["view"] == "conversation"
         assert client.get(url, params={"message_limit": 3, "after_message_id": "missing"}).status_code == 409
         for query in ({"message_limit": 0}, {"message_limit": 101}, {"after_message_id": "m_84"},
+                      {"message_view": "conversation"}, {"message_limit": 3, "message_view": "unknown"},
                       {"message_limit": 3, "before_message_id": "m_1", "after_message_id": "m_2"}):
             assert client.get(url, params=query).status_code == 422
 

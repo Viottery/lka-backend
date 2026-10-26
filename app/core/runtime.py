@@ -939,6 +939,7 @@ class LocalKnowledgeAgentRuntime:
             dispatcher=self.agent_dispatch, authorize=self._authorize_session_input,
             policy=self._session_run_policy, validate_attachments=self.prepare_agent_attachment_input,
             validate_answer_selection=self.validate_agent_answer_selection,
+            accepted_answer_selection=self.management_service.input_answer_selection,
             replace=self.replace_agent_run,
             batch_attachments_fit=self._session_input_batch_attachments_fit,
         )

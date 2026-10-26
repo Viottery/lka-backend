@@ -20,6 +20,24 @@ from app.storage.commit_signals import notify_after_commit
 
 SessionRole = Literal["user", "agent", "system", "tool"]
 SessionCreationSource = Literal["user", "assistant", "system", "unknown"]
+SessionMessageView = Literal["all", "conversation"]
+
+# Apply the conversation projection before LIMIT so internal inputs cannot
+# displace user-facing messages. Full history remains available for audit.
+_MESSAGE_ORIGIN = "trim(coalesce(nullif(json_extract(payload, '$.input_origin'), ''), json_extract(payload, '$.input_envelope.origin'), ''))"
+_CONVERSATION_MESSAGES = f"""
+    AND json_type(payload, '$.user_visible') IS NOT 'false'
+    AND json_type(payload, '$.metadata.user_visible') IS NOT 'false'
+    AND (
+        role IN ('agent', 'assistant')
+        OR {_MESSAGE_ORIGIN} = 'user'
+        OR ({_MESSAGE_ORIGIN} = '' AND role IN ('user', 'tool'))
+        OR (role = 'tool' AND {_MESSAGE_ORIGIN} = 'manager'
+            AND json_extract(payload, '$.input_envelope.origin') = 'manager'
+            AND json_type(payload, '$.input_envelope.purpose') = 'text'
+            AND trim(json_extract(payload, '$.input_envelope.purpose')) != '')
+    )
+"""
 
 
 def _now_iso() -> str:
@@ -411,10 +429,13 @@ class SessionService:
     def get_message_page(
         self, *, session_id: str, limit: int = 30,
         before_message_id: str | None = None, after_message_id: str | None = None,
+        message_view: SessionMessageView = "all",
     ) -> AgentSessionMessagePage:
         """Read a bounded history page in one snapshot, with session-bound cursors."""
         if not 1 <= limit <= 100 or before_message_id and after_message_id:
             raise ValueError("Use one message cursor and a limit from 1 to 100")
+        if message_view not in ("all", "conversation"):
+            raise ValueError("Unsupported message view")
         conn = self._conn_factory()
         try:
             conn.execute("BEGIN")
@@ -437,9 +458,10 @@ class SessionService:
                 clause = f" AND (created_at,rowid) {op} (?,?)"
                 params.extend((anchor["created_at"], anchor["rowid"]))
             direction = "ASC" if after_message_id else "DESC"
+            projection = _CONVERSATION_MESSAGES if message_view == "conversation" else ""
             rows = conn.execute(
                 "SELECT message_id,session_id,role,content,payload,created_at FROM agent_session_messages "
-                f"WHERE session_id=?{clause} ORDER BY created_at {direction},rowid {direction} LIMIT ?",
+                f"WHERE session_id=?{clause}{projection} ORDER BY created_at {direction},rowid {direction} LIMIT ?",
                 [*params, limit + 1],
             ).fetchall()
             has_more = len(rows) > limit
@@ -449,6 +471,7 @@ class SessionService:
             return AgentSessionMessagePage(
                 session=session, messages=[self._message_from_row(item) for item in rows],
                 message_page={
+                    "view": message_view,
                     "direction": "after" if after_message_id else "before",
                     "has_more": has_more,
                     "first_message_id": rows[0]["message_id"] if rows else None,

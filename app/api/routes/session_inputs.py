@@ -1,6 +1,7 @@
 """Local user acceptance and inspection of durable session input queues."""
 from __future__ import annotations
 
+from contextlib import closing
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -61,7 +62,7 @@ def _call(request, operation, session_id, **kwargs):
 @router.post('', status_code=202)
 def submit_input(session_id: str, payload: SubmitSessionInput, request: Request):
     runtime = request.app.state.runtime
-    with runtime._conn() as conn:
+    with closing(runtime._conn()) as conn:
         prior = conn.execute("SELECT 1 FROM session_inputs WHERE session_id=? AND client_message_id=?",
                              (session_id, payload.client_message_id)).fetchone()
     validator = getattr(runtime, "validate_agent_reasoning_selection", None)

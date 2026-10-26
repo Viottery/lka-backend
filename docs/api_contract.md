@@ -1400,6 +1400,7 @@ GET /sessions/session_xxx
 GET /sessions/session_xxx?message_limit=30
 GET /sessions/session_xxx?message_limit=30&before_message_id=message_first
 GET /sessions/session_xxx?message_limit=30&after_message_id=message_last
+GET /sessions/session_xxx?message_limit=30&message_view=conversation
 ```
 
 `message_limit` 为 1–100；`before_message_id` 和 `after_message_id` 只能二选一，
@@ -1411,6 +1412,12 @@ GET /sessions/session_xxx?message_limit=30&after_message_id=message_last
 游标不属于本会话或历史已清空时返回 `409 history_cursor_invalid`，客户端应丢弃旧页并
 重新读取最近页。`history_reset_at` 变化时也必须替换缓存，不能拼接旧历史。
 消息和会话信息在同一 SQLite 读快照中获取；后续追加不会改变已读取页的游标边界。
+
+聊天页面应同时传 `message_view=conversation`，在分页前排除后台内部输入和显式
+`user_visible=false` 的消息，避免内部事件挤掉正常对话。原有用户／助理消息、可显示的
+旧版工具消息与主管派发的任务正文保留，before／after 和 `has_more` 均对应这个视图。
+此参数只在提供 `message_limit` 时可用；省略或传 `all` 仍按完整记录分页。
+`message_page.view` 标明当前视图。此显示投影不删除记录，也不改变 Agent 上下文或审计。
 
 支持 gzip 的客户端可发送 `Accept-Encoding: gzip`，后端自动压缩大于 1 KiB 的响应；
 `text/event-stream` 保持逐块传输，不压缩或等待流结束。

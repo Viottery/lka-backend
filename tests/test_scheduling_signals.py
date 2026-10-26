@@ -295,6 +295,44 @@ def test_no_recovery_wildcard_is_single_flight_when_interval_elapses():
     assert scheduler.stop(1)
 
 
+def test_rescan_during_no_recovery_wildcard_runs_another_pass():
+    class Clock:
+        value = 0.0
+
+        def __call__(self):
+            return self.value
+
+    clock = Clock()
+    entered, release = threading.Event(), threading.Event()
+    calls = []
+
+    def handler(key):
+        calls.append(key)
+        if key == "*" and calls.count("*") == 1:
+            entered.set()
+            assert release.wait(2)
+
+    scheduler = KeyedScheduler(
+        workers=1, reconcile_seconds=30, jitter_ratio=0, clock=clock, random_source=lambda: 0.5
+    )
+    scheduler.register("n", handler)
+    scheduler.start()
+    with scheduler._cv:
+        clock.value = 30
+        scheduler._cv.notify_all()
+    assert entered.wait(1)
+
+    scheduler.request_rescan("n")
+    release.set()
+    deadline = time.monotonic() + 1
+    while (calls.count("*") < 2 or scheduler.status()["needs_rescan"]) and time.monotonic() < deadline:
+        time.sleep(0.005)
+
+    assert calls.count("*") == 2
+    assert not scheduler.status()["needs_rescan"]
+    assert scheduler.stop(1)
+
+
 def test_recovery_slot_race_clears_single_flight_marker():
     scheduler = KeyedScheduler(capacity=1, workers=1)
     scheduler.register("n", lambda key: None, lambda cursor, limit: RecoveryPage([], None, True))

@@ -180,6 +180,27 @@ class ManagementService:
         controller["default_execution_workspace"] = json.loads(controller["default_execution_workspace"]) if controller["default_execution_workspace"] else None
         return {"session": session.model_dump(mode="json"), "controller": controller}
 
+    @staticmethod
+    def input_answer_selection(conn, session_id):
+        """Return the configured answer model for an active manager session.
+
+        The caller owns the connection and transaction so input acceptance can
+        read this setting under its existing write reservation.
+        """
+        row = conn.execute(
+            "SELECT c.llm_answer_client_name,c.llm_answer_model "
+            "FROM manager_controllers c JOIN agent_sessions s "
+            "ON s.session_id=c.session_id WHERE c.session_id=? "
+            "AND s.kind='manager' AND s.status!='deleted'",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(session_id)
+        return {
+            "llm_answer_client_name": row["llm_answer_client_name"],
+            "llm_answer_model": row["llm_answer_model"],
+        }
+
     def list(self, limit=50, offset=0):
         if not isinstance(limit, int) or not 1 <= limit <= 200 or not isinstance(offset, int) or offset < 0:
             raise ValueError("limit must be 1..200 and offset non-negative")

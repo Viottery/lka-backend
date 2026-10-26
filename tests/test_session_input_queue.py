@@ -74,6 +74,58 @@ def test_acceptance_is_immediate_history_once_without_running_models(runtime):
     assert len(runtime.get_session(session_id=session_id).messages) == 2
 
 
+def test_exact_retry_and_conflict_do_not_need_the_writer_permit(runtime):
+    session_id = sid(runtime)
+    accepted = submit(runtime, session_id, 'retry')
+    # Another connection in this thread owns the writer. A duplicate receipt
+    # can use a consistent read snapshot without nested writes or queue waits.
+    with closing(runtime._conn()) as writer:
+        writer.execute('BEGIN IMMEDIATE')
+        try:
+            assert submit(runtime, session_id, 'retry') == accepted
+            with pytest.raises(SessionInputConflict, match='client_message_id_conflict'):
+                submit(runtime, session_id, 'retry', 'different content')
+        finally:
+            writer.rollback()
+    assert len(runtime.get_session(session_id=session_id).messages) == 1
+
+
+def test_acceptance_receipts_skip_history_and_match_full_queue_state(runtime):
+    session_id = sid(runtime)
+    original = runtime.session_inputs._conn
+    statements = []
+
+    def traced():
+        conn = original()
+        conn.set_trace_callback(statements.append)
+        return conn
+
+    runtime.session_inputs._conn = traced
+    first = submit(runtime, session_id, 'a')
+    second = submit(runtime, session_id, 'b')
+    repeated = submit(runtime, session_id, 'a')
+    assert [first['queue']['pending_count'], second['queue']['pending_count']] == [1, 2]
+    assert repeated['input'] == first['input']
+    assert repeated['queue'] == second['queue']
+    assert not any('SELECT i.*,r.status AS run_status' in sql for sql in statements)
+    full = runtime.session_inputs.snapshot(session_id)
+    assert len(full['inputs']) == 2
+    assert second['queue'] == {key: full[key] for key in second['queue']}
+
+
+def test_acceptance_reads_answer_selection_in_its_transaction_without_full_policy(runtime, monkeypatch):
+    session_id = sid(runtime)
+    runtime.management_service.update(session_id, expected_revision=1, llm_answer_model='frozen-answer')
+    monkeypatch.setattr(runtime.session_inputs, 'policy', lambda _sid: pytest.fail('full policy under writer'))
+    receipt = submit(runtime, session_id, 'selection')
+    message = runtime.get_session(session_id=session_id).messages[0]
+    assert message.message_id == receipt['input']['message_id']
+    assert message.payload['answer_model_selection'] == {
+        'llm_answer_client_name': None, 'llm_answer_model': 'frozen-answer',
+    }
+    assert receipt['queue']['pending_count'] == 1
+
+
 def test_empty_session_input_tick_does_not_enter_any_write_transaction(runtime, monkeypatch):
     sid(runtime)
     runtime.session_inputs.ensure_schema()
