@@ -1,5 +1,34 @@
 # Local Knowledge Agent OS Eval Benchmarks
 
+## Conversation history retrieval
+
+Offline contract and runtime tests use disposable databases and model stubs:
+
+```bash
+.venv/bin/python -m pytest -q tests/test_conversation_history_service.py \
+  tests/test_conversation_history_agent.py tests/test_conversation_history_index.py \
+  tests/test_conversation_semantic.py tests/test_context_manifest.py \
+  tests/test_context_window_lifecycle.py
+```
+
+For a small synthetic Chinese synonym smoke test with an already cached model:
+
+```bash
+PYTHONPATH=. .venv/bin/python scripts/eval_conversation_history.py \
+  --cache-dir data/models --output docs/_engineering/history-local-eval.json
+PYTHONPATH=. .venv/bin/python scripts/benchmark_conversation_semantic.py \
+  --rows 10000 --dimensions 384
+```
+
+The first command uses local ONNX only, never downloads a model, never sends
+history to a provider, and does not open production data. Its 12 synthetic
+cases report top-1/top-3 source hits and complete-query timing, including
+source revalidation. This is a smoke set, not a general semantic-quality claim.
+The second command uses deterministic synthetic vectors and measures indexing,
+SQLite, cache and vector math; it excludes real embedding latency and quality.
+Cold/warming, capped candidate windows and model failures must retain explicit
+coverage status and the literal-search/read fallback.
+
 ## Event scheduling transport benchmark
 
 `scripts/benchmark_event_scheduling.py` starts an isolated loopback HTTP backend
@@ -96,6 +125,38 @@ metered call and remains fallible; all reviewed changes must pass the same deter
 Reports separate source preservation, prompt latency and provider usage from semantic quality, which
 requires independent review. Schema-valid or fully loaded records are not automatically quality passes.
 No replay result is published into production. Offline contracts are in `tests/test_context_records.py`.
+
+To replay the bounded session handoff profile incrementally, explicitly select
+`--profile handoff --batch-messages 64 --projection-tokens 2048`. Batches may be
+smaller when the input budget requires it; the full source prefix is preserved.
+Handoff replay rebuilds from raw messages with empty legacy summary state, so a
+historical prefix cannot inherit a future summary. Direction and phase replace
+prior records; each batch saves its projection, coverage, selected size and omitted
+record count. The final check uses the actual active session prompt path.
+Source text and model-call records remain private evaluation artifacts.
+Remote history replay additionally requires authorization for the chosen history
+and configured external provider. Reuse one `--ledger` for all attempts, including
+failed attempts. Protocol, source, size and latency checks do not certify correct
+intent tracking; review the projections against the corresponding source prefixes.
+Offline structural replay contracts are in `tests/test_session_handoff.py`.
+
+The narrower conversation-intent profile uses `--profile intent --input-tokens 24000
+--projection-tokens 512`. It filters genuine user exchanges before model generation;
+background-only batches advance source coverage without a model call. Its two slots
+describe conversational direction and response state, not pending tasks or execution
+logs. Active reads backfill genuine dialogue within the session budget; report raw
+history and uncovered tail separately. Structural tests are in
+`tests/test_context_intent_views.py` and `tests/test_conversation_intent.py`.
+Real replay still requires authorization and the existing shared cost/workload ledgers;
+a new profile or experiment label does not reset allowances or establish semantic quality.
+Each unprocessed prefix is a distinct replay job, matching production's per-batch
+background jobs. Retries of the same prefix retain the same task ID and allowance.
+Workload accounting defaults to the persistent evaluation ledger, alongside the
+cost/call ledger; `--workload-ledger` can explicitly select an existing workload
+database. A new output directory does not reset its usage or circuit breaker.
+Reports distinguish `completed` from the committed `covered_seq`. Successful
+batches persist progress immediately; a later failure retains the last committed
+records and `partial_projection.txt`. An unreviewed draft never advances coverage.
 
 ## Linux real-task quality catalog (2026-10-05)
 

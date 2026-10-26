@@ -135,8 +135,10 @@ class ContextRecordStore:
                 if change["op"] == "archive":
                     value["validity"] = "archived"
                 value.update(record_id=identity, revision=(old["revision"]+1 if old else 1))
-                # Preserve exact prior supporting sources when replacing a record.
-                if old:
+                # General records retain their evidence chain. Handoff slots
+                # replace a current direction/stage, not an accumulating event
+                # history; older versions and sources remain in the event audit.
+                if old and value["kind"] not in {"focus", "phase", "intent", "dialogue"}:
                     supports = {json.dumps(s, sort_keys=True): s for s in [*old["sources"], *value["sources"]]}
                     value["sources"] = list(supports.values())
                 merged_before = []

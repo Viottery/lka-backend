@@ -33,6 +33,7 @@ class BudgetedPrompt:
     conservative: bool
     omitted: dict[str, Any]
     output_reserve_tokens: int | None = None
+    approximate: bool = False
 
 
 class PromptBudgetExceeded(ValueError):
@@ -64,6 +65,7 @@ class PromptBudgeter:
             return BudgetedPrompt(
                 user_prompt, counted.count, input_limit, counted.method,
                 counted.conservative, {}, output_reserve_tokens,
+                getattr(counted, "approximate", False),
             )
         try:
             payload = json.loads(user_prompt)
@@ -190,9 +192,33 @@ class PromptBudgeter:
                 recount()
 
             recent = window.get("recent_messages")
-            while counted.count > input_limit and isinstance(recent, list) and len(recent) > 2:
-                recent.pop(0)
-                omitted["older_context_messages"] = omitted.get("older_context_messages", 0) + 1
+            intent_history = isinstance(window.get("summary_metadata"), dict) and (
+                window["summary_metadata"].get("method") == "conversation_intent"
+            )
+            while counted.count > input_limit and isinstance(recent, list) and recent:
+                first = recent[0]
+                trace = first.get("trace_id") if isinstance(first, dict) else None
+                if isinstance(trace, str) and trace:
+                    indices = [i for i, item in enumerate(recent)
+                               if isinstance(item, dict) and item.get("trace_id") == trace]
+                elif isinstance(first, dict) and first.get("role") in {"user", "agent", "assistant", "tool"}:
+                    # Old untraced history has no batch identity. Keep its
+                    # user/answer prefix together up to the next user input.
+                    boundary = next((i for i, item in enumerate(recent[1:], 1)
+                                     if isinstance(item, dict) and item.get("role") == "user"), len(recent))
+                    indices = list(range(boundary))
+                else:
+                    indices = [0]  # Compatibility with older untyped views.
+                if not intent_history and len(recent) - len(indices) < 2:
+                    break  # Existing profiles retain their mandatory raw tail.
+                for index in reversed(indices):
+                    recent.pop(index)
+                omitted["older_context_messages"] = omitted.get("older_context_messages", 0) + len(indices)
+                metadata = window.get("summary_metadata")
+                if isinstance(metadata, dict):
+                    # Source sequence bounds describe the pre-fit projection,
+                    # since legacy message payloads do not carry individual seq.
+                    metadata["source_range_before_prompt_fit"] = True
                 recount()
 
             instructions = window.get("agent_instructions")
@@ -237,6 +263,7 @@ class PromptBudgeter:
         return BudgetedPrompt(
             user_prompt, counted.count, input_limit, counted.method,
             counted.conservative, omitted, output_reserve_tokens,
+            getattr(counted, "approximate", False),
         )
 
     @staticmethod

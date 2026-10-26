@@ -662,7 +662,8 @@ class AgentGraphRunner:
             user_input=turn_user_input, message_id=f"agent_graph_user_{run.run_id}",
         )
         window = self.turn_loop.session_service.get_prompt_context_window(
-            session_id=session.session_id, token_budget=self.turn_loop.session_context_token_budget
+            session_id=session.session_id, token_budget=self.turn_loop.session_context_token_budget,
+            history_lane="conversation" if self.turn_loop._turn_input_role(run.run_id) == "user" else "work",
         ).model_dump(mode="json")
         window["current_time"] = current_time_payload()
         if session.workspace is not None:

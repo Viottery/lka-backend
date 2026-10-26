@@ -674,11 +674,65 @@ class LocalKnowledgeAgentRuntime:
             background_client_name=memory_config.background_client_name,
             background_model=memory_config.background_model,
             atomic_context_mode=memory_config.atomic_context_mode,
+            atomic_context_profile=memory_config.atomic_context_profile,
+            atomic_context_handoff_tokens=memory_config.atomic_context_handoff_tokens,
+            atomic_context_intent_tokens=memory_config.atomic_context_intent_tokens,
             atomic_context_input_tokens=memory_config.atomic_context_input_tokens,
             atomic_context_projection_tokens=memory_config.atomic_context_projection_tokens,
             atomic_context_debounce_seconds=memory_config.atomic_context_debounce_seconds,
         )
         self.memory_background.initialize_recovery()
+        from app.domains.conversation_history import ConversationHistoryService
+        from app.tool_packages.conversation_history import (
+            HISTORY_PACKAGE,
+            conversation_history_tools,
+        )
+
+        conn = self._conn()
+        try:
+            self.session_service._ensure_context_state_table(conn)
+            conn.commit()
+        finally:
+            conn.close()
+        self.conversation_history = ConversationHistoryService(self._conn)
+        self.conversation_history.ensure_schema()
+        history_config = self.local_app_config.conversation_history
+        self.conversation_history_indexer = None
+        if history_config.semantic_enabled:
+            from app.core.conversation_history_index import ConversationHistoryIndexer
+            from app.domains.conversation_semantic import ConversationSemanticIndex
+            from app.integrations.local_semantic import FastEmbedEmbeddingProvider
+
+            # A separate provider stays local-only even when knowledge imports
+            # explicitly permit downloads on their own provider instance.
+            history_provider = FastEmbedEmbeddingProvider(
+                model_name=embedding_config.model_name, dimensions=embedding_config.dimensions,
+                cache_dir=str(embedding_config.cache_dir), batch_size=embedding_config.batch_size,
+                query_prefix=embedding_config.query_prefix,
+                normalized=True, local_files_only=True,
+            )
+            from hashlib import sha256
+
+            fingerprint_revision = sha256(
+                (history_config.model_revision + "\0" + embedding_config.query_prefix).encode()
+            ).hexdigest()
+            history_index = ConversationSemanticIndex(
+                self._conn, history_provider, model_revision=fingerprint_revision,
+                batch_size=history_config.index_batch_size,
+                max_candidates=history_config.max_candidates,
+            )
+            history_index.ensure_schema()
+            self.conversation_history_indexer = ConversationHistoryIndexer(
+                index=history_index, store=self.background_job_store, conn_factory=self._conn,
+                enabled=memory_config.enabled and memory_config.background_enabled,
+            )
+            self.memory_background.worker.handlers[ConversationHistoryIndexer.kind] = (
+                self.conversation_history_indexer.handle
+            )
+            self.conversation_history.semantic_index = self.conversation_history_indexer
+        self.tool_registry.register_package(HISTORY_PACKAGE.model_copy(deep=True))
+        for tool in conversation_history_tools(self.conversation_history):
+            self.tool_registry.register_tool(tool)
         if self.memory_background.atomic_context_store is not None:
             self.tool_registry.register_package(CONTEXT_PACKAGE)
             self.tool_registry.register_tool(ReadContextRecordsTool(self.memory_background.atomic_context_store))
@@ -1044,14 +1098,22 @@ class LocalKnowledgeAgentRuntime:
         self.management_history = ManagementHistoryService(self._conn, tasks=self.managed_tasks)
         if self.local_app_config.management.enabled:
             self.tool_registry.register_package(MANAGEMENT_PACKAGE.model_copy(deep=True))
+            from app.core.tools import ToolCapabilityHint
             from app.tool_packages.management_capture import management_capture_tools
             from app.tool_packages.management_delegates import management_delegate_tools
             from app.tool_packages.management_history import (
-                HISTORY_PACKAGE,
+                HISTORY_PACKAGE as MANAGEMENT_HISTORY_PACKAGE,
+            )
+            from app.tool_packages.management_history import (
                 management_history_tools,
             )
 
-            self.tool_registry.register_package(HISTORY_PACKAGE.model_copy(deep=True))
+            history_package = next(p for p in self.tool_registry.list_packages() if p.name == "history")
+            history_package.capability_hints.append(ToolCapabilityHint(
+                required_tools=("management.search_history", "management.read_history"),
+                routing_hints=MANAGEMENT_HISTORY_PACKAGE.routing_hints,
+                decision_hints=MANAGEMENT_HISTORY_PACKAGE.decision_hints,
+            ))
             for tool in management_capture_tools(self.management_work):
                 self.tool_registry.register_tool(tool)
             for tool in management_history_tools(self.management_history):
@@ -1624,8 +1686,15 @@ class LocalKnowledgeAgentRuntime:
         self._run_startup_mail_sync()
         self._start_background_mail_sync()
         self.watch_scheduler.start()
-        if self.local_app_config.memory.enabled and self.local_app_config.memory.background_enabled:
-            self.memory_background.start()
+        memory_config = self.local_app_config.memory
+        if memory_config.enabled:
+            if memory_config.background_enabled:
+                self.memory_background.start()
+            elif (
+                memory_config.atomic_context_mode != "off"
+                and memory_config.atomic_context_background_enabled
+            ):
+                self.memory_background.start(context_only=True)
         if self.local_app_config.message_history.enabled and self.local_app_config.message_history.background_enabled:
             self.message_analysis.start()
         if self.local_app_config.management.enabled:

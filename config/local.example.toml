@@ -79,6 +79,11 @@ max_attempts = 2
 # context_window_tokens = 131072
 # output_reserve_tokens = 8192
 # tokenizer_json_path = "./data/tokenizers/model/tokenizer.json"
+# Optional cross-model approximation, scoped to this exact model. This is not
+# an exact count or a guaranteed upper bound. Missing files fall back to bytes.
+# tokenizer_fallback_json_path = "./data/tokenizers/proxy/tokenizer.json"
+# tokenizer_fallback_multiplier = 1.5
+# tokenizer_fallback_extra_tokens = 2048
 # [llm.model_overrides."your-model-id"]
 # context_window_tokens = 131072
 # output_reserve_tokens = 8192
@@ -243,6 +248,16 @@ auto_index_on_import = false
 # be requested explicitly through semantic-index sync.
 local_files_only = true
 
+[conversation_history]
+# Explicit history.search/history.read source access is always available to root
+# ordinary sessions. Semantic search is an optional local-only supplement.
+semantic_enabled = false
+# Reuses [embedding] model/cache/query_prefix, never downloads during serving.
+# Increment this when replacing model weights under the same model name.
+model_revision = "1"
+index_batch_size = 32
+max_candidates = 20000
+
 [client]
 # Optional same-origin LKA Desktop workbench, e.g. "/home/me/lka-desktop/app/web/pet".
 # Served at /desktop-pet/ (entry: /desktop-pet/connect.html). Static files are
@@ -339,7 +354,13 @@ max_pending_requests = 16
 request_timeout_seconds = 12
 
 [memory]
+# Independently run only atomic context maintenance while the legacy memory
+# background pipeline remains disabled. Requires atomic_context_mode != "off".
+atomic_context_background_enabled = false
 atomic_context_mode = "off" # off | shadow (background records only) | active (prompt projection)
+atomic_context_profile = "general" # general | handoff | intent (conversation direction/response state only)
+atomic_context_handoff_tokens = 2048 # Handoff view only; hard maximum 4096, within projection/context budgets.
+atomic_context_intent_tokens = 512 # Intent view only; hard maximum 1024. Keep room for genuine dialogue history.
 atomic_context_input_tokens = 24000 # Whole-message background input budget; never clips source history.
 atomic_context_projection_tokens = 4096
 atomic_context_debounce_seconds = 30

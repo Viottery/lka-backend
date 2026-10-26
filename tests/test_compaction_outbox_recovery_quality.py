@@ -103,7 +103,8 @@ def test_runtime_enqueue_failure_preserves_answer_and_recovers_after_restart(
         # Session sidecar creation is existing behavior, not a recovery migration.
         schema_after = conn.execute(
             "SELECT name, sql FROM sqlite_master WHERE name NOT LIKE 'agent_session_context_%' "
-            "AND name NOT LIKE 'sqlite_autoindex_agent_session_context_%' ORDER BY name",
+            "AND name NOT LIKE 'sqlite_autoindex_agent_session_context_%' "
+            "AND tbl_name NOT LIKE 'agent_session_context_%' ORDER BY name",
         ).fetchall()
     assert [tuple(row) for row in schema_after] == [
         tuple(row) for row in schema_before

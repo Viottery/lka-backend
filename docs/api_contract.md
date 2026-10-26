@@ -804,8 +804,18 @@ audit record 和本地日志路径均不属于正常 HTTP 响应；它们只保�
   完整读取后仍标 historical_only=true、current_evidence=false，当前状态需另行核验。
 - 如果某个 package 需要同步、刷新或跨 package 工作流，这些策略必须写在该 package 的
   metadata / tool descriptions / schemas 中，由 Agent core 注入 prompt 后让 LLM 决策。
-- context window 未满时不做摘要；超过预算时触发独立 `context_summarize` LLM 调用，
-  将旧 summary 和除最近两条消息外的历史问答重写为新 summary，原文只保留最近两条消息。
+- 默认摘要路径保留最近完整问答并异步整理旧上下文，完整原始历史仍保存在本地；
+  超预算时使用现有有界回退。可选 `atomic_context_profile=handoff` 通过后台来源记录增量维护
+  方向、阶段、决定和未闭环事项，再渲染为有界 `summary`；后续原始消息优先。
+  `summary_metadata.method=session_handoff` 表示本次读取实际采用交接投影，
+  `covered_seq`、`projection_revision`、`latest_source_seq` 和 `raw_tail_messages` 表示其覆盖边界。
+  没有改变 `summary` 字符串及 `recent_messages` 的接口形状。
+- 可选 `atomic_context_profile=intent` 将 `summary` 收窄为对话方向和回应状态，默认512 tokens。
+  `summary_metadata.method=conversation_intent`，`history_lane=conversation/work` 区分前台对话和后台工作历史；
+  `raw_history_messages` 是实际装入的原文数量，`backfilled_messages` 是摘要已覆盖但仍回填的数量，
+  `raw_tail_messages` 仅统计未覆盖原文，不能再视为整个 `recent_messages` 数量。
+  `history_row_limit=512`，`history_rows_omitted_by_budget` 描述返回上限和预算裁剪；
+  `state_error` 报告意图尚未建立或引用失效等状态，仍可提供真实历史，不返回旧任务型摘要。
 - 每次调用会显式追加 user / agent session message，并写入本地 markdown run log。
 - run log 由代码模板生成，包含用户输入、package catalog、逐步展开工具、决策事件、
   工具调用输入输出、工具反馈、progress events、verification warnings、LLM 完整 prompt /
@@ -1677,7 +1687,29 @@ controller active 才能发出管理写命令；paused 可对话和读取结果�
 运行观察沿用 `GET /agent/runs/{run_id}/stream`，通过查询队列取得后续 run_id。
 原 `/agent/turn` 接口的忙碌冲突合同保持不变。
 
-顶层主管专用历史读取（普通会话和事务线子 agent 均不获授）：
+本会话历史工具（普通／管理根会话可用，受限或 child 运行拒绝）：
+
+- `history.search(query?,mode?,limit?,offset?,index_cursor?)`：搜索当前会话的真实用户输入及 trace 关联回答，
+  默认 `mode=lexical`，可选 `semantic/hybrid`；空 query 列近期来源目录。
+  query 最长 500 字符，limit 为 1..20。返回消息序号、角色、时间、trace、内容 hash、片段和 source_ref。
+  关键词索引按批补齐，`index.complete/watermark/next_watermark` 与 `incomplete` 说明覆盖范围；
+  返回 `next_index_cursor` 时传作下一次的 index_cursor，继续推进索引；
+  这个进度引用不指定来源范围，也不改变访问权限，且能避免被相同成功调用的防重复缓存拦住。
+  小于三字符的查询只扫描最近 5001 个索引候选，超限报告不完整。
+  可选语义索引返回 `semantic.state/pending/coverage_capped`；预热或不可用时保留关键词路径。
+  hybrid 的 offset 须小于 120，排名窗口截断另有 `ranking_truncated` 标记，分页只覆盖该候选窗口。
+- `history.read(seq?,around_seq?,cursor?,offset?,max_chars?,limit?)`：三种来源选择恰好指定一种。
+  seq 读取单条消息；around_seq 读取同 trace 完整轮次，包含同轮批次中的多条用户输入。
+  单页最多 8000 字符、12 条消息；单条截断通过 next_seq/next_offset 继续，
+  多消息页直接传回 `cursor={anchor_seq,message_offset,char_offset}`。
+  每次读取重新核验来源，不接受模型指定另一个 session_id。
+
+这些工具读取序号化的原始会话上下文，不恢复旧附件二进制、后台事件正文或工具审计；
+源表中未保存的历史不能凭索引重建。返回来源是引用材料，不能重新授予执行或审批权限。
+每次模型实际调用的 `llm_started.payload.context_manifest` 保存最终装配的无正文计数与哈希；
+分区 token 估算有截断标记且不可相加作为整请求用量，实际账单用量沿用 LLM 审计。
+
+顶层主管跨会话历史读取（普通会话和事务线子 agent 均不获授）：
 
 - `management.search_history(query?,kind?,limit?,offset?)`：在未删除的普通／管理会话标题和正文中按区分大小写的字面量子串检索；空 query 列出最近会话。kind 为 all/ordinary/manager，limit 为 1..50。
 - `management.read_history(session_id,message_id?,start_char?,order?,limit?,offset?)`：读取 user/agent/tool 历史正文，默认 newest，可选 oldest。单条至多 4000 字符、单页至多 12000 字符；截断消息用 next_message_id/next_char 续读，或沿 next_offset 与 next_char（无值时为 0）继续分页。
@@ -2380,7 +2412,8 @@ query string 传递 token；它们不暴露 LLM 密钥、原始 prompt、记忆�
   `revision`、`summary_revision`、`recent_message_count`、`degraded`、`degradation`
   和 `active_compaction_jobs`（queued/retry_wait/running 数量）。token 数是持久化窗口
   在 `estimate_as_of` 时的估算，不是当前完整模型请求的真实用量。
-  可选 `atomic_context` 包含原子系统的 `configured_mode`、`revision`、`covered_seq`、
+  可选 `atomic_context` 包含原子系统的 `configured_mode`、`configured_profile`、
+  `handoff_token_budget`、`intent_token_budget`、`revision`、`covered_seq`、
   `records`、`lag_messages`、`updated_at` 和 `last_error`；关闭时只提供模式和错误字段。
   这些是原子维护诊断，不表示 shadow 已替换摘要，也不等于当前请求一定采用原子视图。
 

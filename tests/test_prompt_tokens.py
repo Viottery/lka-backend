@@ -77,3 +77,50 @@ def test_invalid_tokenizer_json_fails_without_download(tmp_path):
     else:
         with pytest.raises(ValueError, match="Invalid tokenizer JSON"):
             PromptTokenCounter(tokenizer_path)
+
+
+def test_explicit_proxy_tokenizer_scales_and_pads_request_once(tmp_path):
+    tokenizers = pytest.importorskip("tokenizers")
+    tokenizer = tokenizers.Tokenizer(
+        tokenizers.models.WordLevel(vocab={"[UNK]": 0, "s": 1, "u": 2}, unk_token="[UNK]")
+    )
+    path = tmp_path / "proxy.json"
+    tokenizer.save(str(path))
+    counter = PromptTokenCounter(
+        fallback_tokenizer_json_path=path,
+        fallback_multiplier=1.5,
+        fallback_extra_tokens=11,
+    )
+    result = counter.count_request("s", "u", [{"name": "t"}])
+    assert result.count == 5 + 11 + 8 + 8
+    assert result.method == "proxy_tokenizer_estimate"
+    assert result.conservative is False
+    assert result.approximate is True
+    assert counter.count_text("s").count == 2  # ceil(1 * 1.5), without request padding
+    assert counter.count_text("s").method == "proxy_tokenizer_estimate"
+
+
+def test_exact_tokenizer_takes_priority_over_proxy(tmp_path):
+    tokenizers = pytest.importorskip("tokenizers")
+    tokenizer = tokenizers.Tokenizer(
+        tokenizers.models.WordLevel(vocab={"[UNK]": 0, "s": 1}, unk_token="[UNK]")
+    )
+    exact = tmp_path / "exact.json"
+    proxy = tmp_path / "proxy.json"
+    tokenizer.save(str(exact))
+    tokenizer.save(str(proxy))
+    result = PromptTokenCounter(
+        exact, fallback_tokenizer_json_path=proxy, fallback_extra_tokens=999
+    ).count_text("s")
+    assert result.count == 1
+    assert result.method == "local_tokenizers_json"
+    assert result.approximate is False
+
+
+def test_invalid_proxy_fails_closed_to_utf8_counter(tmp_path):
+    path = tmp_path / "invalid-proxy.json"
+    path.write_text("invalid", encoding="utf-8")
+    result = PromptTokenCounter(fallback_tokenizer_json_path=path).count_text("你好")
+    assert result.count == len("你好".encode())
+    assert result.method == "utf8_byte_upper_bound"
+    assert result.approximate is False

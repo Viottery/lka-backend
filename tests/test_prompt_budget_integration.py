@@ -119,3 +119,52 @@ def test_session_counter_follows_request_model_override(tmp_path):
         assert loop._selected_session_counter().count_text("你好").method == "local_tokenizers_json"
     finally:
         _turn_llm_model.reset(token)
+
+
+def test_proxy_counter_is_scoped_to_explicit_model_override(tmp_path):
+    tokenizers = pytest.importorskip("tokenizers")
+    tokenizer = tokenizers.Tokenizer(
+        tokenizers.models.WordLevel(vocab={"[UNK]": 0, "hello": 1}, unk_token="[UNK]")
+    )
+    path = tmp_path / "proxy.json"
+    tokenizer.save(str(path))
+    service = build_llm_service(LLMProviderConfig(
+        default_client="local",
+        clients=[LLMClientConfig(
+            name="local", provider="mock", default_model="demo",
+            context_window_tokens=148_000,
+            model_overrides={"proxy-model": LLMModelConfigOverride(
+                context_window_tokens=148_000,
+                tokenizer_fallback_json_path=path,
+                tokenizer_fallback_multiplier=2,
+                tokenizer_fallback_extra_tokens=17,
+            )},
+        )],
+    ))
+    loop = _loop(context_window_tokens=148_000)
+    loop.llm_client = service
+    assert loop._selected_session_counter().count_text("hello").method == "utf8_byte_upper_bound"
+    token = _turn_llm_model.set("proxy-model")
+    try:
+        selected = loop._selected_session_counter()
+        assert selected.count_text("hello").count == 2
+        assert selected.count_text("hello").method == "proxy_tokenizer_estimate"
+    finally:
+        _turn_llm_model.reset(token)
+
+
+def test_proxy_configuration_does_not_leak_to_another_model(tmp_path):
+    path = tmp_path / "proxy.json"
+    config = LLMProviderConfig(
+        default_client="local",
+        clients=[LLMClientConfig(
+            name="local", provider="mock", default_model="demo",
+            model_overrides={"proxy-model": LLMModelConfigOverride(
+                tokenizer_fallback_json_path=path,
+            )},
+        )],
+    )
+    assert config.resolve_model_config("local", "proxy-model").tokenizer_fallback_json_path == path
+    default_config = config.resolve_model_config("local", "demo")
+    assert default_config is None or default_config.tokenizer_fallback_json_path is None
+    assert config.resolve_model_config("local", "other") is None

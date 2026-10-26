@@ -12,11 +12,52 @@ class Count:
     count: int
     method: str = "test_chars"
     conservative: bool = True
+    approximate: bool = False
 
 
 class CharCounter:
     def count_request(self, system_prompt, user_prompt, tools=None):
         return Count(len(system_prompt) + len(user_prompt) + len(str(tools or [])))
+
+
+def test_budget_carries_proxy_approximation_metadata():
+    class ApproximateCounter:
+        def count_request(self, system_prompt, user_prompt, tools=None):
+            return Count(1, method="proxy_tokenizer_estimate", conservative=False, approximate=True)
+
+    fitted = PromptBudgeter(ApproximateCounter()).fit(
+        system_prompt="s", user_prompt='{"user_input":"x"}', input_limit=10,
+    )
+    assert fitted.conservative is False
+    assert fitted.approximate is True
+
+
+def test_whole_prompt_fit_preserves_trace_turns_and_can_omit_huge_intent_history():
+    latest = [{"role": role, "content": "latest", "trace_id": "new"}
+              for role in ["user", "user", "agent"]]
+    payload = {"user_input": "current", "session_context_window": {
+        "summary_metadata": {"method": "conversation_intent", "retained_from_seq": 1},
+        "recent_messages": [
+            {"role": "user", "content": "x" * 800, "trace_id": "old"},
+            {"role": "agent", "content": "old answer", "trace_id": "old"},
+            *latest,
+        ],
+    }}
+    fitted = PromptBudgeter(CharCounter()).fit(
+        system_prompt="system", user_prompt=json.dumps(payload), input_limit=800,
+    )
+    visible = json.loads(fitted.user_prompt)["session_context_window"]
+    assert visible["recent_messages"] == latest
+    assert visible["summary_metadata"]["source_range_before_prompt_fit"] is True
+    assert fitted.omitted["older_context_messages"] == 2
+    payload["session_context_window"]["recent_messages"] = [
+        {"role": "user", "content": "x" * 1000, "trace_id": "huge"},
+        {"role": "agent", "content": "y" * 1000, "trace_id": "huge"},
+    ]
+    fitted = PromptBudgeter(CharCounter()).fit(
+        system_prompt="system", user_prompt=json.dumps(payload), input_limit=800,
+    )
+    assert json.loads(fitted.user_prompt)["session_context_window"]["recent_messages"] == []
 
 
 def test_budget_keeps_current_input_and_drops_older_views():

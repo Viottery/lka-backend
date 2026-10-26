@@ -7,7 +7,7 @@ import inspect
 import json
 import sqlite3
 from collections.abc import Callable
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from contextvars import ContextVar
 from datetime import UTC, datetime
 from hashlib import sha1
@@ -157,6 +157,9 @@ class SessionService:
         self._context_token_counter = context_token_counter
         self.atomic_context_store = None
         self.atomic_context_mode = "off"
+        self.atomic_context_profile = "general"
+        self.atomic_context_handoff_tokens = 2048
+        self.atomic_context_intent_tokens = 512
         self.atomic_context_projection_tokens = 4096
         self.atomic_context_enqueue = None
         self.last_atomic_context_error: str | None = None
@@ -916,6 +919,7 @@ class SessionService:
 
     def get_prompt_context_window(
         self, *, session_id: str, token_budget: int | None = None,
+        history_lane: Literal["conversation", "work"] = "conversation",
     ) -> AgentSessionContextWindow:
         """Return a bounded prompt projection without changing the full raw window."""
         if self.atomic_context_mode == "active" and self.atomic_context_store is not None:
@@ -927,7 +931,7 @@ class SessionService:
                     budget = stored[0] if stored else self.default_context_token_budget
                 finally:
                     conn.close()
-            atomic = self._get_atomic_prompt_context(session_id, budget)
+            atomic = self._get_atomic_prompt_context(session_id, budget, history_lane=history_lane)
             if atomic is not None:
                 return atomic
         raw, state = self._get_context_window_snapshot(session_id=session_id)
@@ -991,36 +995,199 @@ class SessionService:
             "token_estimate": estimate,
         })
 
-    def _get_atomic_prompt_context(self, session_id, budget):
-        from app.core.context_projection import render_context
+    def _get_atomic_prompt_context(self, session_id, budget, *, history_lane="conversation"):
+        from app.core.context_projection import render_context, render_handoff
         from app.storage.context_records import ContextRecordConflict
 
+        if self.atomic_context_profile == "intent":
+            return self._get_intent_prompt_context(session_id, budget, history_lane=history_lane)
         try:
             snapshot = self.atomic_context_store.snapshot(session_id, include_history=False)
             if not snapshot["revision"]:
+                if self.atomic_context_profile == "handoff":
+                    self.last_atomic_context_error = "handoff_state_pending"
                 return None
             tail = [SessionRecentMessage(**{key: row[key] for key in ("role", "content", "created_at", "trace_id")})
                     for row in snapshot["messages"] if row["seq"] > snapshot["covered_seq"]]
             tail_tokens = self._context_token_estimate("", tail)
             available = min(self.atomic_context_projection_tokens, budget-tail_tokens)
+            handoff = self.atomic_context_profile == "handoff"
+            if handoff:
+                available = min(available, self.atomic_context_handoff_tokens, 4096)
             if available < 128:
                 self.last_atomic_context_error = "atomic_tail_exceeds_budget"
                 return None
-            projection = render_context(snapshot["records"], covered_seq=snapshot["covered_seq"],
-                                        budget=available, counter=self._active_context_token_counter())
+            renderer = render_handoff if handoff else render_context
+            projection = renderer(snapshot["records"], covered_seq=snapshot["covered_seq"],
+                                  budget=available, counter=self._active_context_token_counter())
             estimate = self._context_token_estimate(projection["text"], tail)
             if not projection["text"] or estimate > budget:
+                self.last_atomic_context_error = "atomic_projection_exceeds_budget"
                 return None
             self.last_atomic_context_error = None
             return AgentSessionContextWindow(
                 session_id=session_id, token_budget=budget, summary=projection["text"],
                 recent_messages=tail, token_estimate=estimate, updated_at=snapshot["updated_at"],
-                summary_metadata={"method": "atomic_records", "covered_seq": snapshot["covered_seq"],
+                summary_metadata={"method": "session_handoff" if handoff else "atomic_records", "covered_seq": snapshot["covered_seq"],
                                   "projection_revision": snapshot["revision"], "omitted_records": len(projection["omitted_ids"]),
+                                  "raw_tail_messages": len(tail),
+                                  "latest_source_seq": max((r["seq"] for r in snapshot["messages"]), default=snapshot["covered_seq"]),
                                   "count_method": projection["count_method"], "continuation_tool": "context.read"})
         except (ContextRecordConflict, sqlite3.Error, ValueError) as exc:
             self.last_atomic_context_error = type(exc).__name__
             return None
+
+    def _get_intent_prompt_context(self, session_id, budget, *, history_lane):
+        from app.core.context_intent import render_intent
+        from app.storage.context_records import ContextRecordConflict
+
+        snapshot = None
+        error = None
+        candidate_row_limit_reached = False
+        partial_trace_ids: set[str] = set()
+        candidate_rows_omitted = 0
+        candidate_omitted_seqs: set[int] = set()
+        with closing(self._conn_factory()) as conn:
+            conn.execute("BEGIN")
+            # Bound returned rows independently of history length. Indexed trace
+            # joins find genuine replies even after a long stretch of background work.
+            if history_lane == "work":
+                rows = conn.execute("SELECT * FROM agent_session_context_messages WHERE session_id=? "
+                                    "ORDER BY seq DESC LIMIT 512", (session_id,)).fetchall()
+            else:
+                users = conn.execute("SELECT seq,trace_id FROM agent_session_context_messages "
+                    "WHERE session_id=? AND role='user' ORDER BY seq DESC LIMIT 513", (session_id,)).fetchall()
+                candidate_row_limit_reached = len(users) > 512
+                user_limit_reached = candidate_row_limit_reached
+                selected_users = users[:512]
+                if candidate_row_limit_reached:
+                    candidate_rows_omitted += 1  # Sentinel proves at least one omitted row.
+                trace_ids = list(dict.fromkeys(row["trace_id"] for row in selected_users if row["trace_id"]))
+                candidates = {row["seq"]: dict(row) for row in conn.execute(
+                    "SELECT * FROM agent_session_context_messages WHERE session_id=? AND role='user' "
+                    "ORDER BY seq DESC LIMIT 512", (session_id,)).fetchall()}
+                if trace_ids:
+                    placeholders = ",".join("?" for _ in trace_ids)
+                    agent_rows = conn.execute(
+                        "SELECT * FROM agent_session_context_messages WHERE session_id=? AND role='agent' "
+                        f"AND trace_id IN ({placeholders}) AND NOT EXISTS (SELECT 1 FROM agent_session_context_messages t "
+                        "WHERE t.session_id=agent_session_context_messages.session_id "
+                        "AND t.trace_id=agent_session_context_messages.trace_id AND t.role='tool') "
+                        "ORDER BY seq DESC LIMIT 1025",
+                        (session_id, *trace_ids),
+                    ).fetchall()
+                    agent_limit_reached = len(agent_rows) > 1024
+                    candidate_row_limit_reached = candidate_row_limit_reached or agent_limit_reached
+                    included_agents = agent_rows[:1024]
+                    if agent_limit_reached:
+                        candidate_rows_omitted += 1
+                        # Drop traces straddling the candidate cutoff, including
+                        # the sentinel trace just beyond the returned row budget.
+                        partial_trace_ids.update(
+                            row["trace_id"] for row in agent_rows[1023:1025]
+                            if row["trace_id"]
+                        )
+                    for row in included_agents:
+                        candidates[row["seq"]] = dict(row)
+                # A trace with more user inputs than the indexed 512-user window
+                # is excluded as a whole, never projected from a partial batch.
+                if user_limit_reached and selected_users[-1]["trace_id"]:
+                    boundary = selected_users[-1]
+                    if conn.execute("SELECT 1 FROM agent_session_context_messages WHERE session_id=? "
+                        "AND role='user' AND trace_id=? AND seq<? LIMIT 1",
+                        (session_id, boundary["trace_id"], boundary["seq"])).fetchone():
+                        partial_trace_ids.add(boundary["trace_id"])
+                for trace in partial_trace_ids:
+                    omitted_rows = [row for row in candidates.values() if row.get("trace_id") == trace]
+                    candidate_rows_omitted += len(omitted_rows)
+                    candidate_omitted_seqs.update(row["seq"] for row in omitted_rows)
+                candidates = {seq: row for seq, row in candidates.items()
+                              if row.get("trace_id") not in partial_trace_ids}
+                rows = sorted(candidates.values(), key=lambda item: item["seq"])
+            rows = [dict(row) for row in reversed(rows)] if history_lane == "work" else rows
+            try:
+                snapshot = self.atomic_context_store.snapshot(session_id, conn=conn, include_history=False)
+            except (ContextRecordConflict, ValueError) as exc:
+                error = type(exc).__name__
+        covered = snapshot["covered_seq"] if snapshot else 0
+        projection = render_intent(snapshot["records"] if snapshot else [], covered_seq=covered,
+                                   budget=min(self.atomic_context_intent_tokens,
+                                              self.atomic_context_projection_tokens, budget),
+                                   counter=self._active_context_token_counter())
+        messages = [SessionRecentMessage(**{k: row[k] for k in ("role", "content", "created_at", "trace_id")})
+                    for row in rows]
+        # Add complete trace turns from newest to oldest. A large final turn is
+        # omitted whole; its raw source remains available through context.source.
+        groups, traced = [], {}
+        for row, message in zip(rows, messages):
+            trace = row.get("trace_id")
+            if row["role"] == "user" and trace:
+                if trace not in traced:
+                    traced[trace] = []
+                    groups.append(traced[trace])
+                traced[trace].append((row, message))
+            elif row["role"] == "agent" and trace and trace in traced:
+                traced[trace].append((row, message))
+            else:
+                groups.append([(row, message)])
+        kept_pairs = []
+        chronological_groups = sorted(
+            groups, key=lambda group: max(pair[0]["seq"] for pair in group),
+        )
+        whole_pairs = [pair for group in chronological_groups for pair in group]
+        whole_pairs.sort(key=lambda pair: pair[0]["seq"])
+        whole_messages = [message for _, message in whole_pairs]
+        if len(whole_messages) <= 512 and self._context_token_estimate(projection["text"], whole_messages) <= budget:
+            kept_pairs = whole_pairs
+        else:
+            # Binary search the newest complete-turn suffix. Each candidate
+            # remains a whole trace group, including batched user inputs.
+            low, high = 0, len(chronological_groups)
+            while low < high:
+                mid = (low + high + 1) // 2
+                suffix = chronological_groups[len(chronological_groups) - mid:] if mid else []
+                pairs = sorted((pair for group in suffix for pair in group), key=lambda pair: pair[0]["seq"])
+                fits = len(pairs) <= 512 and self._context_token_estimate(
+                    projection["text"], [message for _, message in pairs]) <= budget
+                if fits:
+                    low = mid
+                else:
+                    high = mid - 1
+            suffix = chronological_groups[len(chronological_groups) - low:] if low else []
+            kept_pairs = [pair for group in suffix for pair in group]
+        kept_pairs.sort(key=lambda pair: pair[0]["seq"])
+        kept_rows = [row for row, _ in kept_pairs]
+        kept = [message for _, message in kept_pairs]
+        kept_seqs = {row["seq"] for row in kept_rows}
+        omitted_seqs = candidate_omitted_seqs | {row["seq"] for row in rows if row["seq"] not in kept_seqs}
+        estimate = self._context_token_estimate(projection["text"], kept)
+        state_error = error or (None if projection["text"] else "intent_state_pending")
+        self.last_atomic_context_error = state_error
+        latest = max([covered, *(r["seq"] for r in rows),
+                      *(r["seq"] for r in snapshot["messages"])] if snapshot else [r["seq"] for r in rows], default=0)
+        return AgentSessionContextWindow(
+            session_id=session_id, token_budget=budget, summary=projection["text"], recent_messages=kept,
+            token_estimate=estimate,
+            updated_at=(snapshot["updated_at"] if snapshot else None) or _now_iso(),
+            summary_metadata={"method": "conversation_intent", "history_lane": history_lane,
+                              "covered_seq": covered, "projection_revision": snapshot["revision"] if snapshot else 0,
+                              "raw_history_messages": len(kept),
+                              "raw_tail_messages": sum(r["seq"] > covered for r in kept_rows),
+                              "backfilled_messages": sum(r["seq"] <= covered for r in kept_rows),
+                              "history_rows_omitted_by_budget": len(messages)-len(kept),
+                              "candidate_row_limit_reached": candidate_row_limit_reached,
+                              "partial_turns_omitted": len(partial_trace_ids),
+                              "candidate_rows_omitted": candidate_rows_omitted,
+                              "candidate_rows_omitted_lower_bound": candidate_row_limit_reached,
+                              "omission": len(messages) > len(kept) or candidate_row_limit_reached or bool(partial_trace_ids),
+                              "omitted_from_seq": min(omitted_seqs, default=None),
+                              "omitted_to_seq": max(omitted_seqs, default=None),
+                              "retained_from_seq": min((r["seq"] for r in kept_rows), default=None),
+                              "retained_to_seq": max((r["seq"] for r in kept_rows), default=None),
+                              "omitted_turn_count": len(partial_trace_ids) + sum(1 for group in groups if not any(row["seq"] in kept_seqs for row, _ in group)),
+                              "history_row_limit": 512, "latest_source_seq": latest,
+                              "count_method": projection["count_method"], "continuation_tool": "context.source",
+                              "state_error": state_error})
 
     def record_context_exchange(
         self,
@@ -1127,13 +1294,18 @@ class SessionService:
                 "ON CONFLICT(session_id) DO UPDATE SET revision=excluded.revision, next_seq=excluded.next_seq",
                 (session_id, revision + 1, next_seq + 2, covered_seq),
             )
-            all_messages = self._context_messages_from_connection(
-                conn, session_id=session_id, after_seq=covered_seq
+            intent_active = self.atomic_context_mode == "active" and self.atomic_context_profile == "intent"
+            all_messages = (
+                self._intent_legacy_window_from_connection(conn, session_id=session_id, after_seq=covered_seq)
+                if intent_active else self._context_messages_from_connection(
+                    conn, session_id=session_id, after_seq=covered_seq,
+                )
             )
             estimate = self._context_token_estimate(summary, all_messages)
             hard_async = estimate > budget and transactional_enqueue
             background_mode = (
                 background_enqueue is not None
+                and not (self.atomic_context_mode == "active" and self.atomic_context_profile == "intent")
                 and estimate >= int(budget * 0.70)
                 and (estimate <= budget or hard_async)
             )
@@ -1141,7 +1313,7 @@ class SessionService:
                 kept_summary = summary
                 kept_messages = all_messages
                 token_estimate = estimate
-                if estimate > budget and not hard_async:
+            if estimate > budget and not hard_async and not (self.atomic_context_mode == "active" and self.atomic_context_profile == "intent"):
                     target_seq = next_seq - 1 if len(all_messages) > 2 else next_seq + 1
                     sync_compaction = (
                         revision + 1, covered_seq, target_seq,
@@ -1278,7 +1450,11 @@ class SessionService:
                 "ON CONFLICT(session_id) DO UPDATE SET revision=excluded.revision,next_seq=excluded.next_seq",
                 (session_id, revision + 1, next_seq + 2, covered),
             )
-        messages = self._context_messages_from_connection(conn, session_id=session_id, after_seq=covered)
+        intent_active = self.atomic_context_mode == "active" and self.atomic_context_profile == "intent"
+        messages = (
+            self._intent_legacy_window_from_connection(conn, session_id=session_id, after_seq=covered)
+            if intent_active else self._context_messages_from_connection(conn, session_id=session_id, after_seq=covered)
+        )
         estimate = self._context_token_estimate(summary, messages)
         updated = AgentSessionContextWindow(
             session_id=session_id, token_budget=budget, summary=summary,
@@ -1296,7 +1472,8 @@ class SessionService:
         )
         conn.execute("INSERT INTO agent_session_effects(effect_id,session_id,effect_type,created_at) VALUES(?,?,'context_exchange',?)",
                      (effect_id, session_id, now))
-        if background_enqueue is not None and estimate >= int(budget * .70):
+        if (background_enqueue is not None and estimate >= int(budget * .70)
+                and not (self.atomic_context_mode == "active" and self.atomic_context_profile == "intent")):
             self._invoke_enqueue(background_enqueue, session_id, revision + 1, next_seq + 1, conn)
         if self.atomic_context_enqueue is not None:
             if self.atomic_context_store is not None and next_seq > 1:
@@ -1319,6 +1496,10 @@ class SessionService:
         if "summary_metadata" not in columns:
             self._add_context_column(conn, "summary_metadata", "TEXT NOT NULL DEFAULT '{}' ")
         conn.execute("CREATE TABLE IF NOT EXISTS agent_session_context_messages (session_id TEXT NOT NULL, seq INTEGER NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL, trace_id TEXT, PRIMARY KEY(session_id, seq))")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_context_messages_trace "
+                     "ON agent_session_context_messages(session_id,trace_id,role)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_context_messages_role_seq "
+                     "ON agent_session_context_messages(session_id,role,seq)")
 
     @staticmethod
     def _add_context_column(conn, name: str, declaration: str) -> None:
@@ -1446,6 +1627,26 @@ class SessionService:
             )
             for row in rows
         ]
+
+    def _intent_legacy_window_from_connection(
+        self, conn: sqlite3.Connection, *, session_id: str, after_seq: int,
+    ) -> list[SessionRecentMessage]:
+        """Build a bounded compatibility mirror; sequenced source rows remain authoritative."""
+        rows = conn.execute(
+            "SELECT role,content,created_at,trace_id FROM agent_session_context_messages "
+            "WHERE session_id=? AND seq>? ORDER BY seq DESC LIMIT 512",
+            (session_id, after_seq),
+        ).fetchall()
+        remaining = 32_768
+        bounded = []
+        for row in rows:
+            if remaining <= 0:
+                break
+            content = row["content"][:remaining]
+            bounded.append(SessionRecentMessage(role=row["role"], content=content,
+                created_at=row["created_at"], trace_id=row["trace_id"]))
+            remaining -= len(content)
+        return list(reversed(bounded))
 
     def _upsert_context_window(
         self, window: AgentSessionContextWindow, *, effect_id: str | None = None

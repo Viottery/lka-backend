@@ -157,7 +157,17 @@ def context_status(session_id: str, request: Request):
         for status in ("queued", "retry_wait", "running")
     }
     atomic = {"configured_mode": runtime.session_service.atomic_context_mode,
+              "configured_profile": runtime.session_service.atomic_context_profile,
+              "handoff_token_budget": runtime.session_service.atomic_context_handoff_tokens,
+              "intent_token_budget": runtime.session_service.atomic_context_intent_tokens,
               "last_error": runtime.session_service.last_atomic_context_error}
+    memory_config = getattr(getattr(runtime, "local_app_config", None), "memory", None)
+    atomic["atomic_context_background_enabled"] = bool(
+        getattr(memory_config, "atomic_context_background_enabled", False)
+    )
+    atomic["context_only_worker_active"] = bool(
+        getattr(getattr(runtime, "memory_background", None), "_context_only", False)
+    )
     if runtime.session_service.atomic_context_store is not None:
         with runtime._conn() as conn:
             head = conn.execute("SELECT revision,covered_seq,updated_at FROM context_record_heads WHERE session_id=?", (session_id,)).fetchone()

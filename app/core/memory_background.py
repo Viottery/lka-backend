@@ -123,6 +123,8 @@ class MemoryBackgroundCoordinator:
         consolidation_min_confidence: float = 0.9,
         atomic_context_mode: str = "off", atomic_context_input_tokens: int = 24_000,
         atomic_context_projection_tokens: int = 4096, atomic_context_debounce_seconds: float = 30,
+        atomic_context_profile: str = "general", atomic_context_handoff_tokens: int = 2048,
+        atomic_context_intent_tokens: int = 512,
     ) -> None:
         self.db_path = db_path
         self.memory = memory
@@ -140,6 +142,7 @@ class MemoryBackgroundCoordinator:
         self.recovery_output_tokens = recovery_output_tokens
         self._compaction_state = threading.local()
         self.atomic_context_mode = atomic_context_mode
+        self.atomic_context_profile = atomic_context_profile
         self.atomic_context_input_tokens = atomic_context_input_tokens
         self.atomic_context_debounce_seconds = atomic_context_debounce_seconds
         self.atomic_context_store = None
@@ -150,6 +153,9 @@ class MemoryBackgroundCoordinator:
             self.atomic_context_store.ensure_schema()
             session_service.atomic_context_store = self.atomic_context_store
             session_service.atomic_context_mode = atomic_context_mode
+            session_service.atomic_context_profile = atomic_context_profile
+            session_service.atomic_context_handoff_tokens = atomic_context_handoff_tokens
+            session_service.atomic_context_intent_tokens = atomic_context_intent_tokens
             session_service.atomic_context_projection_tokens = atomic_context_projection_tokens
             session_service.atomic_context_enqueue = self.enqueue_atomic_exchange
         self.consolidation_enabled = consolidation_enabled
@@ -170,6 +176,9 @@ class MemoryBackgroundCoordinator:
             worker_count=worker_count,
             lease_seconds=600, poll_seconds=1,
         )
+        self._saved_worker_handlers: dict[str, Any] | None = None
+        self._context_only = False
+        self._started_mode: bool | None = None
         if memory is not None:
             with connect_sqlite(self.db_path, timeout=10) as conn:
                 conn.execute("""CREATE TABLE IF NOT EXISTS memory_maintenance_state(
@@ -201,8 +210,11 @@ class MemoryBackgroundCoordinator:
             self._compact(job)
 
     def enqueue_atomic_exchange(self, session_id, latest_seq, *, conn):
-        # Keep the latest completed exchange verbatim, even after maintenance.
-        self.enqueue_atomic_context(session_id, latest_seq-2, conn=conn)
+        # Intent keeps recent source turns independently of its coverage head,
+        # so it can describe the latest completed user/answer exchange now.
+        # Other profiles still leave that entire exchange outside compaction.
+        target = latest_seq if self.atomic_context_profile == "intent" else latest_seq - 2
+        self.enqueue_atomic_context(session_id, target, conn=conn)
 
     def enqueue_atomic_context(self, session_id, target_seq, *, conn, delay=True):
         if self.atomic_context_mode == "off" or target_seq <= 0:
@@ -235,12 +247,13 @@ class MemoryBackgroundCoordinator:
     def _bounded_atomic_context(self, job):
         from app.core.context_reconcile import propose_delta, select_prefix
 
-        if self.atomic_context_mode == "off" or not self.allow_remote_extraction or self.llm_client is None:
+        if self.atomic_context_mode == "off" or self.llm_client is None:
             raise BackgroundBudgetDeferred("atomic_context_disabled_or_model_unavailable")
         snapshot = self.atomic_context_store.snapshot(job["scope_id"], target_seq=job["payload"]["target_seq"])
         messages = select_prefix(snapshot, target_seq=job["payload"]["target_seq"],
                                  input_tokens=self.atomic_context_input_tokens,
-                                 counter=self.session_service._active_context_token_counter())
+                                 counter=self.session_service._active_context_token_counter(),
+                                 profile=self.atomic_context_profile)
         if not messages:
             return
         snapshot["messages"] = [row for row in snapshot["messages"] if row["seq"] <= messages[-1]["seq"]]
@@ -252,7 +265,7 @@ class MemoryBackgroundCoordinator:
         with workload_scope("background_memory", task_id=job["job_id"], max_tokens=self.max_job_tokens or None):
             changes, _ = propose_delta(client, snapshot, messages, output_tokens=self.generation_output_tokens,
                                       recovery_tokens=self.recovery_output_tokens, input_tokens=self.atomic_context_input_tokens,
-                                      counter=self.session_service._active_context_token_counter())
+                                      counter=self.session_service._active_context_token_counter(), profile=self.atomic_context_profile)
         if not self.store.heartbeat(job["job_id"], job["lease_owner"], job["lease_epoch"], lease_seconds=600):
             return
         self.atomic_context_store.publish(snapshot, changes, lease=(job["job_id"], job["lease_owner"], job["lease_epoch"]))
@@ -333,7 +346,7 @@ class MemoryBackgroundCoordinator:
     def _maintenance_loop(self):
         while not self._maintenance_stop.is_set():
             try:
-                if self.consolidation_enabled:
+                if not self._context_only and self.consolidation_enabled:
                     self.schedule_maintenance()
                 self.recover_atomic_context()
             except Exception as exc:  # noqa: BLE001 - diagnostics contain no source text.
@@ -372,6 +385,8 @@ class MemoryBackgroundCoordinator:
         self, session_id: str, revision: int, target_seq: int,
         *, conn: sqlite3.Connection,
     ) -> None:
+        if self.atomic_context_mode == "active" and self.atomic_context_profile == "intent":
+            return
         self.store.enqueue_latest_watermark(
             "context_compact", session_id, f"{revision}:{target_seq}",
             {"revision": revision, "target_seq": target_seq},
@@ -389,6 +404,8 @@ class MemoryBackgroundCoordinator:
         Only an explicit failed callback may create intent; never scan historical
         sessions or copy their content into the outbox.
         """
+        if self.atomic_context_mode == "active" and self.atomic_context_profile == "intent":
+            return
         due = conn.execute(
             "SELECT 1 FROM agent_session_context_windows w "
             "JOIN agent_session_context_state s ON s.session_id=w.session_id "
@@ -432,6 +449,12 @@ class MemoryBackgroundCoordinator:
         )
 
     def _compact(self, job: dict[str, Any]) -> None:
+        if self.atomic_context_mode == "active" and self.atomic_context_profile == "intent":
+            with connect_sqlite(self.db_path, timeout=10) as conn:
+                now = datetime.now(UTC).isoformat()
+                conn.execute("UPDATE background_jobs SET status='succeeded',error_class='retired_active_intent',finished_at=?,updated_at=?,lease_owner=NULL,lease_expires_at=NULL WHERE job_id=? AND status='running' AND lease_owner=? AND lease_epoch=?",
+                    (now, now, job["job_id"], job["lease_owner"], job["lease_epoch"]))
+            return
         session_id = job["scope_id"]
         revision = job["payload"]["revision"]
         target_seq = job["payload"]["target_seq"]
@@ -533,6 +556,8 @@ class MemoryBackgroundCoordinator:
         source_refs, truncated = _bounded_compaction_refs([
             *(m.trace_id for m in messages if m.trace_id), *inherited_refs,
         ])
+        if self.atomic_context_mode == "active" and self.atomic_context_profile == "intent":
+            return
         published = self.session_service.publish_context_summary(
             session_id=session_id, expected_revision=revision,
             expected_covered_seq=covered_seq, target_seq=target_seq,
@@ -897,8 +922,27 @@ class MemoryBackgroundCoordinator:
             ]},
         ), publication_lease=(job["job_id"], job["lease_owner"], job["lease_epoch"]))
 
-    def start(self) -> None:
-        self.recover_missing_jobs()
+    def start(self, *, context_only: bool = False) -> None:
+        if self._started_mode is not None:
+            if self._started_mode == context_only:
+                return
+            raise RuntimeError("Memory background worker is already started in a different mode")
+        self._started_mode = context_only
+        self._context_only = context_only
+        if context_only:
+            self._saved_worker_handlers = dict(self.worker.handlers)
+            self.worker.handlers = {
+                kind: handler
+                for kind, handler in self._saved_worker_handlers.items()
+                if kind == "context_records"
+                or (
+                    kind == "context_compact"
+                    and self.atomic_context_mode == "active"
+                    and self.atomic_context_profile == "intent"
+                )
+            }
+        if not context_only:
+            self.recover_missing_jobs()
         self.recover_atomic_context()
         self.worker.start()
         if (self.consolidation_enabled or self.atomic_context_store is not None) and (self._maintenance_thread is None or not self._maintenance_thread.is_alive()):
@@ -975,6 +1019,11 @@ class MemoryBackgroundCoordinator:
         if self._maintenance_thread is not None:
             self._maintenance_thread.join(timeout=5)
         self.worker.stop()
+        if self._saved_worker_handlers is not None:
+            self.worker.handlers = self._saved_worker_handlers
+            self._saved_worker_handlers = None
+        self._context_only = False
+        self._started_mode = None
 
 
 def _trace_id(payload: str) -> str | None:

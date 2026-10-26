@@ -78,6 +78,9 @@ class LLMClientConfig(BaseModel):
     context_window_tokens: int | None = Field(default=None, gt=0)
     output_reserve_tokens: int = Field(default=8192, gt=0)
     tokenizer_json_path: Path | None = None
+    tokenizer_fallback_json_path: Path | None = None
+    tokenizer_fallback_multiplier: float = Field(default=1.5, ge=1, allow_inf_nan=False)
+    tokenizer_fallback_extra_tokens: int = Field(default=2048, ge=0)
     model_overrides: dict[str, LLMModelConfigOverride] = Field(default_factory=dict)
 
     def resolved_api_key(self) -> str | None:
@@ -114,6 +117,9 @@ class LLMProviderConfig(BaseModel):
     context_window_tokens: int | None = Field(default=None, gt=0)
     output_reserve_tokens: int = Field(default=8192, gt=0)
     tokenizer_json_path: Path | None = None
+    tokenizer_fallback_json_path: Path | None = None
+    tokenizer_fallback_multiplier: float = Field(default=1.5, ge=1, allow_inf_nan=False)
+    tokenizer_fallback_extra_tokens: int = Field(default=2048, ge=0)
     model_overrides: dict[str, LLMModelConfigOverride] = Field(default_factory=dict)
 
     def resolved_api_key(self) -> str | None:
@@ -150,6 +156,21 @@ class LLMProviderConfig(BaseModel):
                     if override.tokenizer_json_path is not None
                     else (base.tokenizer_json_path if base else None)
                 ),
+                tokenizer_fallback_json_path=(
+                    override.tokenizer_fallback_json_path
+                    if override.tokenizer_fallback_json_path is not None
+                    else (base.tokenizer_fallback_json_path if base else None)
+                ),
+                tokenizer_fallback_multiplier=(
+                    override.tokenizer_fallback_multiplier
+                    if override.tokenizer_fallback_multiplier is not None
+                    else (base.tokenizer_fallback_multiplier if base else 1.5)
+                ),
+                tokenizer_fallback_extra_tokens=(
+                    override.tokenizer_fallback_extra_tokens
+                    if override.tokenizer_fallback_extra_tokens is not None
+                    else (base.tokenizer_fallback_extra_tokens if base else 2048)
+                ),
             )
         if model != client.default_model:
             return None
@@ -170,15 +191,18 @@ class LLMProviderConfig(BaseModel):
             override.context_window_tokens if override else None,
             override.output_reserve_tokens if override else None,
             override.tokenizer_json_path if override else None,
+            override.tokenizer_fallback_json_path if override else None,
         )
         has_override = any(value is not None for value in values)
         has_client = (
             client.context_window_tokens is not None or client.tokenizer_json_path is not None
+            or client.tokenizer_fallback_json_path is not None
         )
         # Provider-level fields describe only the legacy single-client model.
         # Named clients must not inherit another model's capacity/tokenizer.
         has_provider = not self.clients and (
             self.context_window_tokens is not None or self.tokenizer_json_path is not None
+            or self.tokenizer_fallback_json_path is not None
         )
         if not (has_override or has_client or has_provider):
             return None
@@ -197,6 +221,29 @@ class LLMProviderConfig(BaseModel):
                 (override.tokenizer_json_path if override else None)
                 or client.tokenizer_json_path
                 or (self.tokenizer_json_path if not self.clients else None)
+            ),
+            tokenizer_fallback_json_path=(
+                (override.tokenizer_fallback_json_path if override else None)
+                or client.tokenizer_fallback_json_path
+                or (self.tokenizer_fallback_json_path if not self.clients else None)
+            ),
+            tokenizer_fallback_multiplier=(
+                override.tokenizer_fallback_multiplier
+                if override and override.tokenizer_fallback_multiplier is not None
+                else client.tokenizer_fallback_multiplier
+                if client.tokenizer_fallback_json_path
+                else self.tokenizer_fallback_multiplier
+                if not self.clients
+                else 1.5
+            ),
+            tokenizer_fallback_extra_tokens=(
+                override.tokenizer_fallback_extra_tokens
+                if override and override.tokenizer_fallback_extra_tokens is not None
+                else client.tokenizer_fallback_extra_tokens
+                if client.tokenizer_fallback_json_path
+                else self.tokenizer_fallback_extra_tokens
+                if not self.clients
+                else 2048
             ),
         )
 
@@ -239,6 +286,9 @@ class LLMProviderConfig(BaseModel):
                 context_window_tokens=self.context_window_tokens,
                 output_reserve_tokens=self.output_reserve_tokens,
                 tokenizer_json_path=self.tokenizer_json_path,
+                tokenizer_fallback_json_path=self.tokenizer_fallback_json_path,
+                tokenizer_fallback_multiplier=self.tokenizer_fallback_multiplier,
+                tokenizer_fallback_extra_tokens=self.tokenizer_fallback_extra_tokens,
                 model_overrides=self.model_overrides,
             )
         ]
@@ -252,6 +302,9 @@ class LLMModelConfigOverride(BaseModel):
     context_window_tokens: int | None = Field(default=None, gt=0)
     output_reserve_tokens: int | None = Field(default=None, gt=0)
     tokenizer_json_path: Path | None = None
+    tokenizer_fallback_json_path: Path | None = None
+    tokenizer_fallback_multiplier: float | None = Field(default=None, ge=1, allow_inf_nan=False)
+    tokenizer_fallback_extra_tokens: int | None = Field(default=None, ge=0)
 
 
 class SafetyReviewConfig(BaseModel):
@@ -431,15 +484,29 @@ class WebSearchConfig(BaseModel):
         return _resolved_env_value(self.api_key_env) if self.api_key_env else None
 
 
+class ConversationHistoryConfig(BaseModel):
+    """Optional local semantic supplement; literal source access is always available."""
+
+    semantic_enabled: bool = False
+    model_revision: str = Field(default="1", min_length=1, max_length=100)
+    index_batch_size: int = Field(default=32, ge=1, le=128)
+    max_candidates: int = Field(default=20_000, ge=100, le=20_000)
+
+
 class MemoryConfig(BaseModel):
     # Additive rollout: shadow stores records without replacing legacy summaries.
     atomic_context_mode: Literal["off", "shadow", "active"] = "off"
+    atomic_context_profile: Literal["general", "handoff", "intent"] = "general"
+    atomic_context_intent_tokens: int = Field(default=512, ge=128, le=1024)
+    atomic_context_handoff_tokens: int = Field(default=2048, ge=256, le=4096)
     atomic_context_input_tokens: int = Field(default=24_000, ge=2048, le=131_072)
     atomic_context_projection_tokens: int = Field(default=4096, ge=128, le=16_384)
     atomic_context_debounce_seconds: float = Field(default=30, ge=0, le=3600)
     background_worker_count: int = Field(default=2, ge=1, le=8)
     enabled: bool = True
     background_enabled: bool = True
+    # Allow only the atomic context worker when the legacy memory pipeline is paused.
+    atomic_context_background_enabled: bool = False
     # Controls whether background learning spends an additional model call.
     # Enabling memory/background processing authorizes use of conversation data;
     # this flag is a workload/quality choice, not a privacy-consent gate.
@@ -618,6 +685,7 @@ class LocalAppConfig(BaseModel):
     query_rewrite: QueryRewriteConfig = Field(default_factory=QueryRewriteConfig)
     web_search: WebSearchConfig = Field(default_factory=WebSearchConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
+    conversation_history: ConversationHistoryConfig = Field(default_factory=ConversationHistoryConfig)
     message_history: MessageHistoryConfig = Field(default_factory=MessageHistoryConfig)
     background: BackgroundConfig = Field(default_factory=BackgroundConfig)
     management: ManagementConfig = Field(default_factory=ManagementConfig)

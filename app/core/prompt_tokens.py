@@ -1,14 +1,15 @@
 """Provider-neutral prompt size estimates for chat completion requests.
 
 When configured with a local ``tokenizers`` JSON file, this uses that tokenizer
-for content. Without one, the result is a conservative UTF-8 byte upper bound
-plus bounded chat/tool envelope overhead, not a claim about provider token use.
-No tokenizer files are downloaded by this module.
+for content. An explicitly configured fallback tokenizer is scaled and padded
+as an approximate estimate; it is not a guaranteed upper bound. Otherwise the
+counter uses UTF-8 byte counting. No tokenizer files are downloaded here.
 """
 
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,7 @@ class TokenCount:
     count: int
     method: str
     conservative: bool
+    approximate: bool = False
 
 
 class PromptTokenCounter:
@@ -34,10 +36,29 @@ class PromptTokenCounter:
     _PER_TOOL_ENVELOPE_TOKENS = 8
     _MAX_TOOL_ENVELOPE_TOKENS = 4096
 
-    def __init__(self, tokenizer_json_path: Path | None = None) -> None:
+    def __init__(
+        self,
+        tokenizer_json_path: Path | None = None,
+        *,
+        fallback_tokenizer_json_path: Path | None = None,
+        fallback_multiplier: float = 1.5,
+        fallback_extra_tokens: int = 2048,
+    ) -> None:
         self._tokenizer = None
-        if tokenizer_json_path is None:
-            return
+        self._fallback = None
+        self._fallback_multiplier = fallback_multiplier
+        self._fallback_extra_tokens = fallback_extra_tokens
+        if tokenizer_json_path is not None:
+            self._tokenizer = self._load_tokenizer(tokenizer_json_path)
+        elif fallback_tokenizer_json_path is not None:
+            try:
+                self._fallback = self._load_tokenizer(fallback_tokenizer_json_path)
+            except (FileNotFoundError, RuntimeError, ValueError):
+                # A broken opt-in fallback must not make prompt fitting fail open.
+                self._fallback = None
+
+    @staticmethod
+    def _load_tokenizer(tokenizer_json_path: Path):
         path = Path(tokenizer_json_path).expanduser()
         if not path.is_file():
             raise FileNotFoundError(f"Tokenizer JSON file does not exist: {path}")
@@ -48,9 +69,23 @@ class PromptTokenCounter:
                 "A local tokenizer JSON was configured, but the 'tokenizers' package is not installed."
             ) from exc
         try:
-            self._tokenizer = Tokenizer.from_file(str(path))
+            return Tokenizer.from_file(str(path))
         except Exception as exc:
             raise ValueError(f"Invalid tokenizer JSON file: {path}") from exc
+
+    def _content_count(self, chunks: list[str], *, include_fallback_floor: bool = False) -> TokenCount:
+        if self._tokenizer is not None:
+            return TokenCount(sum(len(self._tokenizer.encode(chunk).ids) for chunk in chunks),
+                              "local_tokenizers_json", False)
+        if self._fallback is not None:
+            raw = sum(len(self._fallback.encode(chunk).ids) for chunk in chunks)
+            return TokenCount(
+                math.ceil(raw * self._fallback_multiplier)
+                + (self._fallback_extra_tokens if include_fallback_floor else 0),
+                "proxy_tokenizer_estimate", False, True,
+            )
+        return TokenCount(sum(len(chunk.encode("utf-8")) for chunk in chunks),
+                          "utf8_byte_upper_bound", True)
 
     def count_request(
         self,
@@ -67,34 +102,12 @@ class PromptTokenCounter:
             + len(serialized_tools) * self._PER_TOOL_ENVELOPE_TOKENS,
         )
 
-        if self._tokenizer is not None:
-            content_count = sum(len(self._tokenizer.encode(chunk).ids) for chunk in chunks)
-            return TokenCount(
-                count=content_count + envelope,
-                method="local_tokenizers_json",
-                conservative=False,
-            )
-
-        byte_count = sum(len(chunk.encode("utf-8")) for chunk in chunks)
-        return TokenCount(
-            count=byte_count + envelope,
-            method="utf8_byte_upper_bound",
-            conservative=True,
-        )
+        content = self._content_count(chunks, include_fallback_floor=True)
+        return TokenCount(content.count + envelope, content.method, content.conservative, content.approximate)
 
     def count_text(self, text: str) -> TokenCount:
         """Count plain text without a chat envelope (for session precompaction)."""
-        if self._tokenizer is not None:
-            return TokenCount(
-                count=len(self._tokenizer.encode(text).ids),
-                method="local_tokenizers_json",
-                conservative=False,
-            )
-        return TokenCount(
-            count=len(text.encode("utf-8")),
-            method="utf8_byte_upper_bound",
-            conservative=True,
-        )
+        return self._content_count([text])
 
     @staticmethod
     def _serialize_tool(tool: Any) -> str:

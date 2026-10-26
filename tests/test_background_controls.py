@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from types import SimpleNamespace
 
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
@@ -141,12 +142,31 @@ def test_context_status_is_payload_free_and_checks_deleted_sessions(tmp_path, mo
             assert "secret message" not in response.text
             assert "summary" not in response.json()
             assert "messages" not in response.json()
+            assert response.json()["atomic_context"]["configured_profile"] == "general"
+            assert response.json()["atomic_context"]["handoff_token_budget"] == 2048
             assert (await client.get("/sessions/missing/context-status", headers=headers)).status_code == 404
             assert (await client.get(f"/sessions/{sid}/context-status")).status_code == 401
             sessions.delete_session(session_id=sid)
             assert (await client.get(f"/sessions/{sid}/context-status", headers=headers)).status_code == 404
 
     asyncio.run(exercise())
+
+
+def test_context_status_reports_dedicated_worker_opt_in_and_runtime_mode(tmp_path, monkeypatch):
+    app, _, sessions = _api(tmp_path, monkeypatch)
+    sid = sessions.create_session(title="test").session.session_id
+    app.state.runtime.local_app_config = SimpleNamespace(
+        memory=SimpleNamespace(atomic_context_background_enabled=True)
+    )
+    app.state.runtime.memory_background = SimpleNamespace(_context_only=True)
+    request = Request({
+        "type": "http", "method": "GET", "path": f"/sessions/{sid}/context-status",
+        "headers": [], "query_string": b"", "server": ("localhost", 80),
+        "client": ("127.0.0.1", 1234), "scheme": "http", "app": app,
+    })
+    result = background_controls.context_status(sid, request)
+    assert result["atomic_context"]["atomic_context_background_enabled"] is True
+    assert result["atomic_context"]["context_only_worker_active"] is True
 
 
 def test_retry_expired_deadline_missing_job_and_http_auth(tmp_path, monkeypatch):

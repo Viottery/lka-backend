@@ -3,6 +3,7 @@
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic_core import PydanticCustomError
 
 
 class SourceQuote(BaseModel):
@@ -18,7 +19,7 @@ class SourcePassageRef(BaseModel):
 
 class ContextRecordInput(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
-    kind: Literal["fact", "preference", "task", "decision", "progress", "correction", "episode"]
+    kind: Literal["fact", "preference", "task", "decision", "progress", "correction", "episode", "focus", "phase", "intent", "dialogue"]
     subject: str = Field(min_length=1, max_length=200)
     topic: str = Field(min_length=1, max_length=200)
     content: str = Field(min_length=1, max_length=2000)
@@ -81,6 +82,7 @@ class ProposedContextRecordInput(ContextRecordInput):
     """New model protocol; legacy exact quotes remain accepted by the validator."""
 
     sources: list[SourcePassageRef] = Field(min_length=1, max_length=12)
+    kind: Literal["fact", "preference", "task", "decision", "progress", "correction", "episode", "focus", "phase"]
 
 
 class ProposedContextChange(ContextChange):
@@ -91,3 +93,80 @@ class ProposedContextChange(ContextChange):
 class ProposedContextDelta(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     changes: list[ProposedContextChange] = Field(default_factory=list, max_length=128)
+
+
+class HandoffRecordInput(ProposedContextRecordInput):
+    """Small session-local state, not another store of durable user facts."""
+
+    kind: Literal["focus", "phase", "task", "decision", "progress", "correction"]
+    content: str = Field(min_length=1, max_length=600)
+
+    @model_validator(mode="after")
+    def singleton_identity(self):
+        if self.kind in {"focus", "phase"}:
+            if self.subject != self.kind or self.topic != "session" or self.validity != "current":
+                raise ValueError("focus/phase use subject=kind, topic=session and validity=current")
+            if self.kind == "focus" and self.evidence != "user_statement":
+                raise PydanticCustomError("handoff_focus_authority", "Current focus must be grounded in the user's request")
+        return self
+
+
+class HandoffChange(ProposedContextChange):
+    value: HandoffRecordInput | None = None
+
+
+class HandoffDelta(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    changes: list[HandoffChange] = Field(default_factory=list, max_length=32)
+
+
+class IntentRecordInput(ProposedContextRecordInput):
+    """Conversation direction and response state, independent of task execution."""
+
+    kind: Literal["intent", "dialogue"]
+    content: str = Field(min_length=1, max_length=240)
+    evidence: Literal["user_statement", "assistant_report"]
+    task_status: None = None
+    event_at: None = None
+    review_at: None = None
+    related_ids: list[str] = Field(default_factory=list, max_length=0)
+
+    @model_validator(mode="after")
+    def conversation_slot(self):
+        if self.subject != self.kind or self.topic != "session" or self.validity != "current":
+            raise ValueError("Intent slots use subject=kind, topic=session, validity=current")
+        if self.kind == "intent" and self.evidence != "user_statement":
+            raise ValueError("Conversation direction requires user evidence")
+        if self.kind == "dialogue" and len(self.content) > 160:
+            raise ValueError("Response state is limited to 160 characters")
+        if self.event_at or self.review_at or self.related_ids:
+            raise ValueError("Intent slots do not store schedules or task relationships")
+        return self
+
+
+class IntentChange(ProposedContextChange):
+    op: Literal["add", "update"]
+    value: IntentRecordInput
+
+
+class IntentDelta(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    changes: list[IntentChange] = Field(default_factory=list, max_length=2)
+
+
+class CitationPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    change_index: int = Field(ge=0, le=31)
+    sources: list[SourcePassageRef] | None = Field(default=None, min_length=1, max_length=12)
+    archive_sources: list[SourcePassageRef] | None = Field(default=None, min_length=1, max_length=12)
+
+    @model_validator(mode="after")
+    def exactly_one_source_field(self):
+        if (self.sources is None) == (self.archive_sources is None):
+            raise ValueError("Choose sources or archive_sources")
+        return self
+
+
+class CitationRepair(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    repairs: list[CitationPatch] = Field(min_length=1, max_length=32)
