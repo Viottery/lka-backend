@@ -63,11 +63,13 @@ class FileAccessPolicy:
             configured = [Path.cwd().resolve(strict=False)]
         return cls(roots=configured, allow_session_root_override=not bool(roots))
 
-    def for_session_workspace(self, workspace_root: str | None) -> "FileAccessPolicy":
+    def for_session_workspace(self, workspace_root: str | None, *, authorized_paths=()) -> FileAccessPolicy:
         if not workspace_root:
             return self
         root = Path(workspace_root).expanduser().resolve(strict=False)
-        if not self.allow_session_root_override and not self._is_allowed(root):
+        scoped = {Path(path).expanduser().resolve(strict=False) for path in authorized_paths}
+        explicitly_allowed = root in scoped
+        if not self.allow_session_root_override and not self._is_allowed(root) and not explicitly_allowed:
             raise PermissionError("session workspace is outside allowed workspace roots")
         return FileAccessPolicy(roots=[root])
 
@@ -172,7 +174,7 @@ class ReadFileTool:
 
     def invoke(self, *, invocation: ToolInvocation, context: ToolContext) -> ToolResult:
         try:
-            policy = self.policy.for_session_workspace(context.workspace_root)
+            policy = _policy_for_context(self.policy, context)
             requested_path = str(invocation.input.get("path") or "")
             resolved = policy.resolve(requested_path, allow_outside=True)
             _require_child_path_scope(resolved, context)
@@ -222,7 +224,7 @@ class ListDirectoryTool(ReadFileTool):
 
     def invoke(self, *, invocation: ToolInvocation, context: ToolContext) -> ToolResult:
         try:
-            policy = self.policy.for_session_workspace(context.workspace_root)
+            policy = _policy_for_context(self.policy, context)
             requested = str(invocation.input.get("path", "."))
             path = policy.resolve(requested, allow_outside=True)
             _require_child_path_scope(path, context)
@@ -289,7 +291,7 @@ class CreateFileTool:
 
     def invoke(self, *, invocation: ToolInvocation, context: ToolContext) -> ToolResult:
         try:
-            policy = self.policy.for_session_workspace(context.workspace_root)
+            policy = _policy_for_context(self.policy, context)
             requested = str(invocation.input.get("path") or "")
             path = policy.resolve(requested, allow_outside=True)
             _require_child_path_scope(path, context)
@@ -384,7 +386,7 @@ class EditFileTool:
 
     def invoke(self, *, invocation: ToolInvocation, context: ToolContext) -> ToolResult:
         try:
-            policy = self.policy.for_session_workspace(context.workspace_root)
+            policy = _policy_for_context(self.policy, context)
             requested_path = str(invocation.input.get("path") or "")
             resolved = policy.resolve(requested_path, allow_outside=True)
             _require_child_path_scope(resolved, context)
@@ -416,11 +418,21 @@ def _require_child_path_scope(path: Path, context: ToolContext) -> None:
     require_child_path_scope(path, context)
 
 
+def _policy_for_context(policy: FileAccessPolicy, context: ToolContext) -> FileAccessPolicy:
+    view = context.tool_view
+    authorized_paths = (
+        view.allowed_paths
+        if view is not None and not view.full_workspace_authority and not view.host_execution_authority
+        else ()
+    )
+    return policy.for_session_workspace(context.workspace_root, authorized_paths=authorized_paths)
+
+
 def workspace_access_request(tool_input: dict[str, Any], context: ToolContext, policy: FileAccessPolicy) -> list[str]:
     """Return canonical out-of-root targets for executor review without reading them."""
 
     try:
-        active = policy.for_session_workspace(context.workspace_root)
+        active = _policy_for_context(policy, context)
         target = active.resolve(str(tool_input.get("path") or ""), allow_outside=True)
         _require_child_path_scope(target, context)
     except (OSError, ValueError, PermissionError):
@@ -432,7 +444,7 @@ def workspace_write_targets(tool_input: dict[str, Any], context: ToolContext, po
     """Resolved write target, used by the executor to decide workspace creation."""
 
     try:
-        active = policy.for_session_workspace(context.workspace_root)
+        active = _policy_for_context(policy, context)
         return [str(active.resolve(str(tool_input.get("path") or ""), allow_outside=True))]
     except (OSError, ValueError, PermissionError):
         return []
@@ -443,7 +455,7 @@ def _is_unmaterialized_root(path: Path, policy: FileAccessPolicy) -> bool:
 
 
 def _require_approved_external_path(path: Path, policy: FileAccessPolicy, context: ToolContext) -> None:
-    active_policy = policy.for_session_workspace(context.workspace_root)
+    active_policy = _policy_for_context(policy, context)
     if active_policy.is_allowed(path):
         return
     # Re-resolve immediately before use so a symlink retarget invalidates the grant.

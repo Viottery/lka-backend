@@ -62,6 +62,9 @@ def info(request: Request):
             # Public hub origin so a node page can offer 真理 when the hub is reachable.
             "hub_url": config.sync.hub_url.rstrip("/") if replica and config.sync.hub_url else None,
             "connections_enabled": config.connections.enabled,
+            "filesystem_browser_enabled": bool(
+                replica and config.connections.node_id and config.connections.filesystem_browser_enabled
+            ),
             "execution_enabled": config.remote_execution.enabled,
             "workbench": _workbench_root(request) is not None}
 

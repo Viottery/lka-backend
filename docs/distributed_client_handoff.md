@@ -124,6 +124,8 @@ grant 尚未安装时兑换可能返回 403，当前客户端在有效期内有�
 | `POST /sessions/{session_id}/restore` | 恢复批准范围内的普通会话，返回详情 |
 | `GET /sessions/{session_id}/runs` | 已受理运行历史，用于断流/丢响应后核对 |
 | `GET /local/workspaces` | `{items:[{workspace_id}]}`，只含本连接批准的映射 |
+| `GET /local/filesystem/entries?path=&query=&offset=0&limit=200` | 完整目录选择器；返回当前目录、父目录、根盘符及最多 200 个子目录名，不读取文件内容 |
+| `POST /local/workspaces/selections` | `{path:"D:/Projects/app"}`，返回绑定到本账号、设备与授权代次的随机 workspace_id |
 | `GET /local/workspaces/{id}/status` | `{kind,available,read_only?}`，不返回私有路径 |
 | `POST /sessions/{session_id}/workspace-id` | `{workspace_id:"work"}`，返回绑定的 workspace 对象 |
 | `GET /local/workspaces/{id}/entries?path=` | `{workspace_id,path,items}`，最多 200 项 |
@@ -133,6 +135,13 @@ grant 尚未安装时兑换可能返回 403，当前客户端在有效期内有�
 
 路径一律为所选工作区内的相对路径。URL 的 workspace_id 和 path 分别编码，
 不能把 Windows 路径发送给 Linux 节点，也不能把前端电脑的本地路径当作目标节点目录。
+完整目录选择需节点配置 `connections.filesystem_browser_enabled=true`，并使用已兑换的
+HTTPS 节点连接。根目录浏览只返回目录名称，不提供该接口的文件读取；选定的根目录保存在
+节点本地数据库，并供同一账号在该设备的连接间复用；选择按账号、设备及授权代次隔离。
+授权撤销会清除旧代次的选择。
+把所选目录绑定到普通会话后，该会话的新运行只取得这个准确目录的工具路径；浏览过的其他目录
+不会自动加入 Agent 权限。会话有运行中的任务、暂停任务或待确认操作时不能换工作区；任务结束后，
+用户可明确换到另一目录供后续新运行使用。旧运行继续保留其原目录权限，切换目录后不能从新目录权限下恢复。
 当前直接文件接口支持新建，不提供覆盖、重命名、删除文件或递归目录传输。
 需要修改文件时，使用该节点普通 Agent 及其审查流程。
 

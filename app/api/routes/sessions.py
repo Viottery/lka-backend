@@ -112,19 +112,22 @@ def get_session(
     message_limit: Annotated[int | None, Query(ge=1, le=100)] = None,
     before_message_id: Annotated[str | None, Query(min_length=1, max_length=256)] = None,
     after_message_id: Annotated[str | None, Query(min_length=1, max_length=256)] = None,
+    around_message_id: Annotated[str | None, Query(min_length=1, max_length=256)] = None,
     message_view: SessionMessageView = "all",
 ) -> SessionDetailResponse | AgentSessionMessagePage:
     try:
         if message_view != "all" and message_limit is None:
             raise HTTPException(422, detail="message_view requires message_limit")
-        if (before_message_id or after_message_id) and (
-            message_limit is None or before_message_id and after_message_id
+        cursors = (before_message_id, after_message_id, around_message_id)
+        if any(cursors) and (
+            message_limit is None or sum(bool(cursor) for cursor in cursors) > 1
         ):
             raise HTTPException(422, detail="Use message_limit and at most one message cursor")
         if message_limit is not None:
             return request.app.state.runtime.session_service.get_message_page(
                 session_id=session_id, limit=message_limit,
                 before_message_id=before_message_id, after_message_id=after_message_id,
+                **({"around_message_id": around_message_id} if around_message_id else {}),
                 message_view=message_view,
             )
         result = request.app.state.runtime.get_session(session_id=session_id)

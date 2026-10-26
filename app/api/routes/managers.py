@@ -42,6 +42,7 @@ class ManagerController(BaseModel):
 class ManagerAutonomy(BaseModel):
     """Server policy, separate from the controller's active/paused status."""
     autonomous_enabled: bool = False
+    status: dict | None = None
 
 
 class ManagerResponse(BaseModel):
@@ -86,8 +87,8 @@ class UpdateManagerRequest(BaseModel):
 class _ManagerReader:
     """Adds server autonomy policy to every manager view the routes return."""
 
-    def __init__(self, service, autonomous):
-        self._service, self._autonomous = service, autonomous
+    def __init__(self, service, autonomous, coordinator=None):
+        self._service, self._autonomous, self._coordinator = service, autonomous, coordinator
 
     def __getattr__(self, name):
         attribute = getattr(self._service, name)
@@ -97,7 +98,9 @@ class _ManagerReader:
         def call(*args, **kwargs):
             value = attribute(*args, **kwargs)
             if isinstance(value, dict) and "controller" in value:
-                value = {**value, "autonomy": {"autonomous_enabled": self._autonomous}}
+                status = (self._coordinator.wake_status(value["controller"]["session_id"])
+                          if self._coordinator is not None else None)
+                value = {**value, "autonomy": {"autonomous_enabled": self._autonomous, "status": status}}
             return value
         return call
 
@@ -107,7 +110,8 @@ def _service(request: Request):
     if not runtime.local_app_config.management.enabled:
         raise HTTPException(409, detail="management_disabled")
     return _ManagerReader(runtime.management_service,
-                          bool(getattr(runtime.local_app_config.management, "autonomous_enabled", False)))
+                          bool(getattr(runtime.local_app_config.management, "autonomous_enabled", False)),
+                          getattr(runtime, "management_coordinator", None))
 
 
 def _validate_client(request: Request, client_name: str | None):

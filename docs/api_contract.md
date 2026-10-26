@@ -1410,10 +1410,11 @@ GET /sessions/session_xxx
 GET /sessions/session_xxx?message_limit=30
 GET /sessions/session_xxx?message_limit=30&before_message_id=message_first
 GET /sessions/session_xxx?message_limit=30&after_message_id=message_last
+GET /sessions/session_xxx?message_limit=30&around_message_id=delivery_message
 GET /sessions/session_xxx?message_limit=30&message_view=conversation
 ```
 
-`message_limit` 为 1–100；`before_message_id` 和 `after_message_id` 只能二选一，
+`message_limit` 为 1–100；`before_message_id`、`after_message_id` 和 `around_message_id` 只能选一个，
 且需要同时提供 `message_limit`。默认返回最近一页；before 读取更早页，after 从游标
 之后增量读取。每页消息均按 `created_at` 和数据库写入顺序升序返回，时间相同时仍稳定。
 响应额外包含 `message_page`：`direction`（before/after）、`has_more`（对应方向是否还有页）、
@@ -1422,6 +1423,12 @@ GET /sessions/session_xxx?message_limit=30&message_view=conversation
 游标不属于本会话或历史已清空时返回 `409 history_cursor_invalid`，客户端应丢弃旧页并
 重新读取最近页。`history_reset_at` 变化时也必须替换缓存，不能拼接旧历史。
 消息和会话信息在同一 SQLite 读快照中获取；后续追加不会改变已读取页的游标边界。
+
+交付记录可以携带其 `message_id`，通过 `around_message_id` 读取包含该消息的有界前后页，
+不需要从最新消息逐页回溯。此时 `direction=around`、`anchor_message_id` 标明定位目标，
+`has_more` 表示还有更早消息，`has_more_after` 表示还有更新消息。目标必须属于当前会话
+且在当前消息视图中可见，否则返回 `409 history_cursor_invalid`。客户端定位失败时应
+明确提示，不能悄悄把最新回复当作该次交付。
 
 聊天页面应同时传 `message_view=conversation`，在分页前排除后台内部输入和显式
 `user_visible=false` 的消息，避免内部事件挤掉正常对话。原有用户／助理消息、可显示的
@@ -1603,6 +1610,12 @@ limit 1..200，offset 0..1,000,000，q 最长 500 字符，按字面子串搜索
 
 单项响应为 `{session: {...}, controller: {...}, autonomy: {autonomous_enabled: false}}`。
 `autonomy.autonomous_enabled` 反映服务器是否允许自主跟进，与 controller 的 active/paused 独立。
+单项接口还返回只读 `autonomy.status`：`reason`、`pending_event_count`、`latest_run_id`
+和 `latest_error_type`。`reason` 区分 ready/idle、用户输入或运行占用、冷却等待、
+每日上限、failure_limit 连续失败保护、execution_guard 执行保护及功能关闭；
+它只解释调度受理条件，不承诺模型额度充足或全部事件均可交付。
+连续失败保护经排查后可通过携带当前 `expected_revision` 的 controller PATCH 显式恢复，
+旧失败、任务结果和模型用量保留；该操作不会重放已完成任务或重置模型额度。
 controller 包含 session_id、
 status(active/paused)、revision、llm_client_name、llm_model、llm_answer_client_name、llm_answer_model、reasoning_level、created_at、updated_at、default_execution_workspace。
 默认执行父目录通过创建或 PATCH 的 default_execution_workspace:{path,platform} 配置，后端验证并返回 backend_path；null 清除。PATCH 必须使用 expected_revision。POST /managers/default 的目录仅在首次创建时采用，后续不覆盖已有配置。

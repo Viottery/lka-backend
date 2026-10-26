@@ -163,6 +163,7 @@ enabled = true
 node_id = "desktop-a"
 allowed_origins = ["https://desktop-a.example-tailnet.ts.net"]
 workspace_roots = { work = "/home/me/work" }
+filesystem_browser_enabled = true # Optional: authenticated node pages may browse names and select a workspace root.
 
 [remote_execution]
 enabled = true
@@ -176,6 +177,9 @@ poll_seconds = 3
 
 同一 workspace_id 在两个映射中必须指向相同本机路径，并包含于该节点的 LKA_WORKSPACE_ROOTS；
 Linux 路径不能直接复制到 Windows。节点已登记的环境必须批准该 workspace_id。
+`filesystem_browser_enabled=true` 为已通过该节点 HTTPS 连接认证的用户开放目录选择器。
+它列出设备根盘及目录名，不读取文件内容；用户选中的目录以账号、设备及授权代次隔离，
+随后需要显式绑定到会话。Agent 仅获得该会话绑定目录的工具范围。默认关闭。
 `tool_policy="allowlist"`（默认）下，allowed_tools 是节点操作者明确授予远程任务的工具；空列表不提供工具。
 明确设置 `tool_policy="local"` 后，远程任务可使用本机注册的普通会话工具，仍与派发范围、来源授权及续作原权限取交集，
 不开放管理助理工具，不代替 `shell_trust` 的主机执行授权。各调用仍经过安全审查。
@@ -269,6 +273,9 @@ controller 新建为 paused；设为 active 才能发出创建、介入或控制
 管理、目标和执行额度继续使用持久账本；当前任一关联额度耗尽时，沿用保守停止该主管后续自动轮的策略，不会因新巡检周期绕过或重置额度。
 显式派发的事务线和它的回报继续运行，不要求打开 autonomous_enabled，也不受普通自主轮间隔／轮数限制；
 父与子 controller 仍须 active。`failure_limit=3` 保留连续失败停止机制，需检查原因后显式介入。
+后台调度将任务结果、定时工作和统一巡检分批处理，优先跟进已受理任务；
+后台模型调用的容量准入与 Agent 上下文装配使用同一型号的 tokenizer 配置，
+包括显式设置的代理 tokenizer、倍率和每请求一次的额外预留。
 
 `internal_items_enabled=false` 默认禁止创建内部事项或把用户事项转为内部事项。
 所有客户端先兼容 visibility 与完整同步并重建缓存后，才启用该开关；它不是权限开关。

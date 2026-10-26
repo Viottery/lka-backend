@@ -109,6 +109,11 @@ class PromptTokenCounter:
         """Count plain text without a chat envelope (for session precompaction)."""
         return self._content_count([text])
 
+    @property
+    def request_padding_tokens(self) -> int:
+        """One padding reservation for callers that count separate message blocks."""
+        return self._content_count([], include_fallback_floor=True).count
+
     @staticmethod
     def _serialize_tool(tool: Any) -> str:
         """Serialize Pydantic definitions and JSON-compatible tool objects."""

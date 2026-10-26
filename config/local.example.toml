@@ -304,6 +304,9 @@ node_id = ""
 allowed_origins = []
 workspace_roots = {} # Example: { work = "/home/me/work" }; never copy another node's paths.
 workspace_mounts = {} # Linux native mounts: ID -> expected_filesystem/expected_source/read_only.
+# Allow authenticated connected users to browse directory names and explicitly
+# bind a chosen local directory as a scoped Agent workspace.
+filesystem_browser_enabled = false
 grant_ttl_seconds = 120
 session_ttl_seconds = 2592000
 allow_native = true

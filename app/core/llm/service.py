@@ -43,7 +43,7 @@ class LLMService:
         self.registry = registry
         self.workloads: LLMWorkloadController | None = None
         self.background_timeout_seconds: float = 30
-        self._token_counters: dict[str | None, PromptTokenCounter] = {}
+        self._token_counters: dict[tuple, PromptTokenCounter] = {}
         self._counter_lock = threading.Lock()
 
     def _resolve_request_identity(self, request: LLMRequest) -> tuple[str, str]:
@@ -288,17 +288,30 @@ class LLMService:
             if capacity is None:
                 raise LLMContextCapacityError("Background model context capacity is not configured.", error_category="context_capacity_missing")
             if input_tokens + output_tokens + 4096 > capacity:
-                raise LLMContextCapacityError("Background prompt exceeds configured model context capacity.", error_category="context_capacity_exceeded")
+                raise LLMContextCapacityError(
+                    f"Background prompt needs {input_tokens} estimated input tokens, "
+                    f"{output_tokens} output tokens and 4096 safety tokens; "
+                    f"configured context capacity is {capacity}.",
+                    error_category="context_capacity_exceeded",
+                )
         async with self.workloads.admit(input_tokens=input_tokens, output_tokens=output_tokens) as ticket:
             yield ticket
 
     def _count_request(self, request: LLMRequest, path) -> int:
-        key = str(path) if path is not None else None
+        resolved = self.config.resolve_model_config(request.client_name, request.model) if request.model else None
+        fallback = resolved.tokenizer_fallback_json_path if resolved else None
+        multiplier = resolved.tokenizer_fallback_multiplier if resolved else 1.5
+        extra = resolved.tokenizer_fallback_extra_tokens if resolved else 2048
+        key = (str(path) if path is not None else None,
+               str(fallback) if fallback is not None else None, multiplier, extra)
         with self._counter_lock:
             counter = self._token_counters.get(key)
             if counter is None:
                 try:
-                    counter = PromptTokenCounter(path)
+                    counter = PromptTokenCounter(
+                        path, fallback_tokenizer_json_path=fallback,
+                        fallback_multiplier=multiplier, fallback_extra_tokens=extra,
+                    )
                 except (FileNotFoundError, ValueError, RuntimeError):
                     counter = PromptTokenCounter()
                 self._token_counters[key] = counter
@@ -319,6 +332,10 @@ class LLMService:
                         count += counter.count_text(block.text).count
         if request.tools:
             count += counter.count_request("", "", request.tools).count
+        else:
+            # Proxy estimates have one per-request padding reservation. Counting
+            # text blocks individually must neither lose nor multiply that floor.
+            count += counter.request_padding_tokens
         return count
 
     def audio_identity(self) -> tuple[str, str]:

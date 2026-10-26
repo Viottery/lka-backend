@@ -432,10 +432,13 @@ class SessionService:
     def get_message_page(
         self, *, session_id: str, limit: int = 30,
         before_message_id: str | None = None, after_message_id: str | None = None,
+        around_message_id: str | None = None,
         message_view: SessionMessageView = "all",
     ) -> AgentSessionMessagePage:
         """Read a bounded history page in one snapshot, with session-bound cursors."""
-        if not 1 <= limit <= 100 or before_message_id and after_message_id:
+        if not 1 <= limit <= 100 or sum(bool(v) for v in (
+            before_message_id, after_message_id, around_message_id,
+        )) > 1:
             raise ValueError("Use one message cursor and a limit from 1 to 100")
         if message_view not in ("all", "conversation"):
             raise ValueError("Unsupported message view")
@@ -448,6 +451,43 @@ class SessionService:
             if row is None:
                 raise KeyError(f"Session not found: {session_id}")
             session = self._session_from_row(row)
+            if around_message_id:
+                projection = _CONVERSATION_MESSAGES if message_view == "conversation" else ""
+                anchor = conn.execute(
+                    "SELECT rowid,created_at FROM agent_session_messages "
+                    f"WHERE session_id=? AND message_id=?{projection}",
+                    (session_id, around_message_id),
+                ).fetchone()
+                if anchor is None:
+                    raise SessionHistoryCursorError("history_cursor_invalid")
+                columns = "message_id,session_id,role,content,payload,created_at"
+                params = (session_id, anchor["created_at"], anchor["rowid"], limit + 1)
+                older = conn.execute(
+                    f"SELECT {columns} FROM agent_session_messages WHERE session_id=? "
+                    f"AND (created_at,rowid)<=(?,?){projection} "
+                    "ORDER BY created_at DESC,rowid DESC LIMIT ?", params,
+                ).fetchall()
+                newer = conn.execute(
+                    f"SELECT {columns} FROM agent_session_messages WHERE session_id=? "
+                    f"AND (created_at,rowid)>(?,?){projection} "
+                    "ORDER BY created_at ASC,rowid ASC LIMIT ?", params,
+                ).fetchall()
+                older_count = min(len(older), max(1, (limit + 1) // 2))
+                newer_count = min(len(newer), limit - older_count)
+                older_count = min(len(older), limit - newer_count)
+                rows = list(reversed(older[:older_count])) + newer[:newer_count]
+                return AgentSessionMessagePage(
+                    session=session, messages=[self._message_from_row(item) for item in rows],
+                    message_page={
+                        "view": message_view, "direction": "around",
+                        "has_more": len(older) > older_count,
+                        "has_more_after": len(newer) > newer_count,
+                        "anchor_message_id": around_message_id,
+                        "first_message_id": rows[0]["message_id"],
+                        "last_message_id": rows[-1]["message_id"],
+                        "history_reset_at": session.metadata.get("history_reset_at"),
+                    },
+                )
             cursor = before_message_id or after_message_id
             clause, params = "", [session_id]
             if cursor:

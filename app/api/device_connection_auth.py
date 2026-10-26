@@ -121,6 +121,8 @@ class DeviceConnectionAuthMiddleware:
         turn = path in {"/agent/turn", "/agent/turn/stream"} and method == "POST"
         workspace_index = path == "/workspaces/index" and method == "POST"
         local_workspaces = re.fullmatch(r"/local/workspaces(?:/([^/]+)/(entries|file|directories|status))?", path)
+        local_filesystem = path == "/local/filesystem/entries" and method == "GET"
+        workspace_selection = path == "/local/workspaces/selections" and method == "POST"
         connection = path == "/connections/me" and method == "GET" or (
             path == "/connections/logout" and method == "POST") or (
             path == "/connections/sessions" and method == "GET") or (
@@ -129,13 +131,16 @@ class DeviceConnectionAuthMiddleware:
                                   "/local/shared-memory/mutations"} and method == "GET" or
                          re.fullmatch(r"/local/shared-memory/mutations/[^/]+", path) and method == "GET" or
                          path == "/local/shared-memory/mutations" and method == "POST")
-        if not (match or run_match or review_match or collection or create or turn or workspace_index or connection or shared_memory or local_workspaces
+        if not (match or run_match or review_match or collection or create or turn or workspace_index or connection or shared_memory or local_workspaces or local_filesystem or workspace_selection
                 or path in {"/capabilities", "/agent/models", "/agent/ui-defaults", "/local/cache"} and method == "GET"):
             return await reject(403, "direct node access is limited to ordinary sessions and workspaces")
         if local_workspaces and local_workspaces[1]:
-            approved = principal["workspace_ids"] if principal else service.config.workspace_roots
-            if local_workspaces[1] not in approved or local_workspaces[1] not in service.config.workspace_roots:
+            approved = (await run_in_threadpool(service.workspace_roots, principal)
+                        if principal else service.config.workspace_roots)
+            if local_workspaces[1] not in approved:
                 return await reject(403, "workspace is not approved")
+        if (local_filesystem or workspace_selection) and not principal:
+            return await reject(401, "authenticated device connection required")
         if collection:
             state["ordinary_sessions_only"] = True
             query = parse_qs(scope.get("query_string", b"").decode("utf-8", errors="replace"))
@@ -146,7 +151,7 @@ class DeviceConnectionAuthMiddleware:
 
         payload = {}
         original_receive = receive
-        needs_body = create or turn or workspace_index or method in {"POST", "PUT", "PATCH"} and (
+        needs_body = create or turn or workspace_index or workspace_selection or method in {"POST", "PUT", "PATCH"} and (
             path.endswith(("/workspace", "/inputs")) or run_match and run_match[2] in {"replace", "continue"})
         if needs_body:
             body = bytearray()
@@ -199,6 +204,13 @@ class DeviceConnectionAuthMiddleware:
                         and service.path_allowed(workspace_principal, workspace.get("backend_path", "")))
             return True
 
+        def session_exists(identity):
+            conn = runtime.session_service._conn_factory()
+            try:
+                return conn.execute("SELECT 1 FROM agent_sessions WHERE session_id=?", (identity,)).fetchone() is not None
+            finally:
+                conn.close()
+
         def allowed_run(identity):
             seen, first = set(), None
             while identity:
@@ -230,7 +242,9 @@ class DeviceConnectionAuthMiddleware:
                 return False
 
         if not collection and match and not await run_in_threadpool(allowed_session, match[1]):
-            return await reject(403, "ordinary local session required")
+            exists = await run_in_threadpool(session_exists, match[1])
+            return await reject(403 if exists else 404,
+                                "ordinary local session required" if exists else "session not found")
         if turn:
             identity = payload.get("session_id")
             if not isinstance(identity, str) or not await run_in_threadpool(allowed_session, identity):
@@ -274,12 +288,12 @@ class DeviceConnectionAuthMiddleware:
             if payload.get("project_id") or metadata.get("project_id"):
                 return await reject(403, "project association requires the hub")
             workspace = metadata.get("workspace")
-            if workspace and (not isinstance(workspace, dict) or not service.path_allowed(
-                    workspace_principal, workspace.get("backend_path", ""))):
+            if workspace and (not isinstance(workspace, dict) or not await run_in_threadpool(
+                    service.path_allowed, workspace_principal, workspace.get("backend_path", ""))):
                 return await reject(403, "workspace is not approved")
         if workspace_index or path.endswith("/workspace") and method == "PUT":
             target = payload.get("workspace") if workspace_index else payload.get("path")
-            if not service.path_allowed(workspace_principal, target):
+            if not await run_in_threadpool(service.path_allowed, workspace_principal, target):
                 return await reject(403, "workspace is not approved")
         if principal and needs_body and (turn or path.endswith("/inputs")
                                         or run_match and run_match[2] == "replace"):

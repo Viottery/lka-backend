@@ -245,48 +245,84 @@ class ManagementCoordinator:
         return False
 
     def _eligible(self, conn, sid, now):
+        return self._wake_block_reason(conn, sid, now) is None
+
+    def wake_status(self, session_id):
+        """Explain persisted wake guards without scheduling or resetting any work."""
+        with closing(self._conn()) as conn:
+            conn.execute("BEGIN")
+            reason = self._wake_block_reason(conn, session_id, datetime.now(UTC))
+            pending = conn.execute(
+                "SELECT count(*) FROM manager_inbox WHERE session_id=? AND consumed_execution_id IS NULL",
+                (session_id,),
+            ).fetchone()[0]
+            latest = conn.execute(
+                "SELECT e.run_id,r.record_payload FROM manager_executions e "
+                "JOIN agent_runs r ON r.run_id=e.run_id WHERE e.session_id=? ORDER BY e.rowid DESC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            return {
+                "reason": reason or ("ready" if pending else "idle"),
+                "pending_event_count": pending,
+                "latest_run_id": latest["run_id"] if latest else None,
+                "latest_error_type": json.loads(latest["record_payload"]).get("error_type") if latest else None,
+            }
+
+    def _wake_block_reason(self, conn, sid, now):
         user_input_pending = getattr(self, 'user_input_pending', None)
         if user_input_pending is not None and user_input_pending(conn, sid):
-            return False
+            return "user_input_pending"
         row = conn.execute("SELECT c.status,c.revision FROM manager_controllers c JOIN agent_sessions s "
                            "ON s.session_id=c.session_id WHERE c.session_id=? "
                            "AND s.status!='deleted'", (sid,)).fetchone()
         explicit = self._explicit_work(conn, sid)
         delegates = getattr(self, "delegates", None)
         if delegates is not None and delegates.get_for_session(conn, sid) is not None and not explicit:
-            return False
-        if (row is None or row[0] != "active" or not self.config.enabled
-                or (not self.config.autonomous_enabled and not explicit) or not self.tasks.durable_execution()):
-            return False
+            return "delegate_inactive"
+        if row is None or row[0] != "active":
+            return "controller_paused"
+        if not self.config.enabled:
+            return "management_disabled"
+        if not self.config.autonomous_enabled and not explicit:
+            return "autonomy_disabled"
+        if not self.tasks.durable_execution():
+            return "durable_execution_disabled"
         if conn.execute("SELECT 1 FROM agent_runs WHERE session_id=? AND status NOT IN "
                         "('completed','failed','cancelled','timed_out') LIMIT 1", (sid,)).fetchone():
-            return False
+            return "run_active"
         latest = conn.execute("SELECT created_at FROM manager_executions WHERE session_id=? "
                               "ORDER BY rowid DESC LIMIT 1", (sid,)).fetchone()
         if not explicit and latest and datetime.fromisoformat(latest[0]) + timedelta(seconds=self.config.min_wake_interval_seconds) > now:
-            return False
+            return "cooldown"
         count = conn.execute("SELECT count(*) FROM manager_executions WHERE session_id=? AND created_at>=?",
                              (sid, now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat())).fetchone()[0]
         if not explicit and self.config.max_daily_rounds is not None and count >= self.config.max_daily_rounds:
-            return False
+            return "daily_limit"
         recent = conn.execute("SELECT status FROM manager_executions WHERE session_id=? AND controller_revision=? "
                               "ORDER BY rowid DESC LIMIT ?", (sid, row[1], self.config.failure_limit)).fetchall()
         if len(recent) == self.config.failure_limit and all(r[0] == "failed" for r in recent):
-            return False
+            return "failure_limit"
         exhausted = conn.execute("SELECT r.record_payload,e.controller_revision FROM manager_executions e JOIN agent_runs r ON r.run_id=e.run_id "
                                  "WHERE e.session_id=? ORDER BY e.rowid DESC LIMIT 1", (sid,)).fetchone()
         # The same unconsumed evidence is not a new allowance. Explicitly
         # resolve the failed execution before scheduling another one.
-        return not (exhausted and exhausted[1] == row[1]
+        if (exhausted and exhausted[1] == row[1]
                     and json.loads(exhausted[0]).get("error_type") in {
                         "work_budget_exhausted", "live_budget_exceeded", "execution_uncertain",
-                    })
+                    }):
+            return "execution_guard"
+        return None
 
     def _pending(self, conn, sid):
         rows = conn.execute("SELECT * FROM manager_inbox WHERE session_id=? "
-                            "AND consumed_execution_id IS NULL ORDER BY event_id", (sid,))
+                            "AND consumed_execution_id IS NULL ORDER BY CASE "
+                            "WHEN kind='task_terminal' OR json_extract(payload,'$.task_waiting')=1 "
+                            "OR json_type(payload,'$.delegate_report') IS NOT NULL "
+                            "OR json_type(payload,'$.delegate_execution_issue') IS NOT NULL THEN 0 "
+                            "WHEN json_extract(payload,'$.attention_sweep')=1 THEN 2 ELSE 1 END,event_id", (sid,))
         events = []
         causes = set()
+        lane = None
         for row in rows:
             item = dict(row)
             item["payload"] = json.loads(item["payload"])
@@ -329,6 +365,20 @@ class ManagementCoordinator:
                 continue
             if len(causes | paths.keys()) > 64:
                 continue
+            current_lane = (
+                "task_report" if item["kind"] == "task_terminal"
+                or item["payload"].get("task_waiting")
+                or item["payload"].get("delegate_report")
+                or item["payload"].get("delegate_execution_issue")
+                else "attention_sweep" if item["payload"].get("attention_sweep") is True
+                else "scheduled"
+            )
+            # A task's accepted work and a periodic inspection have different
+            # purposes. Mixing them can incorrectly scope review and notification
+            # to the inspection's unrelated goals, then consume the task report.
+            if lane is not None and current_lane != lane:
+                continue
+            lane = current_lane
             causes.update(paths)
             events.append(item)
             if len(events) == 16:
@@ -603,6 +653,14 @@ class ManagementCoordinator:
                     + _json({"events": [{"event_id": e["event_id"], "kind": e["kind"], "payload": e["payload"]} for e in events],
                              "goals": goals})
                 )
+                if any(e["kind"] == "task_terminal" or e["payload"].get("task_waiting") for e in events):
+                    purpose = (
+                        "已受理任务的结果跟进：本轮负责下列任务的完成、失败或等待状态，"
+                        "与例行关注巡检分别处理。读取关联任务的原始委托和执行证据，"
+                        "按原验收说明结果、缺口和下一步；有新的可交付结果或重要阻塞时明确通知用户。"
+                        "后台触发不表示缺少原用户委托，但原任务来源和权限仍须核验，"
+                        "不能批准待确认操作或扩大执行范围。\n" + purpose
+                    )
                 if any(e["payload"].get("attention_sweep") is True for e in events):
                     purpose = (
                         "统一关注巡检：本轮 goals 是全部活跃关注项中的一批，其他批次由调度器继续处理。"
