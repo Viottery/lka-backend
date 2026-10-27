@@ -19,6 +19,7 @@
 <p>
 <a href="#overview">概览</a> ·
 <a href="#features">功能</a> ·
+<a href="#assistant">真理助理</a> ·
 <a href="#deployment">部署结构</a> ·
 <a href="#design">设计</a> ·
 <a href="#quickstart">快速开始</a> ·
@@ -105,7 +106,7 @@ LKA 把一次用户请求当作一个通用的 Agent 任务：模型决定查什
 <td width="50%" valign="top">
 
 <h4>🧑‍💼 真理（长期助理）</h4>
-一个持续存在的管理会话：记录目标、按时跟进，把具体工作派给独立任务或远程设备，结果带主题送回。需开启 `management.enabled`
+一个持续存在的管理会话：记录目标、按时跟进，把具体工作派给独立任务或远程设备，结果带主题送回。详见[下文](#assistant)
 
 </td>
 </tr>
@@ -122,6 +123,65 @@ LKA 把一次用户请求当作一个通用的 Agent 任务：模型决定查什
 
 <br>
 
+<a id="assistant"></a>
+
+## 🧑‍💼 真理：长期助理
+
+普通会话一问一答，做完就结束。真理是一个持续存在的 `kind=manager` 会话，
+负责记住你交代过的事，并在之后继续推进。它的分工是规划、下发、监督和验收：
+复杂的检索、分析和批量操作交给独立的执行会话完成，简单问答和一次性操作它直接处理。
+
+<p align="center">
+<img src="docs/assets/assistant-loop.svg" width="100%" alt="真理工作方式：登记目标、下发任务、读取结果验收、统一巡检，必要时通知用户">
+</p>
+
+<table>
+<tr>
+<td width="50%" valign="top">
+
+<h4>🎯 关注目标</h4>
+有跨轮承诺、依赖或验收条件的委托会登记为目标，保存来源、剩余条件、已有证据、下一步和验收标准。
+可设置带时区的 `next_wake_at`，或用 `wait_run_id` 等某个任务结束。
+
+</td>
+<td width="50%" valign="top">
+
+<h4>📤 下发与排队</h4>
+`start_work` 检查依赖后创建绑定任务，`queue_work` 按依赖、优先级和等待时长排队。
+写任务必须指定工作区，同一工作区内互斥。启用远程执行后可派到已授权的电脑。
+
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+
+<h4>✅ 读取与验收</h4>
+任务结束后用 `read_task_result` 分页读取实际回答和工具证据，再说明完成了什么、怎么验证的。
+失败轮也可能留下成功操作，先看证据再决定续作或重做。
+
+</td>
+<td width="50%" valign="top">
+
+<h4>⏱️ 统一巡检</h4>
+开启 `autonomous_enabled` 后，后台默认每 30 分钟检查 active / waiting 目标，不需要浏览器开着。
+没有重要变化时静默保存，有结果、阻塞或需要你决定时才发消息。
+
+</td>
+</tr>
+</table>
+
+一些边界：
+
+- 主管不会替你批准操作。等待审批或答复的任务会以去重事件提醒，仍走原入口。
+- 自主轮对目标的修改先作为提案，随最终回答一起提交，失败时不会留下半份计划。
+- 静音和「稍后提醒」只影响通知，内部巡检照常保存进展；默认仍保留关键决定提醒。
+- 登记目标不会自动开启新的来源权限或额外预算。controller 暂停时可以对话和读取，但不能改目标。
+- 交付记录目前只在本地，外部主动推送尚未实现。
+
+启用方式见 [配置说明](docs/configuration.md)，完整行为见 [日常使用](docs/usage.md)。
+
+<br>
+
 <a id="deployment"></a>
 
 ## ☁️ 部署结构
@@ -133,36 +193,9 @@ LKA 支持两种形态，后者完全可选。
 
 **云端 + 多节点。** 一台 Ubuntu 22.04 云服务器作为 hub，每台电脑作为 replica 节点，网络由 Tailscale 提供。
 
-```mermaid
-flowchart LR
-    subgraph Tailnet["Tailscale tailnet（HTTPS · Serve，不开 Funnel）"]
-        direction LR
-        Phone["📱 手机 / 浏览器<br/>/client"]
-        subgraph Hub["☁️ 云端 hub · lka-cloud.service"]
-            HubDB[("共享 SQLite<br/>账号 · 设备 · 记忆 · 待办 · 项目")]
-            Assist["真理 · 远程任务派发与审批"]
-        end
-        subgraph NodeA["💻 电脑 A · replica 节点"]
-            A1[("本地 SQLite<br/>普通会话 · 记忆镜像")]
-            A2["工作区 · 执行 worker"]
-        end
-        subgraph NodeB["💻 电脑 B · replica 节点"]
-            B1[("本地 SQLite")]
-            B2["工作区 · 执行 worker"]
-        end
-    end
-    Phone -->|账号登录| Hub
-    Phone -.->|一次性授权直连| NodeA
-    Phone -.->|一次性授权直连| NodeB
-    Hub <-->|增量同步 · 任务队列 · 心跳| NodeA
-    Hub <-->|增量同步 · 任务队列 · 心跳| NodeB
-    classDef hub fill:#ede9fe,stroke:#6b46c1,color:#1a1a1a
-    classDef node fill:#e0f2fe,stroke:#0369a1,color:#1a1a1a
-    classDef phone fill:#fef3c7,stroke:#b45309,color:#1a1a1a
-    class Hub hub
-    class NodeA,NodeB node
-    class Phone phone
-```
+<p align="center">
+<img src="docs/assets/deployment-topology.svg" width="100%" alt="LKA 部署结构：手机经 Tailscale 登录云端 hub，hub 与电脑节点同步，手机可凭一次性授权直连节点">
+</p>
 
 | 部分 | 运行方式 | 保存什么 |
 | :--- | :--- | :--- |

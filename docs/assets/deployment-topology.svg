@@ -1,0 +1,101 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="600" viewBox="0 0 1200 600" role="img" aria-labelledby="title desc">
+  <title id="title">LKA 部署结构</title>
+  <desc id="desc">手机通过 Tailscale HTTPS 登录云端 hub，云端与多台电脑节点双向同步，手机可凭一次性授权直连节点。</desc>
+  <defs>
+    <pattern id="dots" width="22" height="22" patternUnits="userSpaceOnUse">
+      <circle cx="1" cy="1" r="1" fill="#cad6e2" opacity="0.55"/>
+    </pattern>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" fill="#5b6b7f"/>
+    </marker>
+    <marker id="arrP" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" fill="#c2780a"/>
+    </marker>
+  </defs>
+
+  <rect x="1" y="1" width="1198" height="598" rx="20" fill="#f6f9fc" stroke="#cad6e2"/>
+  <rect x="1" y="1" width="1198" height="598" rx="20" fill="url(#dots)"/>
+
+  <g font-family="Segoe UI, PingFang SC, Microsoft YaHei, Helvetica, Arial, sans-serif">
+    <!-- tailnet boundary -->
+    <rect x="250" y="40" width="920" height="530" rx="18" fill="none" stroke="#8aa4c0" stroke-width="1.5" stroke-dasharray="7 6"/>
+    <rect x="272" y="28" width="300" height="26" rx="13" fill="#f6f9fc"/>
+    <text x="284" y="46" font-size="14" fill="#52667d" font-weight="600">Tailscale tailnet · HTTPS (Serve，不开 Funnel)</text>
+
+    <!-- phone -->
+    <g transform="translate(46 210)">
+      <rect width="160" height="190" rx="18" fill="#fff8eb" stroke="#d99a2b" stroke-width="1.5"/>
+      <rect x="58" y="22" width="44" height="72" rx="8" fill="none" stroke="#c2780a" stroke-width="3"/>
+      <circle cx="80" cy="84" r="3" fill="#c2780a"/>
+      <text x="80" y="128" font-size="18" font-weight="700" fill="#152c45" text-anchor="middle">手机 / 浏览器</text>
+      <text x="80" y="152" font-size="13" fill="#52667d" text-anchor="middle">打开 /client</text>
+      <text x="80" y="172" font-size="13" fill="#52667d" text-anchor="middle">无需安装</text>
+    </g>
+
+    <!-- hub -->
+    <g transform="translate(470 76)">
+      <rect width="440" height="170" rx="16" fill="#f1edfd" stroke="#6b46c1" stroke-width="1.8"/>
+      <rect width="440" height="44" rx="16" fill="#6b46c1"/>
+      <rect y="28" width="440" height="16" fill="#6b46c1"/>
+      <text x="22" y="29" font-size="17" font-weight="700" fill="#ffffff">云端 hub</text>
+      <text x="418" y="29" font-size="13" fill="#e6defc" text-anchor="end">Ubuntu 22.04 · lka-cloud.service · --require-auth</text>
+      <g font-size="14" fill="#2a2140">
+        <rect x="22" y="62" width="190" height="88" rx="10" fill="#ffffff" stroke="#c8b9f0"/>
+        <text x="38" y="88" font-weight="700">真理 · 长期助理</text>
+        <text x="38" y="112" fill="#52667d">目标跟进 · 任务派发</text>
+        <text x="38" y="134" fill="#52667d">审批与结果回收</text>
+        <rect x="228" y="62" width="190" height="88" rx="10" fill="#ffffff" stroke="#c8b9f0"/>
+        <text x="244" y="88" font-weight="700">共享 SQLite</text>
+        <text x="244" y="112" fill="#52667d">账号 · 设备 · 授权</text>
+        <text x="244" y="134" fill="#52667d">记忆 · 待办 · 项目</text>
+      </g>
+    </g>
+
+    <!-- nodes -->
+    <g transform="translate(330 380)">
+      <rect width="360" height="160" rx="16" fill="#eaf5fc" stroke="#0369a1" stroke-width="1.8"/>
+      <rect width="360" height="44" rx="16" fill="#0369a1"/>
+      <rect y="28" width="360" height="16" fill="#0369a1"/>
+      <text x="22" y="29" font-size="17" font-weight="700" fill="#ffffff">电脑 A · replica 节点</text>
+      <text x="338" y="29" font-size="13" fill="#d3ebf8" text-anchor="end">--require-node</text>
+      <g font-size="14" fill="#13324a">
+        <text x="22" y="76" font-weight="700">本地 SQLite</text>
+        <text x="22" y="98" fill="#52667d">普通会话 · 记忆镜像</text>
+        <text x="196" y="76" font-weight="700">执行 worker</text>
+        <text x="196" y="98" fill="#52667d">工作区 · 本机模型</text>
+        <text x="22" y="136" fill="#52667d" font-size="13">断云时普通会话与文件照常使用</text>
+      </g>
+    </g>
+    <g transform="translate(760 380)">
+      <rect width="360" height="160" rx="16" fill="#eaf5fc" stroke="#0369a1" stroke-width="1.8"/>
+      <rect width="360" height="44" rx="16" fill="#0369a1"/>
+      <rect y="28" width="360" height="16" fill="#0369a1"/>
+      <text x="22" y="29" font-size="17" font-weight="700" fill="#ffffff">电脑 B · replica 节点</text>
+      <text x="338" y="29" font-size="13" fill="#d3ebf8" text-anchor="end">Windows / Linux</text>
+      <g font-size="14" fill="#13324a">
+        <text x="22" y="76" font-weight="700">本地 SQLite</text>
+        <text x="22" y="98" fill="#52667d">普通会话 · 记忆镜像</text>
+        <text x="196" y="76" font-weight="700">执行 worker</text>
+        <text x="196" y="98" fill="#52667d">工作区 · 本机模型</text>
+        <text x="22" y="136" fill="#52667d" font-size="13">各节点数据库独立，不共享文件</text>
+      </g>
+    </g>
+
+    <!-- edges -->
+    <g fill="none" stroke-width="2.2">
+      <path d="M206 270 C 330 240, 380 170, 466 160" stroke="#5b6b7f" marker-end="url(#arr)"/>
+      <path d="M206 340 C 270 380, 290 440, 326 455" stroke="#c2780a" stroke-dasharray="7 6" marker-end="url(#arrP)"/>
+      <path d="M600 250 L 545 376" stroke="#5b6b7f" marker-start="url(#arr)" marker-end="url(#arr)"/>
+      <path d="M780 250 L 880 376" stroke="#5b6b7f" marker-start="url(#arr)" marker-end="url(#arr)"/>
+    </g>
+    <g font-size="13" fill="#3d4f63">
+      <rect x="300" y="168" width="96" height="24" rx="12" fill="#ffffff" stroke="#cad6e2"/>
+      <text x="348" y="185" text-anchor="middle">账号登录</text>
+      <rect x="196" y="410" width="120" height="24" rx="12" fill="#fff8eb" stroke="#e6b866"/>
+      <text x="256" y="427" text-anchor="middle" fill="#8a5300">一次性授权直连</text>
+      <rect x="610" y="300" width="160" height="40" rx="12" fill="#ffffff" stroke="#cad6e2"/>
+      <text x="690" y="316" text-anchor="middle">增量同步 · 任务队列</text>
+      <text x="690" y="333" text-anchor="middle">心跳 · 审批与结果</text>
+    </g>
+  </g>
+</svg>

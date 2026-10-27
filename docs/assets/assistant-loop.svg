@@ -1,0 +1,95 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="520" viewBox="0 0 1200 520" role="img" aria-labelledby="title desc">
+  <title id="title">真理助理工作方式</title>
+  <desc id="desc">用户交代目标，助理登记关注目标，下发独立执行任务，读取结果验收，统一巡检定期唤醒，有需要时才通知用户。</desc>
+  <defs>
+    <pattern id="dots2" width="22" height="22" patternUnits="userSpaceOnUse">
+      <circle cx="1" cy="1" r="1" fill="#cad6e2" opacity="0.55"/>
+    </pattern>
+    <marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0L10 5L0 10z" fill="#5b6b7f"/>
+    </marker>
+  </defs>
+  <rect x="1" y="1" width="1198" height="518" rx="20" fill="#f6f9fc" stroke="#cad6e2"/>
+  <rect x="1" y="1" width="1198" height="518" rx="20" fill="url(#dots2)"/>
+
+  <g font-family="Segoe UI, PingFang SC, Microsoft YaHei, Helvetica, Arial, sans-serif">
+    <!-- user -->
+    <g transform="translate(40 190)">
+      <rect width="170" height="130" rx="16" fill="#fff8eb" stroke="#d99a2b" stroke-width="1.5"/>
+      <text x="85" y="44" font-size="18" font-weight="700" fill="#152c45" text-anchor="middle">你</text>
+      <text x="85" y="72" font-size="13" fill="#52667d" text-anchor="middle">交代目标与约束</text>
+      <text x="85" y="94" font-size="13" fill="#52667d" text-anchor="middle">回答待决定事项</text>
+      <text x="85" y="116" font-size="13" fill="#52667d" text-anchor="middle">在会话中追问</text>
+    </g>
+
+    <!-- manager core -->
+    <g transform="translate(300 60)">
+      <rect width="600" height="400" rx="20" fill="#f1edfd" stroke="#6b46c1" stroke-width="1.8"/>
+      <rect width="600" height="48" rx="20" fill="#6b46c1"/>
+      <rect y="30" width="600" height="18" fill="#6b46c1"/>
+      <text x="24" y="32" font-size="18" font-weight="700" fill="#ffffff">真理 · manager 会话</text>
+      <text x="576" y="32" font-size="13" fill="#e6defc" text-anchor="end">management.enabled · autonomous_enabled</text>
+
+      <g font-size="14">
+        <g transform="translate(30 80)">
+          <rect width="250" height="110" rx="12" fill="#ffffff" stroke="#c8b9f0"/>
+          <text x="18" y="30" font-weight="700" fill="#2a2140">① 登记关注目标</text>
+          <text x="18" y="56" fill="#52667d">委托来源 · 剩余条件</text>
+          <text x="18" y="78" fill="#52667d">下一步 · 验收条件</text>
+          <text x="18" y="100" fill="#52667d" font-size="12">set_goal · next_wake_at · wait_run_id</text>
+        </g>
+        <g transform="translate(320 80)">
+          <rect width="250" height="110" rx="12" fill="#ffffff" stroke="#c8b9f0"/>
+          <text x="18" y="30" font-weight="700" fill="#2a2140">② 下发执行任务</text>
+          <text x="18" y="56" fill="#52667d">独立会话执行检索与操作</text>
+          <text x="18" y="78" fill="#52667d">依赖排队 · 工作区互斥</text>
+          <text x="18" y="100" fill="#52667d" font-size="12">start_work · queue_work · 远程节点</text>
+        </g>
+        <g transform="translate(320 220)">
+          <rect width="250" height="110" rx="12" fill="#ffffff" stroke="#c8b9f0"/>
+          <text x="18" y="30" font-weight="700" fill="#2a2140">③ 读取结果并验收</text>
+          <text x="18" y="56" fill="#52667d">分页读取回答与工具证据</text>
+          <text x="18" y="78" fill="#52667d">review → 更新事项</text>
+          <text x="18" y="100" fill="#52667d" font-size="12">read_task_result · organize_work</text>
+        </g>
+        <g transform="translate(30 220)">
+          <rect width="250" height="110" rx="12" fill="#ffffff" stroke="#c8b9f0"/>
+          <text x="18" y="30" font-weight="700" fill="#2a2140">④ 统一巡检</text>
+          <text x="18" y="56" fill="#52667d">默认每 30 分钟唤醒</text>
+          <text x="18" y="78" fill="#52667d">推进 · 保留 · 完成 · 请你决定</text>
+          <text x="18" y="100" fill="#52667d" font-size="12">无重要变化时静默保存</text>
+        </g>
+      </g>
+      <g fill="none" stroke="#6b46c1" stroke-width="2.2">
+        <path d="M282 135 L 316 135" marker-end="url(#a2)"/>
+        <path d="M445 192 L 445 216" marker-end="url(#a2)"/>
+        <path d="M318 275 L 284 275" marker-end="url(#a2)"/>
+        <path d="M155 218 L 155 194" marker-end="url(#a2)"/>
+      </g>
+      <text x="300" y="372" font-size="13" fill="#52667d" text-anchor="middle">目标修改先作为提案，随最终回答一起提交；主管不会代你批准操作</text>
+    </g>
+
+    <!-- outputs -->
+    <g transform="translate(990 120)">
+      <rect width="170" height="120" rx="16" fill="#eaf5fc" stroke="#0369a1" stroke-width="1.5"/>
+      <text x="85" y="40" font-size="16" font-weight="700" fill="#13324a" text-anchor="middle">执行会话</text>
+      <text x="85" y="68" font-size="13" fill="#52667d" text-anchor="middle">本机或已授权节点</text>
+      <text x="85" y="90" font-size="13" fill="#52667d" text-anchor="middle">可暂停 · 取消 · 续作</text>
+    </g>
+    <g transform="translate(990 290)">
+      <rect width="170" height="120" rx="16" fill="#ecf8f3" stroke="#168f87" stroke-width="1.5"/>
+      <text x="85" y="40" font-size="16" font-weight="700" fill="#0f3d3a" text-anchor="middle">交付</text>
+      <text x="85" y="68" font-size="13" fill="#52667d" text-anchor="middle">带主题的结果消息</text>
+      <text x="85" y="90" font-size="13" fill="#52667d" text-anchor="middle">遵守静音与稍后提醒</text>
+    </g>
+
+    <g fill="none" stroke="#5b6b7f" stroke-width="2.2">
+      <path d="M212 245 L 296 245" marker-end="url(#a2)"/>
+      <path d="M872 195 L 986 180" marker-end="url(#a2)"/>
+      <path d="M986 200 L 872 315" marker-end="url(#a2)"/>
+      <path d="M902 350 L 986 350" marker-end="url(#a2)"/>
+      <path d="M1075 412 C 1075 490, 125 490, 125 324" marker-end="url(#a2)"/>
+    </g>
+    <text x="600" y="502" font-size="13" fill="#52667d" text-anchor="middle">有用结果、阻塞或需要你决定时才生成消息</text>
+  </g>
+</svg>
