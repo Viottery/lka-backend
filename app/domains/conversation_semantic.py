@@ -14,6 +14,8 @@ from contextlib import closing
 from threading import RLock
 from typing import Any
 
+from app.core.conversation_visibility import conversation_source_predicate
+
 try:
     import numpy as np
 except ImportError:  # numpy is an optional acceleration, not a requirement.
@@ -46,7 +48,7 @@ class ConversationSemanticIndex:
         self._schema_ready = False
         self._matrix_cache: OrderedDict[str, tuple[int, int, list[int], Any, int]] = OrderedDict()
         self._query_cache: OrderedDict[str, tuple[str, list[float]]] = OrderedDict()
-        self._eligible_count_cache: OrderedDict[tuple[str, int], int] = OrderedDict()
+        self._eligible_count_cache: OrderedDict[tuple[str, int, str], int] = OrderedDict()
 
     def ensure_schema(self) -> None:
         with self._lock:
@@ -156,12 +158,8 @@ class ConversationSemanticIndex:
             self._schema_ready = True
 
     @staticmethod
-    def _eligible_sql() -> str:
-        return """(m.role='user' OR (m.role='agent' AND m.trace_id IS NOT NULL
-            AND EXISTS (SELECT 1 FROM agent_session_context_messages u
-              WHERE u.session_id=m.session_id AND u.trace_id=m.trace_id AND u.role='user')
-            AND NOT EXISTS (SELECT 1 FROM agent_session_context_messages t
-              WHERE t.session_id=m.session_id AND t.trace_id=m.trace_id AND t.role='tool')))"""
+    def _eligible_sql(conn: sqlite3.Connection, sid: str) -> tuple[str, list]:
+        return conversation_source_predicate(conn, sid)
 
     @staticmethod
     def _hash(row: Any) -> str:
@@ -195,15 +193,27 @@ class ConversationSemanticIndex:
         watermark = int(row["watermark"]) if row else 0
         pending_dirty = conn.execute("SELECT 1 FROM conversation_semantic_dirty WHERE session_id=? AND fingerprint=? LIMIT 1", (sid, self._fingerprint)).fetchone()
         pending_cold = conn.execute("SELECT 1 FROM agent_session_context_messages WHERE session_id=? AND seq>? LIMIT 1", (sid, watermark)).fetchone()
-        pending = bool(pending_dirty or pending_cold)
+        eligibility, eligibility_params = self._eligible_sql(conn, sid)
+        pending_missing = conn.execute(
+            f"""SELECT 1 FROM (
+                    SELECT m.seq FROM agent_session_context_messages m
+                    WHERE m.session_id=? AND m.seq<=? AND {eligibility}
+                    ORDER BY m.seq DESC LIMIT ?
+                ) c LEFT JOIN conversation_semantic_vectors v
+                  ON v.session_id=? AND v.seq=c.seq AND v.fingerprint=?
+                WHERE v.seq IS NULL LIMIT 1""",
+            (sid, watermark, *eligibility_params, self._max_candidates, sid, self._fingerprint),
+        ).fetchone()
+        pending = bool(pending_dirty or pending_cold or pending_missing)
         generation = int(row["source_revision"]) if row else 0
-        cache_key = (sid, generation)
+        visibility_key = hashlib.sha256(json.dumps([eligibility, eligibility_params]).encode()).hexdigest()
+        cache_key = (sid, generation, visibility_key)
         with self._lock:
             eligible_count = self._eligible_count_cache.get(cache_key)
             if eligible_count is not None:
                 self._eligible_count_cache.move_to_end(cache_key)
         if eligible_count is None:
-            eligible_count = conn.execute(f"SELECT COUNT(*) FROM agent_session_context_messages m WHERE m.session_id=? AND {self._eligible_sql()}", (sid,)).fetchone()[0]
+            eligible_count = conn.execute(f"SELECT COUNT(*) FROM agent_session_context_messages m WHERE m.session_id=? AND {eligibility}", (sid, *eligibility_params)).fetchone()[0]
             with self._lock:
                 self._eligible_count_cache[cache_key] = int(eligible_count)
                 while len(self._eligible_count_cache) > 64:
@@ -241,6 +251,23 @@ class ConversationSemanticIndex:
                         (session_id,fingerprint,seq,generation) VALUES(?,?,?,?)
                         ON CONFLICT(session_id,fingerprint,seq) DO NOTHING""",
                         (sid, self._fingerprint, int(source_row["seq"]), int(state["source_revision"])))
+                eligibility, eligibility_params = self._eligible_sql(conn, sid)
+                missing = conn.execute(
+                    f"""SELECT c.seq FROM (
+                            SELECT m.seq FROM agent_session_context_messages m
+                            WHERE m.session_id=? AND m.seq<=? AND {eligibility}
+                            ORDER BY m.seq DESC LIMIT ?
+                        ) c LEFT JOIN conversation_semantic_vectors v
+                          ON v.session_id=? AND v.seq=c.seq AND v.fingerprint=?
+                        WHERE v.seq IS NULL ORDER BY c.seq LIMIT ?""",
+                    (sid, watermark, *eligibility_params, self._max_candidates,
+                     sid, self._fingerprint, self._batch_size),
+                ).fetchall()
+                for source_row in missing:
+                    conn.execute("""INSERT INTO conversation_semantic_dirty
+                        (session_id,fingerprint,seq,generation) VALUES(?,?,?,?)
+                        ON CONFLICT(session_id,fingerprint,seq) DO NOTHING""",
+                        (sid, self._fingerprint, int(source_row["seq"]), int(state["source_revision"])))
                 dirty = conn.execute("SELECT d.seq,d.generation FROM conversation_semantic_dirty d WHERE d.session_id=? AND d.fingerprint=? ORDER BY d.seq LIMIT ?", (sid, self._fingerprint, self._batch_size)).fetchall()
                 dirty_gen = {int(row["seq"]): int(row["generation"]) for row in dirty}
                 candidates: dict[int, Any] = {}
@@ -251,7 +278,7 @@ class ConversationSemanticIndex:
                         removed = conn.execute("DELETE FROM conversation_semantic_vectors WHERE session_id=? AND seq=? AND fingerprint=?", (sid, seq, self._fingerprint)).rowcount
                         changed_index = changed_index or bool(removed)
                         conn.execute("DELETE FROM conversation_semantic_dirty WHERE session_id=? AND fingerprint=? AND seq=? AND generation=?", (sid, self._fingerprint, seq, dirty_generation))
-                    elif conn.execute(f"SELECT 1 FROM agent_session_context_messages m WHERE m.session_id=? AND m.seq=? AND {self._eligible_sql()}", (sid, seq)).fetchone():
+                    elif conn.execute(f"SELECT 1 FROM agent_session_context_messages m WHERE m.session_id=? AND m.seq=? AND {eligibility}", (sid, seq, *eligibility_params)).fetchone():
                         existing = conn.execute("SELECT source_hash FROM conversation_semantic_vectors WHERE session_id=? AND seq=? AND fingerprint=?", (sid, seq, self._fingerprint)).fetchone()
                         if existing and existing["source_hash"] == self._hash(row):
                             conn.execute("DELETE FROM conversation_semantic_dirty WHERE session_id=? AND fingerprint=? AND seq=? AND generation=?", (sid, self._fingerprint, seq, dirty_generation))
@@ -295,6 +322,7 @@ class ConversationSemanticIndex:
                     return {"state": "unavailable", "unavailable": True, "indexed": 0, "pending": False}
                 published = 0
                 dimensions = state_now["dimensions"]
+                live_eligibility, live_params = self._eligible_sql(conn, sid)
                 for ((seq, source, source_hash, source_generation), (blob, dims, _normalized)) in packed:
                     if self._expected_dimensions is not None and dims != self._expected_dimensions:
                         conn.rollback()
@@ -302,7 +330,7 @@ class ConversationSemanticIndex:
                     if dimensions is not None and int(dimensions) != dims:
                         conn.rollback()
                         raise ValueError("embedding dimensions changed")
-                    live = conn.execute(f"SELECT m.session_id,m.seq,m.role,m.content,m.created_at,m.trace_id FROM agent_session_context_messages m WHERE m.session_id=? AND m.seq=? AND {self._eligible_sql()}", (sid, seq)).fetchone()
+                    live = conn.execute(f"SELECT m.session_id,m.seq,m.role,m.content,m.created_at,m.trace_id FROM agent_session_context_messages m WHERE m.session_id=? AND m.seq=? AND {live_eligibility}", (sid, seq, *live_params)).fetchone()
                     if live is None or self._hash(live) != source_hash:
                         continue
                     conn.execute("INSERT INTO conversation_semantic_vectors(session_id,seq,fingerprint,source_hash,vector,dimensions) VALUES(?,?,?,?,?,?) ON CONFLICT(session_id,seq,fingerprint) DO UPDATE SET source_hash=excluded.source_hash,vector=excluded.vector,dimensions=excluded.dimensions", (sid, seq, self._fingerprint, source_hash, blob, dims))
@@ -429,8 +457,9 @@ class ConversationSemanticIndex:
                         scored.append((seq, sum(a * b for a, b in zip(vector, query_vector))))
                     ranked = sorted(scored, key=lambda pair: (-pair[1], -pair[0]))[:offset + limit]
                 output = []
+                live_eligibility, live_params = self._eligible_sql(conn, sid)
                 for seq, score in ranked[offset:offset + limit]:
-                    live = conn.execute(f"SELECT m.session_id,m.seq,m.role,m.content,m.created_at,m.trace_id FROM agent_session_context_messages m WHERE m.session_id=? AND m.seq=? AND {self._eligible_sql()}", (sid, seq)).fetchone()
+                    live = conn.execute(f"SELECT m.session_id,m.seq,m.role,m.content,m.created_at,m.trace_id FROM agent_session_context_messages m WHERE m.session_id=? AND m.seq=? AND {live_eligibility}", (sid, seq, *live_params)).fetchone()
                     vector = conn.execute("SELECT source_hash FROM conversation_semantic_vectors WHERE session_id=? AND seq=? AND fingerprint=?", (sid, seq, self._fingerprint)).fetchone()
                     if live is None or vector is None or self._hash(live) != vector["source_hash"]:
                         continue

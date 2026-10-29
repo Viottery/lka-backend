@@ -66,6 +66,34 @@ def test_cold_search_schedules_bounded_jobs_then_serves_semantic_source(tmp_path
     assert provider.passages == 4
 
 
+def test_semantic_index_discovers_report_published_after_its_watermark(tmp_path):
+    _history, indexer, _worker, _provider, context, factory = setup_index(tmp_path)
+    with factory() as conn:
+        conn.execute(
+            "INSERT INTO agent_session_context_messages VALUES(?,?,?,?,?,?)",
+            (context.session_id, 5, "tool", "silent tool payload", "now", "three"),
+        )
+        conn.execute(
+            "INSERT INTO agent_session_context_messages VALUES(?,?,?,?,?,?)",
+            (context.session_id, 6, "agent", "automobile published report", "now", "three"),
+        )
+    while indexer.index.sync_batch(context.session_id).get("pending"):
+        pass
+    with factory() as conn:
+        conn.execute(
+            "INSERT INTO agent_session_messages(message_id,session_id,role,content,payload,created_at) "
+            "VALUES('report',?,'assistant','automobile published report',?,'now')",
+            (context.session_id, '{"trace_id":"three"}'),
+        )
+    for _ in range(8):
+        status = indexer.index.sync_batch(context.session_id)
+        if not status.get("pending"):
+            break
+    result = indexer.index.search(context.session_id, "automobile")
+    assert 6 in [item["seq"] for item in result["messages"]]
+    assert 5 not in [item["seq"] for item in result["messages"]]
+
+
 def test_semantic_results_are_revalidated_before_source_delivery(tmp_path):
     history, _, _, _, context, factory = setup_index(tmp_path)
     history.search(context, query="automobile")

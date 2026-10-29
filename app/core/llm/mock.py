@@ -92,6 +92,10 @@ def _mock_response(
     default_model: str,
 ) -> LLMResponse:
     content = '{"matters":[]}' if request.require_json else "Mock LLM response."
+    if request.metadata.get("stage") == "answer_review":
+        # Offline mock transport only; this is not a semantic-quality verdict.
+        content = ('{"faithful":true,"hallucination_free":true,"request_aligned":true,'
+                   '"decision":"pass","issues":[],"revision_instructions":"","evidence_gap":""}')
     return LLMResponse(
         provider=provider_name,
         client_name=client_name,

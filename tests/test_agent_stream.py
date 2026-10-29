@@ -224,17 +224,9 @@ def test_agent_turn_stream_emits_provider_token_delta_events(tmp_path, monkeypat
         for frame in delta_frames
         if frame["data"]["payload"]["content_role"] == "final_answer"
     ]
-    assert [frame["data"]["payload"]["delta"] for frame in answer_delta_frames] == [
-        "流式",
-        "回答",
-    ]
-    assert all(
-        frame["data"]["payload"]["display_target"] == "assistant_answer"
-        for frame in answer_delta_frames
-    )
-    assert answer_delta_frames[-1]["data"]["payload"]["content_snapshot"] == "流式回答"
+    assert answer_delta_frames == []  # Draft tokens cannot precede content review.
     assert {frame["data"]["payload"]["content_role"] for frame in delta_frames}.issuperset(
-        {"route_decision", "agent_decision", "final_answer"}
+        {"route_decision", "agent_decision"}
     )
     assert all(
         frame["data"]["payload"]["display_target"] == "agent_process"
@@ -250,9 +242,10 @@ def test_agent_turn_stream_emits_provider_token_delta_events(tmp_path, monkeypat
     final_answer = next(frame for frame in frames if frame["event"] == "final_answer")
     assert final_answer["data"]["stream_part"] == "final_answer"
     assert "流式回答" in final_answer["data"]["message"]
-    first_answer_delta_index = frames.index(answer_delta_frames[0])
     final_answer_index = frames.index(final_answer)
-    assert first_answer_delta_index < final_answer_index
+    reviewed = next(frame for frame in frames if frame["event"] == "answer_review_completed")
+    assert reviewed["data"]["payload"]["decision"] == "pass"
+    assert frames.index(reviewed) < final_answer_index
 
 
 def test_agent_turn_stream_defaults_llm_options_without_response_mode_to_stream(
@@ -302,12 +295,10 @@ def test_agent_turn_stream_defaults_llm_options_without_response_mode_to_stream(
         if frame["event"] == "llm_delta"
         and frame["data"]["payload"]["display_target"] == "assistant_answer"
     ]
-    assert [frame["data"]["payload"]["delta"] for frame in answer_delta_frames] == [
-        "流式",
-        "回答",
-    ]
+    assert answer_delta_frames == []
     final_answer = next(frame for frame in frames if frame["event"] == "final_answer")
-    assert frames.index(answer_delta_frames[0]) < frames.index(final_answer)
+    reviewed = next(frame for frame in frames if frame["event"] == "answer_review_completed")
+    assert frames.index(reviewed) < frames.index(final_answer)
 
 
 def test_agent_turn_stream_endpoint_is_registered_without_changing_turn(tmp_path, monkeypatch):
@@ -973,6 +964,7 @@ class _StreamingAnswerLLM:
         client_name: str | None = None,
         model: str | None = None,
         response_mode=None,
+        reasoning_effort=None,
         require_json: bool = False,
         metadata: dict | None = None,
     ) -> LLMResponse:
@@ -1022,6 +1014,10 @@ class _StreamingAnswerLLM:
         )
 
     def _content_for_prompts(self, *, system_prompt: str, user_prompt: str) -> str:
+        if "Review the current draft answer" in system_prompt:
+            return json.dumps({"faithful": True, "hallucination_free": True,
+                "request_aligned": True, "decision": "pass", "issues": [],
+                "revision_instructions": "", "evidence_gap": ""})
         if "Choose at most one tool package" in system_prompt:
             return (
                 '{"selected_package":"mail","reason":"test route",'

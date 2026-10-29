@@ -494,8 +494,8 @@ def test_three_concurrent_tiny_audits_deliver_through_real_child_graph_under_32k
 
 
 def test_byte_upper_bound_soft_finish_is_partial_with_exact_reads_and_unknowns(tmp_path):
-    # Compact transport can now deliver four sources within the same 32k cap.
-    # A fifth source keeps this an actual pressure/unknown scenario.
+    # The unchanged 32k quota must cover both the writer and content reviewer.
+    # Conservative byte counting now leaves room for one source and honest gaps.
     _run_tiny_audits(tmp_path, counter=PromptTokenCounter(), source_count=5)
 
 
@@ -563,7 +563,7 @@ def _run_tiny_audits(tmp_path, *, counter, source_count):
                 results = [
                     o for o in payload["observations"] if o.get("tool_name") == "evidence.read"
                 ]
-                expected_reads = source_count - 1 if counter.count_text("").conservative else source_count
+                expected_reads = 1 if counter.count_text("").conservative else source_count
                 assert len(results) == expected_reads
                 assert [o["result"]["output"]["text"] for o in results] == [
                     f"Source {index}: fact {index}.\n" for index in range(expected_reads)
@@ -571,8 +571,14 @@ def _run_tiny_audits(tmp_path, *, counter, source_count):
                 content = "Cited source findings: " + ", ".join(
                     f"fact {index}" for index in range(expected_reads)) + "."
                 if len(results) < source_count:
-                    content += f" Unknown/unread: fact {expected_reads}."
+                    content += " Unknown/unread: " + ", ".join(
+                        f"fact {index}" for index in range(expected_reads, source_count)) + "."
                 content += " No independent verification claimed."
+            elif kwargs["metadata"]["stage"] == "answer_review":
+                assert "Cited source findings:" in payload["draft_answer"]
+                content = json.dumps({"faithful": True, "hallucination_free": True,
+                    "request_aligned": True, "decision": "pass", "issues": [],
+                    "revision_instructions": "", "evidence_gap": ""})
             else:
                 raise AssertionError(f"Unexpected model stage: {kwargs['metadata']['stage']}")
             input_tokens = counter.count_request(
@@ -597,8 +603,8 @@ def _run_tiny_audits(tmp_path, *, counter, source_count):
     loop.llm_client = ScriptedModel()
     # The deterministic provider and prompt fitter use the exact same units.
     # A byte upper bound remains a distinct conservative-pressure scenario.
-    loop._prompt_counters[None] = counter
-    loop._selected_session_counter = lambda: counter
+    loop._counter_for_tokenizer = lambda *args, **kwargs: counter
+    loop._selected_session_counter = lambda stage=None: counter
     manager = runtime.agent_run_manager
     parent = manager.create_run(session_id="parent", user_input="Three independent audits.")
     manager.mark_running(parent.run_id)
@@ -668,15 +674,15 @@ def _run_tiny_audits(tmp_path, *, counter, source_count):
             assert result.missing_requirements == ("child_budget_finish",)
             assert len(finishes) == 1
             assert finishes[0].payload["control_output_allowance"] < 256
-            assert "fact 3" in result.summary
-            assert "Unknown/unread: fact 4." in result.summary
+            assert "Cited source findings: fact 0." in result.summary
+            assert "Unknown/unread: fact 1, fact 2, fact 3, fact 4." in result.summary
         else:
             assert result.status.value == "completed", result.failure
             assert result.missing_requirements == ()
             assert finishes == []
             assert sum(e.stage == "decision" and e.type == "llm_completed" for e in events) == 4
             assert "Unknown/unread" not in result.summary
-        assert "fact 2" in result.summary
+            assert "fact 2" in result.summary
         assert result.verification is None
         assert manager.get_run(child.run_id).metadata["context_snapshot"]["budget"]["max_tokens"] == 32768
         assert (
@@ -684,7 +690,7 @@ def _run_tiny_audits(tmp_path, *, counter, source_count):
             < 32768
         )
         assert sum(e.type == "tool_completed" for e in events) == (
-            source_count - 1 if counter.count_text("").conservative else source_count
+            1 if counter.count_text("").conservative else source_count
         )
         for event in events:
             if event.type == "llm_completed":

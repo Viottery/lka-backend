@@ -57,6 +57,7 @@ class PromptBudgeter:
     def fit(
         self, *, system_prompt: str, user_prompt: str, input_limit: int,
         tools: list[Any] | None = None, output_reserve_tokens: int | None = None,
+        preserve_observations: bool = False,
     ) -> BudgetedPrompt:
         if input_limit < 1:
             raise ValueError("input_limit must be positive")
@@ -114,7 +115,7 @@ class PromptBudgeter:
         observations = payload.get("observations")
         # Shrink child reports before sacrificing context for them. Never
         # replace a small verdict with a larger synthetic envelope.
-        if isinstance(observations, list):
+        if isinstance(observations, list) and not preserve_observations:
             for index, item in enumerate(observations):
                 if counted.count <= input_limit:
                     break
@@ -180,7 +181,8 @@ class PromptBudgeter:
                         kept.append(resource)
                 recount()
 
-        trim_observations(keep_recent=True)
+        if not preserve_observations:
+            trim_observations(keep_recent=True)
 
         window = payload.get("session_context_window")
         if isinstance(window, dict):
@@ -253,7 +255,8 @@ class PromptBudgeter:
         # Recent evidence has priority over old context/memory previews, but
         # never enlarges the verified input budget. Preserve handles and mark
         # omissions when even this bounded working view cannot fit.
-        trim_observations(keep_recent=False)
+        if not preserve_observations:
+            trim_observations(keep_recent=False)
 
         if counted.count > input_limit:
             raise PromptBudgetExceeded(

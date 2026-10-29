@@ -48,6 +48,15 @@ from app.core.answer_evidence import (
     build_answer_working_set,
     normalize_answer_checks,
 )
+from app.core.answer_review import (
+    ANSWER_REVIEW_SCHEMA,
+    DEGRADED_ANSWER_INSTRUCTION,
+    DEGRADED_REVIEW_INSTRUCTION,
+    DEGRADED_STATUS_NOTICE,
+    REVIEW_SYSTEM_PROMPT,
+    REWORK_SYSTEM_INSTRUCTION,
+    parse_answer_review,
+)
 from app.core.context_driver import ToolView
 from app.core.context_manifest import build_context_manifest
 from app.core.llm import (
@@ -600,6 +609,15 @@ _turn_input_content: ContextVar[tuple[str, tuple[str, ...]] | None] = ContextVar
 _control_generation_attempt: ContextVar[dict[str, Any] | None] = ContextVar(
     "control_generation_attempt", default=None,
 )
+_private_answer_generation: ContextVar[bool] = ContextVar("private_answer_generation", default=False)
+
+
+class AnswerReworkRequired(Exception):
+    """Return a rejected draft's evidence gap to the existing Agent loop."""
+
+    def __init__(self, feedback: dict[str, Any]) -> None:
+        super().__init__("The answer requires additional authorized work before publication.")
+        self.feedback = feedback
 
 
 class AgentTurnLoop:
@@ -619,6 +637,8 @@ class AgentTurnLoop:
         llm_max_attempts: int = 2,
         answer_timeout_seconds: float = 60,
         answer_timeout_fallback_enabled: bool = True,
+        answer_review_enabled: bool = False,
+        answer_review_max_reworks: int = 2,
         run_manager: InMemoryAgentRunManager | None = None,
         safety_review_mode: SafetyReviewMode | str = SafetyReviewMode.SKIP,
         safety_manual_wait_poll_seconds: float = 0.5,
@@ -656,6 +676,12 @@ class AgentTurnLoop:
         self.llm_max_attempts = llm_max_attempts
         self.answer_timeout_seconds = answer_timeout_seconds
         self.answer_timeout_fallback_enabled = answer_timeout_fallback_enabled
+        # Product runtime explicitly enables this by default through AgentConfig.
+        # Direct low-level adapters retain their existing constructor behavior.
+        self.answer_review_enabled = answer_review_enabled
+        if type(answer_review_max_reworks) is not int or not 0 <= answer_review_max_reworks <= 5:
+            raise ValueError("answer_review_max_reworks must be in 0..5")
+        self.answer_review_max_reworks = answer_review_max_reworks
         self.default_rate_limit_wait_seconds = 1.0
         self.max_decision_steps = max(1, int(max_decision_steps))
         self.decision_format_max_attempts = 2
@@ -1097,6 +1123,8 @@ class AgentTurnLoop:
         return remaining
 
     def _stage_reasoning_selection(self, stage: str) -> tuple[str | None, str]:
+        if stage == "answer_review":
+            return "low", "answer_review"
         level, source = self._reasoning_selection()
         if stage not in {"answer", "context_answer"}:
             return level, source
@@ -1171,7 +1199,7 @@ class AgentTurnLoop:
         # Repair can reinterpret an ambiguous operation; keep the business
         # level unless its caller supplies a separate pure-format utility task.
         policy = ("utility" if stage == "route" else "safety" if stage == "safety_review"
-                  else "internal" if stage in {"tool_result_check", "context_summarize"} else "user")
+                  else "internal" if stage in {"tool_result_check", "context_summarize", "answer_review"} else "user")
         if stage in {"answer", "context_answer"}:
             publication = self._answer_publication()
             notification = publication.get("notification") or {}
@@ -1351,12 +1379,22 @@ class AgentTurnLoop:
                 selected_package=selected_package,
             )
         else:
-            answer = self._answer_from_context_with_llm(
-                user_input=user_input,
-                route=route,
-                context_window=context_window_payload,
-                llm_events=llm_events,
-            )
+            try:
+                answer = self._answer_from_context_with_llm(
+                    user_input=user_input,
+                    route=route,
+                    context_window=context_window_payload,
+                    llm_events=llm_events,
+                )
+            except AnswerReworkRequired as exc:
+                answer = self._run_package_tools(
+                    user_input=user_input, route={**route, "entry_mode": "unified"},
+                    context_window=context_window_payload, context=context,
+                    tool_events=tool_events, llm_events=llm_events,
+                    decision_events=decision_events, progress_events=progress_events,
+                    expanded_tools=expanded_tools, selected_package=None,
+                    initial_observations=[exc.feedback],
+                )
             if answer:
                 self._record_decision(
                     decision_events,
@@ -1381,6 +1419,33 @@ class AgentTurnLoop:
                 )
 
         self._raise_if_cancel_requested()
+        while True:
+            evidence = [{"tool_name": e.tool_name, "input": e.input, "result": e.result,
+                         "feedback": e.feedback} for e in tool_events]
+            try:
+                answer = self._ensure_reviewed_answer(
+                    answer=answer, user_input=user_input, context_window=context_window_payload,
+                    observations=evidence, llm_events=llm_events,
+                )
+                break
+            except AnswerReworkRequired as exc:
+                consumed = sum(e.action not in {"route", "answer"} for e in decision_events)
+                if consumed >= self.max_decision_steps or self._decision_deadline_reached():
+                    answer = self._ensure_reviewed_answer(
+                        answer="", user_input=user_input, context_window=context_window_payload,
+                        observations=[*evidence, exc.feedback], llm_events=llm_events,
+                        force_degraded=True,
+                    )
+                    break
+                answer = self._run_package_tools(
+                    user_input=user_input, route={**route, "entry_mode": "unified"},
+                    context_window=context_window_payload, context=context,
+                    tool_events=tool_events, llm_events=llm_events,
+                    decision_events=decision_events, progress_events=progress_events,
+                    expanded_tools=expanded_tools, selected_package=selected_package,
+                    initial_observations=[*evidence, exc.feedback],
+                )
+        self._record_degraded_answer(progress_events)
         self._append_progress(
             progress_events,
             type="final_answer",
@@ -1651,20 +1716,39 @@ class AgentTurnLoop:
         progress_events: list[AgentTurnProgressEvent],
         expanded_tools: list[dict[str, Any]],
         selected_package: str | None,
+        initial_observations: list[dict[str, Any]] | None = None,
     ) -> str:
         if self.llm_client is not None:
-            answer = self._run_llm_decision_loop(
-                user_input=user_input,
-                route=route,
-                context_window=context_window,
-                context=context,
-                tool_events=tool_events,
-                llm_events=llm_events,
-                decision_events=decision_events,
-                progress_events=progress_events,
-                expanded_tools=expanded_tools,
-                selected_package=selected_package,
-            )
+            while True:
+                try:
+                    answer = self._run_llm_decision_loop(
+                        user_input=user_input,
+                        route=route,
+                        context_window=context_window,
+                        context=context,
+                        tool_events=tool_events,
+                        llm_events=llm_events,
+                        decision_events=decision_events,
+                        progress_events=progress_events,
+                        expanded_tools=expanded_tools,
+                        selected_package=selected_package,
+                        initial_observations=initial_observations,
+                    )
+                    break
+                except AnswerReworkRequired as exc:
+                    consumed = sum(e.action not in {"route", "answer"} for e in decision_events)
+                    if consumed >= self.max_decision_steps or self._decision_deadline_reached():
+                        return self._ensure_reviewed_answer(
+                            answer="", user_input=user_input, context_window=context_window,
+                            observations=[
+                                {"tool_name": e.tool_name, "input": e.input, "result": e.result, "feedback": e.feedback}
+                                for e in tool_events
+                            ] + [exc.feedback], llm_events=llm_events, force_degraded=True,
+                        )
+                    initial_observations = [
+                        {"tool_name": e.tool_name, "input": e.input, "result": e.result, "feedback": e.feedback}
+                        for e in tool_events
+                    ] + [exc.feedback]
             if answer:
                 return answer
         answer = (
@@ -1695,9 +1779,16 @@ class AgentTurnLoop:
         progress_events: list[AgentTurnProgressEvent],
         expanded_tools: list[dict[str, Any]],
         selected_package: str | None,
+        initial_observations: list[dict[str, Any]] | None = None,
     ) -> str | None:
-        observations: list[dict[str, Any]] = []
+        observations: list[dict[str, Any]] = list(initial_observations or [])
         successful_call_fingerprints: set[str] = set()
+        for event in tool_events:
+            if event.result.get("status") != "completed":
+                continue
+            if self._completed_tool_call_changes_state(tool_name=event.tool_name, tool_input=event.input):
+                successful_call_fingerprints.clear()
+            successful_call_fingerprints.add(self._tool_call_fingerprint(tool_name=event.tool_name, tool_input=event.input))
         fork_format_repair_used = False
         completion_state = TaskCompletionState()
         working_state = TaskProgressState()
@@ -1707,7 +1798,8 @@ class AgentTurnLoop:
         allowed_tool_names = {
             str(tool.get("name")) for tool in expanded_tools if isinstance(tool.get("name"), str)
         }
-        for step_index in range(1, self.max_decision_steps + 1):
+        step_offset = sum(event.action not in {"route", "answer"} for event in decision_events)
+        for step_index in range(step_offset + 1, self.max_decision_steps + 1):
             if self._decision_deadline_reached():
                 self._record_incomplete(progress_events, "execution_deadline")
                 break
@@ -1768,7 +1860,7 @@ class AgentTurnLoop:
                 if isinstance(decision.get("assistant_message"), str)
                 else None
             )
-            if assistant_message:
+            if assistant_message and not (self.answer_review_enabled and action == "final_answer"):
                 self._append_progress(
                     progress_events,
                     type="assistant_message",
@@ -1877,14 +1969,18 @@ class AgentTurnLoop:
                     continue
                 decision = {**decision, "_task_completion": completion_state.context(),
                             "_task_working_state": working_state.context()}
-                return self._answer_with_llm(
-                    user_input=user_input,
-                    route=route,
-                    context_window=context_window,
-                    observations=observations,
-                    final_decision=decision,
-                    llm_events=llm_events,
-                )
+                try:
+                    return self._answer_with_llm(
+                        user_input=user_input,
+                        route=route,
+                        context_window=context_window,
+                        observations=observations,
+                        final_decision=decision,
+                        llm_events=llm_events,
+                    )
+                except AnswerReworkRequired as exc:
+                    observations.append(exc.feedback)
+                    continue
 
             if action == "malformed_tool_call":
                 self._record_incomplete(progress_events, "decision_protocol_invalid")
@@ -1991,7 +2087,14 @@ class AgentTurnLoop:
                 continue
 
             if action in {"request_confirmation", "no_op"}:
-                return self._control_stop_answer(decision)
+                try:
+                    return self._ensure_reviewed_answer(
+                        answer=self._control_stop_answer(decision), user_input=user_input,
+                        context_window=context_window, observations=observations, llm_events=llm_events,
+                    )
+                except AnswerReworkRequired as exc:
+                    observations.append(exc.feedback)
+                    continue
 
             if action != "call_tool":
                 self._record_incomplete(progress_events, "decision_protocol_invalid")
@@ -2132,8 +2235,9 @@ class AgentTurnLoop:
         budget_finish = any(item.get("action") == "child_budget_finish" for item in observations)
         child_budget = self._child_budget_for_prompt()
         if child_budget and child_budget.get("remaining_llm_calls") is not None:
-            can_continue = can_continue and child_budget["remaining_llm_calls"] > 1
-            budget_finish = budget_finish or child_budget["remaining_llm_calls"] <= 1
+            finish_calls = 2 if self.answer_review_enabled else 1
+            can_continue = can_continue and child_budget["remaining_llm_calls"] > finish_calls
+            budget_finish = budget_finish or child_budget["remaining_llm_calls"] <= finish_calls
         ready = assess_finish(
             state, operation=decision.get("operation"), observations=observations,
             can_continue=can_continue and not budget_finish,
@@ -2189,6 +2293,12 @@ class AgentTurnLoop:
             progress_events, type="task_incomplete", stage="decision", status="partial",
             message="Execution stopped with unfinished work.", metadata={"stop_reason": reason},
         )
+
+    def _record_degraded_answer(self, progress_events: list[AgentTurnProgressEvent]) -> None:
+        manager, run_id = _turn_run_manager.get(), _turn_run_id.get()
+        run = manager.get_run(run_id) if manager is not None and run_id else None
+        if run is not None and run.metadata.get("answer_review_degraded"):
+            self._record_incomplete(progress_events, "answer_review_degraded")
 
     def _update_task_progress(
         self, state: TaskProgressState, decision: dict[str, Any],
@@ -6837,6 +6947,9 @@ class AgentTurnLoop:
         persist: bool = True,
     ) -> None:
         metadata = dict(metadata or {})
+        if type == "final_answer" and self.answer_review_enabled:
+            self._raise_if_cancel_requested()
+            self._verify_final_answer(answer=metadata.get("answer", message), tool_events=[])
         if type in {"final_answer", "assistant_message"}:
             metadata.update(self._answer_publication(pending=type == "assistant_message"))
         progress_events.append(
@@ -6895,11 +7008,13 @@ class AgentTurnLoop:
         answer: str,
         tool_events: list[AgentTurnToolEvent],
     ) -> list[AgentTurnVerificationWarning]:
-        successful_tools = {
-            event.tool_name for event in tool_events if event.result.get("status") == "completed"
-        }
+        """Bind publication to the exact text approved by the reasoning reviewer."""
         warnings: list[AgentTurnVerificationWarning] = []
-        _ = (answer, successful_tools)
+        manager, run_id = _turn_run_manager.get(), _turn_run_id.get()
+        run = manager.get_run(run_id) if manager is not None and run_id else None
+        if (getattr(self, "answer_review_enabled", False) and run is not None
+                and run.metadata.get("answer_review_approved_hash") != sha256(answer.strip().encode()).hexdigest()):
+            raise LLMResourceError("Final answer has no matching review approval.", error_category="answer_review_unapproved")
         return warnings
 
     def _local_tool_feedback(
@@ -7198,7 +7313,7 @@ class AgentTurnLoop:
                 "Do not print internal notes or counters."
             )
         user_prompt = serialize_prompt_payload(answer_payload)
-        response = self._complete_answer_with_recovery(
+        response = self._complete_answer_with_review(
             stage="answer",
             system_prompt=system_prompt,
             user_prompt=user_prompt,
@@ -7221,7 +7336,220 @@ class AgentTurnLoop:
                     stage="answer",
                     payload={"validation_error": validation_error},
                 )
+                if self.answer_review_enabled:
+                    raise LLMResourceError("Final answer failed its output schema.", error_category="answer_contract_invalid")
                 return "Structured answer did not satisfy the assigned output schema; no validated result is available."
+        return response.content
+
+    def _complete_answer_with_review(
+        self, *, stage: str, system_prompt: str, user_prompt: str,
+        prompt_summary: str, llm_events: list[AgentTurnLLMEvent],
+        initial_response: LLMResponse | None = None,
+        force_degraded: bool = False,
+    ) -> LLMResponse:
+        """Keep drafts private until the reasoning model approves the exact text."""
+        if not self.answer_review_enabled:
+            return self._complete_answer_with_recovery(
+                stage=stage, system_prompt=system_prompt, user_prompt=user_prompt,
+                prompt_summary=prompt_summary, llm_events=llm_events,
+            )
+        original = json.loads(user_prompt)
+        current_prompt, current_system = user_prompt, system_prompt
+        manager, run_id = _turn_run_manager.get(), _turn_run_id.get()
+        run = manager.get_run(run_id) if manager is not None and run_id else None
+        reworks = int(run.metadata.get("answer_review_reworks", 0)) if run is not None else 0
+        degraded = force_degraded or bool(run and run.metadata.get("answer_review_degraded"))
+        degradation_attempted = bool(run and run.metadata.get("answer_degradation_attempted"))
+        degradation_reason = "answer_review_rework_exhausted"
+        if degraded:
+            current_system = system_prompt + "\n" + DEGRADED_ANSWER_INSTRUCTION
+            current_prompt = serialize_prompt_payload({**original, "answer_degradation": {"required": True}})
+        while True:
+            self._raise_if_cancel_requested()
+            child_budget = self._child_budget_for_prompt()
+            if (initial_response is None and child_budget is not None
+                    and child_budget.get("remaining_llm_calls") is not None
+                    and child_budget["remaining_llm_calls"] < 2):
+                return self._answer_degradation_notice(reworks, "answer_review_budget_exhausted")
+            if degraded and degradation_attempted:
+                return self._answer_degradation_notice(reworks, "answer_degradation_attempt_used")
+            if run is not None:
+                latest = manager.get_run(run_id)
+                manager._update_run(run_id, status=latest.status, metadata_patch={
+                    "answer_review_required": True, "answer_review_approved_hash": None,
+                })
+            if degraded:
+                degradation_attempted = True
+                if run is not None:
+                    latest = manager.get_run(run_id)
+                    manager._update_run(run_id, status=latest.status, metadata_patch={
+                        "answer_review_degraded": True, "answer_degradation_attempted": True,
+                    })
+                self._append_run_event(type="answer_degradation_started", stage="answer",
+                    message="Preparing a reduced answer from existing results with explicit incompleteness.",
+                    payload={"reason": degradation_reason})
+            failure = None
+            private_token = _private_answer_generation.set(True)
+            mode_token = _turn_llm_response_mode.set(LLMResponseMode.TEXT)
+            try:
+                response = initial_response
+                initial_response = None
+                if response is None:
+                    if degraded:
+                        response = self._complete_text_with_retry(
+                            stage=stage, system_prompt=current_system, user_prompt=current_prompt,
+                            prompt_summary="final_answer_degraded_delivery", llm_events=llm_events,
+                            max_output_tokens=2048, max_attempts=1,
+                        )
+                        if (response is None or response.status != "completed" or response.partial
+                                or str(response.finish_reason or "").lower() in {"length", "max_tokens", "partial", "content_filter"}):
+                            raise LLMResourceError("Degraded answer generation did not complete.",
+                                                   error_category="answer_degradation_unavailable")
+                    else:
+                        response = self._complete_answer_with_recovery(
+                            stage=stage, system_prompt=current_system, user_prompt=current_prompt,
+                            prompt_summary=prompt_summary, llm_events=llm_events,
+                        )
+                self._raise_if_cancel_requested()
+                review_payload = {**original, "draft_answer": response.content,
+                                  "review_output_schema": ANSWER_REVIEW_SCHEMA}
+                if degraded:
+                    review_payload["answer_degradation"] = {"required": True, "must_disclose_incompleteness": True}
+                self._append_run_event(type="answer_review_started", stage="answer_review",
+                                       message="Checking the draft against evidence and the user's request.")
+                checked = self._complete_text_with_retry(
+                    stage="answer_review", system_prompt=REVIEW_SYSTEM_PROMPT + ("\n" + DEGRADED_REVIEW_INSTRUCTION if degraded else ""),
+                    user_prompt=serialize_prompt_payload(review_payload),
+                    prompt_summary="final_answer_content_review",
+                    max_output_tokens=2048, llm_events=llm_events, max_attempts=1,
+                )
+                self._raise_if_cancel_requested()
+                if (checked is None or checked.status != "completed" or checked.partial
+                        or str(checked.finish_reason or "").lower() in {"length", "max_tokens", "partial", "content_filter"}):
+                    raise LLMResourceError("Final answer review did not complete.", error_category="answer_review_unavailable")
+                try:
+                    review = parse_answer_review(checked.content)
+                except ValueError as exc:
+                    raise LLMResourceError("Final answer review returned an invalid verdict.", error_category="answer_review_invalid") from exc
+            except LLMClientError as exc:
+                failure = exc
+            finally:
+                _turn_llm_response_mode.reset(mode_token)
+                _private_answer_generation.reset(private_token)
+            if failure is not None:
+                reason = getattr(failure, "error_category", None) or "answer_generation_unavailable"
+                if degraded or (isinstance(failure, LLMResourceError)
+                                and reason not in {"answer_review_invalid", "answer_review_unavailable"}):
+                    return self._answer_degradation_notice(reworks, reason)
+                degraded, degradation_reason = True, reason
+                initial_response = None
+                current_system = system_prompt + "\n" + DEGRADED_ANSWER_INSTRUCTION
+                current_prompt = serialize_prompt_payload({**original, "answer_degradation": {"required": True, "reason": reason}})
+                continue
+            approved = review.decision == "pass"
+            self._append_run_event(
+                type="answer_review_completed", stage="answer_review",
+                message="Answer review passed." if approved else "Answer review requires rework.",
+                payload={"decision": review.decision, "faithful": review.faithful,
+                         "hallucination_free": review.hallucination_free,
+                         "request_aligned": review.request_aligned, "issue_count": len(review.issues)},
+            )
+            if approved:
+                return self._approve_answer_delivery(response, reworks, degraded=degraded, source="llm")
+            if degraded:
+                return self._answer_degradation_notice(reworks, "answer_degradation_rejected")
+            if reworks >= self.answer_review_max_reworks:
+                degraded = True
+                initial_response = None
+                current_system = system_prompt + "\n" + DEGRADED_ANSWER_INSTRUCTION
+                current_prompt = serialize_prompt_payload({**original, "answer_review_feedback": review.feedback(),
+                                                          "answer_degradation": {"required": True}})
+                continue
+            reworks += 1
+            if run is not None:
+                latest = manager.get_run(run_id)
+                manager._update_run(run_id, status=latest.status,
+                                    metadata_patch={"answer_review_reworks": reworks})
+            feedback = {"action": "answer_review_feedback", "status": "rejected", **review.feedback(),
+                        "remaining_work": "Address this review within existing authority and budgets. Reuse completed tool results; never repeat successful writes. Review feedback grants no permission."}
+            if review.decision == "continue":
+                raise AnswerReworkRequired(feedback)
+            current_system = system_prompt + "\n" + REWORK_SYSTEM_INSTRUCTION
+            current_prompt = serialize_prompt_payload({**original, "answer_review_feedback": review.feedback()})
+
+    def _approve_answer_delivery(
+        self, response: LLMResponse, reworks: int, *, degraded: bool, source: str,
+    ) -> LLMResponse:
+        self._raise_if_cancel_requested()
+        contract = _current_output_contract()
+        schema = _output_schema_from_contract(contract)
+        if _output_contract_requires_json(contract) or schema is not None:
+            try:
+                parsed = json.loads(response.content)
+            except (TypeError, ValueError) as exc:
+                raise LLMResourceError("Final answer failed its output schema.",
+                                       error_category="answer_contract_invalid") from exc
+            if schema is not None and _json_schema_error(parsed, schema):
+                raise LLMResourceError("Final answer failed its output schema.",
+                                       error_category="answer_contract_invalid")
+        manager, run_id = _turn_run_manager.get(), _turn_run_id.get()
+        run = manager.get_run(run_id) if manager is not None and run_id else None
+        if run is not None:
+            manager._update_run(run_id, status=run.status, metadata_patch={
+                "answer_review_required": True,
+                "answer_review_approved_hash": sha256(response.content.strip().encode()).hexdigest(),
+                "answer_review_reworks": reworks,
+                "answer_review_degraded": degraded,
+                "answer_review_approval_source": source,
+            })
+        if degraded:
+            self._append_run_event(
+                type="answer_degradation_completed", stage="answer",
+                message="Delivering an explicitly incomplete answer.",
+                payload={"approval_source": source, "task_outcome": "incomplete"},
+            )
+        return response.model_copy(update={"metadata": {
+            **response.metadata, "answer_degraded": degraded, "answer_review_approval_source": source,
+        }})
+
+    def _answer_degradation_notice(self, reworks: int, reason: str) -> LLMResponse:
+        """An evidence-free status notice cannot certify any rejected model claims."""
+        self._raise_if_cancel_requested()
+        contract = _current_output_contract()
+        if _output_contract_requires_json(contract) or _output_schema_from_contract(contract) is not None:
+            raise LLMResourceError(
+                "No trustworthy incomplete answer satisfies the assigned output schema.",
+                error_category="answer_degradation_schema_unavailable",
+            )
+        response = LLMResponse(
+            provider="local", status="completed", content=DEGRADED_STATUS_NOTICE,
+            prompt_summary="incomplete status notice",
+            metadata={"answer_degradation_reason": reason},
+        )
+        return self._approve_answer_delivery(response, reworks, degraded=True, source="system_status_notice")
+
+    def _ensure_reviewed_answer(
+        self, *, answer: str, user_input: str, context_window: dict[str, Any],
+        observations: list[dict[str, Any]], llm_events: list[AgentTurnLLMEvent],
+        force_degraded: bool = False,
+    ) -> str:
+        """Gate local/control fallbacks too; reuse an approval only for exact text."""
+        if not self.answer_review_enabled:
+            return answer
+        manager, run_id = _turn_run_manager.get(), _turn_run_id.get()
+        run = manager.get_run(run_id) if manager is not None and run_id else None
+        if not force_degraded and run is not None and run.metadata.get("answer_review_approved_hash") == sha256(answer.strip().encode()).hexdigest():
+            return answer
+        response = self._complete_answer_with_review(
+            stage="answer", system_prompt="Answer the user's request faithfully using the supplied authorized context and observations.",
+            user_prompt=serialize_prompt_payload({"user_input": user_input,
+                "session_context_window": self._context_window_for_llm(context_window),
+                "observations": observations, "output_contract": _current_output_contract()}),
+            prompt_summary="final_answer_review_local_or_control", llm_events=llm_events,
+            initial_response=None if force_degraded else LLMResponse(
+                provider="local", status="completed", content=answer, prompt_summary="local or control answer"),
+            force_degraded=force_degraded,
+        )
         return response.content
 
     def _complete_answer_with_recovery(
@@ -7372,7 +7700,7 @@ class AgentTurnLoop:
                 "session_context_window": self._context_window_for_llm(context_window),
             },
         )
-        response = self._complete_answer_with_recovery(
+        response = self._complete_answer_with_review(
             stage="context_answer",
             system_prompt=system_prompt,
             user_prompt=user_prompt,
@@ -7389,7 +7717,7 @@ class AgentTurnLoop:
         run = manager.get_run(run_id) if manager is not None and run_id else None
         if run is not None and run.parent_run_id is not None:
             return None
-        if stage not in {"route", "decision", "decision_repair", "tool_result_check", "answer", "context_answer"}:
+        if stage not in {"route", "decision", "decision_repair", "tool_result_check", "answer", "context_answer", "answer_review"}:
             return None
         return reference
 
@@ -7421,7 +7749,8 @@ class AgentTurnLoop:
 
     def _should_stream_llm_call(self) -> bool:
         return (
-            _turn_llm_response_mode.get() == LLMResponseMode.STREAM
+            not _private_answer_generation.get()
+            and _turn_llm_response_mode.get() == LLMResponseMode.STREAM
             and self.llm_client is not None
             and hasattr(self.llm_client, "stream")
         )
@@ -7790,6 +8119,7 @@ class AgentTurnLoop:
             input_limit=text_limit,
             tools=tools,
             output_reserve_tokens=output_reserve,
+            preserve_observations=stage == "answer_review" or _private_answer_generation.get(),
         )
         return replace(
             fitted, input_tokens=fitted.input_tokens + image_token_reservation, input_limit=input_limit,
@@ -8006,7 +8336,7 @@ class AgentTurnLoop:
         # Server-owned role policy is frozen per run, before routing or repairs.
         # Ordinary/child policies never infer instructions from user metadata.
         role_instructions = self._session_run_policy().role_instructions
-        if stage != "safety_review" and role_instructions and role_instructions not in system_prompt:
+        if stage not in {"safety_review", "answer_review"} and role_instructions and role_instructions not in system_prompt:
             system_prompt += "\nSession role instructions (subject to authorization and safety):\n" + role_instructions
 
         # All model stages, including answer/result-check/child/safety prompts,
@@ -8887,6 +9217,20 @@ class AgentTurnLoop:
         if run_manager is None or run_id is None:
             return
         event_payload = dict(payload or {})
+        if _private_answer_generation.get():
+            # Drafts stay in private LLM audit artifacts, not replayable SSE.
+            if type == "llm_delta":
+                return
+            audit = event_payload.pop("audit_record", None)
+            if isinstance(audit, dict):
+                event_payload["audit_record"] = {key: audit[key] for key in (
+                    "input_token_count", "output_token_count", "total_token_count",
+                ) if key in audit}
+            for field in ("delta", "content_snapshot", "output", "answer", "partial_content"):
+                event_payload.pop(field, None)
+            event_payload["display_target"] = "agent_process"
+            if stage in {"answer", "context_answer"}:
+                event_payload["content_role"] = "answer_draft"
         if type in {"assistant_message", "final_answer"}:
             event_payload.update(self._answer_publication(run_id, pending=type == "assistant_message"))
         run_manager.append_event(
@@ -9113,7 +9457,7 @@ class AgentTurnLoop:
                 "calls_by_stage": calls_by_stage,
             },
             "instruction": (
-                "Input is charged again on every call. Preserve one call plus input and "
+                f"Input is charged again on every call. Preserve {2 if self.answer_review_enabled else 1} calls plus input and "
                 "output budget for delivery. Finish once evidence suffices; if collection "
                 "stops early, report unfulfilled requirements and unknowns, never verified success."
             ),
@@ -9188,7 +9532,8 @@ class AgentTurnLoop:
         answer_input = self._child_answer_input_estimate(
             user_prompt=user_prompt, observations=observations, fallback=fitted.input_tokens,
         )
-        finish_reserve = answer_input + info["finish_output_reserve_tokens"]
+        finish_calls = 2 if self.answer_review_enabled else 1
+        finish_reserve = finish_calls * (answer_input + info["finish_output_reserve_tokens"])
         remaining, calls = info["remaining_tokens"], info["remaining_llm_calls"]
         control_allowance = (
             remaining - fitted.input_tokens - finish_reserve - 2 * info["prompt_overhead_tokens"]
@@ -9197,7 +9542,7 @@ class AgentTurnLoop:
         should_finish = (
             (control_allowance is not None
              and control_allowance < min(control_cap, CHILD_MIN_CONTROL_OUTPUT_TOKENS))
-            or (calls is not None and calls <= 1)
+            or (calls is not None and calls <= finish_calls)
         )
         if should_finish and not self._multi_agent_replan_pending():
             reason = (

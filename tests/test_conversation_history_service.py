@@ -97,6 +97,69 @@ def test_read_pagination_around_and_source_hash(history):
     assert tail["messages"][0]["content"] == "后来amberwhale的结论是保密"[5:]
 
 
+def test_published_background_report_is_searchable_and_historical_missing_rows_repaired(history):
+    service, db = history
+    context = ToolContext(session_id="s")
+    # Walk the ordinary index beyond the automatic report before publishing it.
+    result = service.search(context, query="launchnote")
+    while not result["index"]["complete"]:
+        result = service.search(context, query="launchnote")
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO agent_session_messages(message_id,session_id,role,content,payload,created_at) "
+            "VALUES('report','s','assistant','A launchnote was published.',?,'now')",
+            ('{"trace_id":"t2"}',),
+        )
+    hits = service.search(context, query="amberwhale")
+    assert [item["seq"] for item in hits["messages"]] == [5, 3, 1]
+    assert service.read(context, seq=5)["messages"][0]["content"] == "后台摘要amberwhale"
+    around = service.read(context, around_seq=5)
+    assert 5 in [item["seq"] for item in around["messages"]]
+
+    with db() as conn:
+        conn.execute(
+            "UPDATE agent_session_messages SET payload=? WHERE message_id='report'",
+            ('{"trace_id":"t2","user_visible":false}',),
+        )
+    assert [item["seq"] for item in service.search(context, query="amberwhale")["messages"]] == [3, 1]
+    with pytest.raises(KeyError):
+        service.read(context, seq=5)
+
+
+def test_historical_report_repair_stays_incomplete_until_bounded_batches_drain(history):
+    service, db = history
+    service.index_batch = 2
+    context = ToolContext(session_id="s")
+    with db() as conn:
+        for number in range(3):
+            trace = f"late-{number}"
+            seq = 20 + number * 2
+            conn.execute(
+                "INSERT INTO agent_session_context_messages VALUES(?,?,?,?,?,?)",
+                ("s", seq, "tool", "private tool data", "now", trace),
+            )
+            conn.execute(
+                "INSERT INTO agent_session_context_messages VALUES(?,?,?,?,?,?)",
+                ("s", seq + 1, "agent", f"published report {number}", "now", trace),
+            )
+    result = service.search(context, query="never-match")
+    while not result["index"]["complete"]:
+        result = service.search(context, query="never-match")
+    with db() as conn:
+        for number in range(3):
+            conn.execute(
+                "INSERT INTO agent_session_messages(message_id,session_id,role,content,payload,created_at) "
+                "VALUES(?, 's','assistant',?,?, 'now')",
+                (f"late-report-{number}", f"published report {number}", f'{{"trace_id":"late-{number}"}}'),
+            )
+    result = service.search(context, query="published")
+    assert result["index"]["indexed"] == 2
+    assert result["index"]["complete"] is False
+    while not result["index"]["complete"]:
+        result = service.search(context, query="published")
+    assert {item["seq"] for item in result["messages"]} >= {21, 23, 25}
+
+
 def test_edits_deletes_sessions_child_and_cross_session_are_rechecked(history):
     service, db = history
     context = ToolContext(session_id="s")

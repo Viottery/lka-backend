@@ -10,6 +10,8 @@ from contextlib import closing
 from threading import RLock
 from typing import Any
 
+from app.core.conversation_visibility import conversation_source_predicate
+
 
 class ConversationHistoryService:
     """Incremental lexical index and bounded source reader for one session."""
@@ -114,20 +116,15 @@ class ConversationHistoryService:
         return dict(row)
 
     @staticmethod
-    def _lane_row(conn: sqlite3.Connection, session_id: str, seq: int) -> Any:
+    def _lane_row(conn: sqlite3.Connection, session_id: str, seq: int,
+                  eligibility: tuple[str, list] | None = None) -> Any:
+        eligibility = eligibility or conversation_source_predicate(conn, session_id)
+        predicate, params = eligibility
         return conn.execute(
-            """SELECT m.session_id,m.seq,m.role,m.content,m.created_at,m.trace_id
+            f"""SELECT m.session_id,m.seq,m.role,m.content,m.created_at,m.trace_id
                FROM agent_session_context_messages m
-               WHERE m.session_id=? AND m.seq=? AND (
-                 m.role='user' OR (m.role='agent' AND m.trace_id IS NOT NULL AND EXISTS (
-                   SELECT 1 FROM agent_session_context_messages u
-                   WHERE u.session_id=m.session_id AND u.trace_id=m.trace_id AND u.role='user'
-                 ) AND NOT EXISTS (
-                   SELECT 1 FROM agent_session_context_messages t
-                   WHERE t.session_id=m.session_id AND t.trace_id=m.trace_id AND t.role='tool'
-                 ))
-               )""",
-            (session_id, seq),
+               WHERE m.session_id=? AND m.seq=? AND {predicate}""",
+            (session_id, seq, *params),
         ).fetchone()
 
     def _index(self, conn: sqlite3.Connection, session_id: str) -> dict[str, Any]:
@@ -136,6 +133,8 @@ class ConversationHistoryService:
             (session_id,),
         ).fetchone()
         watermark = int(state[0]) if state else 0
+        eligibility = conversation_source_predicate(conn, session_id)
+        predicate, eligible_params = eligibility
         dirty = conn.execute(
             "SELECT seq FROM conversation_history_dirty WHERE session_id=? ORDER BY seq LIMIT ?",
             (session_id, self.index_batch),
@@ -147,7 +146,17 @@ class ConversationHistoryService:
                WHERE session_id=? AND seq>? ORDER BY seq LIMIT ?""",
             (session_id, watermark, self.index_batch),
         ).fetchall()
-        touched = dirty_seqs | {int(row["seq"]) for row in new_rows}
+        # Published assistant reports can predate this index's watermark. Find
+        # missing eligible sources in a bounded batch on each warm refresh.
+        newly_eligible = conn.execute(
+            f"""SELECT m.seq FROM agent_session_context_messages m
+                LEFT JOIN conversation_history_fts_map x
+                  ON x.session_id=m.session_id AND x.seq=m.seq
+                WHERE m.session_id=? AND m.seq<=? AND x.seq IS NULL
+                  AND {predicate} ORDER BY m.seq LIMIT ?""",
+            (session_id, watermark, *eligible_params, self.index_batch),
+        ).fetchall()
+        touched = dirty_seqs | {int(row["seq"]) for row in new_rows} | {int(row[0]) for row in newly_eligible}
         for seq in sorted(touched):
             conn.execute(
                 "DELETE FROM conversation_history_fts WHERE rowid=(SELECT rowid FROM conversation_history_fts_map WHERE session_id=? AND seq=?)",
@@ -166,7 +175,7 @@ class ConversationHistoryService:
                    FROM agent_session_context_messages WHERE session_id=? AND seq=?""",
                 (session_id, seq),
             ).fetchone()
-            if row is None or self._lane_row(conn, session_id, seq) is None:
+            if row is None or self._lane_row(conn, session_id, seq, eligibility) is None:
                 continue
             cur = conn.execute(
                 "INSERT INTO conversation_history_fts(content) VALUES(?)",
@@ -192,10 +201,19 @@ class ConversationHistoryService:
             "SELECT seq FROM conversation_history_dirty WHERE session_id=? ORDER BY seq LIMIT 1",
             (session_id,),
         ).fetchone()
+        missing = conn.execute(
+            f"""SELECT 1 FROM agent_session_context_messages m
+                LEFT JOIN conversation_history_fts_map x
+                  ON x.session_id=m.session_id AND x.seq=m.seq
+                WHERE m.session_id=? AND m.seq<=? AND x.seq IS NULL AND {predicate}
+                LIMIT 1""",
+            (session_id, watermark, *eligible_params),
+        ).fetchone()
+        complete = watermark >= high and not pending and not missing
         return {"indexed": len(touched), "watermark": watermark,
-                "complete": watermark >= high and not pending,
+                "complete": complete,
                 "next_dirty_seq": int(pending[0]) if pending else 0,
-                "next_watermark": None if watermark >= high and not pending else watermark}
+                "next_watermark": None if complete else watermark}
 
     def _refresh_index(self, session_id: str) -> dict[str, Any]:
         """Advance the FTS index in a serialized bounded write transaction."""
@@ -219,8 +237,17 @@ class ConversationHistoryService:
                     "SELECT 1 FROM agent_session_context_messages WHERE session_id=? AND seq>? LIMIT 1",
                     (session_id, watermark),
                 ).fetchone()
+                eligibility, eligibility_params = conversation_source_predicate(conn, session_id)
+                missing = conn.execute(
+                    f"""SELECT 1 FROM agent_session_context_messages m
+                        LEFT JOIN conversation_history_fts_map x
+                          ON x.session_id=m.session_id AND x.seq=m.seq
+                        WHERE m.session_id=? AND m.seq<=? AND x.seq IS NULL AND {eligibility}
+                        LIMIT 1""",
+                    (session_id, watermark, *eligibility_params),
+                ).fetchone()
                 conn.rollback()
-                if previous is not None and not pending and not newer:
+                if previous is not None and not pending and not newer and not missing:
                     return {"indexed": 0, "watermark": watermark,
                             "complete": True, "next_watermark": None}
                 conn.execute("BEGIN IMMEDIATE")
@@ -324,27 +351,33 @@ class ConversationHistoryService:
                 "SELECT 1 FROM conversation_history_dirty WHERE session_id=? LIMIT 1",
                 (context.session_id,),
             ).fetchone()
+            predicate, eligible_params = conversation_source_predicate(conn, context.session_id)
+            eligibility = (predicate, eligible_params)
+            missing = conn.execute(
+                f"""SELECT 1 FROM agent_session_context_messages m
+                    LEFT JOIN conversation_history_fts_map x
+                      ON x.session_id=m.session_id AND x.seq=m.seq
+                    WHERE m.session_id=? AND m.seq<=? AND x.seq IS NULL AND {predicate}
+                    LIMIT 1""",
+                (context.session_id, index_state["watermark"], *eligible_params),
+            ).fetchone()
             index_state["complete"] = bool(
-                index_state["complete"] and index_state["watermark"] >= high and not pending
+                index_state["complete"] and index_state["watermark"] >= high and not pending and not missing
             )
             if query:
                 hits, incomplete = self._match(conn, context.session_id, query, limit, offset)
                 incomplete = incomplete or not index_state["complete"]
                 selected = []
                 for hit in hits:
-                    row = self._lane_row(conn, context.session_id, hit["seq"])
+                    row = self._lane_row(conn, context.session_id, hit["seq"], eligibility)
                     if row is not None and self._hash(row) == hit["source_hash"]:
                         selected.append(row)
             else:
                 selected = conn.execute(
-                    """SELECT m.session_id,m.seq,m.role,m.content,m.created_at,m.trace_id
-                       FROM agent_session_context_messages m WHERE m.session_id=? AND (
-                         m.role='user' OR (m.role='agent' AND m.trace_id IS NOT NULL AND EXISTS(
-                           SELECT 1 FROM agent_session_context_messages u WHERE u.session_id=m.session_id AND u.trace_id=m.trace_id AND u.role='user'
-                         ) AND NOT EXISTS(
-                           SELECT 1 FROM agent_session_context_messages t WHERE t.session_id=m.session_id AND t.trace_id=m.trace_id AND t.role='tool'
-                         ))) ORDER BY m.seq DESC LIMIT ? OFFSET ?""",
-                    (context.session_id, limit + 1, offset),
+                    f"""SELECT m.session_id,m.seq,m.role,m.content,m.created_at,m.trace_id
+                       FROM agent_session_context_messages m WHERE m.session_id=? AND {predicate}
+                       ORDER BY m.seq DESC LIMIT ? OFFSET ?""",
+                    (context.session_id, *eligible_params, limit + 1, offset),
                 ).fetchall()
                 incomplete = not index_state["complete"]
             more = len(selected) > limit
@@ -416,8 +449,9 @@ class ConversationHistoryService:
             conn.row_factory = sqlite3.Row
             conn.execute("BEGIN")
             self._session(conn, context.session_id)
+            eligibility = conversation_source_predicate(conn, context.session_id)
             for candidate_offset, seq in enumerate(ranked):
-                row = self._lane_row(conn, context.session_id, seq)
+                row = self._lane_row(conn, context.session_id, seq, eligibility)
                 if row is None or self._hash(row) != candidates[seq]["content_hash"]:
                     stale_candidates = True
                     continue
@@ -496,7 +530,8 @@ class ConversationHistoryService:
             conn.row_factory = sqlite3.Row
             conn.execute("BEGIN")
             self._session(conn, context.session_id)
-            target_row = self._lane_row(conn, context.session_id, target)
+            eligibility = conversation_source_predicate(conn, context.session_id)
+            target_row = self._lane_row(conn, context.session_id, target, eligibility)
             if target_row is None:
                 raise KeyError(target)
             if seq is not None:
@@ -507,25 +542,18 @@ class ConversationHistoryService:
                 anchor_trace = target_row["trace_id"]
                 if not anchor_trace:
                     raise ValueError("Selected source has no turn trace")
+                predicate, params = eligibility
                 rows = conn.execute(
-                    """SELECT m.session_id,m.seq,m.role,m.content,m.created_at,m.trace_id
+                    f"""SELECT m.session_id,m.seq,m.role,m.content,m.created_at,m.trace_id
                        FROM agent_session_context_messages m
-                       WHERE m.session_id=? AND m.trace_id=? AND m.role IN ('user','agent')
-                         AND (m.role='user' OR NOT EXISTS (
-                           SELECT 1 FROM agent_session_context_messages t
-                           WHERE t.session_id=m.session_id AND t.trace_id=m.trace_id AND t.role='tool'
-                         ))
+                       WHERE m.session_id=? AND m.trace_id=? AND {predicate}
                        ORDER BY m.seq LIMIT ? OFFSET ?""",
-                    (context.session_id, anchor_trace, limit + 1, offset),
+                    (context.session_id, anchor_trace, *params, limit + 1, offset),
                 ).fetchall()
                 count_row = conn.execute(
-                    """SELECT COUNT(*) FROM agent_session_context_messages m
-                       WHERE m.session_id=? AND m.trace_id=? AND m.role IN ('user','agent')
-                         AND (m.role='user' OR NOT EXISTS (
-                           SELECT 1 FROM agent_session_context_messages t
-                           WHERE t.session_id=m.session_id AND t.trace_id=m.trace_id AND t.role='tool'
-                         ))""",
-                    (context.session_id, anchor_trace),
+                    f"""SELECT COUNT(*) FROM agent_session_context_messages m
+                       WHERE m.session_id=? AND m.trace_id=? AND {predicate}""",
+                    (context.session_id, anchor_trace, *params),
                 ).fetchone()
                 total = int(count_row[0])
             has_message_page = offset + min(len(rows), limit) < total if seq is None else False

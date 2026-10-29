@@ -226,6 +226,10 @@ def test_real_graph_carries_decision_checks_to_final_provider(tmp_path, monkeypa
     answer_requests = []
 
     async def complete(self, request):
+        if request.metadata["stage"] == "answer_review":
+            return response(json.dumps({"faithful": True, "hallucination_free": True,
+                "request_aligned": True, "decision": "pass", "issues": [],
+                "revision_instructions": "", "evidence_gap": ""}))
         result = await original(self, request)
         prompt = json.loads(request.messages[1].content)
         if request.metadata["stage"] == "decision":

@@ -525,6 +525,8 @@ GET /sessions/{session_id}/runs?client_request_id=input-unique-id&limit=2
 回答客户端时使用该客户端默认模型。普通与 SSE 请求均支持，回答恢复沿用同一选择。
 模型选择冻结进运行策略；暂停／恢复、排队和管理派发不会随后续偏好修改而更换模型。
 回答模型使用自身的上下文容量与推理能力，独立回答模型的推理参数不继承推理模型的原生参数。
+默认启用最终回答 reasoning-LLM 复核，使用运行冻结的推理模型而非回答模型；answer/context_answer 草稿通过前不会作为用户回答 token-delta 发布。复核拦截事实错误和偏离需求的回答；贴合需求且诚实说明已完成范围与未完成部分的合理部分结果可通过，不因需求未全部完成而强制返工。严格 JSON 复核失败时不发布草稿；拒绝后的常规改写／补充次数由本地 `[agent].answer_review_max_reworks` 限定，且不重置运行或子任务预算。
+常规返工耗尽后，系统尽可能基于可信已有结果生成一次范围收窄的部分答复，并由 reasoning model 按同等事实标准复核；该降级不重放工具、不扩大权限或重置预算。通过后运行可正常结束，但 `task_outcome` 为 `incomplete` 并标明未完成范围。若模型不可用或降级答复仍被拒，可交付不含业务事实、明确标记为本地状态说明的固定不完整答复；它不代表经模型复核通过。取消、硬预算不足和严格输出 schema 约束不能被降级绕过，预算不足时不额外调用模型。
 图片／音频输入会分别检查推理和回答模型；不兼容时依次使用配置的音频默认模型（含音频时）、
 全局默认模型或 `fallback_client` 默认模型。兜底必须同时支持全部输入模态并有自身容量配置，
 否则返回 422。实际选择在首次执行、合并完排队附件后冻结；不修改会话偏好或消息幂等身份。
@@ -1702,7 +1704,7 @@ controller active 才能发出管理写命令；paused 可对话和读取结果�
 
 本会话历史工具（普通／管理根会话可用，受限或 child 运行拒绝）：
 
-- `history.search(query?,mode?,limit?,offset?,index_cursor?)`：搜索当前会话的真实用户输入及 trace 关联回答，
+- `history.search(query?,mode?,limit?,offset?,index_cursor?)`：搜索当前会话用户问答及已发布到聊天页面的自动消息，
   默认 `mode=lexical`，可选 `semantic/hybrid`；空 query 列近期来源目录。
   query 最长 500 字符，limit 为 1..20。返回消息序号、角色、时间、trace、内容 hash、片段和 source_ref。
   关键词索引按批补齐，`index.complete/watermark/next_watermark` 与 `incomplete` 说明覆盖范围；

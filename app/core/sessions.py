@@ -15,30 +15,16 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from app.core.conversation_visibility import (
+    CONVERSATION_MESSAGES as _CONVERSATION_MESSAGES,
+)
+from app.core.conversation_visibility import conversation_source_predicate
 from app.core.prompt_tokens import PromptTokenCounter
 from app.storage.commit_signals import notify_after_commit
 
 SessionRole = Literal["user", "agent", "system", "tool"]
 SessionCreationSource = Literal["user", "assistant", "system", "unknown"]
 SessionMessageView = Literal["all", "conversation"]
-
-# Apply the conversation projection before LIMIT so internal inputs cannot
-# displace user-facing messages. Full history remains available for audit.
-_MESSAGE_ORIGIN = "trim(coalesce(nullif(json_extract(payload, '$.input_origin'), ''), json_extract(payload, '$.input_envelope.origin'), ''))"
-_CONVERSATION_MESSAGES = f"""
-    AND json_type(payload, '$.user_visible') IS NOT 'false'
-    AND json_type(payload, '$.metadata.user_visible') IS NOT 'false'
-    AND (
-        role IN ('agent', 'assistant')
-        OR {_MESSAGE_ORIGIN} = 'user'
-        OR ({_MESSAGE_ORIGIN} = '' AND role IN ('user', 'tool'))
-        OR (role = 'tool' AND {_MESSAGE_ORIGIN} = 'manager'
-            AND json_extract(payload, '$.input_envelope.origin') = 'manager'
-            AND json_type(payload, '$.input_envelope.purpose') = 'text'
-            AND trim(json_extract(payload, '$.input_envelope.purpose')) != '')
-    )
-"""
-
 
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
@@ -1089,61 +1075,32 @@ class SessionService:
         candidate_omitted_seqs: set[int] = set()
         with closing(self._conn_factory()) as conn:
             conn.execute("BEGIN")
-            # Bound returned rows independently of history length. Indexed trace
-            # joins find genuine replies even after a long stretch of background work.
+            # Filter before LIMIT so silent work cannot displace visible dialogue.
             if history_lane == "work":
                 rows = conn.execute("SELECT * FROM agent_session_context_messages WHERE session_id=? "
                                     "ORDER BY seq DESC LIMIT 512", (session_id,)).fetchall()
             else:
-                users = conn.execute("SELECT seq,trace_id FROM agent_session_context_messages "
-                    "WHERE session_id=? AND role='user' ORDER BY seq DESC LIMIT 513", (session_id,)).fetchall()
-                candidate_row_limit_reached = len(users) > 512
-                user_limit_reached = candidate_row_limit_reached
-                selected_users = users[:512]
+                eligible, eligibility_params = conversation_source_predicate(conn, session_id)
+                candidates = conn.execute(
+                    "SELECT m.* FROM agent_session_context_messages m "
+                    f"WHERE m.session_id=? AND {eligible} ORDER BY m.seq DESC LIMIT 513",
+                    (session_id, *eligibility_params),
+                ).fetchall()
+                candidate_row_limit_reached = len(candidates) > 512
+                rows = [dict(row) for row in reversed(candidates[:512])]
                 if candidate_row_limit_reached:
                     candidate_rows_omitted += 1  # Sentinel proves at least one omitted row.
-                trace_ids = list(dict.fromkeys(row["trace_id"] for row in selected_users if row["trace_id"]))
-                candidates = {row["seq"]: dict(row) for row in conn.execute(
-                    "SELECT * FROM agent_session_context_messages WHERE session_id=? AND role='user' "
-                    "ORDER BY seq DESC LIMIT 512", (session_id,)).fetchall()}
-                if trace_ids:
-                    placeholders = ",".join("?" for _ in trace_ids)
-                    agent_rows = conn.execute(
-                        "SELECT * FROM agent_session_context_messages WHERE session_id=? AND role='agent' "
-                        f"AND trace_id IN ({placeholders}) AND NOT EXISTS (SELECT 1 FROM agent_session_context_messages t "
-                        "WHERE t.session_id=agent_session_context_messages.session_id "
-                        "AND t.trace_id=agent_session_context_messages.trace_id AND t.role='tool') "
-                        "ORDER BY seq DESC LIMIT 1025",
-                        (session_id, *trace_ids),
-                    ).fetchall()
-                    agent_limit_reached = len(agent_rows) > 1024
-                    candidate_row_limit_reached = candidate_row_limit_reached or agent_limit_reached
-                    included_agents = agent_rows[:1024]
-                    if agent_limit_reached:
-                        candidate_rows_omitted += 1
-                        # Drop traces straddling the candidate cutoff, including
-                        # the sentinel trace just beyond the returned row budget.
-                        partial_trace_ids.update(
-                            row["trace_id"] for row in agent_rows[1023:1025]
-                            if row["trace_id"]
-                        )
-                    for row in included_agents:
-                        candidates[row["seq"]] = dict(row)
-                # A trace with more user inputs than the indexed 512-user window
-                # is excluded as a whole, never projected from a partial batch.
-                if user_limit_reached and selected_users[-1]["trace_id"]:
-                    boundary = selected_users[-1]
-                    if conn.execute("SELECT 1 FROM agent_session_context_messages WHERE session_id=? "
-                        "AND role='user' AND trace_id=? AND seq<? LIMIT 1",
-                        (session_id, boundary["trace_id"], boundary["seq"])).fetchone():
+                    boundary = rows[0]
+                    if boundary["trace_id"] and conn.execute(
+                        "SELECT 1 FROM agent_session_context_messages m "
+                        f"WHERE m.session_id=? AND m.trace_id=? AND m.seq<? AND {eligible} LIMIT 1",
+                        (session_id, boundary["trace_id"], boundary["seq"], *eligibility_params),
+                    ).fetchone():
                         partial_trace_ids.add(boundary["trace_id"])
-                for trace in partial_trace_ids:
-                    omitted_rows = [row for row in candidates.values() if row.get("trace_id") == trace]
-                    candidate_rows_omitted += len(omitted_rows)
-                    candidate_omitted_seqs.update(row["seq"] for row in omitted_rows)
-                candidates = {seq: row for seq, row in candidates.items()
-                              if row.get("trace_id") not in partial_trace_ids}
-                rows = sorted(candidates.values(), key=lambda item: item["seq"])
+                        removed = [row for row in rows if row["trace_id"] in partial_trace_ids]
+                        candidate_rows_omitted += len(removed)
+                        candidate_omitted_seqs.update(row["seq"] for row in removed)
+                        rows = [row for row in rows if row["trace_id"] not in partial_trace_ids]
             rows = [dict(row) for row in reversed(rows)] if history_lane == "work" else rows
             try:
                 snapshot = self.atomic_context_store.snapshot(session_id, conn=conn, include_history=False)
@@ -1161,12 +1118,10 @@ class SessionService:
         groups, traced = [], {}
         for row, message in zip(rows, messages):
             trace = row.get("trace_id")
-            if row["role"] == "user" and trace:
+            if trace:
                 if trace not in traced:
                     traced[trace] = []
                     groups.append(traced[trace])
-                traced[trace].append((row, message))
-            elif row["role"] == "agent" and trace and trace in traced:
                 traced[trace].append((row, message))
             else:
                 groups.append([(row, message)])

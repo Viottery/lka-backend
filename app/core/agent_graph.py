@@ -30,6 +30,7 @@ from app.core.agent_turn import (
     AgentTurnToolEvent,
     AgentTurnVerificationWarning,
     AgentTurnWorkingSet,
+    AnswerReworkRequired,
     _fork_subtasks_function_arguments_example,
     _fork_subtasks_shape_example,
     _stable_id,
@@ -192,7 +193,8 @@ class AgentGraphRunner:
         builder.add_edge("manual_review_interrupt", "safety_gate")
         builder.add_edge("execute_tool", "build_observation")
         builder.add_edge("build_observation", "decide_next_operation")
-        builder.add_edge("answer", "verify_answer")
+        builder.add_conditional_edges("answer", self._after_answer,
+                                      {"verify": "verify_answer", "rework": "decide_next_operation"})
         builder.add_edge("verify_answer", "finalize_run")
         builder.add_edge("finalize_run", END)
         self._builder = builder
@@ -935,7 +937,8 @@ class AgentGraphRunner:
         )
         data["decision_events"] = self._dump(events)
         assistant_message = x.get("assistant_message")
-        if isinstance(assistant_message, str) and assistant_message:
+        if (isinstance(assistant_message, str) and assistant_message
+                and not (self.turn_loop.answer_review_enabled and x.get("action") == "final_answer")):
             progress = self._models(data["progress_events"], AgentTurnProgressEvent)
             self.turn_loop._append_progress(
                 progress,
@@ -1465,28 +1468,42 @@ class AgentGraphRunner:
                 final_decision["operation"] = {
                     "type": "final_answer", "answer_checks": operation["answer_checks"],
                 }
-        answer = (
-            self.turn_loop._unresolved_multi_agent_answer()
-            if self.turn_loop._multi_agent_replan_pending(ws.run_id)
-            else ws.terminal_answer if ws.pending_decision.get("action") in {"request_confirmation", "no_op"}
-            else (
-                self.turn_loop._answer_from_context_with_llm(
-                    user_input=ws.user_input,
-                    route=ws.route,
-                    context_window=data["context_window"],
-                    llm_events=llm,
-                )
-                if ws.initial_package is None and not data["observations"] and not ws.completion_state.requirements
-                else self.turn_loop._answer_with_llm(
-                    user_input=ws.user_input,
-                    route=ws.route,
-                    context_window=data["context_window"],
-                    observations=data["observations"],
-                    final_decision=final_decision,
-                    llm_events=llm,
+        try:
+            answer = (
+                self.turn_loop._unresolved_multi_agent_answer()
+                if self.turn_loop._multi_agent_replan_pending(ws.run_id)
+                else ws.terminal_answer if ws.pending_decision.get("action") in {"request_confirmation", "no_op"}
+                else (
+                    self.turn_loop._answer_from_context_with_llm(
+                        user_input=ws.user_input,
+                        route=ws.route,
+                        context_window=data["context_window"],
+                        llm_events=llm,
+                    )
+                    if ws.initial_package is None and not data["observations"] and not ws.completion_state.requirements
+                    else self.turn_loop._answer_with_llm(
+                        user_input=ws.user_input,
+                        route=ws.route,
+                        context_window=data["context_window"],
+                        observations=data["observations"],
+                        final_decision=final_decision,
+                        llm_events=llm,
+                    )
                 )
             )
-        )
+        except AnswerReworkRequired as exc:
+            if ws.step_index >= self.turn_loop.max_decision_steps or self.turn_loop._decision_deadline_reached():
+                answer = self.turn_loop._ensure_reviewed_answer(
+                    answer="", user_input=ws.user_input, context_window=data["context_window"],
+                    observations=[*data["observations"], exc.feedback], llm_events=llm,
+                    force_degraded=True,
+                )
+            else:
+                data["llm_events"] = self._dump(llm)
+                data["observations"].append(exc.feedback)
+                ws.terminal_answer = None
+                ws.pending_decision = {}
+                return self._save(s, ws, data, "answer_rework")
         generation_failed = not answer or not answer.strip()
         progress = self._models(data["progress_events"], AgentTurnProgressEvent)
         if generation_failed:
@@ -1508,7 +1525,26 @@ class AgentGraphRunner:
                 message="No valid generated answer was available.",
                 metadata={"missing_requirements": ["answer_generation_failed"]},
             )
+        try:
+            answer = self.turn_loop._ensure_reviewed_answer(
+                answer=answer, user_input=ws.user_input, context_window=data["context_window"],
+                observations=data["observations"], llm_events=llm,
+            )
+        except AnswerReworkRequired as exc:
+            if ws.step_index >= self.turn_loop.max_decision_steps or self.turn_loop._decision_deadline_reached():
+                answer = self.turn_loop._ensure_reviewed_answer(
+                    answer="", user_input=ws.user_input, context_window=data["context_window"],
+                    observations=[*data["observations"], exc.feedback], llm_events=llm,
+                    force_degraded=True,
+                )
+            else:
+                data["llm_events"] = self._dump(llm)
+                data["observations"].append(exc.feedback)
+                ws.terminal_answer = None
+                ws.pending_decision = {}
+                return self._save(s, ws, data, "answer_rework")
         data["llm_events"] = self._dump(llm)
+        self.turn_loop._record_degraded_answer(progress)
         ws.terminal_answer = answer
         missing = [item.requirement_id for item in ws.completion_state.requirements if item.status != "supported"]
         if ws.completion_state.stop_reason == "requirement_capacity_exhausted":
@@ -1841,6 +1877,9 @@ class AgentGraphRunner:
             "waiting_confirmation": "interrupt",
             "safety_rejected": "observe",
         }.get(s["phase"], "execute")
+
+    def _after_answer(self, s: AgentGraphState) -> str:
+        return "rework" if s["phase"] == "answer_rework" else "verify"
 
     def _ws(self, s: AgentGraphState) -> AgentTurnWorkingSet:
         return AgentTurnWorkingSet.model_validate(s["working_set"])

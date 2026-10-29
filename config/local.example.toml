@@ -99,6 +99,10 @@ tool_review_mode = "skip"
 manual_wait_poll_seconds = 0.5
 
 [agent]
+# Review final natural-language answers with the frozen reasoning-model selection.
+answer_review_enabled = true
+# Normal rewrite/rework passes after rejection (0–5), before one reviewed partial answer.
+answer_review_max_reworks = 2
 # Final-answer network waiting limit; other model stages retain their provider limits.
 answer_timeout_seconds = 60
 # Before any stream output, a timeout may switch once to a compatible configured model.

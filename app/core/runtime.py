@@ -755,6 +755,8 @@ class LocalKnowledgeAgentRuntime:
             llm_max_attempts=self.local_app_config.llm.max_attempts,
             answer_timeout_seconds=self.local_app_config.agent.answer_timeout_seconds,
             answer_timeout_fallback_enabled=self.local_app_config.agent.answer_timeout_fallback_enabled,
+            answer_review_enabled=self.local_app_config.agent.answer_review_enabled,
+            answer_review_max_reworks=self.local_app_config.agent.answer_review_max_reworks,
             run_manager=self.agent_run_manager,
             safety_review_mode=self.local_app_config.safety.tool_review_mode,
             safety_manual_wait_poll_seconds=(

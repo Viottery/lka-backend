@@ -211,6 +211,52 @@ def test_prompt_context_backfills_real_exchange_and_work_lane_keeps_background_p
     assert len(work.recent_messages) <= 512
 
 
+def test_prompt_includes_published_automatic_reports_but_not_silent_work(system):
+    seed_intent(system)
+    system.sessions.atomic_context_store = system.store
+    system.sessions.atomic_context_mode = "active"
+    system.sessions.atomic_context_profile = "intent"
+    for trace, answer in (("published", "自动邮件报告：普源精电已收到简历。"),
+                          ("silent", "仅内部巡检，不应进入聊天历史。")):
+        system.sessions.record_context_exchange(
+            session_id=system.session, user_input="内部触发器", agent_answer=answer,
+            trace_id=trace, input_role="tool",
+        )
+    system.sessions.append_message(
+        session_id=system.session, role="agent", content="自动邮件报告：普源精电已收到简历。",
+        payload={"trace_id": "published", "user_visible": True}, message_id="report",
+    )
+    prompt = system.sessions.get_prompt_context_window(session_id=system.session, token_budget=12000)
+    texts = [message.content for message in prompt.recent_messages]
+    assert "自动邮件报告：普源精电已收到简历。" in texts
+    assert "内部触发器" not in texts
+    assert "仅内部巡检，不应进入聊天历史。" not in texts
+    assert prompt.summary_metadata["history_lane"] == "conversation"
+    assert prompt.summary_metadata["omission"] is False
+    # The same visibility flag used by chat pages is rechecked on every read.
+    with system.factory() as conn:
+        conn.execute("UPDATE agent_session_messages SET payload=? WHERE message_id='report'",
+                     (json.dumps({"trace_id": "published", "user_visible": False}),))
+    hidden = system.sessions.get_prompt_context_window(session_id=system.session, token_budget=12000)
+    assert "自动邮件报告：普源精电已收到简历。" not in [m.content for m in hidden.recent_messages]
+
+
+def test_visible_history_cutoff_keeps_whole_turns_and_reports_omission(system):
+    system.sessions.atomic_context_store = system.store
+    system.sessions.atomic_context_mode = "active"
+    system.sessions.atomic_context_profile = "intent"
+    with system.factory() as conn:
+        rows = [(system.session, seq, "user" if seq % 2 else "agent", f"message-{seq}",
+                 "2026-01-01T00:00:00Z", f"turn-{(seq-3)//2}") for seq in range(3, 516)]
+        conn.executemany("INSERT INTO agent_session_context_messages VALUES(?,?,?,?,?,?)", rows)
+    prompt = system.sessions.get_prompt_context_window(session_id=system.session, token_budget=100000)
+    assert len(prompt.recent_messages) <= 512
+    assert prompt.summary_metadata["candidate_row_limit_reached"] is True
+    assert prompt.summary_metadata["partial_turns_omitted"] == 1
+    assert all(m.trace_id != "turn-0" for m in prompt.recent_messages)
+    assert prompt.summary_metadata["omission"] is True
+
+
 @pytest.mark.parametrize("withdrawn", [False, True])
 def test_pending_or_withdrawn_intent_never_falls_back_to_legacy_summary(system, withdrawn):
     if withdrawn:

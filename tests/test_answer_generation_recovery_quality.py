@@ -366,10 +366,9 @@ def test_structured_answer_replaces_truncated_json_without_splicing(tmp_path, mo
 
 @pytest.mark.parametrize("orchestrator", ["legacy", "langgraph"])
 @pytest.mark.parametrize("recovered", [True, False])
-def test_orchestrator_marks_failed_recovery_failed_and_publishes_only_complete_final(
+def test_orchestrator_delivers_only_complete_recovery_or_explicit_incomplete_status(
     tmp_path, monkeypatch, orchestrator, recovered,
 ):
-    from app.api.main import create_app
     from app.core.config import get_settings
 
     config_path = tmp_path / "test.toml"
@@ -377,10 +376,13 @@ def test_orchestrator_marks_failed_recovery_failed_and_publishes_only_complete_f
     monkeypatch.setenv("LKA_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("LKA_LOCAL_CONFIG", str(config_path))
     get_settings.cache_clear()
+    from app.api.main import create_app
+
     runtime = create_app().state.runtime
     _, provider, _ = make_loop(tmp_path, [
         response("initial partial |", reason="length"),
         response("replacement complete", reason="stop" if recovered else "length"),
+        response("degradation partial |", reason="length"),
     ], selected_thinking="deepseek")
     original = provider.complete
 
@@ -390,6 +392,10 @@ def test_orchestrator_marks_failed_recovery_failed_and_publishes_only_complete_f
             return response(json.dumps({"selected_package": "filesystem", "reason": "test"}))
         if stage == "decision":
             return response(json.dumps({"operation": {"type": "final_answer", "reason": "test"}}))
+        if stage == "answer_review":
+            return response(json.dumps({"faithful": True, "hallucination_free": True,
+                "request_aligned": True, "decision": "pass", "issues": [],
+                "revision_instructions": "", "evidence_gap": ""}))
         return await original(request)
 
     provider.complete = complete
@@ -407,25 +413,29 @@ def test_orchestrator_marks_failed_recovery_failed_and_publishes_only_complete_f
               "existing_run_id": run.run_id, "llm_client_name": "selected",
               "llm_response_mode": LLMResponseMode.STREAM}
     try:
+        result = runner.run(**kwargs)
         if recovered:
-            result = runner.run(**kwargs)
             assert result.answer == "replacement complete"
         else:
-            with pytest.raises(LLMClientError, match="incomplete"):
-                runner.run(**kwargs)
+            assert result.answer == turn.DEGRADED_STATUS_NOTICE
+            assert result.task_outcome == "incomplete"
+            assert result.stop_reason == "answer_review_degraded"
         events = runtime.agent_run_manager.list_events(run.run_id)
         current = runtime.agent_run_manager.get_run(run.run_id)
-        assert current.status.value == ("completed" if recovered else "failed")
+        assert current.status.value == "completed"
+        if not recovered:
+            assert current.metadata["answer_review_approval_source"] == "system_status_notice"
         final = [e for e in events if e.type == "final_answer"]
-        assert len(final) == int(recovered)
-        assert sum(e.type == "run_completed" for e in events) == int(recovered)
-        if recovered:
-            assert final[0].payload["metadata"]["answer"] == "replacement complete"
+        assert len(final) == 1
+        assert sum(e.type == "run_completed" for e in events) == 1
+        assert final[0].payload["metadata"]["answer"] == result.answer
         answer_audit = [e for e in events if e.type == "llm_completed" and e.stage == "answer"]
-        assert len(answer_audit) == 2
-        assert sum(e.payload["budget_token_count"] for e in answer_audit) == 2800
+        assert len(answer_audit) == (2 if recovered else 3)
+        assert sum(e.payload["budget_token_count"] for e in answer_audit) == (2800 if recovered else 4200)
         deltas = [e.payload["delta"] for e in events if e.type == "llm_delta" and e.stage == "answer"]
-        assert deltas == ["initial partial |"]
+        assert deltas == []  # Incomplete/rejected drafts stay private before review.
+        reviews = [e for e in events if e.type == "answer_review_completed"]
+        assert len(reviews) == int(recovered)
         assert provider.requests[1].thinking_enabled is False
     finally:
         runtime.stop()
