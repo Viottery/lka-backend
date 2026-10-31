@@ -489,6 +489,8 @@ class RemoteExecutionNode:
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=self.sync_config.request_timeout_seconds + 1)
+            if self._thread.is_alive():
+                raise RuntimeError("Remote execution node did not drain; runtime ownership retained")
         # Idle checkpoints and pending terminal publication remain durable over
         # a graceful restart. They acquire no new lease and cannot act until a
         # live hub check succeeds; expiry still becomes unknown on the hub.

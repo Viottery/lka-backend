@@ -1,11 +1,14 @@
 """Offline output-style, reservation and frozen-checkpoint contracts."""
 import asyncio
 import json
+from types import SimpleNamespace
 
 import pytest
 from test_message_prompt_encoding import CodecModel, checkpoint
 from test_message_reading_production_v3 import finish, insert, pipeline
 
+from app.core.background_llm import SelectedBackgroundClient
+from app.core.llm.service import LLMService
 from app.core.local_config import MessageHistoryConfig
 from app.core.message_analysis import MessageAnalysisCoordinator
 from app.tool_packages import message_reading_analysis as reading
@@ -19,6 +22,38 @@ def direct_dispatch(coordinator, calls):
                       "incoming": incoming})
         return asyncio.run(client.complete_text(**kwargs))
     coordinator._call_once = call
+
+
+@pytest.mark.parametrize("remaining", [None, 1000])
+def test_real_service_message_analysis_uses_only_remaining_job_cap(tmp_path, remaining):
+    _, _, _, coordinator, _ = pipeline(tmp_path)
+    service = object.__new__(LLMService)
+    service.workloads = None
+    service.config = SimpleNamespace(default_client="test", model="model", output_reserve_tokens=1024,
+        resolve_model_config=lambda name, model: SimpleNamespace(
+            context_window_tokens=8192, output_reserve_tokens=1024))
+    service.registry = SimpleNamespace(get=lambda name: SimpleNamespace(default_model="model"))
+    service._count_request = lambda request, path: 400
+    calls = []
+
+    async def complete_text(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(content="{}", status="completed", partial=False,
+                               finish_reason="stop", usage={}, metadata={})
+
+    service.complete_text = complete_text
+    service.supports_thinking_control = lambda **kwargs: False
+    coordinator.llm_client = service
+    selected = SelectedBackgroundClient(service, initial_output_tokens=4096, recovery_output_tokens=8192)
+    selected.remaining_job_tokens = lambda: remaining
+    coordinator._call_once(selected, {
+        "system_prompt": "system", "user_prompt": "prompt", "prompt_summary": "test",
+        "max_output_tokens": 4096,
+    }, 300)
+
+    assert len(calls) == 1
+    expected = None if remaining is None else 1000 - 400
+    assert calls[0].get("max_output_tokens") == expected
 
 
 @pytest.mark.parametrize("initial_style", ["standard", "concise"])

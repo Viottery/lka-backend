@@ -20,7 +20,8 @@ from app.domains.memory import (
     MemorySourceInput,
 )
 from app.domains.memory_feedback import MemoryFeedbackInput
-from app.storage.sqlite_timing import connect_sqlite
+from app.storage.connections import connect_database as connect_sqlite
+from app.storage.connections import is_mysql
 
 _HEADER = "<!-- lka-memory-view:v1 scope={scope} project_id={project_id} -->"
 _MAX_VIEW_BYTES = 8 * 1024 * 1024
@@ -118,7 +119,8 @@ class MemoryFiles:
         path = self.path_for(scope=scope, project_id=project_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         with connect_sqlite(self.memory.db_path, timeout=10) as conn:
-            conn.execute("PRAGMA busy_timeout=10000")
+            if not is_mysql(conn):
+                conn.execute("PRAGMA busy_timeout=10000")
             conn.execute("CREATE TABLE IF NOT EXISTS memory_file_hashes "
                          "(path TEXT PRIMARY KEY, digest TEXT NOT NULL)")
             conn.execute("BEGIN IMMEDIATE")

@@ -1,0 +1,8 @@
+{
+  "version": 9,
+  "migration_name": "memory_fulltext_update_without_duplicate_upsert",
+  "trigger_name": "memory_fts_update",
+  "table_name": "memory_entries",
+  "source_sql": "CREATE TRIGGER memory_fts_update AFTER UPDATE OF content,memory_type ON memory_entries BEGIN\n            DELETE FROM memory_entries_fts WHERE memory_id=old.memory_id;\n            INSERT INTO memory_entries_fts(memory_id,content,memory_type)\n            VALUES(new.memory_id,new.content,new.memory_type);\n        END",
+  "mysql_sql": "CREATE TRIGGER memory_fts_update AFTER UPDATE ON memory_entries FOR EACH ROW\nBEGIN\n    IF NOT (OLD.memory_id <=> NEW.memory_id) THEN\n        DELETE FROM memory_entries_fts WHERE memory_id=OLD.memory_id;\n        IF EXISTS (SELECT 1 FROM memory_entries_fts WHERE memory_id=NEW.memory_id) THEN\n            UPDATE memory_entries_fts\n            SET content=NEW.content,memory_type=NEW.memory_type WHERE memory_id=NEW.memory_id;\n        ELSE\n            INSERT INTO memory_entries_fts(memory_id,content,memory_type)\n            VALUES(NEW.memory_id,NEW.content,NEW.memory_type);\n        END IF;\n    ELSEIF NOT (OLD.content <=> NEW.content) OR NOT (OLD.memory_type <=> NEW.memory_type) THEN\n        IF EXISTS (SELECT 1 FROM memory_entries_fts WHERE memory_id=OLD.memory_id) THEN\n            UPDATE memory_entries_fts\n            SET content=NEW.content,memory_type=NEW.memory_type WHERE memory_id=OLD.memory_id;\n        ELSE\n            INSERT INTO memory_entries_fts(memory_id,content,memory_type)\n            VALUES(NEW.memory_id,NEW.content,NEW.memory_type);\n        END IF;\n    END IF;\nEND"
+}

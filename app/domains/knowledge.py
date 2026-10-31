@@ -31,6 +31,7 @@ from app.domains.knowledge_retrieval import (
 )
 from app.domains.knowledge_sources import KnowledgeSourceProvider
 from app.platform.safe_files import open_file_no_follow
+from app.storage.mysql_fulltext import execute_fulltext
 
 KnowledgeSensitivity = Literal["public", "personal", "sensitive", "secret"]
 KnowledgeRemotePolicy = Literal["allow", "redact", "confirm", "deny"]
@@ -436,151 +437,261 @@ class KnowledgeService:
         )
         now = _now_iso()
         chunks = self._chunk_text(text, payload.chunk_chars)
+        source_metadata_json = self._json(source.metadata)
+        source_access_scope_json = self._json(source.access_scope)
+        document_metadata_json = self._json(payload.metadata)
         secret_chunks_redacted = 0
+
+        # Prepare all deterministic chunk work before requesting the SQLite
+        # writer. Keeping these loops and privacy checks outside the write lease
+        # prevents CPU work from extending the single-writer critical section.
+        prepared_chunks = []
+        source_cursor = 0
+        page_spans = payload.metadata.get("extraction", {}).get("page_spans", [])
+        for index, chunk_text in enumerate(chunks):
+            chunk_sensitivity = sensitivity
+            chunk_remote_policy = remote_policy
+            chunk_metadata: dict[str, Any] = self._extraction_chunk_metadata(payload.metadata)
+            start = text.find(chunk_text, source_cursor)
+            if start >= 0 and "extraction" in chunk_metadata:
+                end = start + len(chunk_text)
+                source_cursor = end
+                chunk_metadata["extraction"]["source_start_char"] = start
+                chunk_metadata["extraction"]["source_end_char"] = end
+                if isinstance(page_spans, list):
+                    chunk_metadata["extraction"]["pages"] = [
+                        span["page"] for span in page_spans[:200]
+                        if isinstance(span, dict)
+                        and isinstance(span.get("page"), int)
+                        and isinstance(span.get("start_char"), int)
+                        and isinstance(span.get("end_char"), int)
+                        and isinstance(span.get("marker_start_char", span["start_char"]), int)
+                        and span.get("marker_start_char", span["start_char"]) < end
+                        and span["end_char"] > start
+                    ]
+            stored_text = chunk_text
+            if self.privacy_gateway.contains_secret(chunk_text):
+                chunk_sensitivity = "secret"
+                chunk_remote_policy = "deny"
+                chunk_metadata["secret_detected"] = True
+                stored_text = SECRET_PLACEHOLDER
+                secret_chunks_redacted += 1
+            chunk_id = _stable_id("knowledge_chunk", document_id, str(index))
+            prepared_chunks.append((
+                chunk_id, document_id, index, stored_text, len(stored_text),
+                self._estimate_tokens(stored_text), f"{source_ref}#chunk={index}",
+                chunk_sensitivity, chunk_remote_policy, self._json(chunk_metadata), now,
+                payload.title, source.source_type,
+            ))
 
         removed_chunk_ids: list[str] = []
         committed = False
+        index_unchanged = False
         conn = self._conn_factory()
         try:
-            removed_chunk_ids = self._delete_replaced_documents(
-                conn,
-                source_id=source_id,
-                document_uri=document_uri,
-                keep_document_id=document_id,
+            from app.storage.connections import is_mysql
+
+            mysql = is_mysql(conn)
+            conn.execute("BEGIN" if mysql else "BEGIN IMMEDIATE")
+            lock_suffix = " FOR UPDATE" if mysql else ""
+            existing_source = conn.execute(
+                "SELECT source_id,source_type,display_name,uri,metadata,status,sensitivity,"
+                "remote_policy,access_scope FROM knowledge_sources WHERE source_id=?" + lock_suffix,
+                (source_id,),
+            ).fetchone()
+            source_values = (
+                source_id, source.source_type, source.display_name, source.uri,
+                source_metadata_json, source.status, source.sensitivity,
+                source.remote_policy, source_access_scope_json,
             )
-            conn.execute(
-                """
-                INSERT INTO knowledge_sources(
-                    source_id, source_type, display_name, uri, metadata, status,
-                    sensitivity, remote_policy, access_scope, created_at, updated_at
-                )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(source_id) DO UPDATE SET
-                    display_name=excluded.display_name,
-                    uri=excluded.uri,
-                    metadata=excluded.metadata,
-                    status=excluded.status,
-                    sensitivity=excluded.sensitivity,
-                    remote_policy=excluded.remote_policy,
-                    access_scope=excluded.access_scope,
-                    updated_at=excluded.updated_at
-                """,
-                (
-                    source_id,
-                    source.source_type,
-                    source.display_name,
-                    source.uri,
-                    self._json(source.metadata),
-                    source.status,
-                    source.sensitivity,
-                    source.remote_policy,
-                    self._json(source.access_scope),
-                    now,
-                    now,
-                ),
+            source_columns = (
+                "source_id", "source_type", "display_name", "uri", "metadata", "status",
+                "sensitivity", "remote_policy", "access_scope",
             )
-            conn.execute(
-                """
-                INSERT INTO knowledge_documents(
-                    document_id, source_id, source_type, title, uri, checksum, mime_type,
-                    status, sensitivity, remote_policy, source_ref, created_at, updated_at,
-                    indexed_at, metadata
-                )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(document_id) DO UPDATE SET
-                    title=excluded.title,
-                    uri=excluded.uri,
-                    checksum=excluded.checksum,
-                    mime_type=excluded.mime_type,
-                    status=excluded.status,
-                    sensitivity=excluded.sensitivity,
-                    remote_policy=excluded.remote_policy,
-                    source_ref=excluded.source_ref,
-                    updated_at=excluded.updated_at,
-                    indexed_at=excluded.indexed_at,
-                    metadata=excluded.metadata
-                """,
-                (
-                    document_id,
-                    source_id,
-                    source.source_type,
-                    payload.title,
-                    document_uri,
-                    checksum,
-                    payload.mime_type,
-                    "active",
-                    sensitivity,
-                    remote_policy,
-                    source_ref,
-                    now,
-                    now,
-                    now,
-                    self._json(payload.metadata),
-                ),
+            source_unchanged = (
+                existing_source is not None
+                and tuple(existing_source[name] for name in source_columns) == source_values
             )
-            removed_chunk_ids.extend(self._delete_document_chunks(conn, document_id))
-            source_cursor = 0
-            for index, chunk_text in enumerate(chunks):
-                chunk_sensitivity = sensitivity
-                chunk_remote_policy = remote_policy
-                chunk_metadata: dict[str, Any] = self._extraction_chunk_metadata(payload.metadata)
-                start = text.find(chunk_text, source_cursor)
-                if start >= 0 and "extraction" in chunk_metadata:
-                    end = start + len(chunk_text)
-                    source_cursor = end
-                    chunk_metadata["extraction"]["source_start_char"] = start
-                    chunk_metadata["extraction"]["source_end_char"] = end
-                    spans = payload.metadata.get("extraction", {}).get("page_spans", [])
-                    if isinstance(spans, list):
-                        chunk_metadata["extraction"]["pages"] = [
-                            span["page"] for span in spans[:200]
-                            if isinstance(span, dict)
-                            and isinstance(span.get("page"), int)
-                            and isinstance(span.get("start_char"), int)
-                            and isinstance(span.get("end_char"), int)
-                            and isinstance(span.get("marker_start_char", span["start_char"]), int)
-                            and span.get("marker_start_char", span["start_char"]) < end
-                            and span["end_char"] > start
-                        ]
-                stored_text = chunk_text
-                if self.privacy_gateway.contains_secret(chunk_text):
-                    chunk_sensitivity = "secret"
-                    chunk_remote_policy = "deny"
-                    chunk_metadata["secret_detected"] = True
-                    stored_text = SECRET_PLACEHOLDER
-                    secret_chunks_redacted += 1
-                chunk_id = _stable_id("knowledge_chunk", document_id, str(index))
+            source_index_policy_unchanged = bool(
+                existing_source is not None
+                and existing_source["source_id"] == source_id
+                and existing_source["source_type"] == source.source_type
+                and existing_source["uri"] == source.uri
+                and existing_source["status"] == source.status == "active"
+                and existing_source["sensitivity"] == source.sensitivity
+                and existing_source["remote_policy"] == source.remote_policy
+            )
+            if not source_unchanged:
                 conn.execute(
                     """
-                    INSERT INTO knowledge_chunks(
-                        chunk_id, document_id, chunk_index, text, char_count,
-                        token_estimate, source_ref, sensitivity, remote_policy,
-                        metadata, created_at
+                    INSERT INTO knowledge_sources(
+                        source_id, source_type, display_name, uri, metadata, status,
+                        sensitivity, remote_policy, access_scope, created_at, updated_at
                     )
                     VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(source_id) DO UPDATE SET
+                        display_name=excluded.display_name,
+                        uri=excluded.uri,
+                        metadata=excluded.metadata,
+                        status=excluded.status,
+                        sensitivity=excluded.sensitivity,
+                        remote_policy=excluded.remote_policy,
+                        access_scope=excluded.access_scope,
+                        updated_at=excluded.updated_at
                     """,
                     (
-                        chunk_id,
-                        document_id,
-                        index,
-                        stored_text,
-                        len(stored_text),
-                        self._estimate_tokens(stored_text),
-                        f"{source_ref}#chunk={index}",
-                        chunk_sensitivity,
-                        chunk_remote_policy,
-                        self._json(chunk_metadata),
+                        source_id,
+                        source.source_type,
+                        source.display_name,
+                        source.uri,
+                        source_metadata_json,
+                        source.status,
+                        source.sensitivity,
+                        source.remote_policy,
+                        source_access_scope_json,
+                        now,
                         now,
                     ),
                 )
+
+            documents_at_uri = conn.execute(
+                "SELECT document_id FROM knowledge_documents WHERE source_id=? AND "
+                + ("uri IS NULL" if document_uri is None else "uri=?") + lock_suffix,
+                (source_id,) if document_uri is None else (source_id, document_uri),
+            ).fetchall()
+            existing_document = conn.execute(
+                "SELECT document_id,source_id,source_type,title,uri,checksum,mime_type,status,"
+                "sensitivity,remote_policy,source_ref,metadata FROM knowledge_documents "
+                "WHERE document_id=?" + lock_suffix,
+                (document_id,),
+            ).fetchone()
+            existing_chunks = conn.execute(
+                "SELECT chunk_id,document_id,chunk_index,text,char_count,token_estimate,source_ref,"
+                "sensitivity,remote_policy,metadata FROM knowledge_chunks "
+                "WHERE document_id=? ORDER BY chunk_index" + lock_suffix,
+                (document_id,),
+            ).fetchall()
+            expected_chunks = [tuple(row[:10]) for row in prepared_chunks]
+            chunks_unchanged = [tuple(row) for row in existing_chunks] == expected_chunks
+            expected_fts = [
+                (row[0], row[1], row[11], row[3], row[12]) for row in prepared_chunks
+            ]
+            existing_fts = conn.execute(
+                "SELECT chunk_id,document_id,title,text,source_type FROM knowledge_chunks_fts "
+                "WHERE document_id=? ORDER BY chunk_id" + lock_suffix,
+                (document_id,),
+            ).fetchall()
+            fts_core_unchanged = [
+                (row[0], row[1], row[3], row[4]) for row in existing_fts
+            ] == [(row[0], row[1], row[3], row[4]) for row in expected_fts]
+            fts_title_unchanged = [row[2] for row in existing_fts] == [row[2] for row in expected_fts]
+            replaced_documents = any(str(row[0]) != document_id for row in documents_at_uri)
+            document_core_values = (
+                document_id, source_id, source.source_type, payload.title, document_uri,
+                checksum, payload.mime_type, "active", sensitivity, remote_policy,
+                source_ref, document_metadata_json,
+            )
+            document_columns = (
+                "document_id", "source_id", "source_type", "title", "uri", "checksum",
+                "mime_type", "status", "sensitivity", "remote_policy", "source_ref", "metadata",
+            )
+            document_row_values = (
+                tuple(existing_document[name] for name in document_columns)
+                if existing_document is not None else None
+            )
+            document_core_unchanged = (
+                existing_document is not None
+                and document_row_values == document_core_values
+            )
+            unchanged_identity_fields = (
+                "document_id", "source_id", "source_type", "uri", "checksum", "mime_type",
+                "status", "sensitivity", "remote_policy", "source_ref",
+            )
+            document_identity_and_policy_unchanged = bool(
+                existing_document is not None
+                and all(
+                    existing_document[name] == document_core_values[document_columns.index(name)]
+                    for name in unchanged_identity_fields
+                )
+            )
+            index_unchanged = bool(
+                source_index_policy_unchanged
+                and document_identity_and_policy_unchanged
+                and not replaced_documents
+                and chunks_unchanged
+                and fts_core_unchanged
+            )
+
+            if not index_unchanged:
+                removed_chunk_ids = self._delete_replaced_documents(
+                    conn,
+                    source_id=source_id,
+                    document_uri=document_uri,
+                    keep_document_id=document_id,
+                )
+
+            if not document_core_unchanged:
                 conn.execute(
                     """
-                    INSERT INTO knowledge_chunks_fts(
-                        chunk_id, document_id, title, text, source_type
+                    INSERT INTO knowledge_documents(
+                        document_id, source_id, source_type, title, uri, checksum, mime_type,
+                        status, sensitivity, remote_policy, source_ref, created_at, updated_at,
+                        indexed_at, metadata
                     )
-                    VALUES(?, ?, ?, ?, ?)
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(document_id) DO UPDATE SET
+                        title=excluded.title,
+                        uri=excluded.uri,
+                        checksum=excluded.checksum,
+                        mime_type=excluded.mime_type,
+                        status=excluded.status,
+                        sensitivity=excluded.sensitivity,
+                        remote_policy=excluded.remote_policy,
+                        source_ref=excluded.source_ref,
+                        updated_at=excluded.updated_at,
+                        indexed_at=excluded.indexed_at,
+                        metadata=excluded.metadata
                     """,
-                    (chunk_id, document_id, payload.title, stored_text, source.source_type),
+                    (
+                        document_id,
+                        source_id,
+                        source.source_type,
+                        payload.title,
+                        document_uri,
+                        checksum,
+                        payload.mime_type,
+                        "active",
+                        sensitivity,
+                        remote_policy,
+                        source_ref,
+                        now,
+                        now,
+                        now,
+                        document_metadata_json,
+                    ),
+                )
+
+            if index_unchanged:
+                if not fts_title_unchanged:
+                    conn.execute(
+                        "UPDATE knowledge_chunks_fts SET title=? WHERE document_id=?",
+                        (payload.title, document_id),
+                    )
+            else:
+                removed_chunk_ids.extend(self._delete_document_chunks(conn, document_id))
+                conn.executemany(
+                    """INSERT INTO knowledge_chunks(
+                    chunk_id, document_id, chunk_index, text, char_count,
+                    token_estimate, source_ref, sensitivity, remote_policy,
+                    metadata, created_at
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (row[:11] for row in prepared_chunks),
+                )
+                conn.executemany(
+                    """INSERT INTO knowledge_chunks_fts(
+                    chunk_id, document_id, title, text, source_type
+                    ) VALUES(?, ?, ?, ?, ?)""",
+                    ((row[0], row[1], row[11], row[3], row[12]) for row in prepared_chunks),
                 )
             conn.commit()
             committed = True
@@ -591,7 +702,7 @@ class KnowledgeService:
             self._clear_candidate_cache()
         if committed and removed_chunk_ids and self._semantic_index is not None:
             self._semantic_index.remove(removed_chunk_ids)
-        if self._auto_index_on_import:
+        if self._auto_index_on_import and not index_unchanged:
             self.sync_semantic_index(chunk_ids=[
                 _stable_id("knowledge_chunk", document_id, str(index))
                 for index in range(len(chunks))
@@ -1376,7 +1487,7 @@ class KnowledgeService:
         conn = self._conn_factory()
         try:
             if normalized_query and sort_by == "relevance":
-                rows = conn.execute(
+                rows = execute_fulltext(conn,
                     f"""
                     SELECT
                         c.chunk_id, c.document_id, d.title, d.source_type, d.uri,
@@ -1404,7 +1515,7 @@ class KnowledgeService:
                     sort_by=sort_by,
                 )
             elif normalized_query:
-                rows = conn.execute(
+                rows = execute_fulltext(conn,
                     f"""
                     SELECT
                         c.chunk_id, c.document_id, d.title, d.source_type, d.uri,
@@ -1653,8 +1764,13 @@ class KnowledgeService:
             "SELECT chunk_id FROM knowledge_chunks WHERE document_id = ?",
             (document_id,),
         ).fetchall()
-        for row in rows:
-            conn.execute("DELETE FROM knowledge_chunks_fts WHERE chunk_id = ?", (row["chunk_id"],))
+        if rows:
+            # FTS5's chunk_id column is UNINDEXED. Deleting each id separately
+            # scans the virtual table once per chunk. Remove a document's FTS
+            # rows in one pass and keep it in the caller's transaction.
+            conn.execute(
+                "DELETE FROM knowledge_chunks_fts WHERE document_id = ?", (document_id,)
+            )
         conn.execute("DELETE FROM knowledge_chunks WHERE document_id = ?", (document_id,))
         return [str(row["chunk_id"]) for row in rows]
 

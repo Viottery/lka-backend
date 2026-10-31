@@ -99,12 +99,14 @@ tool_review_mode = "skip"
 manual_wait_poll_seconds = 0.5
 
 [agent]
+# Prompt history budget; older messages remain available through history tools.
+session_context_token_budget = 32384
 # Review final natural-language answers with the frozen reasoning-model selection.
 answer_review_enabled = true
 # Normal rewrite/rework passes after rejection (0–5), before one reviewed partial answer.
 answer_review_max_reworks = 2
-# Final-answer network waiting limit; other model stages retain their provider limits.
-answer_timeout_seconds = 60
+# Optional shorter final-answer timeout; omitted uses the provider timeout.
+# answer_timeout_seconds = 60
 # Before any stream output, a timeout may switch once to a compatible configured model.
 answer_timeout_fallback_enabled = true
 # Orchestration backend. Keep legacy during migration; langgraph enables the
@@ -341,6 +343,8 @@ max_parallel_searches = 4
 max_total_candidates = 240
 
 [web_search]
+# Optional web.snapshot; install the browser extra and Chromium first.
+browser_enabled = false
 # Read-only public web/news search. Set BRAVE_SEARCH_API_KEY in your shell or
 # .env; without it web.search reports unavailable. web.open needs no API key.
 provider = "brave"

@@ -1,0 +1,128 @@
+{
+  "format": 1,
+  "version": 2,
+  "migration_name": "accepted_runtime_create_variants",
+  "source_git_head": "15891fdd850f3cf26a5d4c48e5347c36b37b5ee5",
+  "variants": [
+    {
+      "object_type": "table",
+      "object_name": "agent_session_context_state",
+      "source_path": "app/core/sessions.py",
+      "source_sql": "CREATE TABLE IF NOT EXISTS agent_session_context_state (session_id TEXT PRIMARY KEY, revision INTEGER NOT NULL, next_seq INTEGER NOT NULL, covered_seq INTEGER NOT NULL DEFAULT 0)",
+      "columns": [
+        "session_id",
+        "revision",
+        "next_seq",
+        "covered_seq"
+      ]
+    },
+    {
+      "object_type": "table",
+      "object_name": "llm_workload_usage",
+      "source_path": "app/core/llm_workloads.py",
+      "source_sql": "CREATE TABLE IF NOT EXISTS llm_workload_usage (call_id TEXT PRIMARY KEY, pool TEXT NOT NULL, task_id TEXT, created_at TEXT NOT NULL, expires_at TEXT NOT NULL, status TEXT NOT NULL, input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL, cost REAL NOT NULL, duration_seconds REAL, count_method TEXT NOT NULL)",
+      "columns": [
+        "call_id",
+        "pool",
+        "task_id",
+        "created_at",
+        "expires_at",
+        "status",
+        "input_tokens",
+        "output_tokens",
+        "cost",
+        "duration_seconds",
+        "count_method"
+      ]
+    },
+    {
+      "object_type": "table",
+      "object_name": "manager_controllers",
+      "source_path": "app/domains/management.py",
+      "source_sql": "CREATE TABLE IF NOT EXISTS manager_controllers (session_id TEXT PRIMARY KEY REFERENCES agent_sessions (session_id), status TEXT NOT NULL DEFAULT 'paused' CHECK (status IN ('active', 'paused')), revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1), llm_client_name TEXT, llm_model TEXT, llm_answer_client_name TEXT, llm_answer_model TEXT, reasoning_level TEXT CHECK (reasoning_level IN ('off', 'low', 'high', 'max')), created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+      "columns": [
+        "session_id",
+        "status",
+        "revision",
+        "llm_client_name",
+        "llm_model",
+        "llm_answer_client_name",
+        "llm_answer_model",
+        "reasoning_level",
+        "created_at",
+        "updated_at"
+      ]
+    },
+    {
+      "object_type": "table",
+      "object_name": "manager_delegates",
+      "source_path": "app/domains/management_delegates.py",
+      "source_sql": "CREATE TABLE IF NOT EXISTS manager_delegates (delegate_id TEXT PRIMARY KEY, session_id TEXT NOT NULL UNIQUE, parent_session_id TEXT NOT NULL, objective TEXT NOT NULL, allowed_tools TEXT NOT NULL, workspace TEXT, kickoff_envelope TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('active', 'completed', 'cancelled')), revision INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+      "columns": [
+        "delegate_id",
+        "session_id",
+        "parent_session_id",
+        "objective",
+        "allowed_tools",
+        "workspace",
+        "kickoff_envelope",
+        "state",
+        "revision",
+        "created_at",
+        "updated_at"
+      ]
+    },
+    {
+      "object_type": "table",
+      "object_name": "message_history_policies",
+      "source_path": "app/domains/message_history.py",
+      "source_sql": "CREATE TABLE IF NOT EXISTS message_history_policies (conversation_key TEXT PRIMARY KEY, source_id TEXT NOT NULL UNIQUE, account_scope_id TEXT NOT NULL, platform TEXT NOT NULL, account_id TEXT NOT NULL, conversation_type TEXT NOT NULL, conversation_id TEXT NOT NULL, display_name TEXT, record_enabled INTEGER NOT NULL, analysis_enabled INTEGER NOT NULL, batch_size INTEGER NOT NULL, timezone TEXT NOT NULL, revision INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE (platform, account_id, conversation_type, conversation_id))",
+      "columns": [
+        "conversation_key",
+        "source_id",
+        "account_scope_id",
+        "platform",
+        "account_id",
+        "conversation_type",
+        "conversation_id",
+        "display_name",
+        "record_enabled",
+        "analysis_enabled",
+        "batch_size",
+        "timezone",
+        "revision",
+        "created_at",
+        "updated_at"
+      ]
+    },
+    {
+      "object_type": "table",
+      "object_name": "message_reading_families",
+      "source_path": "app/domains/message_reading_runtime.py",
+      "source_sql": "CREATE TABLE IF NOT EXISTS message_reading_families (family_id TEXT PRIMARY KEY, conversation_key TEXT NOT NULL, start_seq INTEGER NOT NULL, end_seq INTEGER NOT NULL, max_tokens INTEGER NOT NULL, max_calls INTEGER NOT NULL, revision INTEGER NOT NULL DEFAULT 1, UNIQUE (conversation_key, start_seq))",
+      "columns": [
+        "family_id",
+        "conversation_key",
+        "start_seq",
+        "end_seq",
+        "max_tokens",
+        "max_calls",
+        "revision"
+      ]
+    },
+    {
+      "object_type": "table",
+      "object_name": "message_reading_schedules",
+      "source_path": "app/domains/message_reading_runtime.py",
+      "source_sql": "CREATE TABLE IF NOT EXISTS message_reading_schedules (conversation_key TEXT PRIMARY KEY, pending_since TEXT, last_dispatch_at TEXT, next_due_at TEXT, active_work_id TEXT, revision INTEGER NOT NULL DEFAULT 1)",
+      "columns": [
+        "conversation_key",
+        "pending_since",
+        "last_dispatch_at",
+        "next_due_at",
+        "active_work_id",
+        "revision"
+      ]
+    }
+  ]
+}

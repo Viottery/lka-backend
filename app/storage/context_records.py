@@ -9,6 +9,8 @@ from contextlib import closing
 from datetime import UTC, datetime
 from uuid import uuid4
 
+from app.storage.connections import is_mysql
+
 
 def source_digest(rows):
     return hashlib.sha256(json.dumps(rows, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
@@ -72,10 +74,20 @@ class ContextRecordStore:
                     (session_id, max(target_seq, covered) if target_seq is not None else 2**63-1))]
             else:
                 refs = sorted({s["seq"] for r in records for s in r["sources"]})
-                rows = [dict(row) for row in conn.execute(
-                    "SELECT * FROM agent_session_context_messages WHERE session_id=? "
-                    "AND (seq>? OR seq IN (SELECT value FROM json_each(?))) ORDER BY seq",
-                    (session_id, covered, json.dumps(refs)))]
+                if is_mysql(conn):
+                    cursor = conn.execute_native(
+                        "SELECT * FROM agent_session_context_messages WHERE session_id=%s "
+                        "AND (seq>%s OR seq IN (SELECT refs.seq FROM JSON_TABLE(%s, '$[*]' "
+                        "COLUMNS(seq BIGINT PATH '$')) AS refs)) ORDER BY seq",
+                        (session_id, covered, json.dumps(refs)),
+                    )
+                else:
+                    cursor = conn.execute(
+                        "SELECT * FROM agent_session_context_messages WHERE session_id=? "
+                        "AND (seq>? OR seq IN (SELECT value FROM json_each(?))) ORDER BY seq",
+                        (session_id, covered, json.dumps(refs)),
+                    )
+                rows = [dict(row) for row in cursor]
             # A withdrawn or edited source invalidates the derived view, not just
             # a future publication. Never leak revoked text through old records.
             sources = {r["seq"]: r for r in rows}

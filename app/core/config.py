@@ -4,7 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.core.local_config import LocalAppConfig, load_local_config
@@ -13,14 +13,47 @@ from app.core.local_config import LocalAppConfig, load_local_config
 class Settings(BaseSettings):
     """Runtime configuration loaded from `.env` and environment variables."""
 
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=".env", env_file_encoding="utf-8", extra="ignore", populate_by_name=True,
+    )
 
     app_name: str = Field(default="local-knowledge-agent-os", alias="LKA_APP_NAME")
-    version: str = Field(default="0.1.0", alias="LKA_VERSION")
+    version: str = Field(default="0.2.0", alias="LKA_VERSION")
     deployment_id: str | None = Field(default=None, alias="LKA_DEPLOYMENT_ID", pattern=r"^[a-f0-9]{64}$")
     host: str = Field(default="127.0.0.1", alias="LKA_HOST")
     port: int = Field(default=8765, alias="LKA_PORT")
     data_dir: Path = Field(default=Path("./data/runtime"), alias="LKA_DATA_DIR")
+    storage_backend: Literal["sqlite", "mysql"] = Field(default="sqlite", alias="LKA_STORAGE_BACKEND")
+    mysql_host: str = Field(default="127.0.0.1", alias="LKA_MYSQL_HOST")
+    mysql_port: int = Field(default=3306, alias="LKA_MYSQL_PORT", ge=1, le=65535)
+    mysql_database: str = Field(default="lka", alias="LKA_MYSQL_DATABASE", pattern=r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
+    mysql_user: str = Field(default="lka", alias="LKA_MYSQL_USER")
+    mysql_password: SecretStr | None = Field(default=None, alias="LKA_MYSQL_PASSWORD", repr=False)
+    mysql_pool_size: int = Field(default=8, alias="LKA_MYSQL_POOL_SIZE", ge=1, le=64)
+    mysql_pool_queue_capacity: int = Field(default=128, alias="LKA_MYSQL_POOL_QUEUE_CAPACITY", ge=1, le=10000)
+    mysql_pool_wait_seconds: float = Field(default=5, alias="LKA_MYSQL_POOL_WAIT_SECONDS", gt=0, le=60,
+                                          allow_inf_nan=False)
+    mysql_lock_wait_seconds: int = Field(default=5, alias="LKA_MYSQL_LOCK_WAIT_SECONDS", ge=1, le=60)
+
+    @model_validator(mode="after")
+    def validate_storage(self):
+        if self.storage_backend == "mysql" and (not self.mysql_password or not self.mysql_password.get_secret_value()):
+            raise ValueError("MySQL storage requires LKA_MYSQL_PASSWORD")
+        return self
+
+    def mysql_config(self):
+        if self.storage_backend != "mysql":
+            return None
+        from app.storage.mysql import MySQLConfig
+
+        return MySQLConfig(
+            host=self.mysql_host, port=self.mysql_port, user=self.mysql_user,
+            password=self.mysql_password.get_secret_value(), database=self.mysql_database,
+            pool_size=self.mysql_pool_size, pool_wait_seconds=self.mysql_pool_wait_seconds,
+            pool_queue_capacity=self.mysql_pool_queue_capacity,
+            lock_wait_seconds=self.mysql_lock_wait_seconds,
+            transaction_seconds=self.db_write_transaction_seconds,
+        )
     db_timing_enabled: bool = Field(default=True, alias="LKA_DB_TIMING_ENABLED")
     db_timing_sample_rate: float = Field(
         default=0.01, alias="LKA_DB_TIMING_SAMPLE_RATE", ge=0, le=1, allow_inf_nan=False,
@@ -35,6 +68,16 @@ class Settings(BaseSettings):
     db_write_transaction_seconds: float = Field(
         default=30, alias="LKA_DB_WRITE_TRANSACTION_SECONDS", gt=0, le=3600, allow_inf_nan=False,
     )
+    agent_execution_concurrency: int = Field(default=4, alias="LKA_AGENT_EXECUTION_CONCURRENCY", ge=1, le=64)
+    agent_execution_interactive_reserved: int = Field(default=2, alias="LKA_AGENT_EXECUTION_INTERACTIVE_RESERVED", ge=0, le=63)
+    agent_child_execution_concurrency: int = Field(default=2, alias="LKA_AGENT_CHILD_EXECUTION_CONCURRENCY", ge=1, le=32)
+
+    @model_validator(mode="after")
+    def validate_execution_capacity(self):
+        if self.agent_execution_interactive_reserved >= self.agent_execution_concurrency:
+            raise ValueError("Interactive reserved execution capacity must be less than total capacity")
+        return self
+
     scheduling_mode: Literal["poll", "shadow", "event"] = Field(default="event", alias="LKA_SCHEDULING_MODE")
     scheduling_reconcile_seconds: float = Field(
         default=30, alias="LKA_SCHEDULING_RECONCILE_SECONDS", ge=1, le=300, allow_inf_nan=False,

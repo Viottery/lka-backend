@@ -147,8 +147,10 @@ class WebResources:
             url = _safe_public_https_url(url)
             expected = inputs.get("expected_text_sha256")
             # A continuation with an expected version must never refetch on a miss.
+            # Rendered and HTTP-only extractions must never share a URL cache entry.
+            source_key = getattr(fetcher, "cache_namespace", "") + url
             page = None if refresh or max_age == 0 else self.cache.latest(
-                scope_key=scope, kind="page", source_key=url,
+                scope_key=scope, kind="page", source_key=source_key,
                 max_age_seconds=max_age,
             )
             if page is None and expected and not refresh:
@@ -157,7 +159,7 @@ class WebResources:
                 def fetch(deadline):
                     bounded = self._check_deadline(check, deadline)
                     if not refresh and max_age != 0:
-                        found = self.cache.latest(scope_key=scope, kind="page", source_key=url,
+                        found = self.cache.latest(scope_key=scope, kind="page", source_key=source_key,
                                                   max_age_seconds=max_age)
                         if found is not None:
                             return found
@@ -165,14 +167,14 @@ class WebResources:
                     bounded()
                     full.update(snapshot_stable=True, cache_hit=False,
                                 cache_scope="child_run" if context.tool_view and context.tool_view.child_run_id else "session",
-                                extraction_complete=True,
-                                source_scope="bounded_readable_extraction_not_full_webpage")
+                                extraction_complete=full.get("extraction_complete", True),
+                                source_scope=full.get("source_scope", "bounded_readable_extraction_not_full_webpage"))
                     return self.cache.put(scope_key=scope, run_id=context.run_id, kind="page",
-                                          source_key=url, payload=full, check=bounded)
+                                          source_key=source_key, payload=full, check=bounded)
 
                 # Two concurrent refreshes share only that refresh, not an existing snapshot.
                 page = self.cache.acquire(scope_key=scope,
-                                          key=f"page:{url}:refresh={refresh}:max_age={max_age}",
+                                          key=f"page:{source_key}:refresh={refresh}:max_age={max_age}",
                                           operation=fetch, check=check)
         expected = inputs.get("expected_text_sha256")
         if expected and (not isinstance(expected, str) or re.fullmatch(r"[0-9a-f]{64}", expected) is None):
@@ -182,7 +184,8 @@ class WebResources:
         check()
         return page
 
-    def open(self, fetcher: PublicPageFetcher, inputs: dict, context: ToolContext) -> dict[str, Any]:
+    def open(self, fetcher: PublicPageFetcher, inputs: dict, context: ToolContext,
+             tool_name: str = "web.open") -> dict[str, Any]:
         # Validate before acquisition; malformed input cannot consume network/cache quota.
         offset = inputs.get("offset", 0)
         cap = inputs.get("max_chars", self.preview_chars)
@@ -197,7 +200,7 @@ class WebResources:
         view = inputs.get("view", default_view)
         if view not in {"auto", "overview", "page"}:
             raise ValueError("view must be auto, overview, or page.")
-        page = self.page(fetcher, inputs, context, "web.open")
+        page = self.page(fetcher, inputs, context, tool_name)
         result = build_page_view(page, view=view, query=query, offset=offset, max_chars=cap)
         result.update(total_chars=len(page["text"]), truncated=result["returned_chars"] < len(page["text"]),
                       untrusted_data=True)

@@ -1,0 +1,143 @@
+{
+  "format": 1,
+  "version": 6,
+  "migration_name": "shared_sync_identity_binary_comparison",
+  "purpose": "use bytewise identity-key comparison in native MySQL trigger predicates",
+  "triggers": [
+    {
+      "name": "shared_sync_memory_entries_identity_update",
+      "native_name": "shared_sync_memory_entries_identity_update",
+      "table_name": "memory_entries",
+      "timing": "AFTER",
+      "event": "UPDATE",
+      "source_sql": "CREATE TRIGGER IF NOT EXISTS shared_sync_memory_entries_identity_update AFTER UPDATE ON memory_entries WHEN json_array(OLD.memory_id)!=json_array(NEW.memory_id) BEGIN INSERT INTO shared_sync_heads VALUES('memory_entries',json_array(OLD.memory_id),1,1) ON CONFLICT(kind,entity_key) DO UPDATE SET version=version+1,deleted=1; INSERT INTO shared_sync_journal(kind,entity_key) VALUES('memory_entries',json_array(OLD.memory_id)); END",
+      "mysql_sql": "CREATE TRIGGER `shared_sync_memory_entries_identity_update` AFTER UPDATE ON `memory_entries` FOR EACH ROW BEGIN IF BINARY CONCAT('[',JSON_QUOTE(CAST(OLD.`memory_id` AS CHAR)),']')<>BINARY CONCAT('[',JSON_QUOTE(CAST(NEW.`memory_id` AS CHAR)),']') THEN UPDATE `shared_sync_meta` SET `value`=`value` WHERE `key`='hub_id'; INSERT INTO `shared_sync_heads` (`kind`,`entity_key`,`version`,`deleted`) VALUES('memory_entries',CONCAT('[',JSON_QUOTE(CAST(OLD.`memory_id` AS CHAR)),']'),1,1) ON DUPLICATE KEY UPDATE `version`=`version`+1,`deleted`=1; INSERT INTO `shared_sync_journal` (`kind`,`entity_key`) VALUES('memory_entries',CONCAT('[',JSON_QUOTE(CAST(OLD.`memory_id` AS CHAR)),']')); END IF; END"
+    },
+    {
+      "name": "shared_sync_memory_sources_identity_update",
+      "native_name": "shared_sync_memory_sources_identity_update",
+      "table_name": "memory_sources",
+      "timing": "AFTER",
+      "event": "UPDATE",
+      "source_sql": "CREATE TRIGGER IF NOT EXISTS shared_sync_memory_sources_identity_update AFTER UPDATE ON memory_sources WHEN json_array(OLD.source_id)!=json_array(NEW.source_id) BEGIN INSERT INTO shared_sync_heads VALUES('memory_sources',json_array(OLD.source_id),1,1) ON CONFLICT(kind,entity_key) DO UPDATE SET version=version+1,deleted=1; INSERT INTO shared_sync_journal(kind,entity_key) VALUES('memory_sources',json_array(OLD.source_id)); END",
+      "mysql_sql": "CREATE TRIGGER `shared_sync_memory_sources_identity_update` AFTER UPDATE ON `memory_sources` FOR EACH ROW BEGIN IF BINARY CONCAT('[',JSON_QUOTE(CAST(OLD.`source_id` AS CHAR)),']')<>BINARY CONCAT('[',JSON_QUOTE(CAST(NEW.`source_id` AS CHAR)),']') THEN UPDATE `shared_sync_meta` SET `value`=`value` WHERE `key`='hub_id'; INSERT INTO `shared_sync_heads` (`kind`,`entity_key`,`version`,`deleted`) VALUES('memory_sources',CONCAT('[',JSON_QUOTE(CAST(OLD.`source_id` AS CHAR)),']'),1,1) ON DUPLICATE KEY UPDATE `version`=`version`+1,`deleted`=1; INSERT INTO `shared_sync_journal` (`kind`,`entity_key`) VALUES('memory_sources',CONCAT('[',JSON_QUOTE(CAST(OLD.`source_id` AS CHAR)),']')); END IF; END"
+    },
+    {
+      "name": "shared_sync_memory_entry_sources_identity_update",
+      "native_name": "shared_sync_memory_entry_sources_identity_update",
+      "table_name": "memory_entry_sources",
+      "timing": "AFTER",
+      "event": "UPDATE",
+      "source_sql": "CREATE TRIGGER IF NOT EXISTS shared_sync_memory_entry_sources_identity_update AFTER UPDATE ON memory_entry_sources WHEN json_array(OLD.memory_id,OLD.source_id)!=json_array(NEW.memory_id,NEW.source_id) BEGIN INSERT INTO shared_sync_heads VALUES('memory_entry_sources',json_array(OLD.memory_id,OLD.source_id),1,1) ON CONFLICT(kind,entity_key) DO UPDATE SET version=version+1,deleted=1; INSERT INTO shared_sync_journal(kind,entity_key) VALUES('memory_entry_sources',json_array(OLD.memory_id,OLD.source_id)); END",
+      "mysql_sql": "CREATE TRIGGER `shared_sync_memory_entry_sources_identity_update` AFTER UPDATE ON `memory_entry_sources` FOR EACH ROW BEGIN IF BINARY CONCAT('[',JSON_QUOTE(CAST(OLD.`memory_id` AS CHAR)),',',JSON_QUOTE(CAST(OLD.`source_id` AS CHAR)),']')<>BINARY CONCAT('[',JSON_QUOTE(CAST(NEW.`memory_id` AS CHAR)),',',JSON_QUOTE(CAST(NEW.`source_id` AS CHAR)),']') THEN UPDATE `shared_sync_meta` SET `value`=`value` WHERE `key`='hub_id'; INSERT INTO `shared_sync_heads` (`kind`,`entity_key`,`version`,`deleted`) VALUES('memory_entry_sources',CONCAT('[',JSON_QUOTE(CAST(OLD.`memory_id` AS CHAR)),',',JSON_QUOTE(CAST(OLD.`source_id` AS CHAR)),']'),1,1) ON DUPLICATE KEY UPDATE `version`=`version`+1,`deleted`=1; INSERT INTO `shared_sync_journal` (`kind`,`entity_key`) VALUES('memory_entry_sources',CONCAT('[',JSON_QUOTE(CAST(OLD.`memory_id` AS CHAR)),',',JSON_QUOTE(CAST(OLD.`source_id` AS CHAR)),']')); END IF; END"
+    },
+    {
+      "name": "shared_sync_memory_projects_identity_update",
+      "native_name": "shared_sync_memory_projects_identity_update",
+      "table_name": "memory_projects",
+      "timing": "AFTER",
+      "event": "UPDATE",
+      "source_sql": "CREATE TRIGGER IF NOT EXISTS shared_sync_memory_projects_identity_update AFTER UPDATE ON memory_projects WHEN json_array(OLD.project_id)!=json_array(NEW.project_id) BEGIN INSERT INTO shared_sync_heads VALUES('memory_projects',json_array(OLD.project_id),1,1) ON CONFLICT(kind,entity_key) DO UPDATE SET version=version+1,deleted=1; INSERT INTO shared_sync_journal(kind,entity_key) VALUES('memory_projects',json_array(OLD.project_id)); END",
+      "mysql_sql": "CREATE TRIGGER `shared_sync_memory_projects_identity_update` AFTER UPDATE ON `memory_projects` FOR EACH ROW BEGIN IF BINARY CONCAT('[',JSON_QUOTE(CAST(OLD.`project_id` AS CHAR)),']')<>BINARY CONCAT('[',JSON_QUOTE(CAST(NEW.`project_id` AS CHAR)),']') THEN UPDATE `shared_sync_meta` SET `value`=`value` WHERE `key`='hub_id'; INSERT INTO `shared_sync_heads` (`kind`,`entity_key`,`version`,`deleted`) VALUES('memory_projects',CONCAT('[',JSON_QUOTE(CAST(OLD.`project_id` AS CHAR)),']'),1,1) ON DUPLICATE KEY UPDATE `version`=`version`+1,`deleted`=1; INSERT INTO `shared_sync_journal` (`kind`,`entity_key`) VALUES('memory_projects',CONCAT('[',JSON_QUOTE(CAST(OLD.`project_id` AS CHAR)),']')); END IF; END"
+    },
+    {
+      "name": "shared_sync_agent_sessions_identity_update",
+      "native_name": "shared_sync_agent_sessions_identity_update",
+      "table_name": "agent_sessions",
+      "timing": "AFTER",
+      "event": "UPDATE",
+      "source_sql": "CREATE TRIGGER IF NOT EXISTS shared_sync_agent_sessions_identity_update AFTER UPDATE ON agent_sessions WHEN json_array(OLD.session_id)!=json_array(NEW.session_id) AND OLD.kind='manager' BEGIN INSERT INTO shared_sync_heads VALUES('agent_sessions',json_array(OLD.session_id),1,1) ON CONFLICT(kind,entity_key) DO UPDATE SET version=version+1,deleted=1; INSERT INTO shared_sync_journal(kind,entity_key) VALUES('agent_sessions',json_array(OLD.session_id)); END",
+      "mysql_sql": "CREATE TRIGGER `shared_sync_agent_sessions_identity_update` AFTER UPDATE ON `agent_sessions` FOR EACH ROW BEGIN IF BINARY CONCAT('[',JSON_QUOTE(CAST(OLD.`session_id` AS CHAR)),']')<>BINARY CONCAT('[',JSON_QUOTE(CAST(NEW.`session_id` AS CHAR)),']') AND OLD.kind='manager' THEN UPDATE `shared_sync_meta` SET `value`=`value` WHERE `key`='hub_id'; INSERT INTO `shared_sync_heads` (`kind`,`entity_key`,`version`,`deleted`) VALUES('agent_sessions',CONCAT('[',JSON_QUOTE(CAST(OLD.`session_id` AS CHAR)),']'),1,1) ON DUPLICATE KEY UPDATE `version`=`version`+1,`deleted`=1; INSERT INTO `shared_sync_journal` (`kind`,`entity_key`) VALUES('agent_sessions',CONCAT('[',JSON_QUOTE(CAST(OLD.`session_id` AS CHAR)),']')); END IF; END"
+    },
+    {
+      "name": "shared_sync_manager_controllers_identity_update",
+      "native_name": "shared_sync_manager_controllers_identity_update",
+      "table_name": "manager_controllers",
+      "timing": "AFTER",
+      "event": "UPDATE",
+      "source_sql": "CREATE TRIGGER IF NOT EXISTS shared_sync_manager_controllers_identity_update AFTER UPDATE ON manager_controllers WHEN json_array(OLD.session_id)!=json_array(NEW.session_id) BEGIN INSERT INTO shared_sync_heads VALUES('manager_controllers',json_array(OLD.session_id),1,1) ON CONFLICT(kind,entity_key) DO UPDATE SET version=version+1,deleted=1; INSERT INTO shared_sync_journal(kind,entity_key) VALUES('manager_controllers',json_array(OLD.session_id)); END",
+      "mysql_sql": "CREATE TRIGGER `shared_sync_manager_controllers_identity_update` AFTER UPDATE ON `manager_controllers` FOR EACH ROW BEGIN IF BINARY CONCAT('[',JSON_QUOTE(CAST(OLD.`session_id` AS CHAR)),']')<>BINARY CONCAT('[',JSON_QUOTE(CAST(NEW.`session_id` AS CHAR)),']') THEN UPDATE `shared_sync_meta` SET `value`=`value` WHERE `key`='hub_id'; INSERT INTO `shared_sync_heads` (`kind`,`entity_key`,`version`,`deleted`) VALUES('manager_controllers',CONCAT('[',JSON_QUOTE(CAST(OLD.`session_id` AS CHAR)),']'),1,1) ON DUPLICATE KEY UPDATE `version`=`version`+1,`deleted`=1; INSERT INTO `shared_sync_journal` (`kind`,`entity_key`) VALUES('manager_controllers',CONCAT('[',JSON_QUOTE(CAST(OLD.`session_id` AS CHAR)),']')); END IF; END"
+    },
+    {
+      "name": "shared_sync_manager_defaults_identity_update",
+      "native_name": "shared_sync_manager_defaults_identity_update",
+      "table_name": "manager_defaults",
+      "timing": "AFTER",
+      "event": "UPDATE",
+      "source_sql": "CREATE TRIGGER IF NOT EXISTS shared_sync_manager_defaults_identity_update AFTER UPDATE ON manager_defaults WHEN json_array(OLD.slot)!=json_array(NEW.slot) BEGIN INSERT INTO shared_sync_heads VALUES('manager_defaults',json_array(OLD.slot),1,1) ON CONFLICT(kind,entity_key) DO UPDATE SET version=version+1,deleted=1; INSERT INTO shared_sync_journal(kind,entity_key) VALUES('manager_defaults',json_array(OLD.slot)); END",
+      "mysql_sql": "CREATE TRIGGER `shared_sync_manager_defaults_identity_update` AFTER UPDATE ON `manager_defaults` FOR EACH ROW BEGIN IF BINARY CONCAT('[',CAST(OLD.`slot` AS CHAR),']')<>BINARY CONCAT('[',CAST(NEW.`slot` AS CHAR),']') THEN UPDATE `shared_sync_meta` SET `value`=`value` WHERE `key`='hub_id'; INSERT INTO `shared_sync_heads` (`kind`,`entity_key`,`version`,`deleted`) VALUES('manager_defaults',CONCAT('[',CAST(OLD.`slot` AS CHAR),']'),1,1) ON DUPLICATE KEY UPDATE `version`=`version`+1,`deleted`=1; INSERT INTO `shared_sync_journal` (`kind`,`entity_key`) VALUES('manager_defaults',CONCAT('[',CAST(OLD.`slot` AS CHAR),']')); END IF; END"
+    },
+    {
+      "name": "shared_sync_manager_goals_identity_update",
+      "native_name": "shared_sync_manager_goals_identity_update",
+      "table_name": "manager_goals",
+      "timing": "AFTER",
+      "event": "UPDATE",
+      "source_sql": "CREATE TRIGGER IF NOT EXISTS shared_sync_manager_goals_identity_update AFTER UPDATE ON manager_goals WHEN json_array(OLD.goal_id)!=json_array(NEW.goal_id) BEGIN INSERT INTO shared_sync_heads VALUES('manager_goals',json_array(OLD.goal_id),1,1) ON CONFLICT(kind,entity_key) DO UPDATE SET version=version+1,deleted=1; INSERT INTO shared_sync_journal(kind,entity_key) VALUES('manager_goals',json_array(OLD.goal_id)); END",
+      "mysql_sql": "CREATE TRIGGER `shared_sync_manager_goals_identity_update` AFTER UPDATE ON `manager_goals` FOR EACH ROW BEGIN IF BINARY CONCAT('[',JSON_QUOTE(CAST(OLD.`goal_id` AS CHAR)),']')<>BINARY CONCAT('[',JSON_QUOTE(CAST(NEW.`goal_id` AS CHAR)),']') THEN UPDATE `shared_sync_meta` SET `value`=`value` WHERE `key`='hub_id'; INSERT INTO `shared_sync_heads` (`kind`,`entity_key`,`version`,`deleted`) VALUES('manager_goals',CONCAT('[',JSON_QUOTE(CAST(OLD.`goal_id` AS CHAR)),']'),1,1) ON DUPLICATE KEY UPDATE `version`=`version`+1,`deleted`=1; INSERT INTO `shared_sync_journal` (`kind`,`entity_key`) VALUES('manager_goals',CONCAT('[',JSON_QUOTE(CAST(OLD.`goal_id` AS CHAR)),']')); END IF; END"
+    },
+    {
+      "name": "shared_sync_matters_identity_update",
+      "native_name": "shared_sync_matters_identity_update",
+      "table_name": "matters",
+      "timing": "AFTER",
+      "event": "UPDATE",
+      "source_sql": "CREATE TRIGGER IF NOT EXISTS shared_sync_matters_identity_update AFTER UPDATE ON matters WHEN json_array(OLD.matter_id)!=json_array(NEW.matter_id) BEGIN INSERT INTO shared_sync_heads VALUES('matters',json_array(OLD.matter_id),1,1) ON CONFLICT(kind,entity_key) DO UPDATE SET version=version+1,deleted=1; INSERT INTO shared_sync_journal(kind,entity_key) VALUES('matters',json_array(OLD.matter_id)); END",
+      "mysql_sql": "CREATE TRIGGER `shared_sync_matters_identity_update` AFTER UPDATE ON `matters` FOR EACH ROW BEGIN IF BINARY CONCAT('[',JSON_QUOTE(CAST(OLD.`matter_id` AS CHAR)),']')<>BINARY CONCAT('[',JSON_QUOTE(CAST(NEW.`matter_id` AS CHAR)),']') THEN UPDATE `shared_sync_meta` SET `value`=`value` WHERE `key`='hub_id'; INSERT INTO `shared_sync_heads` (`kind`,`entity_key`,`version`,`deleted`) VALUES('matters',CONCAT('[',JSON_QUOTE(CAST(OLD.`matter_id` AS CHAR)),']'),1,1) ON DUPLICATE KEY UPDATE `version`=`version`+1,`deleted`=1; INSERT INTO `shared_sync_journal` (`kind`,`entity_key`) VALUES('matters',CONCAT('[',JSON_QUOTE(CAST(OLD.`matter_id` AS CHAR)),']')); END IF; END"
+    },
+    {
+      "name": "shared_sync_matter_source_links_identity_update",
+      "native_name": "shared_sync_matter_source_links_identity_update",
+      "table_name": "matter_source_links",
+      "timing": "AFTER",
+      "event": "UPDATE",
+      "source_sql": "CREATE TRIGGER IF NOT EXISTS shared_sync_matter_source_links_identity_update AFTER UPDATE ON matter_source_links WHEN json_array(OLD.matter_id,OLD.source_type,OLD.source_id)!=json_array(NEW.matter_id,NEW.source_type,NEW.source_id) BEGIN INSERT INTO shared_sync_heads VALUES('matter_source_links',json_array(OLD.matter_id,OLD.source_type,OLD.source_id),1,1) ON CONFLICT(kind,entity_key) DO UPDATE SET version=version+1,deleted=1; INSERT INTO shared_sync_journal(kind,entity_key) VALUES('matter_source_links',json_array(OLD.matter_id,OLD.source_type,OLD.source_id)); END",
+      "mysql_sql": "CREATE TRIGGER `shared_sync_matter_source_links_identity_update` AFTER UPDATE ON `matter_source_links` FOR EACH ROW BEGIN IF BINARY CONCAT('[',JSON_QUOTE(CAST(OLD.`matter_id` AS CHAR)),',',JSON_QUOTE(CAST(OLD.`source_type` AS CHAR)),',',JSON_QUOTE(CAST(OLD.`source_id` AS CHAR)),']')<>BINARY CONCAT('[',JSON_QUOTE(CAST(NEW.`matter_id` AS CHAR)),',',JSON_QUOTE(CAST(NEW.`source_type` AS CHAR)),',',JSON_QUOTE(CAST(NEW.`source_id` AS CHAR)),']') THEN UPDATE `shared_sync_meta` SET `value`=`value` WHERE `key`='hub_id'; INSERT INTO `shared_sync_heads` (`kind`,`entity_key`,`version`,`deleted`) VALUES('matter_source_links',CONCAT('[',JSON_QUOTE(CAST(OLD.`matter_id` AS CHAR)),',',JSON_QUOTE(CAST(OLD.`source_type` AS CHAR)),',',JSON_QUOTE(CAST(OLD.`source_id` AS CHAR)),']'),1,1) ON DUPLICATE KEY UPDATE `version`=`version`+1,`deleted`=1; INSERT INTO `shared_sync_journal` (`kind`,`entity_key`) VALUES('matter_source_links',CONCAT('[',JSON_QUOTE(CAST(OLD.`matter_id` AS CHAR)),',',JSON_QUOTE(CAST(OLD.`source_type` AS CHAR)),',',JSON_QUOTE(CAST(OLD.`source_id` AS CHAR)),']')); END IF; END"
+    },
+    {
+      "name": "shared_sync_matter_management_identity_update",
+      "native_name": "shared_sync_matter_management_identity_update",
+      "table_name": "matter_management",
+      "timing": "AFTER",
+      "event": "UPDATE",
+      "source_sql": "CREATE TRIGGER IF NOT EXISTS shared_sync_matter_management_identity_update AFTER UPDATE ON matter_management WHEN json_array(OLD.matter_id)!=json_array(NEW.matter_id) BEGIN INSERT INTO shared_sync_heads VALUES('matter_management',json_array(OLD.matter_id),1,1) ON CONFLICT(kind,entity_key) DO UPDATE SET version=version+1,deleted=1; INSERT INTO shared_sync_journal(kind,entity_key) VALUES('matter_management',json_array(OLD.matter_id)); END",
+      "mysql_sql": "CREATE TRIGGER `shared_sync_matter_management_identity_update` AFTER UPDATE ON `matter_management` FOR EACH ROW BEGIN IF BINARY CONCAT('[',JSON_QUOTE(CAST(OLD.`matter_id` AS CHAR)),']')<>BINARY CONCAT('[',JSON_QUOTE(CAST(NEW.`matter_id` AS CHAR)),']') THEN UPDATE `shared_sync_meta` SET `value`=`value` WHERE `key`='hub_id'; INSERT INTO `shared_sync_heads` (`kind`,`entity_key`,`version`,`deleted`) VALUES('matter_management',CONCAT('[',JSON_QUOTE(CAST(OLD.`matter_id` AS CHAR)),']'),1,1) ON DUPLICATE KEY UPDATE `version`=`version`+1,`deleted`=1; INSERT INTO `shared_sync_journal` (`kind`,`entity_key`) VALUES('matter_management',CONCAT('[',JSON_QUOTE(CAST(OLD.`matter_id` AS CHAR)),']')); END IF; END"
+    },
+    {
+      "name": "shared_sync_manager_work_relations_identity_update",
+      "native_name": "shared_sync_manager_work_relations_identity_update",
+      "table_name": "manager_work_relations",
+      "timing": "AFTER",
+      "event": "UPDATE",
+      "source_sql": "CREATE TRIGGER IF NOT EXISTS shared_sync_manager_work_relations_identity_update AFTER UPDATE ON manager_work_relations WHEN json_array(OLD.manager_session_id,OLD.source_matter_id,OLD.target_matter_id,OLD.relation)!=json_array(NEW.manager_session_id,NEW.source_matter_id,NEW.target_matter_id,NEW.relation) BEGIN INSERT INTO shared_sync_heads VALUES('manager_work_relations',json_array(OLD.manager_session_id,OLD.source_matter_id,OLD.target_matter_id,OLD.relation),1,1) ON CONFLICT(kind,entity_key) DO UPDATE SET version=version+1,deleted=1; INSERT INTO shared_sync_journal(kind,entity_key) VALUES('manager_work_relations',json_array(OLD.manager_session_id,OLD.source_matter_id,OLD.target_matter_id,OLD.relation)); END",
+      "mysql_sql": "CREATE TRIGGER `shared_sync_manager_work_relations_identity_update` AFTER UPDATE ON `manager_work_relations` FOR EACH ROW BEGIN IF BINARY CONCAT('[',JSON_QUOTE(CAST(OLD.`manager_session_id` AS CHAR)),',',JSON_QUOTE(CAST(OLD.`source_matter_id` AS CHAR)),',',JSON_QUOTE(CAST(OLD.`target_matter_id` AS CHAR)),',',JSON_QUOTE(CAST(OLD.`relation` AS CHAR)),']')<>BINARY CONCAT('[',JSON_QUOTE(CAST(NEW.`manager_session_id` AS CHAR)),',',JSON_QUOTE(CAST(NEW.`source_matter_id` AS CHAR)),',',JSON_QUOTE(CAST(NEW.`target_matter_id` AS CHAR)),',',JSON_QUOTE(CAST(NEW.`relation` AS CHAR)),']') THEN UPDATE `shared_sync_meta` SET `value`=`value` WHERE `key`='hub_id'; INSERT INTO `shared_sync_heads` (`kind`,`entity_key`,`version`,`deleted`) VALUES('manager_work_relations',CONCAT('[',JSON_QUOTE(CAST(OLD.`manager_session_id` AS CHAR)),',',JSON_QUOTE(CAST(OLD.`source_matter_id` AS CHAR)),',',JSON_QUOTE(CAST(OLD.`target_matter_id` AS CHAR)),',',JSON_QUOTE(CAST(OLD.`relation` AS CHAR)),']'),1,1) ON DUPLICATE KEY UPDATE `version`=`version`+1,`deleted`=1; INSERT INTO `shared_sync_journal` (`kind`,`entity_key`) VALUES('manager_work_relations',CONCAT('[',JSON_QUOTE(CAST(OLD.`manager_session_id` AS CHAR)),',',JSON_QUOTE(CAST(OLD.`source_matter_id` AS CHAR)),',',JSON_QUOTE(CAST(OLD.`target_matter_id` AS CHAR)),',',JSON_QUOTE(CAST(OLD.`relation` AS CHAR)),']')); END IF; END"
+    },
+    {
+      "name": "shared_sync_manager_goal_matter_links_identity_update",
+      "native_name": "shared_sync_manager_goal_matter_links_identity_update",
+      "table_name": "manager_goal_matter_links",
+      "timing": "AFTER",
+      "event": "UPDATE",
+      "source_sql": "CREATE TRIGGER IF NOT EXISTS shared_sync_manager_goal_matter_links_identity_update AFTER UPDATE ON manager_goal_matter_links WHEN json_array(OLD.goal_id)!=json_array(NEW.goal_id) BEGIN INSERT INTO shared_sync_heads VALUES('manager_goal_matter_links',json_array(OLD.goal_id),1,1) ON CONFLICT(kind,entity_key) DO UPDATE SET version=version+1,deleted=1; INSERT INTO shared_sync_journal(kind,entity_key) VALUES('manager_goal_matter_links',json_array(OLD.goal_id)); END",
+      "mysql_sql": "CREATE TRIGGER `shared_sync_manager_goal_matter_links_identity_update` AFTER UPDATE ON `manager_goal_matter_links` FOR EACH ROW BEGIN IF BINARY CONCAT('[',JSON_QUOTE(CAST(OLD.`goal_id` AS CHAR)),']')<>BINARY CONCAT('[',JSON_QUOTE(CAST(NEW.`goal_id` AS CHAR)),']') THEN UPDATE `shared_sync_meta` SET `value`=`value` WHERE `key`='hub_id'; INSERT INTO `shared_sync_heads` (`kind`,`entity_key`,`version`,`deleted`) VALUES('manager_goal_matter_links',CONCAT('[',JSON_QUOTE(CAST(OLD.`goal_id` AS CHAR)),']'),1,1) ON DUPLICATE KEY UPDATE `version`=`version`+1,`deleted`=1; INSERT INTO `shared_sync_journal` (`kind`,`entity_key`) VALUES('manager_goal_matter_links',CONCAT('[',JSON_QUOTE(CAST(OLD.`goal_id` AS CHAR)),']')); END IF; END"
+    },
+    {
+      "name": "shared_sync_manager_delegates_identity_update",
+      "native_name": "shared_sync_manager_delegates_identity_update",
+      "table_name": "manager_delegates",
+      "timing": "AFTER",
+      "event": "UPDATE",
+      "source_sql": "CREATE TRIGGER IF NOT EXISTS shared_sync_manager_delegates_identity_update AFTER UPDATE ON manager_delegates WHEN json_array(OLD.delegate_id)!=json_array(NEW.delegate_id) BEGIN INSERT INTO shared_sync_heads VALUES('manager_delegates',json_array(OLD.delegate_id),1,1) ON CONFLICT(kind,entity_key) DO UPDATE SET version=version+1,deleted=1; INSERT INTO shared_sync_journal(kind,entity_key) VALUES('manager_delegates',json_array(OLD.delegate_id)); END",
+      "mysql_sql": "CREATE TRIGGER `shared_sync_manager_delegates_identity_update` AFTER UPDATE ON `manager_delegates` FOR EACH ROW BEGIN IF BINARY CONCAT('[',JSON_QUOTE(CAST(OLD.`delegate_id` AS CHAR)),']')<>BINARY CONCAT('[',JSON_QUOTE(CAST(NEW.`delegate_id` AS CHAR)),']') THEN UPDATE `shared_sync_meta` SET `value`=`value` WHERE `key`='hub_id'; INSERT INTO `shared_sync_heads` (`kind`,`entity_key`,`version`,`deleted`) VALUES('manager_delegates',CONCAT('[',JSON_QUOTE(CAST(OLD.`delegate_id` AS CHAR)),']'),1,1) ON DUPLICATE KEY UPDATE `version`=`version`+1,`deleted`=1; INSERT INTO `shared_sync_journal` (`kind`,`entity_key`) VALUES('manager_delegates',CONCAT('[',JSON_QUOTE(CAST(OLD.`delegate_id` AS CHAR)),']')); END IF; END"
+    },
+    {
+      "name": "shared_sync_manager_deliveries_identity_update",
+      "native_name": "shared_sync_manager_deliveries_identity_update",
+      "table_name": "manager_deliveries",
+      "timing": "AFTER",
+      "event": "UPDATE",
+      "source_sql": "CREATE TRIGGER IF NOT EXISTS shared_sync_manager_deliveries_identity_update AFTER UPDATE ON manager_deliveries WHEN json_array(OLD.delivery_id)!=json_array(NEW.delivery_id) BEGIN INSERT INTO shared_sync_heads VALUES('manager_deliveries',json_array(OLD.delivery_id),1,1) ON CONFLICT(kind,entity_key) DO UPDATE SET version=version+1,deleted=1; INSERT INTO shared_sync_journal(kind,entity_key) VALUES('manager_deliveries',json_array(OLD.delivery_id)); END",
+      "mysql_sql": "CREATE TRIGGER `shared_sync_manager_deliveries_identity_update` AFTER UPDATE ON `manager_deliveries` FOR EACH ROW BEGIN IF BINARY CONCAT('[',JSON_QUOTE(CAST(OLD.`delivery_id` AS CHAR)),']')<>BINARY CONCAT('[',JSON_QUOTE(CAST(NEW.`delivery_id` AS CHAR)),']') THEN UPDATE `shared_sync_meta` SET `value`=`value` WHERE `key`='hub_id'; INSERT INTO `shared_sync_heads` (`kind`,`entity_key`,`version`,`deleted`) VALUES('manager_deliveries',CONCAT('[',JSON_QUOTE(CAST(OLD.`delivery_id` AS CHAR)),']'),1,1) ON DUPLICATE KEY UPDATE `version`=`version`+1,`deleted`=1; INSERT INTO `shared_sync_journal` (`kind`,`entity_key`) VALUES('manager_deliveries',CONCAT('[',JSON_QUOTE(CAST(OLD.`delivery_id` AS CHAR)),']')); END IF; END"
+    }
+  ]
+}

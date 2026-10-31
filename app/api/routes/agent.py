@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import ValidationError
+from starlette.background import BackgroundTask
 
 from app.api.schemas import (
     AgentChildRunSnapshot,
@@ -36,7 +37,21 @@ from app.domains.session_attachments import SessionAttachmentError
 router = APIRouter(prefix="/agent", tags=["agent"])
 
 
-def _prepare_image_payload(payload: AgentTurnRequest, runtime) -> AgentTurnRequest:
+class _ReservedAgentStreamResponse(StreamingResponse):
+    """Return an unused reservation even if sending response headers fails."""
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # Starlette's normal background task runs after successful streaming.
+            # A header-send exception can bypass it before the body ever starts.
+            # Our cleanup is idempotent and leaves started executions untouched.
+            if self.background is not None:
+                await self.background()
+
+
+def _prepare_image_payload(payload: AgentTurnRequest, runtime, *, frozen_policy=None) -> AgentTurnRequest:
     if not hasattr(runtime, "prepare_agent_image_input"):
         if payload.attachment_ids:
             raise HTTPException(422, "Image input is unavailable.")
@@ -47,6 +62,7 @@ def _prepare_image_payload(payload: AgentTurnRequest, runtime) -> AgentTurnReque
             session_id=payload.session_id, attachment_ids=payload.attachment_ids,
             llm_client_name=options.client_name if options else None,
             llm_model=options.model if options else None,
+            **({"frozen_policy": frozen_policy} if frozen_policy is not None else {}),
         )
         updates = {"attachment_ids": ids}
         resolver = getattr(runtime, "resolve_agent_input_model", None)
@@ -55,6 +71,7 @@ def _prepare_image_payload(payload: AgentTurnRequest, runtime) -> AgentTurnReque
                 session_id=payload.session_id, attachment_ids=ids,
                 llm_client_name=options.client_name if options else None,
                 llm_model=options.model if options else None,
+                **({"frozen_policy": frozen_policy} if frozen_policy is not None else {}),
             )
             if (client_name, model) != (options.client_name if options else None, options.model if options else None):
                 from app.api.schemas import AgentTurnLLMOptions
@@ -79,7 +96,9 @@ def _prepare_image_payload(payload: AgentTurnRequest, runtime) -> AgentTurnReque
     return payload.model_copy(update=updates)
 
 
-def _preflight_reasoning(payload: AgentTurnRequest, runtime, *, session_id: str | None = None) -> None:
+def _preflight_reasoning(
+    payload: AgentTurnRequest, runtime, *, session_id: str | None = None, frozen_policy=None,
+) -> None:
     answer_validator = getattr(runtime, "validate_agent_answer_selection", None)
     if callable(answer_validator):
         try:
@@ -89,6 +108,7 @@ def _preflight_reasoning(payload: AgentTurnRequest, runtime, *, session_id: str 
                 resolve_preference=True,
                 primary_client_name=payload.llm.client_name if payload.llm else None,
                 **_answer_model_kwargs(payload),
+                **({"frozen_policy": frozen_policy} if frozen_policy is not None else {}),
             )
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
@@ -101,9 +121,30 @@ def _preflight_reasoning(payload: AgentTurnRequest, runtime, *, session_id: str 
                   requested=options.reasoning_level if options else None,
                   attachment_ids=payload.attachment_ids,
                   llm_client_name=options.client_name if options else None,
-                  llm_model=options.model if options else None)
+                  llm_model=options.model if options else None,
+                  **({"frozen_policy": frozen_policy} if frozen_policy is not None else {}))
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
+
+
+def _preflight_agent_payload(payload: AgentTurnRequest, runtime) -> AgentTurnRequest:
+    """Share one request-local policy snapshot across input selection checks."""
+    policy = None
+    provider = getattr(getattr(runtime, "session_service", None), "run_policy", None)
+    if payload.session_id and callable(provider):
+        try:
+            policy = provider(payload.session_id).model_copy(deep=True)
+        except KeyError as exc:
+            raise HTTPException(404, "Active session or attachment not found.") from exc
+        except SessionAttachmentError as exc:
+            raise HTTPException(exc.status_code, str(exc)) from exc
+        except OSError as exc:
+            raise HTTPException(422, "Attachment storage is unavailable.") from exc
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+    payload = _prepare_image_payload(payload, runtime, frozen_policy=policy)
+    _preflight_reasoning(payload, runtime, frozen_policy=policy)
+    return payload
 
 
 def _answer_model_kwargs(payload: AgentTurnRequest) -> dict:
@@ -134,8 +175,7 @@ async def run_agent_turn_endpoint(
     payload: AgentTurnRequest,
     request: Request,
 ) -> AgentTurnResponse | JSONResponse:
-    payload = await asyncio.to_thread(_prepare_image_payload, payload, request.app.state.runtime)
-    await asyncio.to_thread(_preflight_reasoning, payload, request.app.state.runtime)
+    payload = await asyncio.to_thread(_preflight_agent_payload, payload, request.app.state.runtime)
     llm_options = payload.llm
     try:
         result = await request.app.state.runtime.run_agent_turn_async(
@@ -168,8 +208,7 @@ async def run_agent_turn_endpoint(
 def run_agent_turn(payload: AgentTurnRequest, request: Request) -> AgentTurnResult:
     """Synchronous test helper preserving the old direct-call path."""
 
-    payload = _prepare_image_payload(payload, request.app.state.runtime)
-    _preflight_reasoning(payload, request.app.state.runtime)
+    payload = _preflight_agent_payload(payload, request.app.state.runtime)
     llm_options = payload.llm
     result = request.app.state.runtime.run_agent_turn(
         session_id=payload.session_id,
@@ -192,8 +231,9 @@ async def stream_agent_turn(
     payload: AgentTurnRequest,
     request: Request,
 ) -> StreamingResponse:
-    payload = await asyncio.to_thread(_prepare_image_payload, payload, request.app.state.runtime)
-    await asyncio.to_thread(_preflight_reasoning, payload, request.app.state.runtime)
+    payload = await asyncio.to_thread(_preflight_agent_payload, payload, request.app.state.runtime)
+    runtime = request.app.state.runtime
+    reservation = None
     if payload.client_request_id is not None:
         admission = asyncio.create_task(_admit_and_start_agent_turn(runtime=request.app.state.runtime, payload=payload))
         admissions = getattr(request.app.state.runtime, "_agent_admission_tasks", None)
@@ -205,10 +245,30 @@ async def stream_agent_turn(
         admission.add_done_callback(_consume_task_exception)
         run = await asyncio.shield(admission)
     else:
-        run = await _admit_agent_turn(runtime=request.app.state.runtime, payload=payload)
-    return StreamingResponse(
+        governor = getattr(runtime, "execution_admission", None)
+        if governor is not None:
+            from app.core.execution_admission import ExecutionCapacityError
+
+            lease = governor.try_acquire("interactive")
+            if lease is None:
+                raise ExecutionCapacityError("Agent execution capacity is full")
+            lease.retain()
+            reservation = {"lease": lease, "started": False}
+            try:
+                with lease.activate():
+                    run = await _admit_agent_turn(runtime=runtime, payload=payload)
+                    lease.key = run.run_id
+            except BaseException:
+                lease.release()
+                raise
+        else:
+            run = await _admit_agent_turn(runtime=runtime, payload=payload)
+    response_type = _ReservedAgentStreamResponse if reservation is not None else StreamingResponse
+    return response_type(
         _agent_turn_event_stream(request=request, run_id=run.run_id,
-                                 start_payload=payload if payload.client_request_id is None else None),
+                                 start_payload=payload if payload.client_request_id is None else None,
+                                 execution_reservation=reservation),
+        background=BackgroundTask(_finish_unused_stream, runtime, run.run_id, reservation),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -216,6 +276,18 @@ async def stream_agent_turn(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+async def _finish_unused_stream(runtime, run_id, reservation):
+    if reservation is None or reservation["started"]:
+        return
+    reservation["started"] = True
+    try:
+        cleanup = getattr(runtime, "_execution_failed_before_start", None)
+        if cleanup is not None:
+            await asyncio.to_thread(cleanup, run_id, RuntimeError("Stream closed before execution started"))
+    finally:
+        reservation["lease"].release()
 
 
 async def _admit_agent_turn(*, runtime, payload: AgentTurnRequest):
@@ -233,9 +305,27 @@ async def _admit_agent_turn(*, runtime, payload: AgentTurnRequest):
 
 
 async def _admit_and_start_agent_turn(*, runtime, payload: AgentTurnRequest):
-    run = await _admit_agent_turn(runtime=runtime, payload=payload)
-    _start_agent_turn_task(runtime=runtime, payload=payload, run_id=run.run_id)
-    return run
+    governor = getattr(runtime, "execution_admission", None)
+    if governor is None:
+        run = await _admit_agent_turn(runtime=runtime, payload=payload)
+        _start_agent_turn_task(runtime=runtime, payload=payload, run_id=run.run_id)
+        return run
+    from app.core.execution_admission import ExecutionCapacityError
+
+    lease = governor.try_acquire("interactive")
+    if lease is None:
+        raise ExecutionCapacityError("Agent execution capacity is full")
+    lease.retain()  # Transfer to the task; stream disconnect never releases it early.
+    try:
+        with lease.activate():
+            run = await _admit_agent_turn(runtime=runtime, payload=payload)
+            lease.key = run.run_id
+            task = _start_agent_turn_task(runtime=runtime, payload=payload, run_id=run.run_id)
+        task.add_done_callback(lambda _: lease.release())
+        return run
+    except BaseException:
+        lease.release()
+        raise
 
 
 @router.get("/runs/{run_id}", response_model=AgentRunResponse)
@@ -809,24 +899,80 @@ async def _agent_turn_event_stream(
     run_id: str,
     after_sequence: int = 0,
     start_payload: AgentTurnRequest | None = None,
+    execution_reservation: dict | None = None,
+) -> AsyncIterator[str]:
+    manager = request.app.state.runtime.agent_run_manager
+    signals = getattr(manager, "change_signals", None)
+    changed = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def wake() -> None:
+        if not loop.is_closed():
+            loop.call_soon_threadsafe(changed.set)
+
+    unsubscribe = signals.subscribe(run_id, wake) if signals is not None else None
+    iterator = _iterate_agent_turn_events(
+        request=request, run_id=run_id, after_sequence=after_sequence,
+        start_payload=start_payload, execution_reservation=execution_reservation,
+        changed=changed if unsubscribe is not None else None,
+    )
+    try:
+        async for frame in iterator:
+            yield frame
+    finally:
+        try:
+            await iterator.aclose()
+        finally:
+            if unsubscribe is not None:
+                unsubscribe()
+
+
+async def _iterate_agent_turn_events(
+    *,
+    request: Request,
+    run_id: str,
+    after_sequence: int = 0,
+    start_payload: AgentTurnRequest | None = None,
+    execution_reservation: dict | None = None,
+    changed: asyncio.Event | None = None,
 ) -> AsyncIterator[str]:
     runtime = request.app.state.runtime
     run_manager = runtime.agent_run_manager
     if start_payload is not None:
-        _start_agent_turn_task(runtime=runtime, payload=start_payload, run_id=run_id)
+        if execution_reservation is None:
+            _start_agent_turn_task(runtime=runtime, payload=start_payload, run_id=run_id)
+        else:
+            lease = execution_reservation["lease"]
+            try:
+                with lease.activate():
+                    task = _start_agent_turn_task(runtime=runtime, payload=start_payload, run_id=run_id)
+                execution_reservation["started"] = True
+                task.add_done_callback(lambda _: lease.release())
+            except BaseException:
+                await _finish_unused_stream(runtime, run_id, execution_reservation)
+                raise
     last_sequence = after_sequence
     last_sent_at = time.monotonic()
     while True:
+        # Clear before reading: a concurrent notification during either read
+        # remains set and prevents sleeping past new events.
+        if changed is not None:
+            changed.clear()
         if await _is_client_disconnected(request):
             # A transport disconnect is not a run cancellation.  The
             # background task and durable event log allow reconnection by ID.
             break
 
-        events = await asyncio.to_thread(run_manager.list_events, run_id, after_sequence=last_sequence)
+        events = await asyncio.to_thread(
+            run_manager.list_events, run_id, after_sequence=last_sequence, limit=128,
+        )
         for event in events:
             last_sequence = event.sequence
             last_sent_at = time.monotonic()
             yield _sse_event_frame(_public_agent_event(event))
+
+        if len(events) == 128:
+            continue
 
         run = await asyncio.to_thread(run_manager.get_run, run_id)
         if run and run.status in {
@@ -839,16 +985,35 @@ async def _agent_turn_event_stream(
             # Completion may publish its final events after the first read.
             # Once terminal status is visible, drain that durable tail before
             # closing so this stream and a reconnect see the same sequence.
-            for event in await asyncio.to_thread(run_manager.list_events, run_id, after_sequence=last_sequence):
+            flush_events = getattr(run_manager, "flush_run_events", None)
+            if callable(flush_events):
+                await asyncio.to_thread(flush_events, run_id)
+            tail = await asyncio.to_thread(
+                run_manager.list_events, run_id, after_sequence=last_sequence, limit=128,
+            )
+            for event in tail:
                 last_sequence = event.sequence
                 yield _sse_event_frame(_public_agent_event(event))
+            if len(tail) == 128:
+                continue
+            break
+
+        signals = getattr(run_manager, "change_signals", None)
+        if signals is not None and signals.closed:
             break
 
         if time.monotonic() - last_sent_at >= 15:
             last_sent_at = time.monotonic()
             yield _heartbeat_frame(run_id=run_id, sequence=last_sequence)
 
-        await asyncio.sleep(0.05)
+        if changed is None:
+            # Compatibility/capacity fallback retains the prior transport.
+            await asyncio.sleep(0.05)
+        else:
+            try:
+                await asyncio.wait_for(changed.wait(), timeout=max(0.01, 15 - (time.monotonic() - last_sent_at)))
+            except TimeoutError:
+                pass
 
 
 def _start_agent_turn_task(*, runtime, payload: AgentTurnRequest, run_id: str) -> asyncio.Task:

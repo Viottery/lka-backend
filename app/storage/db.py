@@ -5,8 +5,9 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+from app.storage.connections import connect_database as connect_sqlite
+from app.storage.connections import is_mysql
 from app.storage.session_origins import add_session_origin_columns, backfill_session_origins
-from app.storage.sqlite_timing import connect_sqlite
 
 CURRENT_TRACE_COLUMNS = {
     "trace_id",
@@ -40,7 +41,6 @@ def connect(db_path: Path) -> sqlite3.Connection:
 
     conn = connect_sqlite(db_path, timeout=5.0)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout = 5000")
     return conn
 
 
@@ -137,6 +137,22 @@ def init_db(db_path: Path) -> None:
 
     conn = connect(db_path)
     try:
+        if is_mysql(conn):
+            from app.storage.connections import (
+                mark_mysql_schema_verified,
+                mysql_config_for,
+                mysql_schema_is_verified,
+            )
+            from app.storage.mysql_bootstrap import bootstrap_mysql
+
+            if mysql_schema_is_verified(db_path):
+                return
+            bootstrap_mysql(conn)
+            signature = tuple(tuple(row) for row in conn.execute_native(
+                "SELECT version,name,checksum FROM lka_schema_migrations ORDER BY version",
+            ).fetchall())
+            mark_mysql_schema_verified(db_path, mysql_config_for(db_path), signature)
+            return
         # The background worker and interactive API use separate connections.
         # WAL permits readers to proceed during a short writer transaction.
         conn.execute("PRAGMA journal_mode = WAL")

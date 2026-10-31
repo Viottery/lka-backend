@@ -15,12 +15,31 @@ from uuid import uuid4
 from app.core.agent_runs import AgentRunCancelled, AgentRunRecord, AgentRunStatus
 from app.core.background_jobs import BackgroundJobWorker
 from app.core.llm_workloads import BudgetQuota, workload_scope
-from app.core.session_admission import SessionBusyError
+from app.core.session_admission import SessionAdmissionStore, SessionBusyError
 from app.core.turn_input import TurnInputEnvelope
 from app.domains.management_notifications import ManagementNotificationService
+from app.storage.connections import is_mysql, lock_row
 
 _logger = logging.getLogger(__name__)
 _TERMINAL = {"completed", "failed", "cancelled", "timed_out"}
+_STORAGE_ADMISSION_ERRORS = {
+    "SqliteWriteAdmissionError": frozenset({
+        "SQLite write queue wait timed out", "SQLite write queue is full",
+    }),
+    # Older persisted runs used the base class for these same admission outcomes.
+    "SqliteWriteQueueError": frozenset({
+        "SQLite write queue wait timed out", "SQLite write queue is full",
+    }),
+    "MySQLPoolTimeout": frozenset({"MySQL connection pool wait timed out"}),
+}
+_DATABASE_ERROR_NAMES = frozenset({
+    "DatabaseError", "OperationalError", "IntegrityError", "ProgrammingError",
+    "InterfaceError", "DataError", "InternalError", "NotSupportedError",
+})
+
+
+def _begin_write(conn):
+    conn.execute("BEGIN" if is_mysql(conn) else "BEGIN IMMEDIATE")
 
 
 def _json(value):
@@ -85,6 +104,11 @@ class ManagementCoordinator:
 
     @staticmethod
     def _table_exists(conn, table):
+        if is_mysql(conn):
+            return conn.execute_native(
+                "SELECT 1 FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name=%s",
+                (table,),
+            ).fetchone() is not None
         return conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone() is not None
 
     def _affected_management_sessions(self, run_id):
@@ -184,12 +208,18 @@ class ManagementCoordinator:
             cooldown = max(0, int(getattr(self.config, "min_wake_interval_seconds", 0)))
             day_start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
             managers = conn.execute(
-                "SELECT c.session_id,MAX(e.created_at) AS latest FROM manager_controllers c "
+                "SELECT c.session_id,c.revision,MAX(e.created_at) AS latest FROM manager_controllers c "
                 "JOIN agent_sessions s ON s.session_id=c.session_id LEFT JOIN manager_executions e "
                 "ON e.session_id=c.session_id WHERE c.status='active' AND s.status!='deleted' "
-                "GROUP BY c.session_id"
+                "GROUP BY c.session_id,c.revision"
             ).fetchall()
             for manager in managers:
+                recovery = self._storage_recovery_state(
+                    conn, manager["session_id"], manager["revision"], now,
+                )
+                retry_at = self._utc_datetime(recovery["retry_at"])
+                if retry_at is not None and retry_at > now:
+                    due_values.append(retry_at.isoformat())
                 latest = manager["latest"]
                 if latest and cooldown:
                     instant = datetime.fromisoformat(latest)
@@ -261,12 +291,161 @@ class ManagementCoordinator:
                 "JOIN agent_runs r ON r.run_id=e.run_id WHERE e.session_id=? ORDER BY e.rowid DESC LIMIT 1",
                 (session_id,),
             ).fetchone()
+            recovery = self._storage_recovery_state(
+                conn, session_id, self._controller_revision(conn, session_id), datetime.now(UTC),
+            )
             return {
                 "reason": reason or ("ready" if pending else "idle"),
                 "pending_event_count": pending,
                 "latest_run_id": latest["run_id"] if latest else None,
                 "latest_error_type": json.loads(latest["record_payload"]).get("error_type") if latest else None,
+                "retry_at": recovery["retry_at"],
+                "blocked_reason": recovery["blocked_reason"] or reason,
             }
+
+    @staticmethod
+    def _controller_revision(conn, sid):
+        row = conn.execute("SELECT revision FROM manager_controllers WHERE session_id=?", (sid,)).fetchone()
+        return row[0] if row is not None else None
+
+    @staticmethod
+    def _storage_failure_kind(record):
+        error_type = record.get("error_type")
+        error = record.get("error")
+        if not isinstance(error_type, str):
+            return None
+        expected = _STORAGE_ADMISSION_ERRORS.get(error_type)
+        if expected is not None:
+            return "admission" if isinstance(error, str) and error in expected else "database"
+        if error_type.startswith(("Sqlite", "MySQL", "sqlite3.")) or error_type in _DATABASE_ERROR_NAMES:
+            return "database"
+        return None
+
+    @staticmethod
+    def _utc_datetime(value):
+        try:
+            instant = datetime.fromisoformat(value)
+        except (TypeError, ValueError):
+            return None
+        if instant.tzinfo is None:
+            instant = instant.replace(tzinfo=UTC)
+        return instant.astimezone(UTC)
+
+    def _safe_unstarted_storage_failure(self, conn, run_id, record):
+        """Require the same durable no-execution evidence as orphan recovery."""
+        if (record.get("run_id") != run_id or record.get("status") != "failed"
+                or record.get("parent_run_id") is not None or record.get("started_at") is not None
+                or record.get("result_snapshot") is not None
+                or any(record.get(key) is not None for key in ("completed_at", "paused_at", "cancelled_at"))):
+            return False
+        metadata = record.get("metadata")
+        if not isinstance(metadata, dict) or any(metadata.get(key) is True for key in (
+            "completion_claimed", "pause_requested", "cancel_requested",
+        )):
+            return False
+        # A missing/failed checkpoint probe is unknown evidence, so it fails closed.
+        checkpoint_probe = getattr(self.dispatcher, "has_checkpoint", None)
+        if not callable(checkpoint_probe):
+            return False
+        try:
+            if checkpoint_probe(run_id):
+                return False
+        except Exception:  # noqa: BLE001 - inability to prove absence is unsafe.
+            return False
+        if conn.execute("SELECT 1 FROM agent_tool_invocations WHERE run_id=? LIMIT 1", (run_id,)).fetchone():
+            return False
+        if conn.execute(
+            "SELECT 1 FROM agent_runs WHERE json_extract(record_payload,'$.parent_run_id')=? LIMIT 1",
+            (run_id,),
+        ).fetchone():
+            return False
+        if conn.execute("SELECT 1 FROM agent_safety_reviews WHERE run_id=? LIMIT 1", (run_id,)).fetchone():
+            return False
+        # The only permitted event is the terminal diagnostic for this exact
+        # admission error. Any activity event means the loop may have started.
+        rows = conn.execute(
+            "SELECT event_payload FROM agent_run_events WHERE run_id=? ORDER BY sequence LIMIT 2",
+            (run_id,),
+        ).fetchall()
+        if len(rows) > 1:
+            return False
+        if rows:
+            try:
+                event = json.loads(rows[0][0])
+            except (TypeError, ValueError):
+                return False
+            payload = event.get("payload")
+            if (event.get("type") != "run_failed" or not isinstance(payload, dict)
+                    or payload.get("error_type") != record.get("error_type")):
+                return False
+        return True
+
+    def _storage_recovery_state(self, conn, sid, revision, now):
+        empty = {"retry_at": None, "blocked_reason": None}
+        if revision is None:
+            return empty
+        limit = max(1, int(self.config.failure_limit))
+        rows = conn.execute(
+            "SELECT e.status,e.run_id,e.updated_at,r.record_payload FROM manager_executions e "
+            "JOIN agent_runs r ON r.run_id=e.run_id WHERE e.session_id=? AND e.controller_revision=? "
+            "ORDER BY e.rowid DESC LIMIT ?", (sid, revision, limit),
+        ).fetchall()
+        if not rows:
+            return empty
+        records = []
+        for row in rows:
+            try:
+                record = json.loads(row["record_payload"])
+            except (TypeError, ValueError):
+                return {"retry_at": None, "blocked_reason": "storage_recovery_required"}
+            records.append(record)
+            if row["status"] != "failed":
+                continue
+            kind = self._storage_failure_kind(record)
+            if kind == "database" or (kind == "admission" and not self._safe_unstarted_storage_failure(
+                conn, row["run_id"], record,
+            )):
+                return {"retry_at": None, "blocked_reason": "storage_recovery_required"}
+        latest_record = records[0]
+        latest_kind = self._storage_failure_kind(latest_record) if rows[0]["status"] == "failed" else None
+        if latest_kind is None:
+            return empty
+        # Budget exhaustion and uncertain external outcomes remain hard guards.
+        if latest_record.get("error_type") in {
+            "work_budget_exhausted", "live_budget_exceeded", "execution_uncertain",
+        }:
+            return {"retry_at": None, "blocked_reason": "execution_guard"}
+        if latest_kind != "admission":
+            return {"retry_at": None, "blocked_reason": "storage_recovery_required"}
+        if any(record.get("error_type") in {
+            "work_budget_exhausted", "live_budget_exceeded", "execution_uncertain",
+        } for record in records[1:]):
+            return {"retry_at": None, "blocked_reason": "execution_guard"}
+        # Bound the retry chain by the existing failed-round limit. Count only
+        # immediately preceding, exact admission failures within this revision.
+        attempts = 0
+        for row, record in zip(rows, records, strict=True):
+            if row["status"] != "failed":
+                break
+            if self._storage_failure_kind(record) != "admission":
+                break
+            attempts += 1
+        if attempts >= limit:
+            return {"retry_at": None, "blocked_reason": "failure_limit"}
+        failed_at = self._utc_datetime(rows[0]["updated_at"])
+        created = conn.execute(
+            "SELECT created_at FROM manager_executions WHERE run_id=? AND session_id=?",
+            (rows[0]["run_id"], sid),
+        ).fetchone()
+        created_at = self._utc_datetime(created[0]) if created is not None else None
+        if failed_at is None or created_at is None:
+            return {"retry_at": None, "blocked_reason": "storage_recovery_required"}
+        delay = min(60, 5 * (2 ** min(attempts - 1, 4)))
+        retry_at = failed_at + timedelta(seconds=delay)
+        cooldown = max(0, int(getattr(self.config, "min_wake_interval_seconds", 0)))
+        retry_at = max(retry_at, created_at + timedelta(seconds=cooldown))
+        return {"retry_at": retry_at.isoformat(),
+                "blocked_reason": "storage_retry_wait" if retry_at > now else None}
 
     def _wake_block_reason(self, conn, sid, now):
         user_input_pending = getattr(self, 'user_input_pending', None)
@@ -290,6 +469,22 @@ class ManagementCoordinator:
         if conn.execute("SELECT 1 FROM agent_runs WHERE session_id=? AND status NOT IN "
                         "('completed','failed','cancelled','timed_out') LIMIT 1", (sid,)).fetchone():
             return "run_active"
+        exhausted = conn.execute("SELECT r.record_payload,e.controller_revision FROM manager_executions e JOIN agent_runs r ON r.run_id=e.run_id "
+                                 "WHERE e.session_id=? ORDER BY e.rowid DESC LIMIT 1", (sid,)).fetchone()
+        # The same unconsumed evidence is not a new allowance. Explicitly
+        # resolve the failed execution before scheduling another one.
+        if (exhausted and exhausted[1] == row[1]
+                    and json.loads(exhausted[0]).get("error_type") in {
+                        "work_budget_exhausted", "live_budget_exceeded", "execution_uncertain",
+                    }):
+            return "execution_guard"
+        recovery = self._storage_recovery_state(conn, sid, row[1], now)
+        if recovery["blocked_reason"]:
+            return recovery["blocked_reason"]
+        if recovery["retry_at"]:
+            retry_at = self._utc_datetime(recovery["retry_at"])
+            if retry_at is None or retry_at > now:
+                return "storage_retry_wait"
         latest = conn.execute("SELECT created_at FROM manager_executions WHERE session_id=? "
                               "ORDER BY rowid DESC LIMIT 1", (sid,)).fetchone()
         if not explicit and latest and datetime.fromisoformat(latest[0]) + timedelta(seconds=self.config.min_wake_interval_seconds) > now:
@@ -302,15 +497,6 @@ class ManagementCoordinator:
                               "ORDER BY rowid DESC LIMIT ?", (sid, row[1], self.config.failure_limit)).fetchall()
         if len(recent) == self.config.failure_limit and all(r[0] == "failed" for r in recent):
             return "failure_limit"
-        exhausted = conn.execute("SELECT r.record_payload,e.controller_revision FROM manager_executions e JOIN agent_runs r ON r.run_id=e.run_id "
-                                 "WHERE e.session_id=? ORDER BY e.rowid DESC LIMIT 1", (sid,)).fetchone()
-        # The same unconsumed evidence is not a new allowance. Explicitly
-        # resolve the failed execution before scheduling another one.
-        if (exhausted and exhausted[1] == row[1]
-                    and json.loads(exhausted[0]).get("error_type") in {
-                        "work_budget_exhausted", "live_budget_exceeded", "execution_uncertain",
-                    }):
-            return "execution_guard"
         return None
 
     def _pending(self, conn, sid):
@@ -576,6 +762,42 @@ class ManagementCoordinator:
                 candidates.append(sid)
             if not candidates:
                 return 0
+            if is_mysql(conn):
+                scheduled = 0
+                for sid in sorted(candidates):
+                    _begin_write(conn)
+                    try:
+                        session = conn.execute("SELECT kind,status FROM agent_sessions WHERE session_id=?", (sid,)).fetchone()
+                        if session is None or session["kind"] != "manager" or session["status"] == "deleted":
+                            conn.commit()
+                            continue
+                        SessionAdmissionStore.lock_session(conn, sid)
+                        lock_row(conn, "manager_controllers", "session_id", sid)
+                        if not self._eligible(conn, sid, now) or not self._pending(conn, sid):
+                            conn.commit()
+                            continue
+                        if conn.execute("SELECT 1 FROM background_jobs WHERE kind='manager_wake' AND scope_id=? "
+                                        "AND status IN ('queued','running','retry_wait') LIMIT 1", (sid,)).fetchone():
+                            conn.commit()
+                            continue
+                        counter = lock_row(conn, "manager_wake_counters", "session_id", sid)
+                        if counter is None:
+                            conn.execute("INSERT INTO manager_wake_counters(session_id,generation) VALUES(?,1)", (sid,))
+                            generation = 1
+                        else:
+                            conn.execute("UPDATE manager_wake_counters SET generation=generation+1 WHERE session_id=?",
+                                         (sid,))
+                            generation = int(counter["generation"]) + 1
+                        self.dispatcher.store.enqueue_latest_watermark(
+                            "manager_wake", sid, str(generation), {"session_id": sid},
+                            conn=conn, watermark_order=generation,
+                        )
+                        conn.commit()
+                        scheduled += 1
+                    except BaseException:
+                        conn.rollback()
+                        raise
+                return scheduled
             conn.execute("BEGIN IMMEDIATE")
             for sid in candidates:
                 if not self._eligible(conn, sid, now) or not self._pending(conn, sid):
@@ -605,36 +827,61 @@ class ManagementCoordinator:
         run = None
         try:
             with closing(self._conn()) as conn, conn:
-                conn.execute("BEGIN IMMEDIATE")
+                _begin_write(conn)
+                SessionAdmissionStore.lock_session(conn, sid)
                 now = datetime.now(UTC)
                 current_job = conn.execute("SELECT status,lease_owner,lease_epoch,lease_expires_at FROM background_jobs "
                                            "WHERE job_id=?", (job["job_id"],)).fetchone()
                 if (not current_job or current_job[0] != "running" or current_job[1] != job["lease_owner"]
                         or current_job[2] != job["lease_epoch"] or datetime.fromisoformat(current_job[3]) <= now):
                     raise ManagementExecutionFenced("manager_wake_lease_lost")
-                current = conn.execute("SELECT revision FROM manager_controllers WHERE session_id=?", (sid,)).fetchone()
-                if not current or current[0] != controller["revision"] or not self._eligible(conn, sid, now):
+                current = lock_row(conn, "manager_controllers", "session_id", sid)
+                if not current or current["revision"] != controller["revision"] or not self._eligible(conn, sid, now):
                     return
                 events = self._pending(conn, sid)
+                locked_events = {}
+                for event_id in sorted(event["event_id"] for event in events):
+                    row = lock_row(conn, "manager_inbox", "event_id", event_id)
+                    if row is None or row["session_id"] != sid or row["consumed_execution_id"] is not None:
+                        raise ManagementExecutionFenced("manager_event_changed")
+                    locked_events[event_id] = {**dict(row), "payload": json.loads(row["payload"])}
+                events = [locked_events[event["event_id"]] for event in events]
+                # Freeze every goal and Matter the pending events can expose
+                # before building attention cards from their source snapshots.
+                _, candidate_revisions = self._related_goals(conn, sid, events)
+                for goal_id in sorted(candidate_revisions):
+                    lock_row(conn, "manager_goals", "goal_id", goal_id)
+                _, rechecked_revisions = self._related_goals(conn, sid, events)
+                if rechecked_revisions != candidate_revisions:
+                    raise ManagementExecutionFenced("manager_goal_changed")
+                work = getattr(self, "work_service", None)
+                matter_versions = {}
+                if work is not None:
+                    matter_ids = set()
+                    for goal_id in candidate_revisions:
+                        link = conn.execute("SELECT matter_id FROM manager_goal_matter_links WHERE goal_id=?",
+                                            (goal_id,)).fetchone()
+                        if link:
+                            matter_ids.add(link[0])
+                    for event in events:
+                        matter_id = event["payload"].get("matter_id")
+                        if matter_id:
+                            matter_ids.add(matter_id)
+                    for matter_id in sorted(matter_ids):
+                        matter_row = lock_row(conn, "matters", "matter_id", matter_id)
+                        if matter_row is None:
+                            continue
+                        matter = work.matters.get_matter(matter_id=matter_id, conn=conn)
+                        matter_versions[matter.matter_id] = matter.revision
                 events, attention_context = self._attention_batch(conn, sid, events, now)
                 if not events:
                     return
                 goals, revisions = self._related_goals(conn, sid, events)
-                work = getattr(self, "work_service", None)
-                matter_versions = {}
-                if work is not None:
-                    for goal_id in revisions:
-                        link = conn.execute("SELECT matter_id FROM manager_goal_matter_links WHERE goal_id=?",
-                                            (goal_id,)).fetchone()
-                        if link:
-                            matter = work.matters.get_matter(matter_id=link[0], conn=conn)
-                            matter_versions[matter.matter_id] = matter.revision
-                    for event in events:
-                        matter_id = event["payload"].get("matter_id")
-                        if matter_id:
-                            matter = work.matters.get_matter(matter_id=matter_id, conn=conn)
-                            matter_versions[matter_id] = matter.revision
+                if any(candidate_revisions.get(goal_id) != revision for goal_id, revision in revisions.items()):
+                    raise ManagementExecutionFenced("manager_goal_changed")
                 delivery = getattr(self, "delivery", None)
+                if delivery is not None:
+                    lock_row(conn, "manager_delivery_policies", "session_id", sid)
                 delivery_policy = delivery._get(conn, sid) if delivery is not None else None
                 execution_id = "manager_execution_" + uuid4().hex
                 goal_guidance = (
@@ -681,6 +928,15 @@ class ManagementCoordinator:
                                  'goal_ids': list(revisions)})
                         + "\n截断预览：\n" + purpose[:4000]
                     )
+                if any(e["payload"].get("schedule_id") for e in events):
+                    purpose = (
+                        "定时任务执行规则：schedule_id 与 occurrence 标识本次到期任务，不是一般巡检。"
+                        "此前补跑或同一天其他执行不能自动抵扣本次任务；只有实际结果已满足本次要求时才复用，"
+                        "并核对其覆盖范围与本次到期时间。未覆盖的部分应按原委托继续执行或派发，避免重复已有写入。"
+                        "未读取或核验新来源，不能以‘没有新证据／没有变化’为由跳过应执行的检查。"
+                        "用户要求定期交付报告时，无变化也应交付简报；无法执行时说明阻塞，不把事件消费当作任务完成。\n"
+                        + purpose
+                    )
                 if attention_context is not None:
                     # Append after generic preview compaction so the bounded
                     # ranked cards and their continuation handles stay intact.
@@ -725,7 +981,11 @@ class ManagementCoordinator:
                              (execution_id, sid, run.run_id, controller["revision"],
                               _json([e["event_id"] for e in events]), _json(revisions), now.isoformat(), now.isoformat()))
                 self.dispatcher.enqueue(run.run_id, conn=conn)
-                if datetime.fromisoformat(current_job[3]) <= datetime.now(UTC):
+                latest_job = conn.execute("SELECT status,lease_owner,lease_epoch,lease_expires_at FROM background_jobs "
+                                          "WHERE job_id=?", (job["job_id"],)).fetchone()
+                if (not latest_job or latest_job[0] != "running" or latest_job[1] != job["lease_owner"]
+                        or latest_job[2] != job["lease_epoch"]
+                        or datetime.fromisoformat(latest_job[3]) <= datetime.now(UTC)):
                     raise ManagementExecutionFenced("manager_wake_lease_lost")
         except SessionBusyError:
             # A foreground root won admission. Inbox remains intact and a later
@@ -754,20 +1014,54 @@ class ManagementCoordinator:
                               quotas=tuple(BudgetQuota(**s) for s in scopes),
                               before_dispatch=lambda: self.check_run(run.run_id))
 
+    def _run_guard_snapshot(self, conn, run_id):
+        """Read current run and applicable relationships in one statement.
+
+        This is an operation-local read, not a cached permission decision.
+        Positive relationships still go through their domain fences below.
+        A singleton left join also preserves queue checks for a missing run.
+        """
+        columns = ["r.record_payload"]
+        flags = []
+        delegates = getattr(self, "delegates", None)
+        if delegates is not None:
+            columns.extend([
+                ("EXISTS(SELECT 1 FROM manager_delegates d "
+                 "WHERE d.session_id=r.session_id) AS is_delegate"),
+                ("EXISTS(SELECT 1 FROM manager_delegates d "
+                 "JOIN managed_session_links l ON l.manager_session_id=d.session_id "
+                 "WHERE l.task_session_id=r.session_id) AS has_delegate_owner"),
+            ])
+            flags.extend(["is_delegate", "has_delegate_owner"])
+        queue = getattr(self, "work_queue", None)
+        parameters = []
+        if queue is not None:
+            columns.append("EXISTS(SELECT 1 FROM manager_work_queue q WHERE q.run_id=?) AS is_queued")
+            flags.append("is_queued")
+            parameters.append(run_id)
+        parameters.append(run_id)
+        row = conn.execute(
+            "SELECT " + ",".join(columns) + " FROM (SELECT 1) AS probe "
+            "LEFT JOIN agent_runs r ON r.run_id=?", parameters,
+        ).fetchone()
+        record = json.loads(row[0]) if row[0] else {}
+        return record, {name: bool(row[index + 1]) for index, name in enumerate(flags)}
+
     def check_run(self, run_id, *, conn=None):
         self.dispatcher.check_run(run_id, conn=conn)
         def check(db):
-            row = db.execute("SELECT record_payload FROM agent_runs WHERE run_id=?", (run_id,)).fetchone()
-            record = json.loads(row[0]) if row else {}
+            record, applicable = self._run_guard_snapshot(db, run_id)
             delegates = getattr(self, "delegates", None)
             if delegates is not None:
-                delegates.check_session(db, record.get("session_id"))
-                for owner in db.execute("SELECT DISTINCT d.session_id FROM manager_delegates d "
-                                        "JOIN managed_session_links l ON l.manager_session_id=d.session_id "
-                                        "WHERE l.task_session_id=?", (record.get("session_id"),)):
-                    delegates.check_session(db, owner[0])
+                if applicable["is_delegate"]:
+                    delegates.check_session(db, record.get("session_id"))
+                if applicable["has_delegate_owner"]:
+                    for owner in db.execute("SELECT DISTINCT d.session_id FROM manager_delegates d "
+                                            "JOIN managed_session_links l ON l.manager_session_id=d.session_id "
+                                            "WHERE l.task_session_id=?", (record.get("session_id"),)):
+                        delegates.check_session(db, owner[0])
             queue = getattr(self, "work_queue", None)
-            if queue is not None:
+            if queue is not None and applicable["is_queued"]:
                 queue.check_run(run_id, conn=db)
             # Child work is fenced by the same root execution snapshot.
             if record.get("parent_run_id"):
@@ -859,6 +1153,65 @@ class ManagementCoordinator:
                 if schedule and schedule[0] and datetime.fromisoformat(schedule[0]) <= now:
                     raise ManagementExecutionFenced("manager_schedule_expired")
 
+    def _lock_publication_resources(self, conn, execution, record, events):
+        """Freeze all versioned inputs used by this publication in stable order."""
+        session_id = execution["session_id"]
+        controller = lock_row(conn, "manager_controllers", "session_id", session_id)
+        if controller is None or controller["revision"] != execution["controller_revision"]:
+            raise ManagementExecutionFenced("manager_controller_changed")
+
+        goal_ids = set(json.loads(execution["goal_revisions"]))
+        for row in conn.execute("SELECT goal_id FROM manager_goal_proposals WHERE execution_id=?",
+                                (execution["execution_id"],)).fetchall():
+            goal_ids.add(row["goal_id"])
+        matter_ids = set((record.get("metadata", {}).get("manager_matter_versions") or {}).keys())
+        schedule_ids = set()
+        for event in events:
+            payload = event["payload"]
+            if event.get("goal_id"):
+                goal_ids.add(event["goal_id"])
+            if payload.get("goal_id"):
+                goal_ids.add(payload["goal_id"])
+            if payload.get("matter_id"):
+                matter_ids.add(payload["matter_id"])
+            if payload.get("schedule_id"):
+                schedule_ids.add(payload["schedule_id"])
+        for row in conn.execute("SELECT payload FROM manager_work_proposals WHERE execution_id=?",
+                                (execution["execution_id"],)).fetchall():
+            try:
+                payload = json.loads(row["payload"])
+            except (TypeError, ValueError):
+                continue
+            for operation in payload if isinstance(payload, list) else payload.get("operations", []):
+                if isinstance(operation, dict):
+                    if operation.get("goal_id"):
+                        goal_ids.add(operation["goal_id"])
+                    if operation.get("matter_id"):
+                        matter_ids.add(operation["matter_id"])
+        for goal_id in sorted(goal_ids):
+            row = lock_row(conn, "manager_goals", "goal_id", goal_id)
+            expected = json.loads(execution["goal_revisions"]).get(goal_id)
+            if expected is not None and (row is None or row["revision"] != expected):
+                raise ManagementExecutionFenced("manager_goal_changed")
+        for matter_id in sorted(matter_ids):
+            row = lock_row(conn, "matters", "matter_id", matter_id)
+            expected = (record.get("metadata", {}).get("manager_matter_versions") or {}).get(matter_id)
+            if expected is not None and (row is None or row["revision"] != expected):
+                raise ManagementExecutionFenced("manager_matter_changed")
+        delivery = getattr(self, "delivery", None)
+        if delivery is not None:
+            # The admission anchor also serializes creation of the defaultless
+            # policy row; lock_row protects an existing policy version.
+            policy = lock_row(conn, "manager_delivery_policies", "session_id", session_id)
+            actual_revision = policy["revision"] if policy is not None else 0
+            if actual_revision != int(record.get("metadata", {}).get("manager_delivery_revision", 0)):
+                raise ManagementExecutionFenced("manager_delivery_policy_changed")
+        for schedule_id in sorted(schedule_ids):
+            row = lock_row(conn, "manager_schedules", "schedule_id", schedule_id)
+            if row is None or row["session_id"] != session_id:
+                raise ManagementExecutionFenced("manager_schedule_changed")
+        return controller
+
     def finalize(self, run_id, result, completed_snapshot, *, user_input, input_role,
                  message_payload, message_id, context_effect_id, token_budget, background_enqueue):
         current = self.run_manager.get_run(run_id)
@@ -866,13 +1219,27 @@ class ManagementCoordinator:
             return False
         self.run_manager.flush_events()
         with closing(self._conn()) as conn, conn:
-            conn.execute("BEGIN IMMEDIATE")
-            stored = conn.execute("SELECT record_payload FROM agent_runs WHERE run_id=?", (run_id,)).fetchone()
-            record = json.loads(stored[0])
-            execution = conn.execute("SELECT * FROM manager_executions WHERE run_id=?", (run_id,)).fetchone()
+            _begin_write(conn)
+            SessionAdmissionStore.lock_session(conn, current.session_id)
+            execution_id = current.metadata["manager_execution_id"]
+            execution = lock_row(conn, "manager_executions", "execution_id", execution_id)
+            if execution is None or execution["run_id"] != run_id or execution["session_id"] != current.session_id:
+                raise ManagementExecutionFenced("manager_execution_changed")
+            stored = lock_row(conn, "agent_runs", "run_id", run_id)
+            if stored is None:
+                raise ManagementExecutionFenced("manager_run_missing")
+            record = json.loads(stored["record_payload"])
             if execution["status"] == "completed" and record["status"] == "completed":
                 completed = AgentRunRecord.model_validate(record)
             else:
+                event_rows = []
+                for event_id in sorted(json.loads(execution["event_ids"])):
+                    event_row = lock_row(conn, "manager_inbox", "event_id", event_id)
+                    if (event_row is None or event_row["session_id"] != execution["session_id"]
+                            or event_row["consumed_execution_id"] is not None):
+                        raise ManagementExecutionFenced("manager_event_already_consumed")
+                    event_rows.append({**dict(event_row), "payload": json.loads(event_row["payload"])})
+                self._lock_publication_resources(conn, execution, record, event_rows)
                 self.check_run(run_id, conn=conn)
                 visibility = self.notifications.apply(conn, record)
                 completed_snapshot = {**completed_snapshot, **visibility}

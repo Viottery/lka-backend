@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from app.core.background_jobs import BackgroundJobStore
 from app.core.background_llm import (
     BatchedExtractionClient,
     IncompleteGenerationError,
@@ -13,6 +14,11 @@ from app.core.background_llm import (
     recover_generation,
     require_complete_response,
 )
+
+
+@pytest.fixture
+def summary_store(tmp_path):
+    return BackgroundJobStore(tmp_path / "summary-jobs.sqlite3")
 
 
 class SequenceClient:
@@ -181,7 +187,7 @@ def test_complete_but_malformed_batch_fails_closed_and_is_cached_empty():
 
 
 @pytest.mark.parametrize("failure", ["length", "budget", "invalid_json"])
-def test_compaction_falls_back_preserving_constraints_and_old_summary(failure):
+def test_compaction_falls_back_preserving_constraints_and_old_summary(failure, summary_store):
     from app.core.llm_workloads import BackgroundTaskBudgetExceeded
     from app.core.memory_background import MemoryBackgroundCoordinator
     from app.core.sessions import SessionRecentMessage, SessionService
@@ -194,7 +200,7 @@ def test_compaction_falls_back_preserving_constraints_and_old_summary(failure):
         outputs = [response('{"summary":"unsafe partial"}', finish_reason="length")] * 2
     client = SequenceClient(outputs, thinking=True)
     coordinator = MemoryBackgroundCoordinator(
-        db_path=":memory:", memory=None, store=None,
+        db_path=":memory:", memory=None, store=summary_store,
         session_service=SessionService(lambda: None), llm_client=client,
     )
     summary = coordinator._summarize("旧目标：整理票务", [SessionRecentMessage(
@@ -220,12 +226,255 @@ def test_configured_selected_budget_applies_to_extraction():
     assert client.calls[0]["max_output_tokens"] == 6000
 
 
-def test_unlimited_compaction_does_not_fall_back_after_crossing_old_allowance():
+def test_real_service_uses_no_estimated_output_cap_without_job_limit():
+    from app.core.llm.service import LLMService
+
+    service = object.__new__(LLMService)
+    service.workloads = None
+    service._count_request = lambda request, path: 256
+    service.config = _background_test_config(context=8192)
+    service.registry = _background_test_registry()
+    calls = []
+    outputs = [response("", finish_reason="length"), response("complete")]
+
+    async def complete_text(**kwargs):
+        calls.append(kwargs)
+        return outputs.pop(0)
+
+    service.complete_text = complete_text
+    service.supports_thinking_control = lambda **kwargs: False
+    selected = SelectedBackgroundClient(service, initial_output_tokens=128, recovery_output_tokens=256)
+    result = recover_generation(selected, system_prompt="s", user_prompt="u", prompt_summary="test")
+
+    assert result.content == "complete"
+    assert len(calls) == 2
+    assert all("max_output_tokens" not in call for call in calls)
+
+
+def test_real_service_clamps_only_to_explicit_total_budget():
+    from app.core.llm.service import LLMService
+
+    service = object.__new__(LLMService)
+    service.workloads = None
+    service._count_request = lambda request, path: 256
+    service.config = _background_test_config(context=8192)
+    service.registry = _background_test_registry()
+    calls = []
+
+    async def complete_text(**kwargs):
+        calls.append(kwargs)
+        return response("complete")
+
+    service.complete_text = complete_text
+    service.supports_thinking_control = lambda **kwargs: False
+    selected = SelectedBackgroundClient(service, initial_output_tokens=128)
+    recover_generation(selected, system_prompt="s", user_prompt="u", prompt_summary="test",
+                       total_tokens_budget=1000)
+
+    assert calls[0]["max_output_tokens"] == 1000 - max(256, len(b"s\nu") // 3 + 64)
+
+
+def test_real_service_direct_client_honors_total_budget():
+    from app.core.llm.service import LLMService
+
+    service = object.__new__(LLMService)
+    service.workloads = None
+    service._count_request = lambda request, path: 256
+    service.config = _background_test_config(context=8192)
+    service.registry = _background_test_registry()
+    calls = []
+
+    async def complete_text(**kwargs):
+        calls.append(kwargs)
+        return response("complete")
+
+    service.complete_text = complete_text
+    recover_generation(service, system_prompt="s", user_prompt="u", prompt_summary="test",
+                       total_tokens_budget=1000)
+
+    assert calls[0]["max_output_tokens"] == 1000 - max(256, len(b"s\nu") // 3 + 64)
+
+
+def test_real_service_direct_client_has_no_estimated_output_cap():
+    from app.core.llm.service import LLMService
+
+    service = object.__new__(LLMService)
+    service.workloads = None
+    service._count_request = lambda request, path: 256
+    service.config = _background_test_config(context=8192)
+    service.registry = _background_test_registry()
+    calls = []
+
+    async def complete_text(**kwargs):
+        calls.append(kwargs)
+        return response("complete")
+
+    service.complete_text = complete_text
+    recover_generation(service, system_prompt="s", user_prompt="u", prompt_summary="test")
+
+    assert "max_output_tokens" not in calls[0]
+
+
+def test_direct_service_treats_zero_job_limit_as_unbounded(tmp_path):
+    from app.core.llm.service import LLMService
+    from app.core.llm_workloads import LLMWorkloadController, workload_scope
+
+    service = object.__new__(LLMService)
+    service.workloads = LLMWorkloadController(tmp_path / "usage.sqlite")
+    service._count_request = lambda request, path: 256
+    service.config = _background_test_config(context=8192)
+    service.registry = _background_test_registry()
+    calls = []
+
+    async def complete_text(**kwargs):
+        calls.append(kwargs)
+        return response("complete")
+
+    service.complete_text = complete_text
+    with workload_scope("background_memory", task_id="unlimited", max_tokens=0):
+        recover_generation(service, system_prompt="s", user_prompt="u", prompt_summary="test")
+
+    assert "max_output_tokens" not in calls[0]
+
+
+def test_unbounded_large_job_remainder_does_not_become_huge_provider_cap():
+    from app.core.llm.service import LLMService
+
+    service = object.__new__(LLMService)
+    service.workloads = None
+    service._count_request = lambda request, path: 256
+    service.config = _background_test_config(context=8192)
+    service.registry = _background_test_registry()
+    calls = []
+
+    async def complete_text(**kwargs):
+        calls.append(kwargs)
+        return response("complete")
+
+    service.complete_text = complete_text
+    service.supports_thinking_control = lambda **kwargs: False
+    selected = SelectedBackgroundClient(service, initial_output_tokens=4096)
+    selected.remaining_job_tokens = lambda: 1_000_000
+    recover_generation(selected, system_prompt="s", user_prompt="u", prompt_summary="test")
+
+    assert "max_output_tokens" not in calls[0]
+
+
+def test_limit_output_false_replaces_estimated_cap_with_finite_job_budget_cap():
+    from app.core.llm.service import LLMService
+
+    service = object.__new__(LLMService)
+    service.workloads = None
+    service._count_request = lambda request, path: 256
+    service.config = _background_test_config(context=8192)
+    service.registry = _background_test_registry()
+    calls = []
+
+    async def complete_text(**kwargs):
+        calls.append(kwargs)
+        return response("complete")
+
+    service.complete_text = complete_text
+    service.supports_thinking_control = lambda **kwargs: False
+    selected = SelectedBackgroundClient(service, initial_output_tokens=4096, limit_output_tokens=False)
+    selected.remaining_job_tokens = lambda: 1000
+    recover_generation(selected, system_prompt="s", user_prompt="u", prompt_summary="test",
+                       max_output_tokens=128)
+
+    assert calls[0]["max_output_tokens"] == 1000 - max(256, len(b"s\nu") // 3 + 64)
+
+
+def test_job_budget_cap_is_clamped_to_model_context_room():
+    from app.core.llm.service import LLMService
+
+    service = object.__new__(LLMService)
+    service.workloads = None
+    service._count_request = lambda request, path: 256
+    service.config = _background_test_config(context=8192)
+    service.registry = _background_test_registry()
+    calls = []
+
+    async def complete_text(**kwargs):
+        calls.append(kwargs)
+        return response("complete")
+
+    service.complete_text = complete_text
+    service.supports_thinking_control = lambda **kwargs: False
+    selected = SelectedBackgroundClient(service)
+    selected.remaining_job_tokens = lambda: 8191
+    recover_generation(selected, system_prompt="s", user_prompt="u", prompt_summary="test")
+
+    assert calls[0]["max_output_tokens"] == 8192 - max(256, len(b"s\nu") // 3 + 64) - 4096
+
+
+def test_explicit_output_cap_is_clamped_to_remaining_total_budget():
+    from app.core.llm.service import LLMService
+
+    service = object.__new__(LLMService)
+    service.workloads = None
+    service._count_request = lambda request, path: 256
+    service.config = _background_test_config(context=8192)
+    service.registry = _background_test_registry()
+    calls = []
+
+    async def complete_text(**kwargs):
+        calls.append(kwargs)
+        return response("complete")
+
+    service.complete_text = complete_text
+    recover_generation(service, system_prompt="s", user_prompt="u", prompt_summary="test",
+                       max_output_tokens=900, total_tokens_budget=500)
+
+    assert calls[0]["max_output_tokens"] == 500 - max(256, len(b"s\nu") // 3 + 64)
+
+
+def test_real_service_counter_is_used_before_clamping_job_budget():
+    from app.core.llm.service import LLMService
+
+    service = object.__new__(LLMService)
+    service.workloads = None
+    service._count_request = lambda request, path: 256
+    service.config = _background_test_config(context=16384)
+    service.registry = _background_test_registry()
+    service._count_request = lambda request, path: 3000
+    calls = []
+
+    async def complete_text(**kwargs):
+        calls.append(kwargs)
+        return response("complete")
+
+    service.complete_text = complete_text
+    service.supports_thinking_control = lambda **kwargs: False
+    selected = SelectedBackgroundClient(service)
+    selected.remaining_job_tokens = lambda: 5000
+    recover_generation(selected, system_prompt="s", user_prompt="u", prompt_summary="test")
+
+    assert calls[0]["max_output_tokens"] == 2000
+
+
+def _background_test_config(*, context):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        default_client="test", model="model", output_reserve_tokens=1024,
+        resolve_model_config=lambda name, model: SimpleNamespace(
+            context_window_tokens=context, output_reserve_tokens=1024,
+        ),
+    )
+
+
+def _background_test_registry():
+    from types import SimpleNamespace
+
+    return SimpleNamespace(get=lambda name: SimpleNamespace(default_model="model"))
+
+
+def test_unlimited_compaction_does_not_fall_back_after_crossing_old_allowance(summary_store):
     from app.core.memory_background import MemoryBackgroundCoordinator
     from app.core.sessions import SessionRecentMessage, SessionService
 
     client = SequenceClient([response('{"summary":"完整摘要","source_trace_ids":[]}') for _ in range(3)])
-    coordinator = MemoryBackgroundCoordinator(db_path=":memory:", memory=None, store=None,
+    coordinator = MemoryBackgroundCoordinator(db_path=":memory:", memory=None, store=summary_store,
         session_service=SessionService(lambda: None), llm_client=client, max_job_tokens=0)
     messages = [SessionRecentMessage(role="user", content="保留用户限定" * 320,
                 created_at="2026-10-07T00:00:00Z", trace_id=f"source-{i}") for i in range(3)]
@@ -235,7 +484,7 @@ def test_unlimited_compaction_does_not_fall_back_after_crossing_old_allowance():
 
 
 @pytest.mark.parametrize("long_previous_summary", [False, True])
-def test_compaction_over_16kb_reaches_model_instead_of_local_fallback(long_previous_summary):
+def test_compaction_over_16kb_reaches_model_instead_of_local_fallback(long_previous_summary, summary_store):
     from app.core.memory_background import MemoryBackgroundCoordinator
     from app.core.sessions import SessionRecentMessage, SessionService
 
@@ -246,7 +495,7 @@ def test_compaction_over_16kb_reaches_model_instead_of_local_fallback(long_previ
     )
     client = SequenceClient([response('{"summary":"整合后的摘要","source_trace_ids":["source-1"]}')])
     coordinator = MemoryBackgroundCoordinator(
-        db_path=":memory:", memory=None, store=None,
+        db_path=":memory:", memory=None, store=summary_store,
         session_service=SessionService(lambda: None), llm_client=client, max_job_tokens=0,
     )
     summary = coordinator._summarize(old_summary, [SessionRecentMessage(
@@ -262,7 +511,7 @@ def test_compaction_over_16kb_reaches_model_instead_of_local_fallback(long_previ
     assert coordinator._compaction_state.used_local_fallback is False
 
 
-def test_compaction_initial_and_recovery_requests_have_no_output_cap():
+def test_compaction_initial_and_recovery_requests_have_no_output_cap(summary_store):
     from app.core.memory_background import MemoryBackgroundCoordinator
     from app.core.sessions import SessionRecentMessage, SessionService
 
@@ -272,7 +521,7 @@ def test_compaction_initial_and_recovery_requests_have_no_output_cap():
                  usage={"prompt_tokens": 500, "completion_tokens": 12000}),
     ], thinking=True)
     coordinator = MemoryBackgroundCoordinator(
-        db_path=":memory:", memory=None, store=None,
+        db_path=":memory:", memory=None, store=summary_store,
         session_service=SessionService(lambda: None), llm_client=client,
     )
     summary = coordinator._summarize("旧摘要", [SessionRecentMessage(
@@ -286,13 +535,13 @@ def test_compaction_initial_and_recovery_requests_have_no_output_cap():
 
 
 @pytest.mark.parametrize("budget,target", [(65536, 4096), (2048, 512), (64, 32)])
-def test_compaction_prompt_requests_current_scoped_state_without_output_cap(budget, target):
+def test_compaction_prompt_requests_current_scoped_state_without_output_cap(budget, target, summary_store):
     from app.core.memory_background import MemoryBackgroundCoordinator
     from app.core.sessions import SessionRecentMessage, SessionService
 
     client = SequenceClient([response('{"summary":"当前状态","source_trace_ids":["source-1"]}')])
     coordinator = MemoryBackgroundCoordinator(
-        db_path=":memory:", memory=None, store=None,
+        db_path=":memory:", memory=None, store=summary_store,
         session_service=SessionService(lambda: None), llm_client=client,
     )
     coordinator._summarize("带有过期待办的旧摘要", [SessionRecentMessage(

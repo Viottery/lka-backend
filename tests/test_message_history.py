@@ -121,6 +121,29 @@ def test_scope_filters_are_dynamic_and_empty_scope_denies(tmp_path):
     assert service.summary(policy["conversation_key"], allowed_sources=[]) is None
 
 
+def test_search_casefolds_text_and_sender_while_keeping_literal_wildcards_and_scope(tmp_path):
+    service, _ = _service(tmp_path)
+    policy = _policy(service)
+    service.import_messages([
+        _message(
+            "casefold", text="CaseProbeAlpha literal 100%_done",
+            sender_name="CaseProbeAlpha Sender",
+        ),
+        _message("decoy", text="Other literal 100XXdone", sender_name="Other Sender"),
+    ])
+
+    casefold = service.search(
+        "caseprobealpha", policy["conversation_key"], sender="caseprobealpha sender",
+        allowed_sources=[policy["source_id"]], allowed_accounts=[policy["account_scope_id"]],
+    )["messages"]
+    assert [item["provider_message_id"] for item in casefold] == ["casefold"]
+    literal_wildcards = service.search("%_", policy["conversation_key"], sender_id="u1")["messages"]
+    assert [item["provider_message_id"] for item in literal_wildcards] == ["casefold"]
+    assert not service.search("caseprobealpha", policy["conversation_key"], allowed_sources=[])["messages"]
+    with pytest.raises(PermissionError):
+        service.search("caseprobealpha", policy["conversation_key"], allowed_sources=["unrelated-source"])
+
+
 def test_fixed_batches_and_atomic_publish_with_fact_provenance(tmp_path):
     service, jobs = _service(tmp_path)
     policy = _policy(service, analysis_enabled=True, batch_size=2, max_batch_messages=2)

@@ -14,8 +14,8 @@ from app.api.main import create_app
 from app.api.routes.agent import (
     decide_agent_safety_review,
     get_agent_safety_review,
-    list_agent_safety_review_queue,
     list_agent_run_safety_reviews,
+    list_agent_safety_review_queue,
     resume_agent_run,
 )
 from app.api.schemas import SafetyReviewDecisionRequest
@@ -23,8 +23,8 @@ from app.core.agent_graph import AgentTurnWaitingForConfirmation
 from app.core.config import get_settings
 from app.core.llm import LLMResponse
 from app.core.safety import SafetyReviewDecision, SafetyReviewMode, SafetyReviewRequest
-from app.storage.db import connect
 from app.core.tools import ToolContext
+from app.storage.db import connect
 
 
 def _app(tmp_path: Path, monkeypatch):
@@ -66,7 +66,8 @@ def test_registered_tools_declare_read_only(tmp_path, monkeypatch):
 
 def test_agent_skip_review_records_and_executes_write_tool(tmp_path, monkeypatch):
     app = _app(tmp_path, monkeypatch)
-    app.state.runtime.agent_turn_loop.llm_client = _CreateMatterLLM()
+    client = _CreateMatterLLM()
+    app.state.runtime.agent_turn_loop.llm_client = client
     request = SimpleNamespace(app=app)
 
     response = app.state.runtime.run_agent_turn(
@@ -75,6 +76,7 @@ def test_agent_skip_review_records_and_executes_write_tool(tmp_path, monkeypatch
     )
 
     assert response.answer == "已创建事务。"
+    assert client.answer_review_calls == 1
     reviews = app.state.runtime.agent_run_manager.list_safety_reviews(response.run_id)
     assert len(reviews) == 1
     assert reviews[0].tool_name == "matter.create"
@@ -103,7 +105,8 @@ def test_explicit_request_overrides_default_safety_review_mode(tmp_path, monkeyp
 
 def test_manual_review_api_approves_waiting_agent_run(tmp_path, monkeypatch):
     app = _app(tmp_path, monkeypatch)
-    app.state.runtime.agent_turn_loop.llm_client = _CreateMatterLLM()
+    client = _CreateMatterLLM()
+    app.state.runtime.agent_turn_loop.llm_client = client
     request = SimpleNamespace(app=app)
     result_holder: dict[str, object] = {}
 
@@ -152,6 +155,7 @@ def test_manual_review_api_approves_waiting_agent_run(tmp_path, monkeypatch):
     assert not thread.is_alive()
     response = result_holder["response"]
     assert response.answer == "已创建事务。"
+    assert client.answer_review_calls == 1
     run = app.state.runtime.agent_run_manager.get_run(review.run_id)
     assert run is not None
     assert run.status == "completed"
@@ -185,7 +189,7 @@ def test_langgraph_manual_review_api_resumes_waiting_run(tmp_path, monkeypatch):
         assert review.status.value == "pending"
         runner = runtime.agent_turn_runner
         state = runner.get_state(run.run_id)
-        runtime_data = runtime.agent_run_store.load_artifact(
+        runtime_data = runtime.agent_run_store.load_graph_runtime(
             state.values["runtime_artifact_ref"]["artifact_id"]
         )
         assert runtime_data is not None
@@ -425,6 +429,9 @@ def _wait_for_review(run_manager):
 
 
 class _CreateMatterLLM:
+    def __init__(self):
+        self.answer_review_calls = 0
+
     def complete_text(
         self,
         *,
@@ -483,6 +490,19 @@ class _CreateMatterLLM:
                         },
                     }
                 )
+        elif "Review the current draft answer" in system_prompt:
+            self.answer_review_calls += 1
+            content = json.dumps(
+                {
+                    "faithful": True,
+                    "hallucination_free": True,
+                    "request_aligned": True,
+                    "decision": "pass",
+                    "issues": [],
+                    "revision_instructions": "",
+                    "evidence_gap": "",
+                }
+            )
         elif "Final Answer Writer" in system_prompt:
             content = "已创建事务。"
         else:

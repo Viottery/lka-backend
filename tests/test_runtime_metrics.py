@@ -1,8 +1,11 @@
 import importlib.util
 import json
+import os
 import sqlite3
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -211,7 +214,8 @@ def test_health_checks_payload_and_never_follows_redirects(mode):
             self.send_response(302 if mode == "redirect" else 200)
             self.send_header("Location", "/must-not-be-requested")
             self.end_headers()
-            payload = {"status": "ok", "service": "other" if mode == "wrong_service" else "local-knowledge-agent-os"}
+            payload = {"status": "ok", "service": "other" if mode == "wrong_service" else "local-knowledge-agent-os",
+                       "storage_backend": "mysql", "deployment_id": "deploy-123"}
             self.wfile.write(b"x" * 1025 if mode == "oversized" else json.dumps(payload).encode())
 
         def log_message(self, *args):
@@ -223,6 +227,166 @@ def test_health_checks_payload_and_never_follows_redirects(mode):
     try:
         result = metrics.health(f"http://127.0.0.1:{server.server_port}/health")
         assert result["status"] == ("available" if mode == "healthy" else "unavailable")
+        if mode == "healthy":
+            assert result["storage_backend"] == "mysql" and result["deployment_id"] == "deploy-123"
         assert requests == ["/health"]
     finally:
         server.shutdown(); server.server_close(); thread.join(timeout=2)
+
+
+class _MySQLMetricsCursor:
+    def __init__(self, owner):
+        self.owner = owner
+        self.rows = []
+        self.row = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def execute(self, sql, params=()):
+        self.owner.statements.append((sql, params))
+        if "INFORMATION_SCHEMA.TABLES" in sql:
+            self.row = (987654,)
+        elif "GROUP BY status" in sql:
+            self.rows = [("running", 2), ("failed", 1)]
+        elif "FROM session_inputs" in sql:
+            self.row = (3,)
+        elif "FROM session_input_queues" in sql:
+            self.row = (5, 2)
+        elif sql.startswith("SHOW GLOBAL STATUS"):
+            self.rows = [("Threads_connected", "4"), ("Slow_queries", "1")]
+        else:
+            raise AssertionError("unexpected MySQL metrics query")
+
+    def fetchone(self):
+        return self.row
+
+    def fetchall(self):
+        return list(self.rows)
+
+
+class _MySQLMetricsConnection:
+    def __init__(self):
+        self.statements = []
+        self.closed = False
+
+    def cursor(self):
+        return _MySQLMetricsCursor(self)
+
+    def close(self):
+        self.closed = True
+
+
+def _mysql_config_file(tmp_path, *, mode=0o600):
+    path = tmp_path / "mysql.json"
+    path.write_text(json.dumps({"host": "db.internal", "port": 3306, "user": "reader",
+                                "password": "private", "database": "lka"}), encoding="utf-8")
+    if os.name != "nt": path.chmod(mode)
+    return path
+
+
+def test_mysql_state_uses_bounded_native_read_only_queries(tmp_path, monkeypatch):
+    connection = _MySQLMetricsConnection()
+    connect_args = {}
+    monkeypatch.setitem(sys.modules, "pymysql", SimpleNamespace(connect=lambda **kwargs:
+                                                                connect_args.update(kwargs) or connection))
+    config_file = _mysql_config_file(tmp_path)
+
+    state, database_size, status = metrics.mysql_database_state(config_file)
+
+    assert state == {"status": "available", "runs_by_status": {"running": 2, "failed": 1},
+                     "pending_unbound_inputs": 3, "input_queues": {"queues": 5, "paused_queues": 2}}
+    assert database_size == 987654
+    assert status == {"Threads_connected": 4, "Slow_queries": 1}
+    assert connect_args["connect_timeout"] == 1 and connect_args["read_timeout"] == 2
+    assert connect_args["write_timeout"] == 2 and connect_args["autocommit"] is True
+    assert all("MAX_EXECUTION_TIME(2000)" in sql for sql, _ in connection.statements if sql.startswith("SELECT"))
+    assert all(sql.startswith(("SELECT", "SHOW GLOBAL STATUS")) for sql, _ in connection.statements)
+    assert connection.closed
+
+
+def test_mysql_state_failure_is_unavailable_without_secret_or_zero_fallback(tmp_path, monkeypatch):
+    config_file = _mysql_config_file(tmp_path)
+
+    class BrokenCursor(_MySQLMetricsCursor):
+        def execute(self, sql, params=()):
+            raise RuntimeError("private-password-and-sql")
+
+    connection = _MySQLMetricsConnection()
+    connection.cursor = lambda: BrokenCursor(connection)
+    monkeypatch.setitem(sys.modules, "pymysql", SimpleNamespace(
+        connect=lambda **_kwargs: connection, MySQLError=RuntimeError,
+    ))
+    state, database_size, status = metrics.mysql_database_state(config_file)
+    assert state == {"status": "unavailable", "reason": "mysql_read_failed"}
+    assert database_size is None and status == {}
+    assert "private-password-and-sql" not in json.dumps((state, database_size, status))
+
+
+def test_mysql_metrics_reject_world_readable_config(tmp_path, monkeypatch):
+    config_file = _mysql_config_file(tmp_path, mode=0o644)
+    monkeypatch.setitem(sys.modules, "pymysql", SimpleNamespace(connect=lambda **_kwargs: pytest.fail("must not connect")))
+    state, size, status = metrics.mysql_database_state(config_file)
+    assert state == {"status": "unavailable", "reason": "mysql_config_permissions_invalid"}
+    assert size is None and status == {}
+
+
+def test_health_mysql_without_connection_never_reads_legacy_sqlite(tmp_path, monkeypatch):
+    data = tmp_path / "data"; data.mkdir()
+    monkeypatch.setattr(metrics, "health", lambda _url: {"status": "available", "storage_backend": "mysql"})
+    monkeypatch.setattr(metrics, "database_state", lambda _path: pytest.fail("must not read legacy SQLite"))
+    monkeypatch.setattr(metrics, "_file_size", lambda *_args, **_kwargs: pytest.fail("must not stat legacy SQLite"))
+    args = SimpleNamespace(data_dir=data, output=None, history=None, window_seconds=300,
+                           database_state=False, health_url="http://127.0.0.1/health",
+                           mysql_connection_file=None)
+
+    result = metrics.sample(args)
+
+    assert result["database_state"] == {"status": "unavailable", "reason": "mysql_connection_config_missing"}
+    assert result["storage"]["backend"] == "mysql"
+    assert result["storage"]["database_bytes"] is None
+    assert result["storage"]["wal_bytes"] is None
+    assert result["metrics"]["sqlite"] == {}
+
+
+def test_explicit_mysql_mode_uses_only_mysql_state(tmp_path, monkeypatch):
+    data = tmp_path / "data"; data.mkdir()
+    connection_file = _mysql_config_file(tmp_path)
+    monkeypatch.setattr(metrics, "mysql_database_state", lambda _path, include_queue: (
+        {"status": "available"}, 1234, {"Questions": 9},
+    ))
+    monkeypatch.setattr(metrics, "database_state", lambda _path: pytest.fail("must not read SQLite"))
+    monkeypatch.setattr(metrics, "_file_size", lambda *_args, **_kwargs: pytest.fail("must not stat SQLite"))
+    args = SimpleNamespace(data_dir=data, output=None, history=None, window_seconds=300,
+                           database_state=True, health_url=None, mysql_connection_file=connection_file)
+
+    result = metrics.sample(args)
+
+    assert result["database_state"] == {"status": "available"}
+    assert result["mysql_global_status"] == {"Questions": 9}
+    assert result["storage"]["backend"] == "mysql"
+    assert result["storage"]["database_bytes"] == 1234
+    assert result["storage"]["database_size_approximate"] is True
+    assert result["storage"]["wal_bytes"] is None
+    assert result["metrics"]["sqlite"] == {}
+
+
+@pytest.mark.skipif(not os.environ.get("LKA_MYSQL_TEST_CONFIG"), reason="Disposable MySQL config required")
+def test_live_mysql_metrics_are_read_only_and_bounded():
+    from app.storage.mysql import MySQLConfig
+
+    config_file = Path(os.environ["LKA_MYSQL_TEST_CONFIG"])
+    config = MySQLConfig(**json.loads(config_file.read_text(encoding="utf-8")))
+    if not any(part in config.database.lower() for part in ("test", "lab")):
+        pytest.fail("live metrics require an explicitly named test/lab database")
+
+    state, database_size, global_status = metrics.mysql_database_state(config_file)
+
+    assert state["status"] == "available"
+    assert isinstance(state["runs_by_status"], dict)
+    assert isinstance(state["input_queues"], dict)
+    assert database_size is None or database_size >= 0
+    assert all(value >= 0 for value in global_status.values())

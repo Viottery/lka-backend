@@ -11,6 +11,8 @@ import sqlite3
 from collections.abc import Mapping
 from typing import Any
 
+from app.storage.connections import is_mysql, lock_row
+
 TERMINAL_RUN_STATUSES = frozenset({"completed", "failed", "cancelled", "timed_out"})
 
 
@@ -24,6 +26,10 @@ class SessionBusyError(ValueError):
 class SessionAdmissionStore:
     @staticmethod
     def ensure_schema(conn: sqlite3.Connection) -> None:
+        # MySQL schemas are installed by the central schema registry; DDL here
+        # would implicitly commit a caller's admission transaction.
+        if is_mysql(conn):
+            return
         conn.execute("""CREATE TABLE IF NOT EXISTS session_admissions (
             session_id TEXT PRIMARY KEY,
             run_id TEXT,
@@ -31,8 +37,11 @@ class SessionAdmissionStore:
         )""")
 
     @staticmethod
-    def _existing_session(conn: sqlite3.Connection, session_id: str) -> bool:
-        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_sessions'").fetchone() is None:
+    def _existing_session(
+        conn: sqlite3.Connection, session_id: str, *, schema_prepared: bool = False,
+    ) -> bool:
+        if (not schema_prepared and not is_mysql(conn)
+                and conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_sessions'").fetchone() is None):
             return False
         row = conn.execute("SELECT status FROM agent_sessions WHERE session_id=?", (session_id,)).fetchone()
         if row is not None and row[0] == "deleted":
@@ -42,7 +51,7 @@ class SessionAdmissionStore:
     @staticmethod
     def reserve(
         conn: sqlite3.Connection, session_id: str, run_id: str,
-        ignore_run_ids: tuple[str, ...] = (),
+        ignore_run_ids: tuple[str, ...] = (), *, schema_prepared: bool = False,
     ) -> int | None:
         """Reserve/revalidate a root slot; legacy active roots also block it.
 
@@ -50,9 +59,16 @@ class SessionAdmissionStore:
         ignore_run_ids is for atomic transitions whose old runs are being retired
         in the same transaction, never for bypassing a live root independently.
         """
-        if not SessionAdmissionStore._existing_session(conn, session_id):
+        if not SessionAdmissionStore._existing_session(
+            conn, session_id, schema_prepared=schema_prepared,
+        ):
             return None
-        SessionAdmissionStore.ensure_schema(conn)
+        # Low-level callers retain lazy setup by default. The durable run store
+        # passes schema_prepared after its constructor has initialized schema.
+        if not schema_prepared:
+            SessionAdmissionStore.ensure_schema(conn)
+        if is_mysql(conn):
+            SessionAdmissionStore.lock_session(conn, session_id)
         ignored = set(ignore_run_ids)
         rows = conn.execute(
             "SELECT run_id,status,record_payload FROM agent_runs WHERE session_id=? "
@@ -60,7 +76,10 @@ class SessionAdmissionStore:
             (session_id,),
         ).fetchall()
         live_roots = set()
-        for candidate_id, status, payload in rows:
+        for candidate in rows:
+            candidate_id = candidate["run_id"]
+            status = candidate["status"]
+            payload = candidate["record_payload"]
             if status in TERMINAL_RUN_STATUSES:
                 continue
             try:
@@ -80,18 +99,37 @@ class SessionAdmissionStore:
         if row is not None and row[0] in live_roots and row[0] not in ignored:
             raise SessionBusyError(session_id, row[0])
         generation = (row[1] if row else 0) + 1
-        conn.execute(
-            "INSERT INTO session_admissions(session_id,run_id,generation) VALUES(?,?,?) "
-            "ON CONFLICT(session_id) DO UPDATE SET run_id=excluded.run_id,generation=excluded.generation",
-            (session_id, run_id, generation),
-        )
+        if is_mysql(conn):
+            conn.execute("UPDATE session_admissions SET run_id=?,generation=? WHERE session_id=?",
+                         (run_id, generation, session_id))
+        else:
+            conn.execute(
+                "INSERT INTO session_admissions(session_id,run_id,generation) VALUES(?,?,?) "
+                "ON CONFLICT(session_id) DO UPDATE SET run_id=excluded.run_id,generation=excluded.generation",
+                (session_id, run_id, generation),
+            )
         return generation
 
     @staticmethod
-    def release_if_terminal(conn: sqlite3.Connection, record: Mapping[str, Any]) -> None:
-        if record.get("parent_run_id") is not None or record.get("status") not in TERMINAL_RUN_STATUSES:
+    def lock_session(conn: sqlite3.Connection, session_id: str) -> None:
+        """Acquire the root admission anchor before other session-owned rows."""
+        if not is_mysql(conn):
             return
         SessionAdmissionStore.ensure_schema(conn)
+        conn.execute_native(
+            "INSERT INTO session_admissions(session_id,run_id,generation) VALUES(%s,NULL,0) "
+            "ON DUPLICATE KEY UPDATE session_id=VALUES(session_id)", (session_id,),
+        )
+        lock_row(conn, "session_admissions", "session_id", session_id)
+
+    @staticmethod
+    def release_if_terminal(
+        conn: sqlite3.Connection, record: Mapping[str, Any], *, schema_prepared: bool = False,
+    ) -> None:
+        if record.get("parent_run_id") is not None or record.get("status") not in TERMINAL_RUN_STATUSES:
+            return
+        if not schema_prepared:
+            SessionAdmissionStore.ensure_schema(conn)
         conn.execute(
             "UPDATE session_admissions SET run_id=NULL WHERE session_id=? AND run_id=?",
             (record["session_id"], record["run_id"]),

@@ -14,6 +14,8 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.storage.connections import is_mysql, lock_row
+
 
 class SharedSyncConfig(BaseModel):
     enabled: bool = False
@@ -133,7 +135,15 @@ class SharedSyncService:
             # Read endpoints use a deferred transaction so SQLite establishes
             # a consistent snapshot without reserving the single writer slot.
             # Schema, proposal, and publication paths retain the write lock.
-            conn.execute("BEGIN" if readonly else "BEGIN IMMEDIATE")
+            if readonly and is_mysql(conn):
+                # Pool sessions use READ COMMITTED for ordinary operations.
+                # Pin heads, entities and dependencies to one page snapshot;
+                # SET TRANSACTION applies only to this transaction. The final
+                # device reauthorization still uses a fresh connection.
+                conn.execute_native("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                conn.execute_native("START TRANSACTION WITH CONSISTENT SNAPSHOT")
+            else:
+                conn.execute("BEGIN" if readonly else "BEGIN IMMEDIATE")
             yield conn
             conn.commit()
         except Exception:
@@ -146,11 +156,14 @@ class SharedSyncService:
         if not self.config.enabled or self.config.role != "hub":
             raise PermissionError("shared sync hub disabled")
 
-    def _authorize(self, conn, principal, scope="sync.read"):
+    def _authorize(self, conn, principal, scope="sync.read", *, lock=False):
         if principal is not None:
             if self.devices is None:
                 raise PermissionError("device authentication unavailable")
-            self.devices.require_node(conn, principal, scope)
+            if lock and is_mysql(conn):
+                self.devices.require_node(conn, principal, scope, lock=True)
+            else:
+                self.devices.require_node(conn, principal, scope)
 
     def _reauthorize_current(self, principal, scope="sync.read"):
         # A read transaction pins its data snapshot. Recheck on a fresh
@@ -161,6 +174,17 @@ class SharedSyncService:
 
     def ensure_schema(self):
         with self._connection() as conn:
+            if is_mysql(conn):
+                # Native triggers are installed by the privileged, versioned
+                # schema migration. Runtime startup verifies them and only
+                # seeds the configured hub identity / initial journal.
+                from app.domains.shared_sync_mysql import verify_shared_sync_mysql
+
+                verify_shared_sync_mysql(conn)
+                self._ensure_hub_identity(conn)
+                for kind in PROJECTIONS:
+                    self._bootstrap_kind(conn, kind, lock=True)
+                return
             for statement in (
                 "CREATE TABLE IF NOT EXISTS shared_sync_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)",
                 "CREATE TABLE IF NOT EXISTS shared_sync_heads(kind TEXT NOT NULL,entity_key TEXT NOT NULL,version INTEGER NOT NULL,deleted INTEGER NOT NULL,PRIMARY KEY(kind,entity_key))",
@@ -175,6 +199,7 @@ class SharedSyncService:
                 "INSERT OR IGNORE INTO shared_sync_meta VALUES('hub_id',?)",
                 (self.config.hub_id or "hub_" + uuid4().hex,),
             )
+            self._ensure_hub_identity(conn)
             for kind, (keys, fields) in PROJECTIONS.items():
                 columns = {r["name"] for r in conn.execute(f"PRAGMA table_info({kind})")}
                 if not set(fields) <= columns:
@@ -200,18 +225,7 @@ class SharedSyncService:
                     INSERT INTO shared_sync_heads VALUES('{kind}',{old_key},1,1)
                     ON CONFLICT(kind,entity_key) DO UPDATE SET version=version+1,deleted=1;
                     INSERT INTO shared_sync_journal(kind,entity_key) VALUES('{kind}',{old_key}); END""")
-                marker = "bootstrap:" + kind
-                if conn.execute("SELECT 1 FROM shared_sync_meta WHERE key=?", (marker,)).fetchone():
-                    continue
-                key = "json_array(" + ",".join(keys) + ")"
-                where = " WHERE kind='manager'" if kind == "agent_sessions" else ""
-                conn.execute(
-                    f"INSERT OR IGNORE INTO shared_sync_heads SELECT '{kind}',{key},1,0 FROM {kind}{where}"
-                )
-                conn.execute(
-                    f"INSERT INTO shared_sync_journal(kind,entity_key) SELECT '{kind}',{key} FROM {kind}{where} ORDER BY {key}"
-                )
-                conn.execute("INSERT INTO shared_sync_meta VALUES(?,?)", (marker, "1"))
+                self._bootstrap_kind(conn, kind)
 
             # Derived visibility changes must get new versions even when the
             # owning business row is unchanged. These are references only.
@@ -299,6 +313,70 @@ class SharedSyncService:
                         UPDATE shared_sync_heads SET version=version+1 WHERE kind='{target}' AND ({where});
                         INSERT INTO shared_sync_journal(kind,entity_key) SELECT kind,entity_key FROM shared_sync_heads WHERE kind='{target}' AND ({where}); END""")
 
+    def _ensure_hub_identity(self, conn):
+        candidate = self.config.hub_id or "hub_" + uuid4().hex
+        if is_mysql(conn):
+            conn.execute_native(
+                "INSERT IGNORE INTO `shared_sync_meta`(`key`,`value`) VALUES('hub_id',%s)",
+                (candidate,),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO shared_sync_meta(key,value) VALUES('hub_id',?) "
+                "ON CONFLICT(key) DO NOTHING",
+                (candidate,),
+            )
+        row = lock_row(conn, "shared_sync_meta", "key", "hub_id")
+        if row is None:
+            raise RuntimeError("shared sync hub identity row could not be initialized")
+        if self.config.hub_id and row["value"] != self.config.hub_id:
+            raise SyncConflictError("configured hub identity differs from stored identity")
+
+    def _bootstrap_kind(self, conn, kind, *, lock=False):
+        marker = "bootstrap:" + kind
+        if lock:
+            if is_mysql(conn):
+                conn.execute_native(
+                    "INSERT IGNORE INTO `shared_sync_meta`(`key`,`value`) VALUES(%s,%s)",
+                    (marker, "pending"),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO shared_sync_meta(key,value) VALUES(?,?) "
+                    "ON CONFLICT(key) DO NOTHING",
+                    (marker, "pending"),
+                )
+            marker_row = lock_row(conn, "shared_sync_meta", "key", marker)
+            if marker_row is not None and marker_row["value"] == "1":
+                return
+        elif conn.execute("SELECT 1 FROM shared_sync_meta WHERE key=?", (marker,)).fetchone():
+            return
+        keys, _fields = PROJECTIONS[kind]
+        if is_mysql(conn):
+            from app.domains.shared_sync_mysql import mysql_entity_key
+
+            key = mysql_entity_key(kind, keys, null_safe=True)
+        else:
+            key = "json_array(" + ",".join(keys) + ")"
+        where = " WHERE kind='manager'" if kind == "agent_sessions" else ""
+        if is_mysql(conn):
+            conn.execute_native(
+                f"INSERT INTO `shared_sync_heads`(`kind`,`entity_key`,`version`,`deleted`) "
+                f"SELECT '{kind}',{key},1,0 FROM `{kind}`{where} "
+                "ON DUPLICATE KEY UPDATE `entity_key`=VALUES(`entity_key`)"
+            )
+        else:
+            conn.execute(
+                f"INSERT OR IGNORE INTO shared_sync_heads SELECT '{kind}',{key},1,0 FROM {kind}{where}"
+            )
+        conn.execute(
+            f"INSERT INTO shared_sync_journal(kind,entity_key) SELECT '{kind}',{key} FROM {kind}{where} ORDER BY {key}"
+        )
+        if lock:
+            conn.execute("UPDATE shared_sync_meta SET value='1' WHERE key=?", (marker,))
+        else:
+            conn.execute("INSERT INTO shared_sync_meta VALUES(?,?)", (marker, "1"))
+
     @staticmethod
     def _project(conn, kind, record):
         if record is None:
@@ -306,20 +384,26 @@ class SharedSyncService:
         from datetime import UTC, datetime
 
         now = datetime.now(UTC).isoformat()
-        source_metadata = "metadata" in {row["name"] for row in conn.execute("PRAGMA table_info(memory_sources)")}
+        source_metadata = "metadata" in {
+            row["name"] for row in conn.execute("PRAGMA table_info(memory_sources)")
+        }
         if kind == "memory_sources" and record.get("source_type") == "node_memory_replica":
             if not source_metadata:
                 return None
-            source = conn.execute("SELECT metadata FROM memory_sources WHERE source_id=?",
-                                  (record["source_id"],)).fetchone()
+            source = conn.execute(
+                "SELECT metadata FROM memory_sources WHERE source_id=?", (record["source_id"],)
+            ).fetchone()
             try:
                 publication = json.loads(source[0]) if source else None
             except (TypeError, ValueError):
                 return None
             # Candidate provenance remains in the hub, but must not prolong an
             # expired active origin in an offline recall mirror.
-            if (not isinstance(publication, dict) or publication.get("published_status") != "active"
-                    or publication.get("needs_review")):
+            if (
+                not isinstance(publication, dict)
+                or publication.get("published_status") != "active"
+                or publication.get("needs_review")
+            ):
                 return None
         if kind == "memory_entries":
             # Conflict-review metadata is private, but its suppression must
@@ -421,8 +505,10 @@ class SharedSyncService:
                     "SELECT coalesce(max(sequence),0) FROM shared_sync_journal"
                 ).fetchone()[0],
             }
-            self._reauthorize_current(principal)
-            return result
+        # Release the page lease before acquiring the fresh authorization
+        # connection, including when the configured pool has only one slot.
+        self._reauthorize_current(principal)
+        return result
 
     def pull(self, after=0, limit=100, principal=None):
         self._enabled()
@@ -445,71 +531,79 @@ class SharedSyncService:
                 "has_more": False,
                 "changes": [],
             }
-            size = 0
-            memory_has_metadata = any(
-                column["name"] == "metadata"
-                for column in conn.execute("PRAGMA table_info(memory_entries)")
+            events = list(
+                conn.execute(
+                    "SELECT * FROM shared_sync_journal WHERE sequence>? AND sequence<=? ORDER BY sequence LIMIT ?",
+                    (after, high, limit),
+                )
             )
-            for event in conn.execute(
-                "SELECT * FROM shared_sync_journal WHERE sequence>? ORDER BY sequence LIMIT ?",
-                (after, limit),
-            ):
-                kind, key = event["kind"], event["entity_key"]
-                head = conn.execute(
-                    "SELECT * FROM shared_sync_heads WHERE kind=? AND entity_key=?", (kind, key)
-                ).fetchone()
-                keys, fields = PROJECTIONS[kind]
-                if kind == "memory_entries" and memory_has_metadata:
-                    fields = (*fields, "metadata")
-                record = None
-                if not head["deleted"]:
-                    record = conn.execute(
-                        f"SELECT {','.join(fields)} FROM {kind} WHERE "
-                        + " AND ".join(f"{k}=?" for k in keys),
-                        json.loads(key),
-                    ).fetchone()
-                    record = dict(record) if record is not None else None
-                record = self._project(conn, kind, record)
-                change = {
-                    "sequence": event["sequence"],
-                    "kind": kind,
-                    "key": json.loads(key),
-                    "version": head["version"],
-                    "deleted": bool(head["deleted"]) or record is None,
-                    "record": record,
-                }
-                length = len(canonical(change).encode())
-                if length > MAX_RECORD_BYTES:
-                    raise ValueError("shared record exceeds sync size limit")
-                if size + length > self.config.max_page_bytes - 8192:
-                    if not result["changes"]:
-                        raise ValueError("shared record exceeds configured page size limit")
+            # Schema capabilities are read once per pull and never cached across
+            # transactions. Projection data itself stays within this read snapshot.
+            from app.domains.shared_sync_read import (
+                READ_BATCH_EVENTS,
+                load_changes,
+                table_columns,
+                table_exists,
+            )
+
+            kinds = {event["kind"] for event in events}
+            schema = {"memory_metadata": False, "source_metadata": False, "goal_links": False}
+            if "memory_entries" in kinds:
+                schema["memory_metadata"] = "metadata" in table_columns(conn, "memory_entries")
+            if kinds.intersection({"memory_entries", "memory_sources"}):
+                schema["source_metadata"] = "metadata" in table_columns(conn, "memory_sources")
+            if "manager_goals" in kinds:
+                schema["goal_links"] = table_exists(conn, "manager_goal_matter_links")
+            size = 0
+            for offset in range(0, len(events), READ_BATCH_EVENTS):
+                candidates = load_changes(conn, events[offset : offset + READ_BATCH_EVENTS], schema)
+                for change in candidates:
+                    length = len(canonical(change).encode())
+                    if length > MAX_RECORD_BYTES:
+                        raise ValueError("shared record exceeds sync size limit")
+                    if size + length > self.config.max_page_bytes - 8192:
+                        if not result["changes"]:
+                            raise ValueError("shared record exceeds configured page size limit")
+                        break
+                    result["changes"].append(change)
+                    result["cursor"] = change["sequence"]
+                    size += length
+                if candidates and result["cursor"] < candidates[-1]["sequence"]:
                     break
-                result["changes"].append(change)
-                result["cursor"] = event["sequence"]
-                size += length
             result["has_more"] = result["cursor"] < high
-            self._reauthorize_current(principal)
-            return result
+        self._reauthorize_current(principal)
+        return result
 
     def propose(self, principal, payload):
         self._enabled()
         item = NodeProposal.model_validate(payload)
         data = canonical(item.model_dump())
         with self._connection() as conn:
-            self._authorize(conn, principal, "sync.propose")
+            self._authorize(conn, principal, "sync.propose", lock=True)
             node_id = principal["node_id"]
-            old = conn.execute(
-                "SELECT payload,status FROM shared_sync_proposals WHERE node_id=? AND proposal_id=?",
-                (node_id, item.proposal_id),
-            ).fetchone()
+            if is_mysql(conn):
+                conn.execute_native(
+                    "INSERT IGNORE INTO `shared_sync_proposals`(`node_id`,`proposal_id`,`payload`,`status`) "
+                    "VALUES(%s,%s,%s,'pending')",
+                    (node_id, item.proposal_id, data),
+                )
+            else:
+                conn.execute(
+                    "INSERT OR IGNORE INTO shared_sync_proposals(node_id,proposal_id,payload,status) "
+                    "VALUES(?,?,?,'pending')",
+                    (node_id, item.proposal_id, data),
+                )
+            select = (
+                "SELECT payload,status FROM shared_sync_proposals WHERE node_id=? AND proposal_id=?"
+            )
+            if is_mysql(conn):
+                select += " FOR UPDATE"
+            old = conn.execute(select, (node_id, item.proposal_id)).fetchone()
+            if old is None:
+                raise RuntimeError("shared sync proposal could not be persisted")
             if old and old["payload"] != data:
                 raise SyncConflictError("proposal id already has different content")
-            conn.execute(
-                "INSERT OR IGNORE INTO shared_sync_proposals(node_id,proposal_id,payload) VALUES(?,?,?)",
-                (node_id, item.proposal_id, data),
-            )
-            self._authorize(conn, principal, "sync.propose")
+            self._authorize(conn, principal, "sync.propose", lock=True)
             return {
                 "node_id": node_id,
                 "proposal_id": item.proposal_id,
@@ -538,16 +632,18 @@ class SharedSyncService:
                 "proposal resolution is rejected or reviewed; activation is not supported"
             )
         with self._connection() as conn:
-            row = conn.execute(
-                "SELECT status FROM shared_sync_proposals WHERE node_id=? AND proposal_id=?",
-                (node_id, proposal_id),
-            ).fetchone()
+            select = "SELECT status FROM shared_sync_proposals WHERE node_id=? AND proposal_id=?"
+            if is_mysql(conn):
+                select += " FOR UPDATE"
+            row = conn.execute(select, (node_id, proposal_id)).fetchone()
             if row is None:
                 raise KeyError(proposal_id)
             if row["status"] not in ("pending", status):
                 raise SyncConflictError("proposal already resolved")
-            conn.execute(
-                "UPDATE shared_sync_proposals SET status=? WHERE node_id=? AND proposal_id=?",
-                (status, node_id, proposal_id),
+            changed = conn.execute(
+                "UPDATE shared_sync_proposals SET status=? WHERE node_id=? AND proposal_id=? AND status=?",
+                (status, node_id, proposal_id, row["status"]),
             )
+            if changed.rowcount != 1:
+                raise SyncConflictError("proposal resolution raced with another update")
             return {"node_id": node_id, "proposal_id": proposal_id, "status": status}

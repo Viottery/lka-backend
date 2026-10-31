@@ -7,6 +7,7 @@ import logging
 import queue
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -18,6 +19,7 @@ from uuid import uuid4
 from pydantic import BaseModel, Field
 
 from app.core.agent_storage import SqliteAgentRunStore, validate_child_plan_ownership
+from app.core.run_change_signals import RunChangeSignals
 from app.core.safety import (
     InMemorySafetyReviewStore,
     SafetyReviewDecision,
@@ -29,6 +31,8 @@ from app.core.safety import (
 )
 
 _logger = logging.getLogger(__name__)
+_MAX_CACHED_STREAM_CALLS = 64
+_MAX_CACHED_STREAM_CHARS = 1_000_000
 
 
 def _now_iso() -> str:
@@ -101,16 +105,33 @@ class AgentRunEvent(BaseModel):
 class InMemoryAgentRunManager:
     """Thread-safe hot cache with optional durable SQLite backing for Agent runs."""
 
-    def __init__(self, *, durable_store: SqliteAgentRunStore | None = None) -> None:
+    def __init__(self, *, durable_store: SqliteAgentRunStore | None = None,
+                 terminal_cache_limit: int = 128, event_cache_limit: int = 256,
+                 safety_review_cache_limit: int = 512) -> None:
+        if type(terminal_cache_limit) is not int or terminal_cache_limit < 1:
+            raise ValueError("terminal_cache_limit must be a positive integer")
+        if type(event_cache_limit) is not int or event_cache_limit < 1:
+            raise ValueError("event_cache_limit must be a positive integer")
+        if type(safety_review_cache_limit) is not int or safety_review_cache_limit < 1:
+            raise ValueError("safety_review_cache_limit must be a positive integer")
         self._execution_owner_id = uuid4().hex
         self._lock = threading.RLock()
+        self.change_signals = RunChangeSignals()
         self._runs: dict[str, AgentRunRecord] = {}
         self._events: dict[str, list[AgentRunEvent]] = {}
+        self._terminal_cache_limit = terminal_cache_limit
+        self._event_cache_limit = event_cache_limit
+        self._terminal_cache: OrderedDict[str, None] = OrderedDict()
+        self._snapshot_cursors: OrderedDict[str, tuple[int, dict[str, str]]] = OrderedDict()
         self._cancel_requests: dict[str, str | None] = {}
-        self.safety_reviews = InMemorySafetyReviewStore()
+        self.safety_reviews = InMemorySafetyReviewStore(
+            decided_cache_limit=safety_review_cache_limit if durable_store is not None else None
+        )
         self._user_continuations: dict[str, tuple[str, str, str]] = {}
         self.durable_store = durable_store
         self._pending_delta_events: queue.Queue[dict[str, Any] | None] | None = None
+        self._event_completion = threading.Condition()
+        self._pending_run_events: dict[str, int] = {}
         self._event_writer: threading.Thread | None = None
         self._event_writer_error: BaseException | None = None
         self._closed = False
@@ -229,8 +250,8 @@ class InMemoryAgentRunManager:
                 )
             self._runs[child.run_id] = child
             self._runs[parent_run_id] = parent
-            self._events[child.run_id] = events[1:]
-            self._events[parent_run_id].append(events[0])
+            self._cache_events(child.run_id, events[1:])
+            self._cache_event(events[0])
             return child
 
     def attach_child_context(self, run_id: str, *, snapshot: dict[str, Any], views: dict[str, Any]) -> AgentRunRecord:
@@ -333,6 +354,10 @@ class InMemoryAgentRunManager:
                     (event for event in reversed(self._events.get(run_id, [])) if event.type == "multi_agent_aggregated"),
                     None,
                 )
+                if prior is None and self.durable_store is not None:
+                    payload = self.durable_store.latest_event(run_id, "multi_agent_aggregated")
+                    if payload is not None:
+                        prior = AgentRunEvent.model_validate(payload)
                 if prior is not None:
                     return prior
             metadata.update({
@@ -363,7 +388,7 @@ class InMemoryAgentRunManager:
         )
 
     def _new_event(self, run_id: str, type: str, message: str, stage: str, refs: dict[str, Any]) -> AgentRunEvent:
-        sequence = len(self._events.setdefault(run_id, [])) + 1
+        sequence = self._last_event_sequence(run_id) + 1
         return AgentRunEvent(
             event_id=f"{run_id}_event_{sequence:06d}", run_id=run_id, sequence=sequence,
             type=type, stage=stage, message=message, payload={}, created_at=_now_iso(), **refs,
@@ -535,18 +560,17 @@ class InMemoryAgentRunManager:
         with self._lock:
             self._runs[record.run_id] = record
             if committed_events is None or record.run_id not in self._events:
-                self._events[record.run_id] = events if committed_events is None else self._load_events(record.run_id)
+                self._cache_events(record.run_id, self._load_events(record.run_id)
+                                   if committed_events is None else events)
             else:
                 cached = self._events[record.run_id]
                 by_id = {event.event_id: event for event in cached}
                 by_id.update({event.event_id: event for event in events})
                 merged = sorted(by_id.values(), key=lambda event: event.sequence)
-                # A missing sequence means another committed writer was not in
-                # this cache; hydrate once to keep future local event numbering safe.
-                if merged and [event.sequence for event in merged] != list(range(1, merged[-1].sequence + 1)):
-                    merged = self._load_events(record.run_id)
-                self._events[record.run_id] = merged
+                # Gaps below the retained suffix are durable history.
+                self._cache_events(record.run_id, merged)
             self._restore_cancel_request(record)
+            self._remember_terminal_run(record)
         self._notify_state_change(record)
         return record
 
@@ -659,7 +683,7 @@ class InMemoryAgentRunManager:
             )
             restored = AgentRunRecord.model_validate(record_payload)
             self._runs[run_id] = restored
-            self._events[run_id] = self._load_events(run_id)
+            self._cache_events(run_id, self._load_events(run_id))
             return restored
 
     def continue_user_question(
@@ -709,7 +733,7 @@ class InMemoryAgentRunManager:
                 )
                 updated = AgentRunRecord.model_validate(record_payload)
                 self._runs[run_id] = updated
-                self._events[run_id] = self._load_events(run_id)
+                self._cache_events(run_id, self._load_events(run_id))
                 return updated, question_id, replayed
 
             existing = self._user_continuations.get(command_id)
@@ -845,7 +869,7 @@ class InMemoryAgentRunManager:
             )
             restored = AgentRunRecord.model_validate(record_payload)
             self._runs[parent_run_id] = restored
-            self._events[parent_run_id] = self._load_events(parent_run_id)
+            self._cache_events(parent_run_id, self._load_events(parent_run_id))
             return restored
 
     def resume_after_child_user(self, parent_run_id: str) -> AgentRunRecord:
@@ -878,7 +902,7 @@ class InMemoryAgentRunManager:
                 )
                 restored = AgentRunRecord.model_validate(record_payload)
                 self._runs[parent_run_id] = restored
-                self._events[parent_run_id] = self._load_events(parent_run_id)
+                self._cache_events(parent_run_id, self._load_events(parent_run_id))
                 return restored
 
             child_ids = parent.metadata.get("waiting_child_user_run_ids")
@@ -946,10 +970,14 @@ class InMemoryAgentRunManager:
             return None
         restored = SafetyReviewRecord.model_validate(payload)
         self.get_run(restored.run_id)
-        return self.safety_reviews.restore(restored)
+        restored = self.safety_reviews.restore(restored)
+        self.safety_reviews.trim_decided_cache()
+        return restored
 
     def list_safety_reviews(self, run_id: str) -> list[SafetyReviewRecord]:
-        self._restore_reviews(run_id)
+        if self.durable_store is not None:
+            return [SafetyReviewRecord.model_validate(payload)
+                    for payload in self.durable_store.list_reviews(run_id)]
         return self.safety_reviews.list_for_run(run_id)
 
     def list_pending_safety_reviews(self) -> list[SafetyReviewRecord]:
@@ -964,7 +992,6 @@ class InMemoryAgentRunManager:
         records = [SafetyReviewRecord.model_validate(item) for item in payloads]
         for record in records:
             self.get_run(record.run_id)
-            self.safety_reviews.restore(record)
         return records
 
     def decide_safety_review(
@@ -975,6 +1002,15 @@ class InMemoryAgentRunManager:
         decided_by: str,
         reason: str | None,
     ) -> SafetyReviewRecord:
+        if self.durable_store is not None:
+            current = self.get_safety_review(review_id)
+            if current is None:
+                raise KeyError(f"Safety review not found: {review_id}")
+            # A cold decided review may be immediately evicted when older
+            # waiters pin the cache above its limit. It is already durable, so
+            # return the loaded decision without requiring a cache entry.
+            if current.status != SafetyReviewStatus.PENDING:
+                return current
         review = self.safety_reviews.decide(
             review_id=review_id,
             decision=decision,
@@ -1069,6 +1105,7 @@ class InMemoryAgentRunManager:
                 decided = SafetyReviewRecord.model_validate(persisted)
                 if not transitioned:
                     self.safety_reviews.restore(decided)
+                    self.safety_reviews.trim_decided_cache()
                     if persisted_event is not None:
                         self._cache_persisted_event(AgentRunEvent.model_validate(persisted_event))
                     # Older persisted decisions may have been committed just
@@ -1126,7 +1163,7 @@ class InMemoryAgentRunManager:
             if self.durable_store is not None:
                 # Reload the ordered durable stream so subsequent events use a
                 # sequence after any event allocated by another manager.
-                self._events[event.run_id] = self._load_events(event.run_id)
+                self._cache_events(event.run_id, self._load_events(event.run_id))
                 return
             events = self._events.setdefault(event.run_id, [])
             review_id = event.payload.get("review", {}).get("review_id")
@@ -1283,6 +1320,8 @@ class InMemoryAgentRunManager:
                 return current.status == AgentRunStatus.COMPLETED
             if run_id in self._cancel_requests or current.metadata.get("cancel_requested") is True:
                 return False
+            if current.status == AgentRunStatus.PAUSED or current.metadata.get("pause_requested"):
+                return False
             if current.metadata.get("completion_claimed") is True:
                 return True
             metadata = dict(current.metadata)
@@ -1393,9 +1432,11 @@ class InMemoryAgentRunManager:
         attempt: int | None = None,
     ) -> AgentRunEvent:
         with self._lock:
+            if self._closed:
+                raise RuntimeError("Agent event writer is closed.")
             if run_id not in self._runs:
                 raise KeyError(f"Agent run not found: {run_id}")
-            sequence = len(self._events.setdefault(run_id, [])) + 1
+            sequence = self._last_event_sequence(run_id) + 1
             event = AgentRunEvent(
                 event_id=f"{run_id}_event_{sequence:06d}",
                 run_id=run_id,
@@ -1412,17 +1453,19 @@ class InMemoryAgentRunManager:
                 attempt=attempt,
             )
             if type == "llm_delta":
-                self._events[run_id].append(event)
+                self._cache_event(event)
                 self._queue_delta_event(event)
             else:
                 self._persist_event(event)
-                self._events[run_id].append(event)
+                self._cache_event(event)
             return event
 
     def get_run(self, run_id: str) -> AgentRunRecord | None:
         with self._lock:
             current = self._runs.get(run_id)
             if current is not None or self.durable_store is None:
+                if current is not None:
+                    self._remember_terminal_run(current)
                 return current
             payload = self.durable_store.load_run(run_id)
             if payload is None:
@@ -1440,20 +1483,63 @@ class InMemoryAgentRunManager:
         after_sequence: int = 0,
         limit: int | None = None,
     ) -> list[AgentRunEvent]:
+        if limit is not None and (type(limit) is not int or limit < 1):
+            raise ValueError("Event page limit must be a positive integer.")
         with self._lock:
-            events = self._events.get(run_id, [])
-            low, high = 0, len(events)
-            while low < high:
-                middle = (low + high) // 2
-                if events[middle].sequence <= after_sequence:
-                    low = middle + 1
-                else:
-                    high = middle
+            if self.durable_store is None:
+                events = self._events.get(run_id, [])
+                low, high = 0, len(events)
+                while low < high:
+                    middle = (low + high) // 2
+                    if events[middle].sequence <= after_sequence:
+                        low = middle + 1
+                    else:
+                        high = middle
+                return events[low:] if limit is None else events[low:low + limit]
+
+            cached = self._events.get(run_id, [])
+            if cached:
+                first_cached = cached[0].sequence
+                last_cached = cached[-1].sequence
+                if after_sequence >= last_cached:
+                    return []
+                if after_sequence >= first_cached - 1:
+                    hot = [event for event in cached if event.sequence > after_sequence]
+                    if limit is not None:
+                        hot = hot[:limit]
+                    expected = after_sequence + 1
+                    for event in hot:
+                        if event.sequence != expected:
+                            break
+                        expected += 1
+                    else:
+                        return self._restore_page_snapshots(run_id, hot, cached) if hot else []
+            elif run_id in self._events and after_sequence >= 0:
+                # A newly created run has an explicitly known empty event tail.
+                return []
+            persisted = [AgentRunEvent.model_validate(item) for item in self.durable_store.list_events(
+                run_id, after_sequence=after_sequence, limit=limit,
+            )]
+            by_sequence = {event.sequence: event for event in persisted}
+            by_sequence.update({event.sequence: event for event in cached
+                                if event.sequence > after_sequence})
+            selected = sorted(by_sequence.values(), key=lambda event: event.sequence)
+            # The token writer persists deltas asynchronously. Never advance
+            # past a sequence that is still pending; the next SSE poll will
+            # pick it up after commit.
+            contiguous = []
+            expected = after_sequence + 1
+            for event in selected:
+                if event.sequence != expected:
+                    break
+                contiguous.append(event)
+                expected += 1
+            selected = contiguous
             if limit is not None:
-                if type(limit) is not int or limit < 1:
-                    raise ValueError("Event page limit must be a positive integer.")
-                return events[low:low + limit]
-            return events[low:]
+                selected = selected[:limit]
+            if not selected:
+                return []
+            return self._restore_page_snapshots(run_id, selected, cached)
 
     def request_pause(self, run_id: str) -> AgentRunRecord:
         """Persist intent; only the checkpoint owner may acknowledge a safe pause."""
@@ -1661,7 +1747,7 @@ class InMemoryAgentRunManager:
         payload: dict[str, Any] | None = None,
         refs: dict[str, Any] | None = None,
     ) -> AgentRunEvent:
-        sequence = len(self._events.get(run_id, [])) + 1 + sum(
+        sequence = self._last_event_sequence(run_id) + 1 + sum(
             event.run_id == run_id for event in pending
         )
         return AgentRunEvent(
@@ -1708,8 +1794,9 @@ class InMemoryAgentRunManager:
             if record.metadata.get("cancel_requested") is True:
                 self._cancel_requests[record.run_id] = record.metadata.get("cancel_reason")
         for event in events:
-            self._events[event.run_id].append(event)
+            self._cache_event(event)
         for record in [*(created or []), *updated]:
+            self._remember_terminal_run(record)
             self._notify_state_change(record)
 
     def is_cancel_requested(self, run_id: str) -> bool:
@@ -1749,6 +1836,7 @@ class InMemoryAgentRunManager:
             self._runs[run_id] = updated
             if status in {AgentRunStatus.COMPLETED, AgentRunStatus.FAILED,
                           AgentRunStatus.CANCELLED, AgentRunStatus.TIMED_OUT}:
+                self._remember_terminal_run(updated)
                 self._acknowledge_ready_ancestors(updated)
             return updated
 
@@ -1763,6 +1851,7 @@ class InMemoryAgentRunManager:
             self._notify_state_change(record)
 
     def _notify_state_change(self, record: AgentRunRecord) -> None:
+        self.change_signals.notify(record.run_id)
         if self.on_state_change is not None:
             try:
                 # Callbacks may only enqueue IDs. Persistence has completed;
@@ -1775,11 +1864,78 @@ class InMemoryAgentRunManager:
         if self.durable_store is not None:
             self.durable_store.save_event(event.model_dump(mode="json"))
 
+    def _compact_cached_event(self, event: AgentRunEvent) -> AgentRunEvent:
+        if self.durable_store is None or event.type != "llm_delta":
+            return event
+        payload = dict(event.payload)
+        payload.pop("content_snapshot", None)
+        return event.model_copy(update={"payload": payload})
+
+    def _cache_events(self, run_id: str, events: Iterable[AgentRunEvent]) -> None:
+        cached = sorted({event.event_id: self._compact_cached_event(event)
+                         for event in events}.values(), key=lambda event: event.sequence)
+        if self.durable_store is not None:
+            cached = cached[-self._event_cache_limit:]
+        self._events[run_id] = cached
+
+    def _cache_event(self, event: AgentRunEvent) -> None:
+        events = self._events.setdefault(event.run_id, [])
+        if not events or events[-1].event_id != event.event_id:
+            events.append(self._compact_cached_event(event))
+        if self.durable_store is not None and len(events) > self._event_cache_limit:
+            del events[:-self._event_cache_limit]
+        self.change_signals.notify(event.run_id)
+
+    def _last_event_sequence(self, run_id: str) -> int:
+        events = self._events.get(run_id)
+        if events:
+            return events[-1].sequence
+        if self.durable_store is not None:
+            return self.durable_store.latest_event_sequence(run_id)
+        return 0
+
+    def _remember_terminal_run(self, record: AgentRunRecord) -> None:
+        if self.durable_store is None or record.status not in {
+            AgentRunStatus.COMPLETED, AgentRunStatus.FAILED,
+            AgentRunStatus.CANCELLED, AgentRunStatus.TIMED_OUT,
+        }:
+            return
+        self._terminal_cache.pop(record.run_id, None)
+        self._terminal_cache[record.run_id] = None
+        while len(self._terminal_cache) > self._terminal_cache_limit:
+            expired_run_id, _ = self._terminal_cache.popitem(last=False)
+            expired = self._runs.get(expired_run_id)
+            if expired is not None and expired.status in {
+                AgentRunStatus.COMPLETED, AgentRunStatus.FAILED,
+                AgentRunStatus.CANCELLED, AgentRunStatus.TIMED_OUT,
+            }:
+                self._runs.pop(expired_run_id, None)
+                self._events.pop(expired_run_id, None)
+                self._snapshot_cursors.pop(expired_run_id, None)
+
     def _queue_delta_event(self, event: AgentRunEvent) -> None:
         if self._pending_delta_events is None:
             return
         # Queue only the durable delta, not another copy of its growing prefix.
-        self._pending_delta_events.put(SqliteAgentRunStore._event_for_storage(event.model_dump(mode="json")))
+        stored = SqliteAgentRunStore._event_for_storage(event.model_dump(mode="json"))
+        with self._event_completion:
+            self._pending_run_events[event.run_id] = self._pending_run_events.get(event.run_id, 0) + 1
+        try:
+            self._pending_delta_events.put(stored)
+        except BaseException:
+            self._finish_pending_run_events([stored])
+            raise
+
+    def _finish_pending_run_events(self, events: list[dict[str, Any]]) -> None:
+        with self._event_completion:
+            for event in events:
+                run_id = event["run_id"]
+                remaining = self._pending_run_events[run_id] - 1
+                if remaining:
+                    self._pending_run_events[run_id] = remaining
+                else:
+                    self._pending_run_events.pop(run_id)
+            self._event_completion.notify_all()
 
     def _write_delta_events(self) -> None:
         if self._pending_delta_events is None or self.durable_store is None:
@@ -1818,6 +1974,9 @@ class InMemoryAgentRunManager:
             except BaseException as exc:  # noqa: BLE001 - surfaced by flush/close callers.
                 self._event_writer_error = exc
             finally:
+                self._finish_pending_run_events(batch)
+                for run_id in {event["run_id"] for event in batch}:
+                    self.change_signals.notify(run_id)
                 for _ in batch:
                     self._pending_delta_events.task_done()
             if stopping:
@@ -1830,16 +1989,34 @@ class InMemoryAgentRunManager:
         if self._event_writer_error is not None:
             raise RuntimeError("Agent event persistence failed.") from self._event_writer_error
 
+    def flush_run_events(self, run_id: str) -> None:
+        """Wait for this run only; unrelated active streams must not block SSE."""
+        with self._event_completion:
+            while self._pending_run_events.get(run_id, 0):
+                self._event_completion.wait()
+        if self._event_writer_error is not None:
+            raise RuntimeError("Agent event persistence failed.") from self._event_writer_error
+
     def close(self) -> None:
         """Flush pending token events before shutting down the local runtime."""
 
-        if self._pending_delta_events is None or self._closed:
-            return
-        self.flush_events()
-        self._closed = True
-        self._pending_delta_events.put(None)
-        if self._event_writer is not None:
-            self._event_writer.join(timeout=2)
+        writer = None
+        self.change_signals.close()
+        try:
+            # append_event uses this same lock. No producer may enqueue behind
+            # the stop sentinel, including when flushing reports a writer error.
+            with self._lock:
+                if self._pending_delta_events is None or self._closed:
+                    return
+                self._closed = True
+                writer = self._event_writer
+                try:
+                    self.flush_events()
+                finally:
+                    self._pending_delta_events.put(None)
+        finally:
+            if writer is not None:
+                writer.join(timeout=2)
 
     def _restore_cancel_request(self, record: AgentRunRecord) -> None:
         if record.metadata.get("cancel_requested") is True:
@@ -1853,40 +2030,110 @@ class InMemoryAgentRunManager:
         using this helper; ordinary cache misses only read durable state.
         """
         self._runs[record.run_id] = record
-        self._events[record.run_id] = self._load_events(record.run_id)
-        self._restore_reviews(record.run_id)
+        self._cache_events(record.run_id, self._load_events(record.run_id))
         self._restore_cancel_request(record)
+        self._remember_terminal_run(record)
+
+    @staticmethod
+    def _snapshot_key(event: AgentRunEvent) -> str:
+        call_id = event.payload.get("llm_call_id")
+        return str(call_id) if isinstance(call_id, str) else f"stage:{event.stage or ''}"
+
+    @staticmethod
+    def _advance_snapshot(snapshots: dict[str, str], event: AgentRunEvent) -> None:
+        if event.type != "llm_delta":
+            return
+        existing = event.payload.get("content_snapshot")
+        key = InMemoryAgentRunManager._snapshot_key(event)
+        if isinstance(existing, str):
+            snapshots[key] = existing
+            return
+        delta = event.payload.get("delta")
+        if isinstance(delta, str):
+            snapshots[key] = snapshots.get(key, "") + delta
+
+    def _restore_page_snapshots(self, run_id: str, events: list[AgentRunEvent],
+                                cached: list[AgentRunEvent]) -> list[AgentRunEvent]:
+        """Add SSE-compatible text prefixes to a result page without caching them."""
+        page_calls = {self._snapshot_key(event) for event in events
+                      if event.type == "llm_delta"}
+        if not page_calls:
+            return events
+        first_sequence = events[0].sequence
+        cursor = self._snapshot_cursors.get(run_id)
+        if (cursor is not None and cursor[0] <= first_sequence - 1
+                and page_calls.issubset(cursor[1])):
+            prefix_sequence, snapshots = cursor[0], dict(cursor[1])
+        else:
+            prefix_sequence, snapshots = 0, {}
+        cached_prefix = {event.sequence: event for event in cached
+                         if prefix_sequence < event.sequence < first_sequence}
+        cached_prefix_events = iter(sorted(cached_prefix.values(), key=lambda event: event.sequence))
+        cached_event = next(cached_prefix_events, None)
+        # A complete cached prefix (including an empty interval) needs no DB
+        # connection on each live stream page.
+        if (self.durable_store is not None
+                and len(cached_prefix) != first_sequence - prefix_sequence - 1):
+            for payload in self.durable_store.iter_events(
+                    run_id, after_sequence=prefix_sequence,
+                    through_sequence=first_sequence - 1):
+                event = AgentRunEvent.model_validate(payload)
+                while cached_event is not None and cached_event.sequence < event.sequence:
+                    self._advance_snapshot(snapshots, cached_event)
+                    cached_event = next(cached_prefix_events, None)
+                if cached_event is not None and cached_event.sequence == event.sequence:
+                    # Prefer the durable copy when an event exists in both sources.
+                    cached_event = next(cached_prefix_events, None)
+                self._advance_snapshot(snapshots, event)
+        # Pending async deltas may be absent from the durable prefix. Merge them
+        # by sequence so a synchronous later event cannot reorder their text.
+        while cached_event is not None:
+            self._advance_snapshot(snapshots, cached_event)
+            cached_event = next(cached_prefix_events, None)
+        restored = []
+        for event in events:
+            if event.type != "llm_delta":
+                restored.append(event)
+                continue
+            payload = dict(event.payload)
+            key = self._snapshot_key(event)
+            existing = payload.get("content_snapshot")
+            if isinstance(existing, str):
+                snapshots[key] = existing
+            else:
+                delta = payload.get("delta")
+                if isinstance(delta, str):
+                    snapshots[key] = snapshots.get(key, "") + delta
+                payload["content_snapshot"] = snapshots.get(key, "")
+            restored.append(event.model_copy(update={"payload": payload}))
+        if not cursor or events[-1].sequence > cursor[0]:
+            self._snapshot_cursors.pop(run_id, None)
+            self._snapshot_cursors[run_id] = (
+                events[-1].sequence, self._trim_stream_snapshots(snapshots))
+            while len(self._snapshot_cursors) > self._terminal_cache_limit:
+                self._snapshot_cursors.popitem(last=False)
+        return restored
+
+    @staticmethod
+    def _trim_stream_snapshots(snapshots: dict[str, str]) -> dict[str, str]:
+        result: dict[str, str] = {}
+        total_chars = 0
+        for call_id, snapshot in reversed(list(snapshots.items())):
+            if len(result) >= _MAX_CACHED_STREAM_CALLS:
+                break
+            if total_chars + len(snapshot) > _MAX_CACHED_STREAM_CHARS:
+                continue
+            result[call_id] = snapshot
+            total_chars += len(snapshot)
+        return dict(reversed(list(result.items())))
 
     def _persist_review(self, review: SafetyReviewRecord) -> None:
         if self.durable_store is not None:
             self.durable_store.save_review(review.model_dump(mode="json"), updated_at=_now_iso())
+            self.safety_reviews.trim_decided_cache()
 
     def _load_events(self, run_id: str) -> list[AgentRunEvent]:
         if self.durable_store is None:
             return []
-        events = [
-            AgentRunEvent.model_validate(payload)
-            for payload in self.durable_store.list_events(run_id)
-        ]
-        snapshots: dict[str, str] = {}
-        for event in events:
-            if event.type != "llm_delta":
-                continue
-            payload = event.payload
-            if isinstance(payload.get("content_snapshot"), str):
-                continue
-            delta = payload.get("delta")
-            if not isinstance(delta, str):
-                continue
-            call_id = payload.get("llm_call_id")
-            key = str(call_id) if isinstance(call_id, str) else f"stage:{event.stage or ''}"
-            snapshot = snapshots.get(key, "") + delta
-            snapshots[key] = snapshot
-            payload["content_snapshot"] = snapshot
-        return events
-
-    def _restore_reviews(self, run_id: str) -> None:
-        if self.durable_store is None:
-            return
-        for payload in self.durable_store.list_reviews(run_id):
-            self.safety_reviews.restore(SafetyReviewRecord.model_validate(payload))
+        payloads = self.durable_store.list_event_tail(run_id, limit=self._event_cache_limit)
+        return [AgentRunEvent.model_validate(payload) for payload in payloads]

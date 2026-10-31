@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -9,7 +10,7 @@ from app.core.agent_runs import AgentRunStatus, InMemoryAgentRunManager
 from app.core.agent_storage import SqliteAgentRunStore
 from app.core.config import Settings
 from app.core.context_driver import AgentView, AuditView, ContextViews, PlannerView, ToolView
-from app.core.llm import LLMResponse
+from app.core.llm import LLMResponse, LLMService
 from app.core.multi_agent import (
     ContextSnapshot,
     RuntimeBudget,
@@ -192,7 +193,7 @@ def synchronous_tool_boundary(monkeypatch):
 async def test_complete_metadata_snapshot(setup, count):
     expert, child, snap, views, llm = _case(setup, count, "list")
     result = await _execute(expert, child, snap, views)
-    assert result.status == TaskResultStatus.COMPLETED
+    assert result.status == TaskResultStatus.COMPLETED, result.failure
     payload = setup[1].load_artifact(f"mail_expert_{child.run_id}")
     assert payload["coverage"]["enumerated"] == count
     assert payload["coverage"]["metadata_complete"] is True
@@ -236,7 +237,8 @@ async def test_route_length_exhaustion_recovers_once_with_supported_thinking_con
     assert len(llm.requests) == 2
     assert llm.requests[0].thinking_enabled is None
     assert llm.requests[1].thinking_enabled is False
-    assert llm.requests[1].max_output_tokens > llm.requests[0].max_output_tokens
+    assert llm.requests[0].max_output_tokens > 400
+    assert llm.requests[1].max_output_tokens < llm.requests[0].max_output_tokens
 
 
 @pytest.mark.parametrize("call_budget,expected_calls", [(1, 1), (4, 2)])
@@ -525,6 +527,98 @@ async def test_legacy_mail_snapshot_without_reasoning_fields_keeps_provider_defa
     assert [request.reasoning_level for request in llm.requests] == [None, None]
     assert llm.requests[0].metadata["reasoning_source"] == "legacy_snapshot"
     assert llm.requests[1].metadata["reasoning_source"] == "legacy_snapshot"
+
+
+@pytest.mark.parametrize("token_budget", [None, 100_000])
+async def test_mail_stage_caps_only_explicit_remaining_task_budget(setup, token_budget):
+    expert, _child, snapshot, _views, _ = _case(setup, 2, "list")
+    snapshot = snapshot.model_copy(update={"budget": RuntimeBudget(max_tokens=token_budget)})
+
+    class Capture(FakeLLM):
+        async def complete(self, request):
+            self.request = request
+            return await super().complete(request)
+
+    llm = Capture("list")
+    expert.llm_service = llm
+    expert._check_active = lambda _run_id: None
+    usage = _Usage(estimated_tokens=100)
+    system, user = "system", json.dumps({"messages": []})
+    await expert._llm(snapshot, usage, None, None, stage="analyze_batch",
+                      system=system, user=user, max_output_tokens=128)
+    expected = None if token_budget is None else token_budget - 100 - len((system + user).encode()) - 128
+    assert llm.request.max_output_tokens == expected
+    assert usage.estimated_tokens == 150
+
+
+@pytest.mark.parametrize("token_budget", [None, 100_000])
+async def test_mail_truncation_retry_does_not_reintroduce_stage_cap(setup, token_budget):
+    expert, _child, snapshot, _views, _ = _case(setup, 2, "list")
+    snapshot = snapshot.model_copy(update={"budget": RuntimeBudget(max_tokens=token_budget)})
+
+    class Capture(FakeLLM):
+        requests = None
+
+        async def complete(self, request):
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                return LLMResponse(provider="fake", status="completed", content="",
+                    prompt_summary="test", finish_reason="length", usage={"total_tokens": 5000})
+            return await super().complete(request)
+
+    llm = Capture("list")
+    llm.requests = []
+    expert.llm_service = llm
+    expert._check_active = lambda _run_id: None
+    await expert._llm(snapshot, _Usage(), None, None, stage="analyze_batch",
+                      system="system", user='{"messages":[]}', max_output_tokens=128)
+    assert len(llm.requests) == 2
+    if token_budget is None:
+        assert all(r.max_output_tokens is None for r in llm.requests)
+    else:
+        assert llm.requests[1].max_output_tokens == llm.requests[0].max_output_tokens - 5000
+
+
+async def test_mail_missing_usage_cannot_reuse_explicit_token_budget(setup):
+    expert, _child, snapshot, _views, _ = _case(setup, 2, "list")
+    snapshot = snapshot.model_copy(update={"budget": RuntimeBudget(max_tokens=10_000)})
+
+    class MissingUsage(FakeLLM):
+        calls = 0
+
+        async def complete(self, request):
+            self.calls += 1
+            return LLMResponse(provider="fake", status="completed", content="",
+                prompt_summary="test", finish_reason="length", usage={})
+
+    llm = MissingUsage("list")
+    expert.llm_service = llm
+    expert._check_active = lambda _run_id: None
+    with pytest.raises(RuntimeError, match="token budget exhausted"):
+        await expert._llm(snapshot, _Usage(), None, None, stage="analyze_batch",
+                          system="system", user='{"messages":[]}', max_output_tokens=128)
+    assert llm.calls == 1
+
+
+async def test_mail_multi_call_budget_larger_than_model_window_is_not_provider_cap(setup):
+    expert, _child, snapshot, _views, _ = _case(setup, 2, "list")
+    service = object.__new__(LLMService)
+    service._resolve_request_identity = lambda request: ("fixture", "fixture-model")
+    service._count_request = lambda request, path: 512
+    service.config = SimpleNamespace(resolve_model_config=lambda *args: SimpleNamespace(context_window_tokens=32768))
+    requests = []
+
+    async def complete(request):
+        requests.append(request)
+        return LLMResponse(provider="fake", status="completed", content="{}",
+                           prompt_summary="test", usage={"total_tokens": 50})
+
+    service.complete = complete
+    expert.llm_service = service
+    expert._check_active = lambda _run_id: None
+    await expert._llm(snapshot, _Usage(), None, None, stage="analyze_batch",
+                      system="system", user='{"messages":[]}', max_output_tokens=128)
+    assert requests[0].max_output_tokens is None
 
 
 async def test_invalid_router_shape_never_retries_unboundedly_or_runs_tools(setup):

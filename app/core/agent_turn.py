@@ -12,7 +12,7 @@ import threading
 import time
 from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 from dataclasses import replace
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
@@ -635,7 +635,8 @@ class AgentTurnLoop:
         log_dir: Path,
         max_decision_steps: int = DEFAULT_MAX_DECISION_STEPS,
         llm_max_attempts: int = 2,
-        answer_timeout_seconds: float = 60,
+        session_context_token_budget: int = 32_384,
+        answer_timeout_seconds: float | None = None,
         answer_timeout_fallback_enabled: bool = True,
         answer_review_enabled: bool = False,
         answer_review_max_reworks: int = 2,
@@ -686,7 +687,7 @@ class AgentTurnLoop:
         self.max_decision_steps = max(1, int(max_decision_steps))
         self.decision_format_max_attempts = 2
         self.llm_generation_token_budget: int | None = None
-        self.session_context_token_budget = 65_536
+        self.session_context_token_budget = session_context_token_budget
         # This is a whole-request input target, separate from session history.
         self.prompt_input_target_tokens = 131_072
         self.prompt_safety_margin_tokens = 4_096
@@ -881,6 +882,10 @@ class AgentTurnLoop:
             maxsize=1
         )
 
+        from app.core.execution_admission import retain_execution_for_worker
+
+        permit = retain_execution_for_worker()
+
         def target() -> None:
             try:
                 result_queue.put(
@@ -904,9 +909,18 @@ class AgentTurnLoop:
                 )
             except BaseException as exc:  # noqa: BLE001 - propagate worker cancellation/errors.
                 result_queue.put((False, exc))
+            finally:
+                if permit is not None:
+                    permit.release()
 
-        thread = threading.Thread(target=target, name="lka-agent-turn", daemon=True)
-        thread.start()
+        context = copy_context()
+        thread = threading.Thread(target=lambda: context.run(target), name="lka-agent-turn", daemon=True)
+        try:
+            thread.start()
+        except BaseException:
+            if permit is not None:
+                permit.release()
+            raise
         while True:
             try:
                 ok, value = result_queue.get_nowait()
@@ -929,6 +943,7 @@ class AgentTurnLoop:
         llm_answer_model: str | None = None,
         llm_reasoning_level: str | None = None,
         llm_reasoning_source: str | None = None,
+        trusted_session_policy: SessionRunPolicy | None = None,
     ) -> AgentRunRecord:
         if self.run_manager is None:
             raise RuntimeError("Agent run manager is not configured.")
@@ -938,7 +953,12 @@ class AgentTurnLoop:
             metadata={"entrypoint": "agent.turn"},
         )
         trace_id = _stable_id("agent_turn", session.session_id, user_input, _now_iso())
-        policy = self.session_service.run_policy(session.session_id)
+        # Runtime admission may pass the policy it just resolved for an existing
+        # session. Keep this private handoff request-local; direct/fork callers
+        # and newly-created sessions still resolve policy after ensure_session.
+        policy = (trusted_session_policy.model_copy(deep=True)
+                  if trusted_session_policy is not None and parent_run_id is None
+                  else self.session_service.run_policy(session.session_id))
         explicit_level = llm_reasoning_level or _turn_llm_reasoning_level.get()
         selected_level = ReasoningLevel(explicit_level or policy.llm_reasoning_level or "low").value
         reasoning_source = llm_reasoning_source or (
@@ -1118,7 +1138,7 @@ class AgentTurnLoop:
 
     def _model_network_timeout(self, stage: str) -> float | None:
         remaining = self._remaining_execution_seconds()
-        if stage in {"answer", "context_answer"}:
+        if stage in {"answer", "context_answer"} and self.answer_timeout_seconds is not None:
             return min(self.answer_timeout_seconds, remaining) if remaining is not None else self.answer_timeout_seconds
         return remaining
 
@@ -1198,7 +1218,7 @@ class AgentTurnLoop:
             return {}  # Keep legacy run/profile controls unchanged.
         # Repair can reinterpret an ambiguous operation; keep the business
         # level unless its caller supplies a separate pure-format utility task.
-        policy = ("utility" if stage == "route" else "safety" if stage == "safety_review"
+        policy = ("utility" if stage in {"route", "answer_review"} else "safety" if stage == "safety_review"
                   else "internal" if stage in {"tool_result_check", "context_summarize", "answer_review"} else "user")
         if stage in {"answer", "context_answer"}:
             publication = self._answer_publication()
@@ -6918,16 +6938,25 @@ class AgentTurnLoop:
     def _answer_publication(self, run_id: str | None = None, *, pending: bool = False) -> dict[str, Any]:
         provider = getattr(self, "answer_visibility_provider", None)
         run_id = run_id or _turn_run_id.get()
-        projection = provider(run_id) if callable(provider) and run_id else None
+        projection = None
+        manager = getattr(self, "run_manager", None)
+        record_provider = getattr(provider, "for_run_record", None)
+        run = (manager.get_run(run_id) if run_id and manager is not None
+               and (callable(record_provider) or pending) else None)
+        if callable(record_provider) and run is not None:
+            # The trusted provider only inspects fields; do not repeatedly
+            # serialize large context/result metadata to decide applicability.
+            projection = record_provider(dict(run))
+        elif callable(provider) and run_id:
+            # Preserve the legacy provider contract for custom integrations.
+            projection = provider(run_id)
         if projection is None:
             return {}
         if type(projection.get("user_visible")) is not bool:
             raise ValueError("Publication visibility must be an explicit server boolean")
         publication = {"user_visible": projection["user_visible"],
                        "notification": projection.get("notification")}
-        manager = getattr(self, "run_manager", None)
-        run = manager.get_run(run_id) if pending and manager is not None else None
-        if run is not None and run.metadata.get("defer_answer_publication") is True:
+        if pending and run is not None and run.metadata.get("defer_answer_publication") is True:
             # A staged notification cannot publish text ahead of transactional
             # revision/lease checks. The committed final event reveals it.
             publication.update(user_visible=False, publication_pending=True)
@@ -7399,7 +7428,7 @@ class AgentTurnLoop:
                         response = self._complete_text_with_retry(
                             stage=stage, system_prompt=current_system, user_prompt=current_prompt,
                             prompt_summary="final_answer_degraded_delivery", llm_events=llm_events,
-                            max_output_tokens=2048, max_attempts=1,
+                            max_output_tokens=None, max_attempts=1,
                         )
                         if (response is None or response.status != "completed" or response.partial
                                 or str(response.finish_reason or "").lower() in {"length", "max_tokens", "partial", "content_filter"}):
@@ -7421,7 +7450,7 @@ class AgentTurnLoop:
                     stage="answer_review", system_prompt=REVIEW_SYSTEM_PROMPT + ("\n" + DEGRADED_REVIEW_INSTRUCTION if degraded else ""),
                     user_prompt=serialize_prompt_payload(review_payload),
                     prompt_summary="final_answer_content_review",
-                    max_output_tokens=2048, llm_events=llm_events, max_attempts=1,
+                    max_output_tokens=None, llm_events=llm_events, max_attempts=1,
                 )
                 self._raise_if_cancel_requested()
                 if (checked is None or checked.status != "completed" or checked.partial
@@ -7563,8 +7592,8 @@ class AgentTurnLoop:
     ) -> LLMResponse:
         """Regenerate one incomplete answer through the audited provider boundary.
 
-        Recovery uses the selected model's existing output reserve, not a larger
-        inferred model limit. Streaming recovery is collected as a single reply:
+        Recovery preserves the provider output policy; explicit child budgets
+        remain enforced at dispatch. Streaming recovery is collected as a single reply:
         the terminal final_answer snapshot replaces any provisional first stream.
         """
         call = {
@@ -7594,14 +7623,8 @@ class AgentTurnLoop:
                     llm_events[-1].error_message or "Final answer generation timed out."
                 )
             raise LLMClientError("Final answer generation failed; no complete answer is available.")
-        recovery_prompt, recovery_content = self._input_prompt(stage, user_prompt)
-        budgeted = self._budget_llm_prompt(
-            system_prompt=system_prompt, user_prompt=recovery_prompt,
-            max_output_tokens=None, tools=None,
-            image_token_reservation=recovery_content.token_reservation,
-            stage=stage,
-        )
-        call["max_output_tokens"] = budgeted.output_reserve_tokens
+        # Reuse an explicit caller limit, but never turn the accounting reserve
+        # into a new generation cap during an incomplete-answer retry.
         client_name, model, *_ = self._stage_inference_selection(stage)
         supports = getattr(self.llm_client, "supports_thinking_control", None)
         thinking_enabled = None
@@ -7621,7 +7644,7 @@ class AgentTurnLoop:
             stage=stage,
             payload={"finish_reason": getattr(response, "finish_reason", None),
                      "partial": bool(getattr(response, "partial", False)),
-                     "thinking_enabled": thinking_enabled, "max_output_tokens": budgeted.output_reserve_tokens},
+                     "thinking_enabled": thinking_enabled, "max_output_tokens": call["max_output_tokens"]},
         )
         # Never append a regenerated stream to the first attempt's deltas. The
         # existing terminal snapshot is authoritative for both orchestrators.
@@ -8062,7 +8085,7 @@ class AgentTurnLoop:
         """Apply the whole-prompt cap for the exact selected client/model.
 
         Unknown OpenAI-compatible models fail closed until their capacity is
-        configured. The session's 65k history budget is not changed by this
+        configured. The independent session history budget is not changed by this
         per-request fitting step.
         """
 
@@ -8379,10 +8402,12 @@ class AgentTurnLoop:
             )
             raise LLMResourceError(str(exc), error_category="prompt_budget_exceeded") from exc
         user_prompt = budgeted.user_prompt
-        if max_output_tokens is None and isinstance(self.llm_client, LLMService) and stage != "safety_review":
-            # Normal stages enforce the output reserve. Safety review deliberately
-            # leaves provider output unset; its reserve remains admission accounting,
-            # not a generation cap. Explicit child-run budgets still apply below.
+        # The context output reserve is admission accounting, not a provider
+        # generation limit: reasoning tokens may consume it before any answer.
+        # Leave an unspecified limit unset for every stage. Explicit caller and
+        # frozen child-task budgets still apply below.
+        if (max_output_tokens is None and stage != "safety_review"
+                and self._child_budget_for_prompt() is not None):
             max_output_tokens = budgeted.output_reserve_tokens
         if budgeted.omitted:
             self._append_run_event(

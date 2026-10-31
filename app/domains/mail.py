@@ -13,6 +13,8 @@ from hashlib import sha1, sha256
 
 from pydantic import BaseModel, Field
 
+from app.storage.mysql_fulltext import execute_fulltext
+
 
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
@@ -469,7 +471,7 @@ class MailService:
         conn = self._conn_factory()
         try:
             if normalized_query:
-                rows = conn.execute(
+                rows = execute_fulltext(conn,
                     """
                     SELECT
                         m.message_id,

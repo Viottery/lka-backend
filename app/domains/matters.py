@@ -16,6 +16,8 @@ from pydantic import BaseModel, Field, field_validator
 
 from app.domains.mail_knowledge import MailKnowledgeMirror
 from app.storage.commit_signals import notify_after_commit
+from app.storage.connections import is_mysql, lock_row
+from app.storage.mysql_fulltext import execute_fulltext
 
 
 def _now_iso() -> str:
@@ -297,7 +299,7 @@ class MatterService:
         owns = conn is None
         if owns:
             conn = self._conn_factory()
-            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("BEGIN" if is_mysql(conn) else "BEGIN IMMEDIATE")
         elif not conn.in_transaction:
             raise ValueError("Caller-owned matter connection requires an active transaction.")
         try:
@@ -838,7 +840,7 @@ class MatterService:
             filter_sql = " AND " + " AND ".join(filters) if filters else ""
             limit_sql = "LIMIT ?" if source_ids is None and account_ids is None else ""
             if normalized_query:
-                rows = conn.execute(
+                rows = execute_fulltext(conn,
                     f"""
                     SELECT
                         m.matter_id,
@@ -940,6 +942,7 @@ class MatterService:
     def _update_matter_transaction(
         self, conn, *, matter_id, payload, source_ids, account_ids, allow_unattributed
     ):
+        lock_row(conn, "matters", "matter_id", matter_id)
         current = self.get_matter(matter_id=matter_id, conn=conn)
         title = payload.title.strip() if payload.title is not None else current.title
         summary = payload.summary.strip() if payload.summary is not None else current.summary
@@ -989,13 +992,13 @@ class MatterService:
             kind=current.kind, scheduled_start=planning["scheduled_start"],
             scheduled_end=planning["scheduled_end"], sections=planning["sections"],
         )
-        conn.execute(
+        updated = conn.execute(
             """
                 UPDATE matters
                 SET title = ?, summary = ?, status = ?, priority = ?, due_at = ?,
                     tags = ?, metadata = ?, updated_at = ?, parent_matter_id = ?, project_id = ?,
                     scheduled_on = ?, scheduled_start = ?, scheduled_end = ?, inbox = ?, section = ?, sort_order = ?, sections = ?, visibility = ?, revision = revision + 1
-                WHERE matter_id = ?
+                WHERE matter_id = ? AND revision = ?
                 """,
             (
                 title or "Untitled matter",
@@ -1017,8 +1020,11 @@ class MatterService:
                 self._json_dumps(planning["sections"]),
                 visibility,
                 matter_id,
+                current.revision,
             ),
         )
+        if updated.rowcount != 1:
+            raise MatterConflictError(f"Matter revision conflict: {matter_id}")
         self._upsert_fts(conn, matter_id, title, summary, tags)
         return self.get_matter(matter_id=matter_id, conn=conn, source_ids=source_ids, account_ids=account_ids, allow_unattributed=allow_unattributed)
 

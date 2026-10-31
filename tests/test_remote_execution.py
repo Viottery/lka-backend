@@ -1,4 +1,5 @@
 """Synthetic hub/node integration through durable generic Agent admission, without network or models."""
+import json
 from contextlib import closing
 
 import pytest
@@ -18,7 +19,20 @@ from app.domains.remote_execution import (
 from app.domains.shared_sync import SharedSyncConfig
 from app.integrations.remote_execution import RemoteExecutionNode
 from tests.test_management_api import runtime as runtime_fixture
-from tests.test_unified_entry_quality import ScriptedClient, operation
+from tests.test_unified_entry_quality import ScriptedClient as _ScriptedClient
+from tests.test_unified_entry_quality import operation
+
+
+class ScriptedClient(_ScriptedClient):
+    """One protocol-valid review after the scripted synthetic answer.
+
+    These tests validate transport/authority, not real-model answer quality.
+    Unknown extra stages still exhaust the finite script and fail.
+    """
+    def __init__(self, outputs):
+        review = json.dumps({"faithful": True, "hallucination_free": True, "request_aligned": True,
+                             "decision": "pass", "issues": [], "revision_instructions": ""})
+        super().__init__([*outputs, review])
 
 
 @pytest.fixture
@@ -244,6 +258,7 @@ def test_workspace_policy_accepts_explicit_workspace_and_preserves_retry_receipt
     assert e["node"].agent_dispatch.run_one("workspace-task")
     e["worker"].run_once()
     assert service.get(first["remote_execution"]["task_id"])["state"] == "completed"
+    assert e["node"].agent_turn_loop.llm_client.calls[-1]["metadata"]["stage"] == "answer_review"
 
 
 def test_concurrent_identical_remote_admissions_return_one_receipt(setup_remote, monkeypatch):
@@ -1079,6 +1094,7 @@ def test_native_question_answer_relay_once_survives_runtime_restart(setup_remote
         resumed_worker.run_once()
         assert restarted.agent_dispatch.run_one("answer")
         assert restarted.agent_run_manager.get_run(run_id).status.value == "completed"
+        assert [call["metadata"]["stage"] for call in restarted.agent_turn_loop.llm_client.calls] == ["answer_review"]
         resumed_worker.run_once()
         assert e["service"].get(task_id)["state"] == "completed"
         assert sum(o.get("action") == "user_answer" for o in observations) == 1

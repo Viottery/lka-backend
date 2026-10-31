@@ -6,6 +6,8 @@ import time
 from collections.abc import Callable
 from contextlib import closing
 
+from app.storage.sqlite_write_queue import SqliteWriteAdmissionError
+
 
 def is_sqlite_busy(exc: BaseException) -> bool:
     code = getattr(exc, "sqlite_errorcode", None)
@@ -13,13 +15,18 @@ def is_sqlite_busy(exc: BaseException) -> bool:
 
 
 def begin_sqlite_write(conn: sqlite3.Connection) -> None:
-    """Retry only write-lock admission, before the caller can produce effects."""
+    """Retry only write-lock admission, before the caller can produce effects.
+
+    At most two admissions, each subject to its original queue/SQLite timeout.
+    Transaction expiry, nested writes and SQL/body failures are never retried.
+    """
     for attempt in range(2):
         try:
             conn.execute("BEGIN IMMEDIATE")
             return
         except sqlite3.OperationalError as exc:
-            if attempt or conn.in_transaction or not is_sqlite_busy(exc):
+            if (attempt or conn.in_transaction
+                    or not (isinstance(exc, SqliteWriteAdmissionError) or is_sqlite_busy(exc))):
                 raise
             time.sleep(0.05)
 
@@ -35,7 +42,7 @@ def persist_sqlite[T](connect: Callable[[], sqlite3.Connection], operation: Call
             with closing(connect()) as conn, conn:
                 return operation(conn)
         except sqlite3.OperationalError as exc:
-            if attempt or not is_sqlite_busy(exc):
+            if attempt or not (isinstance(exc, SqliteWriteAdmissionError) or is_sqlite_busy(exc)):
                 raise
             time.sleep(0.05)
     raise AssertionError("Unreachable SQLite retry state")

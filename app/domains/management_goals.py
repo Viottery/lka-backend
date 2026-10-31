@@ -9,6 +9,7 @@ from uuid import uuid4
 
 from app.domains.management import ManagementConflictError
 from app.storage.commit_signals import notify_after_commit
+from app.storage.connections import is_mysql, lock_row
 
 UNSET = object()
 _UNSET = UNSET
@@ -36,6 +37,9 @@ class ManagementGoalService:
         self.work_service = None
 
     def ensure_schema(self):
+        with closing(self._conn()) as probe:
+            if is_mysql(probe):
+                return
         self.management.ensure_schema()
         with closing(self._conn()) as conn, conn:
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(manager_goals)")}
@@ -75,6 +79,11 @@ class ManagementGoalService:
 
     @staticmethod
     def _has_table(conn, name):
+        if is_mysql(conn):
+            return conn.execute_native(
+                "SELECT 1 FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name=%s",
+                (name,),
+            ).fetchone() is not None
         return conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone() is not None
 
     def _matter_link(self, conn, goal_id):
@@ -204,7 +213,7 @@ class ManagementGoalService:
     def update_goal(self, session_id, goal_id, *, expected_revision, objective=_UNSET, status=_UNSET,
                     next_wake_at=_UNSET, wait_run_id=_UNSET):
         with closing(self._conn()) as conn, conn:
-            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("BEGIN" if is_mysql(conn) else "BEGIN IMMEDIATE")
             return self.update_goal_in_transaction(conn, session_id, goal_id, expected_revision=expected_revision,
                                                    objective=objective, status=status,
                                                    next_wake_at=next_wake_at, wait_run_id=wait_run_id)
@@ -223,6 +232,9 @@ class ManagementGoalService:
         if next_wake_at is not _UNSET:
             changes["next_wake_at"] = _instant(next_wake_at).isoformat() if next_wake_at is not None else None
         self._manager(conn, session_id)
+        locked = lock_row(conn, "manager_goals", "goal_id", goal_id)
+        if locked is None or locked["session_id"] != session_id:
+            raise KeyError(goal_id)
         row = conn.execute("SELECT revision FROM manager_goals WHERE session_id=? AND goal_id=?", (session_id, goal_id)).fetchone()
         if row is None:
             raise KeyError(goal_id)
@@ -236,8 +248,11 @@ class ManagementGoalService:
             changes["wait_run_id"] = self._wait_run(conn, wait_run_id)
         assignments = [f"{name}=?" for name in changes]
         assignments.extend(["revision=revision+1", "timer_generation=timer_generation+1", "updated_at=?"])
-        conn.execute("UPDATE manager_goals SET " + ",".join(assignments) + " WHERE session_id=? AND goal_id=?",
-                     [*changes.values(), _instant().isoformat(), session_id, goal_id])
+        updated = conn.execute("UPDATE manager_goals SET " + ",".join(assignments) +
+                               " WHERE session_id=? AND goal_id=? AND revision=?",
+                               [*changes.values(), _instant().isoformat(), session_id, goal_id, expected_revision])
+        if updated.rowcount != 1:
+            raise ManagementConflictError("Goal revision changed")
         return self._project(conn, conn.execute("SELECT * FROM manager_goals WHERE goal_id=?", (goal_id,)).fetchone())
 
     @staticmethod
@@ -245,6 +260,12 @@ class ManagementGoalService:
         encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False)
         if len(encoded.encode("utf-8")) > 4096:
             raise ValueError("Event payload exceeds 4096 bytes")
+        if is_mysql(conn):
+            return conn.execute_native(
+                "INSERT INTO manager_inbox(session_id,dedup_key,kind,goal_id,goal_revision,payload,created_at) "
+                "VALUES(%s,%s,%s,%s,%s,%s,%s) ON DUPLICATE KEY UPDATE event_id=event_id",
+                (session_id, dedup_key, kind, goal_id, goal_revision, encoded, stamp),
+            ).rowcount
         return conn.execute("INSERT OR IGNORE INTO manager_inbox(session_id,dedup_key,kind,goal_id,goal_revision,"
                             "payload,created_at) VALUES(?,?,?,?,?,?,?)",
                             (session_id, dedup_key, kind, goal_id, goal_revision, encoded, stamp)).rowcount
@@ -466,7 +487,7 @@ class ManagementGoalService:
         self._page(limit, after)
         with closing(self._conn()) as conn:
             self._manager(conn, session_id)
-            rows = conn.execute(f"SELECT rowid AS cursor,* FROM {table} WHERE session_id=? AND rowid>? ORDER BY rowid LIMIT ?",
+            rows = conn.execute(f"SELECT rowid AS cursor,{table}.* FROM {table} WHERE session_id=? AND rowid>? ORDER BY rowid LIMIT ?",
                                 (session_id, after, limit + 1)).fetchall()
         records = [dict(row) for row in rows[:limit]]
         if table == "manager_executions":

@@ -6,9 +6,11 @@ from contextlib import closing
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.core.session_admission import SessionAdmissionStore
 from app.domains.management import ManagementConflictError
 from app.domains.management_goals import ManagementGoalService, _instant
 from app.storage.commit_signals import notify_after_commit
+from app.storage.connections import is_mysql, lock_row
 
 
 class DeliveryPolicyInput(BaseModel):
@@ -29,6 +31,9 @@ class ManagementDeliveryService:
         self._conn = conn_factory
 
     def ensure_schema(self):
+        with closing(self._conn()) as conn:
+            if is_mysql(conn):
+                return
         with closing(self._conn()) as conn, conn:
             conn.execute("""CREATE TABLE IF NOT EXISTS manager_delivery_policies (
                 session_id TEXT PRIMARY KEY, revision INTEGER NOT NULL,
@@ -55,18 +60,31 @@ class ManagementDeliveryService:
         args = DeliveryPolicyInput.model_validate({"expected_revision": expected_revision, "muted": muted,
             "snooze_until": snooze_until, "allow_decisions": allow_decisions})
         with closing(self._conn()) as conn, conn:
-            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("BEGIN" if is_mysql(conn) else "BEGIN IMMEDIATE")
+            SessionAdmissionStore.lock_session(conn, session_id)
             if authority_check is not None:
                 authority_check(conn)
             ManagementGoalService._manager(conn, session_id)
+            locked = lock_row(conn, "manager_delivery_policies", "session_id", session_id)
             prior = self._get(conn, session_id)
             if (prior["revision"] if prior else 0) != args.expected_revision:
                 raise ManagementConflictError("Delivery policy revision changed")
-            conn.execute("INSERT INTO manager_delivery_policies VALUES(?,?,?,?,?) "
-                         "ON CONFLICT(session_id) DO UPDATE SET revision=excluded.revision,muted=excluded.muted,"
-                         "snooze_until=excluded.snooze_until,allow_decisions=excluded.allow_decisions",
-                         (session_id, args.expected_revision + 1, int(args.muted), args.snooze_until,
-                          int(args.allow_decisions)))
+            values = (session_id, args.expected_revision + 1, int(args.muted), args.snooze_until,
+                      int(args.allow_decisions))
+            if is_mysql(conn):
+                if locked is None:
+                    conn.execute("INSERT INTO manager_delivery_policies VALUES(?,?,?,?,?)", values)
+                else:
+                    changed = conn.execute("UPDATE manager_delivery_policies SET revision=?,muted=?,snooze_until=?,"
+                                           "allow_decisions=? WHERE session_id=? AND revision=?",
+                                           (args.expected_revision + 1, int(args.muted), args.snooze_until,
+                                            int(args.allow_decisions), session_id, args.expected_revision))
+                    if changed.rowcount != 1:
+                        raise ManagementConflictError("Delivery policy revision changed")
+            else:
+                conn.execute("INSERT INTO manager_delivery_policies VALUES(?,?,?,?,?) "
+                             "ON CONFLICT(session_id) DO UPDATE SET revision=excluded.revision,muted=excluded.muted,"
+                             "snooze_until=excluded.snooze_until,allow_decisions=excluded.allow_decisions", values)
             if authority_check is not None:
                 authority_check(conn)
             return self._get(conn, session_id)

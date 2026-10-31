@@ -6,6 +6,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 
 from app.api.account_auth import AccountAuthMiddleware
+from app.api.database_errors import register_mysql_storage_error_handler
 from app.api.device_connection_auth import DeviceConnectionAuthMiddleware
 from app.api.remote_session_boundary import RemoteSessionBoundaryMiddleware
 from app.api.routes.accounts import router as accounts_router
@@ -96,6 +97,16 @@ def create_app() -> FastAPI:
     app.add_middleware(DeviceConnectionAuthMiddleware)
     # Compress after node admission has filtered JSON; SSE remains uncompressed.
     app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
+    register_mysql_storage_error_handler(app)
+
+    from app.core.execution_admission import ExecutionCapacityError
+
+    @app.exception_handler(ExecutionCapacityError)
+    async def execution_capacity_error(request, exc):
+        return JSONResponse(status_code=503, headers={"Retry-After": "1"}, content={
+            "detail": "agent_execution_capacity_full", "accepted": False,
+            "retry_safe": True,
+        })
 
     @app.exception_handler(SessionBusyError)
     async def session_busy(request, exc):
@@ -120,6 +131,7 @@ def create_app() -> FastAPI:
             allow_credentials=runtime.local_app_config.auth.enabled,
             allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
             allow_headers=["*"],
+            expose_headers=["ETag"],
         )
 
     app.include_router(accounts_router)

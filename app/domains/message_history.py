@@ -27,7 +27,8 @@ from app.domains.message_reading_results import (
     TopicUpdate,
 )
 from app.domains.message_reading_runtime import MessageReadingRuntimeMixin
-from app.storage.sqlite_timing import connect_sqlite
+from app.storage.connections import connect_database as connect_sqlite
+from app.storage.connections import is_mysql
 
 ANALYSIS_JOB_KIND = "message_analysis"
 _FACT_KINDS = {"fact", "event", "decision", "task_candidate", "question", "correction"}
@@ -289,8 +290,9 @@ class MessageHistoryService(MessageMetadataMixin, MessageDossierMixin, MessageRe
     def _connect(self) -> sqlite3.Connection:
         conn = connect_sqlite(self.db_path, timeout=10, isolation_level=None)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA busy_timeout=10000")
-        conn.execute("PRAGMA journal_mode=WAL")
+        if not is_mysql(conn):
+            conn.execute("PRAGMA busy_timeout=10000")
+            conn.execute("PRAGMA journal_mode=WAL")
         return conn
 
     @contextmanager
@@ -815,7 +817,7 @@ class MessageHistoryService(MessageMetadataMixin, MessageDossierMixin, MessageRe
             raise ValueError("query must contain 1..256 characters")
         escaped = query.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         where, params = self._message_filters(since, sender_id, until=until, sender=sender)
-        where += " AND text LIKE ? ESCAPE '\\'"
+        where += " AND LOWER(text) LIKE LOWER(?) ESCAPE '\\'"
         params.append(f"%{escaped}%")
         return self._messages(conversation_key=conversation_key, where=where,
                               params=params, limit=limit, offset=offset,
@@ -845,7 +847,7 @@ class MessageHistoryService(MessageMetadataMixin, MessageDossierMixin, MessageRe
         if sender is not None:
             if not isinstance(sender, str) or not sender.strip() or len(sender) > 256:
                 raise ValueError("sender must be 1..256 characters")
-            conditions.append("sender_name LIKE ? ESCAPE '\\'")
+            conditions.append("LOWER(sender_name) LIKE LOWER(?) ESCAPE '\\'")
             params.append("%" + sender.strip().replace("%", "\\%").replace("_", "\\_") + "%")
         return ("AND " + " AND ".join(conditions) if conditions else ""), params
 

@@ -151,7 +151,7 @@ def test_output_limit_is_explicit_and_bounded(setup, limit):
     tool, c, image = setup
 
     async def complete(request):
-        assert request.max_output_tokens == (1024 if limit is None else limit)
+        assert request.max_output_tokens == limit
         return LLMResponse(provider="test", status="completed", content="Done", prompt_summary="image")
 
     c.complete = complete
@@ -159,7 +159,7 @@ def test_output_limit_is_explicit_and_bounded(setup, limit):
     assert invoke(tool, image, **extra).status == "completed"
 
 
-@pytest.mark.parametrize("limit", [True, 0, 127, 4097, "512"])
+@pytest.mark.parametrize("limit", [None, True, 0, 127, 4097, "512"])
 def test_invalid_output_limit_fails_before_model_dispatch(setup, limit):
     tool, c, image = setup
 

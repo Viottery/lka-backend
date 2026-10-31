@@ -325,9 +325,10 @@ class AgentInferenceProfile(BaseModel):
 
 class AgentConfig(BaseModel):
     max_decision_steps: int = 32
+    session_context_token_budget: int = Field(default=32_384, ge=1024, le=131_072)
     answer_review_enabled: bool = True
     answer_review_max_reworks: int = Field(default=2, ge=0, le=5)
-    answer_timeout_seconds: float = Field(default=60, gt=0, le=600)
+    answer_timeout_seconds: float | None = Field(default=None, gt=0, le=600)
     answer_timeout_fallback_enabled: bool = True
     # Opt-in rollout: choose the first operation in ReAct, without a separate route call.
     unified_entry_enabled: bool = False
@@ -469,6 +470,7 @@ class QueryRewriteConfig(BaseModel):
 
 
 class WebSearchConfig(BaseModel):
+    browser_enabled: bool = False
     provider: Literal["brave"] = "brave"
     api_key_env: str = "BRAVE_SEARCH_API_KEY"
     monthly_request_limit: int = Field(default=900, ge=0, le=1_000_000)

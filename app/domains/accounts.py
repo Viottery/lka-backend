@@ -12,6 +12,8 @@ from contextlib import contextmanager
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.storage.connections import is_mysql, lock_row
+
 
 class AccountConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -92,6 +94,17 @@ class AccountService:
             conn.close()
 
     def ensure_schema(self):
+        conn = self._conn_factory()
+        if is_mysql(conn):
+            try:
+                # MySQL tables are created by the privileged versioned schema
+                # migration; constructors must never issue business DDL.
+                for table in ("auth_accounts", "auth_sessions", "auth_login_throttle"):
+                    conn.execute(f"SELECT 1 FROM `{table}` LIMIT 0")
+            finally:
+                conn.close()
+            return
+        conn.close()
         with self._db(write=True) as conn:
             conn.execute("""CREATE TABLE IF NOT EXISTS auth_accounts(
                 user_id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE,
@@ -129,6 +142,18 @@ class AccountService:
         password_hash = _hash_password(password)
         with self._db(write=True) as conn:
             if actor_user_id is None:
+                # The first-account check has no account row to lock. Use a
+                # reserved throttle key as a per-dataset bootstrap mutex.
+                # It is distinct from the SHA-256 login keys below.
+                # Acquire X on existing keys immediately; INSERT IGNORE's S
+                # lock can deadlock when concurrent callers upgrade it below.
+                seed = ("INSERT INTO auth_login_throttle VALUES(%s,%s,0) "
+                        "ON DUPLICATE KEY UPDATE throttle_key=throttle_key"
+                        if is_mysql(conn) else
+                        "INSERT OR IGNORE INTO auth_login_throttle VALUES(?, ?, 0)")
+                execute = conn.execute_native if is_mysql(conn) else conn.execute
+                execute(seed, ("__lka_account_bootstrap__", int(time.time())))
+                lock_row(conn, "auth_login_throttle", "throttle_key", "__lka_account_bootstrap__")
                 if conn.execute("SELECT 1 FROM auth_accounts LIMIT 1").fetchone():
                     raise AccountError("Bootstrap is only allowed before the first account; use an administrator session", 409)
             else:
@@ -152,14 +177,33 @@ class AccountService:
         keys = [(_digest("user:" + username), self.config.login_max_attempts),
                 (_digest("source:" + source), self.config.login_max_attempts * 5)]
         with self._db(write=True) as conn:
-            conn.execute("DELETE FROM auth_login_throttle WHERE window_start<?", (now - self.config.login_window_seconds,))
-            for key, limit in keys:
-                row = conn.execute("SELECT * FROM auth_login_throttle WHERE throttle_key=?", (key,)).fetchone()
-                if row and row["attempts"] >= limit:
+            # Seed then lock both independent quota rows before testing limits.
+            # Sorted acquisition order avoids a cross-login deadlock.
+            # The no-op duplicate update preserves counters while taking X.
+            for key, _limit in sorted(keys):
+                seed = ("INSERT INTO auth_login_throttle VALUES(%s,%s,0) "
+                        "ON DUPLICATE KEY UPDATE throttle_key=throttle_key"
+                        if is_mysql(conn) else
+                        "INSERT OR IGNORE INTO auth_login_throttle VALUES(?, ?, 0)")
+                execute = conn.execute_native if is_mysql(conn) else conn.execute
+                execute(seed, (key, now))
+            rows = {}
+            for key, limit in sorted(keys):
+                row = lock_row(conn, "auth_login_throttle", "throttle_key", key)
+                if row["window_start"] < now - self.config.login_window_seconds:
+                    conn.execute(
+                        "UPDATE auth_login_throttle SET window_start=?,attempts=0 WHERE throttle_key=?",
+                        (now, key),
+                    )
+                    attempts = 0
+                else:
+                    attempts = row["attempts"]
+                if attempts >= limit:
                     raise AccountError("Too many login attempts; try later", 429)
-            for key, _ in keys:
-                conn.execute("""INSERT INTO auth_login_throttle VALUES(?,?,1)
-                    ON CONFLICT(throttle_key) DO UPDATE SET attempts=attempts+1""", (key, now))
+                rows[key] = attempts
+            for key, _ in sorted(keys):
+                conn.execute("UPDATE auth_login_throttle SET attempts=? WHERE throttle_key=?",
+                             (rows[key] + 1, key))
         return keys
 
     def login(self, username: str, password: str, source: str):
@@ -185,7 +229,7 @@ class AccountService:
                          (session_id, row["user_id"], _digest(token), _digest(csrf), now,
                           now + self.config.session_ttl_seconds))
             for key, _ in keys:
-                conn.execute("UPDATE auth_login_throttle SET attempts=MAX(0,attempts-1) WHERE throttle_key=?", (key,))
+                conn.execute("UPDATE auth_login_throttle SET attempts=CASE WHEN attempts>0 THEN attempts-1 ELSE 0 END WHERE throttle_key=?", (key,))
         return {"account": self._public(row), "session_id": session_id, "token": token,
                 "csrf_token": csrf, "expires_at": now + self.config.session_ttl_seconds}
 

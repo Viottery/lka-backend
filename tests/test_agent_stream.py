@@ -54,8 +54,9 @@ def test_agent_stream_drains_events_published_before_terminal_status(terminal_st
     )
     cursors = []
 
-    def list_events(run_id, *, after_sequence):
+    def list_events(run_id, *, after_sequence, limit):
         assert run_id == "run_late"
+        assert limit == 128
         cursors.append(after_sequence)
         return [] if len(cursors) == 1 else [late_event]
 

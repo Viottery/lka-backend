@@ -5,13 +5,15 @@ import hashlib
 import json
 import logging
 import threading
-from contextlib import closing
+from contextlib import closing, nullcontext
 from datetime import UTC, datetime
 from functools import wraps
+from typing import Any
 from uuid import uuid4
 
 from app.core.agent_runs import AgentRunRecord, AgentRunStatus
-from app.core.session_admission import TERMINAL_RUN_STATUSES
+from app.core.session_admission import TERMINAL_RUN_STATUSES, SessionAdmissionStore
+from app.storage.connections import is_mysql
 
 _logger = logging.getLogger(__name__)
 
@@ -41,7 +43,8 @@ class SessionInputQueue:
     def __init__(self, conn_factory, *, sessions, run_store, dispatcher,
                  authorize, policy, validate_attachments, replace=None, batch_attachments_fit=None,
                  validate_answer_selection=None, accepted_answer_selection=None,
-                 capacity=100, poll_seconds=0.25):
+                 validate_selection=None,
+                 capacity=100, poll_seconds=0.25, write_admission=None):
         self._conn = conn_factory
         self.sessions, self.run_store, self.dispatcher = sessions, run_store, dispatcher
         self.authorize, self.policy = authorize, policy
@@ -50,7 +53,9 @@ class SessionInputQueue:
         self.batch_attachments_fit = batch_attachments_fit
         self.validate_answer_selection = validate_answer_selection
         self.accepted_answer_selection = accepted_answer_selection
+        self.validate_selection = validate_selection
         self.capacity, self.poll_seconds = capacity, poll_seconds
+        self.write_admission = write_admission
         self._stop = threading.Event()
         self._thread = None
         self.last_error = None
@@ -58,6 +63,22 @@ class SessionInputQueue:
         self._scheduling_mode = 'poll'
         self._owns_scheduler = False
         self.on_change = None
+
+    @staticmethod
+    def _begin_write(conn):
+        # SQLite uses its established database-wide write admission. MySQL
+        # transactions instead lock the specific session rows they mutate.
+        conn.execute("BEGIN" if is_mysql(conn) else "BEGIN IMMEDIATE")
+
+    @staticmethod
+    def _ensure_queue_anchor(conn, session_id):
+        if is_mysql(conn):
+            conn.execute_native("INSERT INTO session_input_queues(session_id) VALUES(%s) "
+                                "ON DUPLICATE KEY UPDATE session_id=VALUES(session_id)", (session_id,))
+            # The INSERT/duplicate-key UPDATE already holds this row's X lock
+            # until the transaction ends; a second SELECT FOR UPDATE is redundant.
+        else:
+            conn.execute("INSERT OR IGNORE INTO session_input_queues(session_id) VALUES(?)", (session_id,))
 
     def attach_scheduler(self, scheduler, *, mode='event'):
         if mode not in {'event', 'shadow', 'poll'}:
@@ -99,6 +120,9 @@ class SessionInputQueue:
 
     def ensure_schema(self):
         with closing(self._conn()) as conn, conn:
+            if is_mysql(conn):
+                # MySQL tables and indexes are installed by the central schema registry.
+                return
             conn.execute('BEGIN IMMEDIATE')
             conn.execute("""CREATE TABLE IF NOT EXISTS session_input_queues (
                     session_id TEXT PRIMARY KEY, paused INTEGER NOT NULL DEFAULT 0,
@@ -157,6 +181,20 @@ class SessionInputQueue:
         metadata = json.loads(row['record_payload']).get('metadata', {})
         return bool(metadata.get('session_input_id')) or (metadata.get('input_envelope') or {}).get('origin', 'user') == 'user'
 
+    @staticmethod
+    def _candidate_is_user_run(row):
+        """Match the legacy SQL COALESCE checks for recovery candidates."""
+        metadata = json.loads(row['record_payload']).get('metadata') or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        input_id = metadata.get('session_input_id')
+        has_input_id = input_id is not None and str(input_id) != ''
+        envelope = metadata.get('input_envelope') or {}
+        origin = envelope.get('origin') if isinstance(envelope, dict) else None
+        if origin is None:
+            origin = 'user'
+        return has_input_id or origin == 'user'
+
     @classmethod
     def _watched_user_run(cls, conn, active):
         if active is None:
@@ -164,22 +202,74 @@ class SessionInputQueue:
         row = conn.execute('SELECT record_payload FROM agent_runs WHERE run_id=?', (active[0],)).fetchone()
         return active[0] if row is not None and cls._is_user_run(row) else None
 
+    def _queue_observation(self, conn, sid):
+        """Read queue state, active root, pending count and watch status together."""
+        row = conn.execute(
+            "SELECT q.session_id AS queue_session_id,q.paused AS queue_paused,"
+            "q.watched_run_id AS watched_run_id,q.next_sequence AS next_sequence,"
+            "w.run_id AS watched_found_run_id,w.status AS watched_status,"
+            "w.record_payload AS watched_payload,a.run_id AS active_run_id,"
+            "a.record_payload AS active_payload,"
+            "(SELECT count(*) FROM session_inputs i LEFT JOIN agent_runs r ON r.run_id=i.run_id "
+            "WHERE i.session_id=s.session_id AND i.cancelled=0 AND (i.run_id IS NULL OR r.status NOT IN "
+            "('completed','failed','cancelled','timed_out'))) AS pending_count "
+            "FROM agent_sessions s "
+            "LEFT JOIN session_input_queues q ON q.session_id=s.session_id "
+            "LEFT JOIN agent_runs w ON w.run_id=q.watched_run_id "
+            "LEFT JOIN agent_runs a ON a.run_id=(SELECT candidate.run_id FROM agent_runs candidate "
+            "WHERE candidate.session_id=s.session_id AND candidate.status NOT IN "
+            "('completed','failed','cancelled','timed_out') "
+            "AND json_extract(candidate.record_payload,'$.parent_run_id') IS NULL "
+            "ORDER BY candidate.created_at,candidate.run_id LIMIT 1) "
+            "WHERE s.session_id=?",
+            (sid,),
+        ).fetchone()
+        if row is None:
+            return {
+                'state': None,
+                'summary': {'paused': False, 'pending_count': 0, 'active_run_id': None},
+                'watched_user_run_id': None,
+            }
+
+        state = None
+        failed_watch = False
+        if row['queue_session_id'] is not None:
+            state = {
+                'session_id': sid,
+                'paused': row['queue_paused'],
+                'watched_run_id': row['watched_run_id'],
+                'next_sequence': row['next_sequence'],
+            }
+            if (state['watched_run_id']
+                    and (row['watched_found_run_id'] is None
+                         or (self._is_user_run({'record_payload': row['watched_payload']})
+                             and row['watched_status'] in {'failed', 'cancelled', 'timed_out'}))):
+                failed_watch = True
+
+        active_run_id = row['active_run_id']
+        watched_user_run_id = (
+            active_run_id if active_run_id is not None
+            and self._is_user_run({'record_payload': row['active_payload']}) else None
+        )
+        summary = {
+            'paused': bool(state and (state['paused'] or failed_watch)),
+            'pending_count': row['pending_count'],
+            'active_run_id': active_run_id,
+        }
+        return {'state': state, 'summary': summary, 'watched_user_run_id': watched_user_run_id}
+
     def _queue_summary(self, conn, sid):
-        state = conn.execute('SELECT * FROM session_input_queues WHERE session_id=?', (sid,)).fetchone()
-        active = self._active(conn, sid)
-        pending = conn.execute("SELECT count(*) FROM session_inputs i LEFT JOIN agent_runs r ON r.run_id=i.run_id "
-                               "WHERE i.session_id=? AND i.cancelled=0 AND (i.run_id IS NULL OR r.status NOT IN "
-                               "('completed','failed','cancelled','timed_out'))", (sid,)).fetchone()[0]
-        return {'paused': bool(state and (state['paused'] or self._failed_watch(conn, state))),
-                'pending_count': pending, 'active_run_id': active[0] if active else None}
+        """Return only the stable, public queue fields from one DB observation."""
+        return self._queue_observation(conn, sid)['summary']
 
     def _snapshot(self, conn, sid):
         # Retain every pending receipt and a bounded tail of completed receipts.
         rows = conn.execute("SELECT i.*,r.status AS run_status FROM session_inputs i "
                             "LEFT JOIN agent_runs r ON r.run_id=i.run_id WHERE i.session_id=? "
                             "AND ((i.cancelled=0 AND (i.run_id IS NULL OR r.status NOT IN ('completed','failed','cancelled','timed_out'))) "
-                            "OR i.sequence IN (SELECT sequence FROM session_inputs WHERE session_id=? "
-                            "ORDER BY sequence DESC LIMIT 100)) ORDER BY i.sequence", (sid, sid)).fetchall()
+                            "OR i.sequence IN (SELECT recent_inputs.sequence FROM "
+                            "(SELECT sequence FROM session_inputs WHERE session_id=? "
+                            "ORDER BY sequence DESC LIMIT 100) AS recent_inputs)) ORDER BY i.sequence", (sid, sid)).fetchall()
         inputs = []
         for row in rows:
             status = row['run_status']
@@ -189,6 +279,22 @@ class SessionInputQueue:
             inputs.append({key: row[key] for key in (
                 'input_id', 'client_message_id', 'message_id', 'sequence', 'run_id') } | {'status': status})
         return {'inputs': inputs, **self._queue_summary(conn, sid)}
+
+    @staticmethod
+    def state_revision(conn, session_id):
+        """Opaque display revision; never authorizes queue mutations.
+
+        New inputs increment next_sequence; bind/resume/failure reconciliation
+        update the queue watch or pause flag. Deletion is gated by SessionService.
+        No message bodies or historical receipt scans are needed here.
+        """
+        row = conn.execute(
+            "SELECT q.paused,q.watched_run_id,q.next_sequence,r.status,r.updated_at "
+            "FROM session_input_queues q LEFT JOIN agent_runs r ON r.run_id=q.watched_run_id "
+            "WHERE q.session_id=?", (session_id,),
+        ).fetchone()
+        values = list(row) if row is not None else []
+        return hashlib.sha256(json.dumps(values, separators=(',', ':')).encode()).hexdigest()[:32]
 
     def snapshot(self, session_id):
         with closing(self._conn()) as conn:
@@ -228,19 +334,33 @@ class SessionInputQueue:
                     raise SessionInputConflict('client_message_id_conflict')
                 return self._receipt(conn, session_id, previous)
         if previous is None:
+            if self.validate_selection is not None:
+                self.validate_selection(
+                    session_id=session_id,
+                    attachment_ids=list(attachment_ids),
+                    llm=llm_options,
+                )
             self.validate_attachments(session_id=session_id, attachment_ids=list(attachment_ids))
             if replace_run_id is not None:
-                return self._submit_replacement(session_id, client_message_id, request, encoded)
-        with closing(self._conn()) as conn, conn:
-            conn.execute('BEGIN IMMEDIATE')
-            self.authorize(conn, session_id)
+                admission = self.write_admission.admit(session_id) if self.write_admission is not None else nullcontext()
+                with admission:
+                    return self._submit_replacement(session_id, client_message_id, request, encoded)
+        # Same-session waiters stay outside the connection pool. The database
+        # anchor below still provides the durable serialization/fence.
+        admission = self.write_admission.admit(session_id) if self.write_admission is not None else nullcontext()
+        with admission, closing(self._conn()) as conn, conn:
+            self._begin_write(conn)
+            # Match bind, controller updates and deletion: session anchor first.
+            # This lock serializes only this transaction, not the running turn.
+            SessionAdmissionStore.lock_session(conn, session_id)
             previous = conn.execute('SELECT * FROM session_inputs WHERE session_id=? AND client_message_id=?',
                                     (session_id, client_message_id)).fetchone()
+            self.authorize(conn, session_id, accepting=previous is None)
             if previous is None:
-                self.authorize(conn, session_id, accepting=True)
-                # The write reservation also serializes this read-only policy
-                # snapshot with controller preference updates.
-                if self.accepted_answer_selection is not None:
+                if llm_options.get('answer_client_name') is not None or llm_options.get('answer_model') is not None:
+                    answer_selection = {'llm_answer_client_name': llm_options.get('answer_client_name'),
+                                        'llm_answer_model': llm_options.get('answer_model')}
+                elif self.accepted_answer_selection is not None:
                     answer_selection = self.accepted_answer_selection(conn, session_id)
                 else:
                     accepted_policy = self.policy(session_id)
@@ -248,19 +368,17 @@ class SessionInputQueue:
                         'llm_answer_client_name': accepted_policy.llm_answer_client_name,
                         'llm_answer_model': accepted_policy.llm_answer_model,
                     }
-                if llm_options.get('answer_client_name') is not None or llm_options.get('answer_model') is not None:
-                    answer_selection = {'llm_answer_client_name': llm_options.get('answer_client_name'),
-                                        'llm_answer_model': llm_options.get('answer_model')}
             if previous is not None:
                 if previous['request_json'] != encoded:
                     raise SessionInputConflict('client_message_id_conflict')
                 return self._receipt(conn, session_id, previous)
             else:
-                receipt = self._queue_summary(conn, session_id)
+                self._ensure_queue_anchor(conn, session_id)
+                observation = self._queue_observation(conn, session_id)
+                state = observation['state']
+                receipt = observation['summary']
                 if receipt['pending_count'] >= self.capacity:
                     raise SessionInputConflict('session_input_queue_full')
-                conn.execute('INSERT OR IGNORE INTO session_input_queues(session_id) VALUES(?)', (session_id,))
-                state = conn.execute('SELECT * FROM session_input_queues WHERE session_id=?', (session_id,)).fetchone()
                 input_id = 'input_' + uuid4().hex
                 item = {'input_id': input_id, 'client_message_id': client_message_id,
                         'message_id': 'input_message_' + uuid4().hex, 'sequence': state['next_sequence'],
@@ -271,8 +389,7 @@ class SessionInputQueue:
                 conn.execute('UPDATE session_input_queues SET next_sequence=next_sequence+1, '
                              'paused=CASE WHEN ? THEN 1 ELSE paused END, '
                              'watched_run_id=COALESCE(?,watched_run_id) WHERE session_id=?',
-                             (receipt['paused'], self._watched_user_run(conn, (receipt['active_run_id'],))
-                              if receipt['active_run_id'] else None, session_id))
+                             (receipt['paused'], observation['watched_user_run_id'], session_id))
                 self.sessions.append_message_in_transaction(
                     conn, session_id=session_id, role='user', content=user_input, message_id=item['message_id'],
                     payload={'entrypoint': 'agent.turn', 'input_id': input_id, 'client_message_id': client_message_id,
@@ -286,7 +403,8 @@ class SessionInputQueue:
     def _receipt(self, conn, session_id, row):
         receipt = self._queue_summary(conn, session_id)
         # Old exact retries remain available even outside the recent tail.
-        status = conn.execute('SELECT status FROM agent_runs WHERE run_id=?', (row['run_id'],)).fetchone()
+        status = (conn.execute('SELECT status FROM agent_runs WHERE run_id=?', (row['run_id'],)).fetchone()
+                  if row['run_id'] is not None else None)
         item = {key: row[key] for key in ('input_id', 'client_message_id', 'message_id', 'sequence', 'run_id')}
         item['status'] = ('cancelled' if row['cancelled'] else 'queued' if row['run_id'] is None else
                           'failed' if status is None or status[0] == 'timed_out' else
@@ -308,13 +426,16 @@ class SessionInputQueue:
 
         def created(conn, replacement):
             self.authorize(conn, session_id, accepting=True)
+            SessionAdmissionStore.lock_session(conn, session_id)
+            self._ensure_queue_anchor(conn, session_id)
             if conn.execute('SELECT 1 FROM session_inputs WHERE session_id=? AND client_message_id=?',
                             (session_id, client_message_id)).fetchone():
                 raise SessionInputConflict('client_message_id_conflict')
             # The superseded root is already cancelled in this transaction.
             if self._snapshot(conn, session_id)['pending_count'] >= self.capacity:
                 raise SessionInputConflict('session_input_queue_full')
-            conn.execute('INSERT OR IGNORE INTO session_input_queues(session_id) VALUES(?)', (session_id,))
+            if not is_mysql(conn):
+                self._ensure_queue_anchor(conn, session_id)
             sequence = conn.execute('SELECT next_sequence FROM session_input_queues WHERE session_id=?',
                                     (session_id,)).fetchone()[0]
             conn.execute('INSERT INTO session_inputs(input_id,session_id,client_message_id,message_id,sequence,request_json,run_id,created_at) '
@@ -358,6 +479,7 @@ class SessionInputQueue:
             raise ValueError('Answer model recovery requires input_id')
         with closing(self._conn()) as conn, conn:
             conn.execute('BEGIN IMMEDIATE')
+            SessionAdmissionStore.lock_session(conn, session_id)
             self.authorize(conn, session_id)
             if input_id is not None:
                 item = conn.execute('SELECT * FROM session_inputs WHERE session_id=? AND input_id=? '
@@ -400,46 +522,106 @@ class SessionInputQueue:
         conn.execute('UPDATE session_input_queues SET paused=1 WHERE session_id=?', (session_id,))
 
     def _candidate_ids(self, conn, *, session_id=None, after='', upper=None, limit=None):
-        # Keep the polling read-only and avoid opening a write transaction for
-        # idle queues. Include queues needing failed-watch reconciliation,
-        # even when they have no pending input.
-        sql = """
-            SELECT q.session_id
-            FROM session_input_queues q
-            WHERE (q.paused=0 AND q.watched_run_id IS NOT NULL AND NOT EXISTS (
-                SELECT 1 FROM agent_runs w WHERE w.run_id=q.watched_run_id
-            )) OR (q.paused=0 AND q.watched_run_id IS NOT NULL AND EXISTS (
-                SELECT 1 FROM agent_runs w WHERE w.run_id=q.watched_run_id
-                  AND (coalesce(json_extract(w.record_payload,'$.metadata.session_input_id'),'')!=''
-                       OR coalesce(json_extract(w.record_payload,'$.metadata.input_envelope.origin'),'user')='user')
-                  AND w.status IN ('failed','cancelled','timed_out')
-            )) OR (q.paused=0 AND EXISTS (
-                SELECT 1 FROM agent_runs a WHERE a.session_id=q.session_id
-                  AND a.status NOT IN ('completed','failed','cancelled','timed_out')
-                  AND json_extract(a.record_payload,'$.parent_run_id') IS NULL
-                  AND a.run_id IS NOT q.watched_run_id
-                  AND (coalesce(json_extract(a.record_payload,'$.metadata.session_input_id'),'')!=''
-                       OR coalesce(json_extract(a.record_payload,'$.metadata.input_envelope.origin'),'user')='user')
-            )) OR (q.paused=0 AND NOT EXISTS (
-                SELECT 1 FROM agent_runs a WHERE a.session_id=q.session_id
-                  AND a.status NOT IN ('completed','failed','cancelled','timed_out')
-                  AND json_extract(a.record_payload,'$.parent_run_id') IS NULL
-            ) AND EXISTS (
-                SELECT 1 FROM session_inputs i WHERE i.session_id=q.session_id
-                  AND i.run_id IS NULL AND i.cancelled=0
-            ))
-            ORDER BY q.session_id
-        """
-        sql = 'SELECT session_id FROM (' + sql + ') WHERE session_id>?'
-        args = [after]
-        if upper is not None:
-            sql += ' AND session_id<=?'; args.append(upper)
-        if session_id is not None:
-            sql += ' AND session_id=?'; args.append(session_id)
-        sql += ' ORDER BY session_id'
-        if limit is not None:
-            sql += ' LIMIT ?'; args.append(limit)
-        return [row[0] for row in conn.execute(sql, args)]
+        # Keep recovery read-only. Page queue keys first, then read run metadata
+        # only for those sessions. JSON predicates across the whole run table
+        # make startup recovery scale with historical payload size.
+        if limit is not None and limit <= 0:
+            return []
+        candidates = []
+        scan_after = after
+        scan_size = 256 if limit is None else max(1, min(256, limit))
+        terminal = {'failed', 'cancelled', 'timed_out'}
+        nonterminal_sql = "'completed','failed','cancelled','timed_out'"
+
+        while True:
+            queue_sql = (
+                'SELECT session_id,watched_run_id FROM session_input_queues '
+                'WHERE paused=0 AND session_id>?'
+            )
+            queue_args: list[Any] = [scan_after]
+            if upper is not None:
+                queue_sql += ' AND session_id<=?'
+                queue_args.append(upper)
+            if session_id is not None:
+                queue_sql += ' AND session_id=?'
+                queue_args.append(session_id)
+            queue_sql += ' ORDER BY session_id LIMIT ?'
+            queue_args.append(scan_size)
+            queue_rows = conn.execute(queue_sql, queue_args).fetchall()
+            if not queue_rows:
+                break
+
+            session_ids = [row['session_id'] for row in queue_rows]
+            scan_after = session_ids[-1]
+            marks = ','.join('?' for _ in session_ids)
+            watched_ids = sorted({row['watched_run_id'] for row in queue_rows
+                                  if row['watched_run_id'] is not None})
+            watched_status: dict[str, str | None] = {}
+            terminal_watch_ids = []
+            if watched_ids:
+                watch_marks = ','.join('?' for _ in watched_ids)
+                watched_rows = conn.execute(
+                    f'SELECT run_id,status FROM agent_runs WHERE run_id IN ({watch_marks})',
+                    watched_ids,
+                ).fetchall()
+                watched_status = {row['run_id']: row['status'] for row in watched_rows}
+                terminal_watch_ids = [run_id for run_id, status in watched_status.items()
+                                      if status in terminal]
+
+            watched_user_runs = set()
+            if terminal_watch_ids:
+                watch_marks = ','.join('?' for _ in terminal_watch_ids)
+                terminal_rows = conn.execute(
+                    f'SELECT run_id,record_payload FROM agent_runs '
+                    f'WHERE run_id IN ({watch_marks}) AND status IN (\'failed\',\'cancelled\',\'timed_out\')',
+                    terminal_watch_ids,
+                ).fetchall()
+                watched_user_runs = {row['run_id'] for row in terminal_rows
+                                     if self._candidate_is_user_run(row)}
+
+            active_rows = conn.execute(
+                f'SELECT run_id,session_id,record_payload FROM agent_runs '
+                f'WHERE session_id IN ({marks}) AND status NOT IN ({nonterminal_sql})',
+                session_ids,
+            ).fetchall()
+            root_run_ids: dict[str, set[str]] = {}
+            user_root_run_ids: dict[str, set[str]] = {}
+            for run in active_rows:
+                record = json.loads(run['record_payload'])
+                if record.get('parent_run_id') is not None:
+                    continue
+                root_run_ids.setdefault(run['session_id'], set()).add(run['run_id'])
+                if self._candidate_is_user_run(run):
+                    user_root_run_ids.setdefault(run['session_id'], set()).add(run['run_id'])
+
+            pending_rows = conn.execute(
+                f'SELECT DISTINCT session_id FROM session_inputs '
+                f'WHERE session_id IN ({marks}) AND run_id IS NULL AND cancelled=0',
+                session_ids,
+            ).fetchall()
+            pending_sessions = {row['session_id'] for row in pending_rows}
+
+            for queue in queue_rows:
+                sid = queue['session_id']
+                watched = queue['watched_run_id']
+                watched_missing = watched is not None and watched not in watched_status
+                failed_user_watch = watched is not None and watched in watched_user_runs
+                user_root_elsewhere = any(
+                    run_id != watched for run_id in user_root_run_ids.get(sid, ())
+                )
+                has_any_root = bool(root_run_ids.get(sid))
+                pending_without_root = sid in pending_sessions and not has_any_root
+                if watched_missing or failed_user_watch or user_root_elsewhere or pending_without_root:
+                    candidates.append(sid)
+                    if limit is not None and len(candidates) >= limit:
+                        return candidates
+
+            if len(queue_rows) < scan_size:
+                break
+            if session_id is not None:
+                break
+
+        return candidates
 
     def tick(self):
         with closing(self._conn()) as conn:
@@ -463,8 +645,11 @@ class SessionInputQueue:
     def _bind(self, sid):
         policy = self.policy(sid).model_dump(mode='json')
         with closing(self._conn()) as conn, conn:
-            conn.execute('BEGIN IMMEDIATE')
+            self._begin_write(conn)
             self.authorize(conn, sid)
+            SessionAdmissionStore.lock_session(conn, sid)
+            if is_mysql(conn):
+                self._ensure_queue_anchor(conn, sid)
             state = conn.execute('SELECT * FROM session_input_queues WHERE session_id=?', (sid,)).fetchone()
             if self._failed_watch(conn, state):
                 conn.execute('UPDATE session_input_queues SET paused=1,watched_run_id=NULL WHERE session_id=?', (sid,))
@@ -477,8 +662,8 @@ class SessionInputQueue:
                 if watched:
                     conn.execute('UPDATE session_input_queues SET watched_run_id=? WHERE session_id=?', (watched, sid))
                 return
-            row = conn.execute('SELECT * FROM session_inputs WHERE session_id=? AND run_id IS NULL AND cancelled=0 ORDER BY sequence LIMIT 1',
-                               (sid,)).fetchone()
+            row = conn.execute('SELECT * FROM session_inputs WHERE session_id=? AND run_id IS NULL AND cancelled=0 ORDER BY sequence LIMIT 1' +
+                               (' FOR UPDATE' if is_mysql(conn) else ''), (sid,)).fetchone()
             if row is None:
                 return
             request = json.loads(row['request_json'])

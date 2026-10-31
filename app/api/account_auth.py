@@ -7,6 +7,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import Headers
 from starlette.responses import JSONResponse
 
+from app.api.database_errors import run_asgi_with_mysql_storage_errors
 from app.api.routes.distributed_client import is_workbench_asset_request
 
 
@@ -15,6 +16,9 @@ class AccountAuthMiddleware:
         self.app = app
 
     async def __call__(self, scope, receive, send):
+        await run_asgi_with_mysql_storage_errors(self._dispatch, scope, receive, send)
+
+    async def _dispatch(self, scope, receive, send):
         if scope["type"] not in {"http", "websocket"}:
             return await self.app(scope, receive, send)
         state = scope.setdefault("state", {})
@@ -42,7 +46,23 @@ class AccountAuthMiddleware:
 
         node_path = path == "/node" or path.startswith("/node/")
         if enabled and path == "/health" and scope["type"] == "http" and scope["method"] in {"GET", "HEAD"}:
-            return await JSONResponse({"status": "ok", "service": "local-knowledge-agent-os"})(scope, receive, send)
+            runtime = getattr(scope["app"].state, "runtime", None)
+            health = getattr(runtime, "health", None)
+            try:
+                details = health() if callable(health) else {}
+                available = isinstance(details, dict) and details.get("status") == "ok"
+                payload = {
+                    "status": "ok" if available else "unavailable",
+                    "service": details.get("service", "local-knowledge-agent-os")
+                    if isinstance(details, dict) else "local-knowledge-agent-os",
+                }
+            except Exception:  # noqa: BLE001 - readiness fails closed without exposing internal errors.
+                available = False
+                payload = {"status": "unavailable", "service": "local-knowledge-agent-os"}
+            return await JSONResponse(
+                payload, status_code=200 if available else 503,
+                headers={"Cache-Control": "no-store"},
+            )(scope, receive, send)
         if enabled and service.config.require_https and scope.get("scheme") not in {"https", "wss"}:
             return await reject(403, "HTTPS required")
         authorization = headers.get("authorization", "")

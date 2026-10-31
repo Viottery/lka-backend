@@ -87,15 +87,17 @@ class MemoryConsolidator:
         self.batch_items, self.max_chars, self.min_confidence = batch_items, max_chars, min_confidence
 
     def signature(self, scope: str, project_id: str | None) -> str:
-        identities = sorted((r.memory_id, r.version) for r in scoped_memories(self.memory, scope, project_id)
-                            if r.sensitivity in {"normal", "public"})
+        identities = sorted((memory_id, version) for memory_id, version, sensitivity
+                            in self.memory.active_identities(scope=scope, project_id=project_id)
+                            if sensitivity in {"normal", "public"})
         return hashlib.sha256(json.dumps(identities).encode()).hexdigest()
 
     def run(self, job, *, client, store) -> tuple[list, str]:
         project_id = job["payload"].get("project_id")
         scope = "project" if project_id else "global"
         lease = (job["job_id"], job["lease_owner"], job["lease_epoch"])
-        if not self.memory.learning_enabled(scope="global") or not self.memory.learning_enabled(scope=scope, project_id=project_id):
+        # The scoped policy check includes the global master gate.
+        if not self.memory.learning_enabled(scope=scope, project_id=project_id):
             raise MemoryPublicationSuppressed("Memory learning is disabled")
         records = [r for r in scoped_memories(self.memory, scope, project_id) if r.sensitivity in {"normal", "public"}]
         expected = {r.memory_id: r.version for r in records}

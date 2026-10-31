@@ -58,6 +58,69 @@ def test_progress_lookup_uses_relational_scope_without_reading_large_run_json(tm
         manager.close()
 
 
+def test_mysql_progress_lookup_does_not_open_a_read_transaction(tmp_path, monkeypatch):
+    path = tmp_path / "mysql-read-probe.sqlite3"
+    store = SqliteAgentRunStore(path)
+    manager = InMemoryAgentRunManager(durable_store=store)
+    try:
+        run = manager.create_run(session_id="progress-session", user_input="synthetic")
+        store.put_artifact(
+            artifact_id="progress-row", run_id=run.run_id, kind="session_progress",
+            payload={"identifier": "progress-row"}, summary="synthetic",
+            created_at="2026-01-01T00:00:00+00:00",
+        )
+        statements = []
+        original = storage.connect
+
+        def traced_connection(db):
+            conn = original(db)
+            conn.set_trace_callback(statements.append)
+            return conn
+
+        monkeypatch.setattr(storage, "connect", traced_connection)
+        monkeypatch.setattr(storage, "is_mysql", lambda _conn: True)
+
+        assert store.list_session_progress("progress-session") == [
+            {"identifier": "progress-row"},
+        ]
+        assert not any(sql.strip().upper().startswith("BEGIN") for sql in statements)
+    finally:
+        manager.close()
+
+
+def test_progress_lookup_skips_candidate_deleted_before_payload_read(tmp_path, monkeypatch):
+    store = SqliteAgentRunStore(tmp_path / "progress-race.sqlite3")
+
+    class Result:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def fetchall(self):
+            return self.rows
+
+        def __iter__(self):
+            return iter(self.rows)
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, statement, _parameters=()):
+            if statement.startswith("SELECT a.artifact_id"):
+                return Result([{"artifact_id": "removed-row"}])
+            if statement.startswith("SELECT artifact_id,payload"):
+                return Result([])  # Simulates concurrent artifact pruning.
+            raise AssertionError(f"Unexpected query: {statement}")
+
+    monkeypatch.setattr(storage, "connect", lambda _db: Connection())
+    monkeypatch.setattr(storage, "is_mysql", lambda _conn: True)
+
+    assert store.list_session_progress("progress-session") == []
+
+
 @pytest.mark.parametrize("release_after_first_wait", [True, False])
 def test_task_admission_retries_only_before_writes_and_remains_idempotent(
     runtime, manager_context, monkeypatch, release_after_first_wait,

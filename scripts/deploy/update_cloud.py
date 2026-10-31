@@ -16,6 +16,7 @@ import shutil
 import sqlite3
 import subprocess
 import time
+import tomllib
 import uuid
 from contextlib import closing, contextmanager
 from datetime import UTC, datetime
@@ -115,7 +116,79 @@ def guard(c):
     return {name: hashlib.sha256(Path(name).read_bytes()).hexdigest() for name in paths}
 
 
-def idle(c):
+def _service_process_state(c):
+    pid = run(["systemctl", "show", c["service"], "-p", "MainPID", "--value"])
+    if not pid.isdigit() or pid == "0":
+        raise UpdateError("Cannot identify the active service process; refusing the SQLite-only updater.")
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+        cwd = Path(f"/proc/{pid}/cwd").resolve(strict=True)
+    except OSError as exc:
+        raise UpdateError("Cannot inspect active service settings; refusing the SQLite-only updater.") from exc
+    process_environment = {}
+    for entry in raw.split(b"\0"):
+        key, separator, value = entry.partition(b"=")
+        if separator and key == b"LKA_STORAGE_BACKEND":
+            process_environment["LKA_STORAGE_BACKEND"] = value.decode("utf-8", errors="replace")
+    return process_environment, cwd
+
+
+def effective_storage_backend(c):
+    """Resolve storage selection from active process and service-backed files.
+
+    The updater implements SQLite quiescence and snapshots only. Any MySQL hint
+    in the live process or its configured files therefore blocks this path,
+    including conflicting settings that could indicate a stale rollout config.
+    """
+    process_environment, process_cwd = _service_process_state(c)
+    values = []
+    if "LKA_STORAGE_BACKEND" in process_environment:
+        values.append(process_environment["LKA_STORAGE_BACKEND"])
+
+    try:
+        from dotenv import dotenv_values
+        for candidate in (Path(c["env_file"]), process_cwd / ".env"):
+            if candidate.is_file():
+                parsed = dotenv_values(candidate)
+                value = parsed.get("LKA_STORAGE_BACKEND")
+                if value is not None:
+                    values.append(str(value))
+    except (OSError, ValueError) as exc:
+        raise UpdateError("Cannot safely read active service settings; refusing the SQLite-only updater.") from exc
+
+    config_path = Path(c["config_file"])
+    if config_path.is_file():
+        try:
+            config_data = tomllib.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError) as exc:
+            raise UpdateError("Cannot safely parse active service settings; refusing the SQLite-only updater.") from exc
+        configured = config_data.get("storage_backend")
+        if configured is not None:
+            values.append(str(configured))
+        storage = config_data.get("storage")
+        if isinstance(storage, dict) and storage.get("backend") is not None:
+            values.append(str(storage["backend"]))
+
+    normalized = {value.strip().strip("\"'").casefold() for value in values if value.strip()}
+    if "mysql" in normalized:
+        return "mysql"
+    if normalized - {"sqlite"}:
+        raise UpdateError("Cannot determine active storage backend; refusing the SQLite-only updater.")
+    return "sqlite"
+
+
+def require_sqlite_backend(c):
+    backend = effective_storage_backend(c)
+    if backend == "mysql":
+        raise UpdateError(
+            "MySQL storage is active; this updater uses SQLite-only task checks and snapshots. "
+            "Use the MySQL-specific migration and backup workflow."
+        )
+
+
+def idle(c, *, verify_backend=True):
+    if verify_backend:
+        require_sqlite_backend(c)
     db = Path(c["data"]) / "lka.sqlite3"
     with closing(sqlite3.connect(db.as_uri() + "?mode=ro", uri=True, timeout=5)) as conn:
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -133,8 +206,8 @@ def idle(c):
     return counts
 
 
-def require_idle(c):
-    if any(idle(c).values()):
+def require_idle(c, *, verify_backend=True):
+    if any(idle(c, verify_backend=verify_backend).values()):
         raise UpdateError("Tasks are active, paused, awaiting input or remotely leased; finish them before applying.")
 
 
@@ -212,6 +285,7 @@ def targets(c, ref):
 
 
 def prepare(c, target):
+    require_sqlite_backend(c)
     before = current(c)
     plan = {"previous": before, "target": target, "guard": guard(c), "stage": "preparing"}
     name = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ-") + uuid.uuid4().hex[:8]
@@ -289,6 +363,7 @@ def wait_health(c, backend):
 
 
 def apply(c):
+    require_sqlite_backend(c)
     state = Path(c["state"])
     transaction = state / "transaction.json"
     if transaction.exists():
@@ -315,7 +390,7 @@ def apply(c):
     try:
         service(c, "stop")
         # Refuse a task accepted between the initial idle check and systemd stop.
-        require_idle(c)
+        require_idle(c, verify_backend=False)
         backup = state / ("snapshot-" + candidate.name)
         run([Path(c["backend"]) / ".venv/bin/python", c["snapshot_script"], "create", "--offline",
              "--data-dir", c["data"], "--env-file", c["env_file"], "--config-file", c["config_file"],
@@ -360,6 +435,7 @@ def main():
         raise UpdateError("Run this host maintenance command with sudo.")
     os.umask(0o022)
     c = config(args.config)
+    require_sqlite_backend(c)
     with lock(c):
         if args.action == "apply":
             result = apply(c)

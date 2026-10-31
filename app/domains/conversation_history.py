@@ -11,6 +11,7 @@ from threading import RLock
 from typing import Any
 
 from app.core.conversation_visibility import conversation_source_predicate
+from app.storage.mysql_fulltext import execute_fulltext
 
 
 class ConversationHistoryService:
@@ -307,7 +308,7 @@ class ConversationHistoryService:
 
         escaped = '"' + query.replace('"', '""') + '"'
         try:
-            rows = conn.execute(
+            rows = execute_fulltext(conn,
                 """SELECT m.rowid,m.seq,m.source_hash,f.content
                    FROM conversation_history_fts f
                    JOIN conversation_history_fts_map m ON m.rowid=f.rowid

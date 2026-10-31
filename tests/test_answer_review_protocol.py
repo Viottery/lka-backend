@@ -33,6 +33,18 @@ def test_parse_pass_and_bounded_feedback():
     }
 
 
+def test_pass_preserves_nonblocking_evidence_gap():
+    note = "The source is partial; the answer explicitly limits its claims."
+    review = parse_answer_review(json.dumps(payload(evidence_gap=note)))
+    assert review.decision == "pass"
+    assert review.feedback()["evidence_gap"] == note
+
+
+def test_nonblocking_gap_does_not_override_a_failed_factual_criterion():
+    with pytest.raises(ValueError):
+        parse_answer_review(json.dumps(payload(faithful=False, evidence_gap="Missing source")))
+
+
 @pytest.mark.parametrize("decision,change", [
     ("rewrite", {"faithful": False, "issues": ["Correct the date."], "revision_instructions": "Use the date in the tool result."}),
     ("continue", {"hallucination_free": False, "issues": ["The source is unavailable."], "evidence_gap": "Authorized source evidence is missing."}),

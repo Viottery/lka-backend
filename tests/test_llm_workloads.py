@@ -4,7 +4,6 @@ import sqlite3
 import pytest
 
 from app.core.llm import build_llm_service
-from app.core.llm.errors import LLMClientError
 from app.core.llm_workloads import (
     BackgroundBudgetDeferred,
     BackgroundCircuitOpen,
@@ -117,8 +116,11 @@ def test_service_background_capacity_and_timeout_are_separate_from_foreground(tm
     async def scenario():
         with workload_scope("background_memory", task_id="small"):
             await service.complete_text(system_prompt="s", user_prompt="u", prompt_summary="test", max_output_tokens=100)
-            with pytest.raises(LLMClientError, match="exceeds"):
+            from app.core.llm.errors import LLMContextCapacityError
+
+            with pytest.raises(LLMContextCapacityError) as oversized:
                 await service.complete_text(system_prompt="s", user_prompt="u" * 2000, prompt_summary="test", max_output_tokens=100)
+            assert oversized.value.error_category == "context_capacity_exceeded"
         await service.complete_text(system_prompt="s", user_prompt="u", prompt_summary="test")
 
     asyncio.run(scenario())

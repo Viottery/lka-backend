@@ -22,7 +22,12 @@ class _HistoryRetrievalLLM:
     def complete_text(self, *, system_prompt, user_prompt, prompt_summary,
                       temperature=0.0, max_output_tokens=None):
         self.prompts.append((system_prompt, user_prompt, prompt_summary))
-        if "Choose at most one tool package" in system_prompt:
+        if prompt_summary == "final_answer_content_review":
+            assert "HISTORY_FACT_7F2" in json.loads(user_prompt)["draft_answer"]
+            content = json.dumps({"faithful": True, "hallucination_free": True,
+                "request_aligned": True, "decision": "pass", "issues": [],
+                "revision_instructions": "", "evidence_gap": ""})
+        elif "Choose at most one tool package" in system_prompt:
             payload = json.loads(user_prompt)
             self.route_payloads.append(payload)
             content = json.dumps({"selected_package": None,
@@ -69,7 +74,12 @@ class _SufficientContextLLM:
 
     def complete_text(self, *, system_prompt, user_prompt, prompt_summary,
                       temperature=0.0, max_output_tokens=None):
-        if "Choose at most one tool package" in system_prompt:
+        if prompt_summary == "final_answer_content_review":
+            assert "DIRECT_FACT_92" in json.loads(user_prompt)["draft_answer"]
+            content = json.dumps({"faithful": True, "hallucination_free": True,
+                "request_aligned": True, "decision": "pass", "issues": [],
+                "revision_instructions": "", "evidence_gap": ""})
+        elif "Choose at most one tool package" in system_prompt:
             content = json.dumps({"selected_package": None,
                 "reason": "The exact fact is in the visible context.",
                 "context_need": "sufficient"})

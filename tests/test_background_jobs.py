@@ -596,6 +596,77 @@ def test_retry_failure_after_deadline_is_terminal(tmp_path):
     assert status["error_class"] == "deadline_exceeded"
 
 
+def test_maintenance_expires_deadlines_without_claiming_or_materializing(tmp_path):
+    store = make_store(tmp_path)
+    expiring = store.enqueue(
+        "agent_dispatch", "scope-expired", "expired", {},
+        deadline=datetime.now(UTC) + timedelta(minutes=1),
+    )
+    other_kind = store.enqueue(
+        "other_kind", "scope-other", "expired", {},
+        deadline=datetime.now(UTC) + timedelta(minutes=1),
+    )
+    with store._connect() as conn:
+        past = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
+        conn.execute("UPDATE background_jobs SET deadline=? WHERE job_id IN (?,?)",
+                     (past, expiring["job_id"], other_kind["job_id"]))
+        conn.execute(
+            "INSERT INTO background_pending_watermarks"
+            "(kind,scope_id,watermark_id,payload_json,priority,available_at,max_attempts,deadline,updated_at) "
+            "VALUES('agent_dispatch','pending-scope','wm-1','{}',0,?,3,?,?)",
+            (past, past, past),
+        )
+        conn.execute(
+            "INSERT INTO background_pending_inputs(kind,scope_id,input_id,created_at) "
+            "VALUES('agent_dispatch','input-scope','input-1',?)", (past,),
+        )
+
+    assert store.maintain_expired(kinds=("agent_dispatch",)) == 2
+    assert store.get(expiring["job_id"])["status"] == "failed"
+    assert store.get(other_kind["job_id"])["status"] == "queued"
+    with store._connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM background_pending_watermarks").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM background_pending_inputs").fetchone()[0] == 1
+    assert store.get(other_kind["job_id"])["status"] == "queued"
+    assert len(store.list()) == 2
+
+
+def test_maintenance_is_rate_limited_and_noop_when_no_deadlines(tmp_path):
+    store = make_store(tmp_path)
+    pending = add(store)
+    assert store.maintain_expired(kinds=("memory.extract",)) == 0
+    assert store.maintain_expired(kinds=("memory.extract",)) == 0
+    assert store.get(pending["job_id"])["status"] == "queued"
+
+
+def test_maintenance_deadline_throttle_isolated_by_kind(tmp_path):
+    store = make_store(tmp_path)
+    assert store.maintain_expired(kinds=("agent_dispatch",)) == 0
+    memory = add(store, key="memory-expired", deadline=datetime.now(UTC) + timedelta(minutes=1))
+    with store._connect() as conn:
+        conn.execute("UPDATE background_jobs SET deadline=? WHERE job_id=?",
+                     ((datetime.now(UTC) - timedelta(seconds=1)).isoformat(), memory["job_id"]))
+
+    assert store.claim("memory-worker", 30, kinds=("memory.extract",)) is None
+    assert store.get(memory["job_id"])["status"] == "failed"
+
+
+def test_exact_claim_does_not_delay_kind_wide_deadline_cleanup(tmp_path):
+    store = make_store(tmp_path)
+    kind = "dispatch.deadline"
+    expired = store.enqueue(kind, "scope-expired", "expired", {},
+                            deadline=datetime.now(UTC) + timedelta(minutes=1))
+    ready = store.enqueue(kind, "scope-ready", "ready", {})
+    with store._connect() as conn:
+        conn.execute("UPDATE background_jobs SET deadline=? WHERE job_id=?",
+                     ((datetime.now(UTC) - timedelta(seconds=1)).isoformat(), expired["job_id"]))
+
+    assert store.claim("exact-worker", 30, kinds=(kind,), job_ids=(expired["job_id"], ready["job_id"]))["job_id"] == ready["job_id"]
+    assert store.get(expired["job_id"])["status"] == "queued"
+    assert store.claim("maintenance-worker", 30, kinds=(kind,)) is None
+    assert store.get(expired["job_id"])["status"] == "failed"
+
+
 def test_cancel_prevents_claim_and_late_completion(tmp_path):
     store = make_store(tmp_path)
     job = add(store)

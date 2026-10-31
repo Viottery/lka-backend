@@ -1,0 +1,2095 @@
+{
+  "format": 1,
+  "version": 1,
+  "migration_name": "initial_native_schema",
+  "source_report": "mysql-source-schema-20261029.json",
+  "source_report_sha256": "6cf46ffeea1692defcf9c7ffb255bf4bc2d4b2c7ed7dd132c039656ff1c21e41",
+  "source_object_count": 231,
+  "excluded_fts_shadow_count": 25,
+  "objects": [
+    {
+      "object_type": "external_trigger",
+      "name": "conversation_history_source_delete",
+      "table_name": "agent_session_context_messages",
+      "source_sql": "CREATE TRIGGER conversation_history_source_delete\n                AFTER DELETE ON agent_session_context_messages BEGIN\n                    DELETE FROM conversation_history_dirty WHERE session_id=OLD.session_id AND seq=OLD.seq;\n                    DELETE FROM conversation_history_fts\n                    WHERE rowid=(SELECT rowid FROM conversation_history_fts_map\n                                 WHERE session_id=OLD.session_id AND seq=OLD.seq);\n                    DELETE FROM conversation_history_fts_map\n                    WHERE session_id=OLD.session_id AND seq=OLD.seq;\n                    INSERT OR IGNORE INTO conversation_history_dirty(session_id,seq)\n                    SELECT session_id,seq FROM agent_session_context_messages\n                    WHERE session_id=OLD.session_id AND trace_id=OLD.trace_id AND role='agent';\n                END",
+      "handling": "external"
+    },
+    {
+      "object_type": "external_trigger",
+      "name": "conversation_history_source_insert",
+      "table_name": "agent_session_context_messages",
+      "source_sql": "CREATE TRIGGER conversation_history_source_insert\n                AFTER INSERT ON agent_session_context_messages BEGIN\n                    INSERT OR IGNORE INTO conversation_history_dirty(session_id,seq)\n                    VALUES(NEW.session_id,NEW.seq);\n                    INSERT OR IGNORE INTO conversation_history_dirty(session_id,seq)\n                    SELECT session_id,seq FROM agent_session_context_messages\n                    WHERE session_id=NEW.session_id AND trace_id=NEW.trace_id AND role='agent';\n                END",
+      "handling": "external"
+    },
+    {
+      "object_type": "external_trigger",
+      "name": "conversation_history_source_update",
+      "table_name": "agent_session_context_messages",
+      "source_sql": "CREATE TRIGGER conversation_history_source_update\n                AFTER UPDATE OF role,content,created_at,trace_id ON agent_session_context_messages BEGIN\n                    INSERT OR IGNORE INTO conversation_history_dirty(session_id,seq)\n                    VALUES(OLD.session_id,OLD.seq);\n                    INSERT OR IGNORE INTO conversation_history_dirty(session_id,seq)\n                    SELECT session_id,seq FROM agent_session_context_messages\n                    WHERE session_id=OLD.session_id AND trace_id=OLD.trace_id AND role='agent';\n                    INSERT OR IGNORE INTO conversation_history_dirty(session_id,seq)\n                    SELECT session_id,seq FROM agent_session_context_messages\n                    WHERE session_id=NEW.session_id AND trace_id=NEW.trace_id AND role='agent';\n                END",
+      "handling": "external"
+    },
+    {
+      "object_type": "external_trigger",
+      "name": "memory_fts_delete",
+      "table_name": "memory_entries",
+      "source_sql": "CREATE TRIGGER memory_fts_delete AFTER DELETE ON memory_entries\n                    BEGIN\n                        DELETE FROM memory_entries_fts WHERE memory_id=old.memory_id;\n                    END",
+      "handling": "external"
+    },
+    {
+      "object_type": "external_trigger",
+      "name": "memory_fts_insert",
+      "table_name": "memory_entries",
+      "source_sql": "CREATE TRIGGER memory_fts_insert AFTER INSERT ON memory_entries\n                    BEGIN\n                        INSERT INTO memory_entries_fts(memory_id,content,memory_type)\n                        VALUES(new.memory_id,new.content,new.memory_type);\n                    END",
+      "handling": "external"
+    },
+    {
+      "object_type": "external_trigger",
+      "name": "memory_fts_update",
+      "table_name": "memory_entries",
+      "source_sql": "CREATE TRIGGER memory_fts_update AFTER UPDATE OF content,memory_type ON memory_entries\n                    BEGIN\n                        DELETE FROM memory_entries_fts WHERE memory_id=old.memory_id;\n                        INSERT INTO memory_entries_fts(memory_id,content,memory_type)\n                        VALUES(new.memory_id,new.content,new.memory_type);\n                    END",
+      "handling": "external"
+    },
+    {
+      "object_type": "fts",
+      "name": "conversation_history_fts",
+      "table_name": "conversation_history_fts",
+      "source_sql": "CREATE VIRTUAL TABLE conversation_history_fts\n                    USING fts5(content, tokenize='trigram')",
+      "handling": "external"
+    },
+    {
+      "object_type": "fts",
+      "name": "knowledge_chunks_fts",
+      "table_name": "knowledge_chunks_fts",
+      "source_sql": "CREATE VIRTUAL TABLE knowledge_chunks_fts USING fts5(\n                chunk_id UNINDEXED,\n                document_id UNINDEXED,\n                title,\n                text,\n                source_type\n            )",
+      "handling": "external"
+    },
+    {
+      "object_type": "fts",
+      "name": "mail_messages_fts",
+      "table_name": "mail_messages_fts",
+      "source_sql": "CREATE VIRTUAL TABLE mail_messages_fts USING fts5(\n                message_id UNINDEXED,\n                subject,\n                sender,\n                folder,\n                body_text\n            )",
+      "handling": "external"
+    },
+    {
+      "object_type": "fts",
+      "name": "matters_fts",
+      "table_name": "matters_fts",
+      "source_sql": "CREATE VIRTUAL TABLE matters_fts USING fts5(\n                matter_id UNINDEXED,\n                title,\n                summary,\n                tags\n            )",
+      "handling": "external"
+    },
+    {
+      "object_type": "fts",
+      "name": "memory_entries_fts",
+      "table_name": "memory_entries_fts",
+      "source_sql": "CREATE VIRTUAL TABLE memory_entries_fts\n                    USING fts5(memory_id UNINDEXED, content, memory_type)",
+      "handling": "external"
+    },
+    {
+      "object_type": "index",
+      "name": "idx_agent_run_artifacts_run_kind",
+      "table_name": "agent_run_artifacts",
+      "source_sql": "CREATE INDEX idx_agent_run_artifacts_run_kind\n                ON agent_run_artifacts(run_id, kind, created_at)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "idx_agent_runs_parent_run_id",
+      "table_name": "agent_runs",
+      "source_sql": "CREATE INDEX idx_agent_runs_parent_run_id\n                ON agent_runs(json_extract(record_payload, '$.parent_run_id'))",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "idx_agent_runs_session_created",
+      "table_name": "agent_runs",
+      "source_sql": "CREATE INDEX idx_agent_runs_session_created\n                ON agent_runs(session_id, created_at)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "idx_agent_safety_reviews_run",
+      "table_name": "agent_safety_reviews",
+      "source_sql": "CREATE INDEX idx_agent_safety_reviews_run\n                ON agent_safety_reviews(run_id, created_at)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "idx_context_messages_role_seq",
+      "table_name": "agent_session_context_messages",
+      "source_sql": "CREATE INDEX idx_context_messages_role_seq ON agent_session_context_messages(session_id,role,seq)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "idx_context_messages_trace",
+      "table_name": "agent_session_context_messages",
+      "source_sql": "CREATE INDEX idx_context_messages_trace ON agent_session_context_messages(session_id,trace_id,role)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "idx_agent_session_messages_session_id",
+      "table_name": "agent_session_messages",
+      "source_sql": "CREATE INDEX idx_agent_session_messages_session_id\n                ON agent_session_messages(session_id, created_at)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "idx_agent_sessions_creation_source",
+      "table_name": "agent_sessions",
+      "source_sql": "CREATE INDEX idx_agent_sessions_creation_source\n                ON agent_sessions(creation_source, status, updated_at DESC, session_id DESC)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "idx_agent_sessions_creator",
+      "table_name": "agent_sessions",
+      "source_sql": "CREATE INDEX idx_agent_sessions_creator\n                ON agent_sessions(creator_session_id, status, updated_at DESC, session_id DESC)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "idx_agent_sessions_updated_at",
+      "table_name": "agent_sessions",
+      "source_sql": "CREATE INDEX idx_agent_sessions_updated_at\n                ON agent_sessions(updated_at)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "idx_agent_tool_invocations_run",
+      "table_name": "agent_tool_invocations",
+      "source_sql": "CREATE INDEX idx_agent_tool_invocations_run\n                ON agent_tool_invocations(run_id, claimed_at)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "idx_agent_user_continuations_run",
+      "table_name": "agent_user_continuations",
+      "source_sql": "CREATE INDEX idx_agent_user_continuations_run\n                ON agent_user_continuations(run_id, created_at)\n                ",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "auth_sessions_user",
+      "table_name": "auth_sessions",
+      "source_sql": "CREATE INDEX auth_sessions_user ON auth_sessions(user_id)",
+      "handling": "mysql",
+      "runtime_source": "app/domains/accounts.py:105"
+    },
+    {
+      "object_type": "index",
+      "name": "idx_background_jobs_finished",
+      "table_name": "background_jobs",
+      "source_sql": "CREATE INDEX idx_background_jobs_finished ON background_jobs(status,finished_at)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "idx_background_jobs_lease",
+      "table_name": "background_jobs",
+      "source_sql": "CREATE INDEX idx_background_jobs_lease ON background_jobs(status, lease_expires_at)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "idx_background_jobs_ready",
+      "table_name": "background_jobs",
+      "source_sql": "CREATE INDEX idx_background_jobs_ready ON background_jobs(status, available_at, priority DESC, created_at)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "context_record_events_session",
+      "table_name": "context_record_events",
+      "source_sql": "CREATE INDEX context_record_events_session ON context_record_events(session_id, head_revision)",
+      "handling": "mysql",
+      "runtime_source": "app/storage/context_records.py:27"
+    },
+    {
+      "object_type": "index",
+      "name": "conversation_history_map_session_seq",
+      "table_name": "conversation_history_fts_map",
+      "source_sql": "CREATE INDEX conversation_history_map_session_seq\n                    ON conversation_history_fts_map(session_id, seq)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "conversation_semantic_dirty_order",
+      "table_name": "conversation_semantic_dirty",
+      "source_sql": "CREATE INDEX conversation_semantic_dirty_order ON conversation_semantic_dirty(session_id, fingerprint, seq)",
+      "handling": "mysql",
+      "runtime_source": "app/domains/conversation_semantic.py:56"
+    },
+    {
+      "object_type": "index",
+      "name": "conversation_semantic_vectors_order",
+      "table_name": "conversation_semantic_vectors",
+      "source_sql": "CREATE INDEX conversation_semantic_vectors_order ON conversation_semantic_vectors(session_id, fingerprint, seq)",
+      "handling": "mysql",
+      "runtime_source": "app/domains/conversation_semantic.py:56"
+    },
+    {
+      "object_type": "index",
+      "name": "idx_knowledge_embedding_records_index",
+      "table_name": "knowledge_embedding_records",
+      "source_sql": "CREATE INDEX idx_knowledge_embedding_records_index\n                ON knowledge_embedding_records(index_key, chunk_id)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "idx_llm_quota_scope",
+      "table_name": "llm_workload_quota_usage",
+      "source_sql": "CREATE INDEX idx_llm_quota_scope ON llm_workload_quota_usage(scope_id,call_id)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "idx_llm_usage_reserved_expiry",
+      "table_name": "llm_workload_usage",
+      "source_sql": "CREATE INDEX idx_llm_usage_reserved_expiry ON llm_workload_usage(expires_at) WHERE status='reserved'",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "idx_llm_usage_time",
+      "table_name": "llm_workload_usage",
+      "source_sql": "CREATE INDEX idx_llm_usage_time ON llm_workload_usage(created_at,pool)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "manager_delegates_parent",
+      "table_name": "manager_delegates",
+      "source_sql": "CREATE INDEX manager_delegates_parent ON manager_delegates(parent_session_id)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "manager_deliveries_session",
+      "table_name": "manager_deliveries",
+      "source_sql": "CREATE INDEX manager_deliveries_session ON manager_deliveries(session_id)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "manager_executions_session",
+      "table_name": "manager_executions",
+      "source_sql": "CREATE INDEX manager_executions_session ON manager_executions(session_id)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "manager_goals_session_status",
+      "table_name": "manager_goals",
+      "source_sql": "CREATE INDEX manager_goals_session_status\n                    ON manager_goals(session_id,status)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "manager_attention_sweep_pending",
+      "table_name": "manager_inbox",
+      "source_sql": "CREATE INDEX manager_attention_sweep_pending ON manager_inbox(session_id,goal_id,goal_revision) WHERE kind='timer' AND consumed_execution_id IS NULL",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "manager_inbox_session_event",
+      "table_name": "manager_inbox",
+      "source_sql": "CREATE INDEX manager_inbox_session_event ON manager_inbox(session_id,event_id)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "manager_schedules_due",
+      "table_name": "manager_schedules",
+      "source_sql": "CREATE INDEX manager_schedules_due ON manager_schedules(next_run_at)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "idx_manager_work_queue_pending",
+      "table_name": "manager_work_queue",
+      "source_sql": "CREATE INDEX idx_manager_work_queue_pending ON manager_work_queue(state,created_at)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "idx_matter_changes_id",
+      "table_name": "matter_changes",
+      "source_sql": "CREATE INDEX idx_matter_changes_id ON matter_changes(matter_id)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "idx_matters_parent",
+      "table_name": "matters",
+      "source_sql": "CREATE INDEX idx_matters_parent ON matters(parent_matter_id)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "idx_matters_project",
+      "table_name": "matters",
+      "source_sql": "CREATE INDEX idx_matters_project ON matters(project_id, kind)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "idx_matters_schedule",
+      "table_name": "matters",
+      "source_sql": "CREATE INDEX idx_matters_schedule ON matters(scheduled_on)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "idx_memory_entries_scope_status",
+      "table_name": "memory_entries",
+      "source_sql": "CREATE INDEX idx_memory_entries_scope_status\n                    ON memory_entries(scope, project_id, status, expires_at)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "idx_memory_feedback_memory",
+      "table_name": "memory_feedback",
+      "source_sql": "CREATE INDEX idx_memory_feedback_memory ON memory_feedback(old_memory_id,new_memory_id)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "idx_memory_feedback_scope_created",
+      "table_name": "memory_feedback",
+      "source_sql": "CREATE INDEX idx_memory_feedback_scope_created ON memory_feedback(scope,project_id,created_at DESC,feedback_id)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "idx_message_attachments_conversation",
+      "table_name": "message_history_attachments",
+      "source_sql": "CREATE INDEX idx_message_attachments_conversation\n                ON message_history_attachments(conversation_key,updated_at DESC)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "idx_message_history_facts_conversation",
+      "table_name": "message_history_facts",
+      "source_sql": "CREATE INDEX idx_message_history_facts_conversation\n                    ON message_history_facts(conversation_key, created_at DESC, fact_id)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "idx_message_history_conversation_seq",
+      "table_name": "message_history_messages",
+      "source_sql": "CREATE INDEX idx_message_history_conversation_seq\n                    ON message_history_messages(conversation_key, seq DESC)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "idx_message_history_sender",
+      "table_name": "message_history_messages",
+      "source_sql": "CREATE INDEX idx_message_history_sender\n                    ON message_history_messages(conversation_key, sender_id, seq DESC)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "idx_message_proposals_feed",
+      "table_name": "message_matter_proposals",
+      "source_sql": "CREATE INDEX idx_message_proposals_feed ON\n                    message_matter_proposals(state,updated_at,proposal_id,revision)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "idx_reading_badcases_feed",
+      "table_name": "message_reading_badcases",
+      "source_sql": "CREATE INDEX idx_reading_badcases_feed ON message_reading_badcases(created_at DESC,badcase_id DESC)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "idx_reading_insights",
+      "table_name": "message_reading_insights",
+      "source_sql": "CREATE INDEX idx_reading_insights ON message_reading_insights(conversation_key,importance,updated_at DESC,insight_id)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "idx_reading_manifests_scope",
+      "table_name": "message_reading_manifests",
+      "source_sql": "CREATE INDEX idx_reading_manifests_scope ON message_reading_manifests(conversation_key,end_seq DESC)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "idx_message_reading_due",
+      "table_name": "message_reading_schedules",
+      "source_sql": "CREATE INDEX idx_message_reading_due ON message_reading_schedules(next_due_at,conversation_key)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "idx_reading_sources_message",
+      "table_name": "message_reading_sources",
+      "source_sql": "CREATE INDEX idx_reading_sources_message ON message_reading_sources(message_id,object_kind,object_id)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "idx_reading_topics",
+      "table_name": "message_reading_topics",
+      "source_sql": "CREATE INDEX idx_reading_topics ON message_reading_topics(conversation_key,last_seen DESC,topic_id)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "idx_project_profiles_name",
+      "table_name": "project_profiles",
+      "source_sql": "CREATE INDEX idx_project_profiles_name ON project_profiles(name, project_id)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "remote_execution_pending",
+      "table_name": "remote_execution_tasks",
+      "source_sql": "CREATE INDEX remote_execution_pending ON remote_execution_tasks(node_id, state, created_at)",
+      "handling": "mysql",
+      "runtime_source": "app/domains/remote_execution.py:214"
+    },
+    {
+      "object_type": "index",
+      "name": "session_inputs_pending",
+      "table_name": "session_inputs",
+      "source_sql": "CREATE INDEX session_inputs_pending ON session_inputs(session_id,run_id)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "session_inputs_ready",
+      "table_name": "session_inputs",
+      "source_sql": "CREATE INDEX session_inputs_ready ON session_inputs(session_id,sequence) WHERE run_id IS NULL AND cancelled=0",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "idx_watch_briefings_inbox",
+      "table_name": "watch_briefings",
+      "source_sql": "CREATE INDEX idx_watch_briefings_inbox\n                    ON watch_briefings(read_at, created_at DESC)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "idx_watch_occurrences_claim",
+      "table_name": "watch_occurrences",
+      "source_sql": "CREATE INDEX idx_watch_occurrences_claim\n                    ON watch_occurrences(status, scheduled_for, lease_expires_at)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "idx_watches_status",
+      "table_name": "watches",
+      "source_sql": "CREATE INDEX idx_watches_status ON watches(status, updated_at)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "index",
+      "name": "idx_web_cache_source",
+      "table_name": "web_cache_index",
+      "source_sql": "CREATE INDEX idx_web_cache_source\n                ON web_cache_index(scope_key, kind, source_key, created DESC)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "agent_artifact_lineage",
+      "table_name": "agent_artifact_lineage",
+      "source_sql": "CREATE TABLE agent_artifact_lineage (\n                artifact_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, artifact_hash TEXT NOT NULL,\n                source_artifact_id TEXT NOT NULL, source_run_id TEXT NOT NULL, source_hash TEXT NOT NULL\n            )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "agent_run_artifacts",
+      "table_name": "agent_run_artifacts",
+      "source_sql": "CREATE TABLE agent_run_artifacts (\n                artifact_id TEXT PRIMARY KEY,\n                run_id TEXT NOT NULL,\n                kind TEXT NOT NULL,\n                content_hash TEXT NOT NULL,\n                summary TEXT NOT NULL,\n                payload TEXT NOT NULL,\n                created_at TEXT NOT NULL,\n                updated_at TEXT NOT NULL,\n                FOREIGN KEY(run_id) REFERENCES agent_runs(run_id)\n            )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "agent_run_events",
+      "table_name": "agent_run_events",
+      "source_sql": "CREATE TABLE agent_run_events (\n                run_id TEXT NOT NULL,\n                sequence INTEGER NOT NULL,\n                event_payload TEXT NOT NULL,\n                created_at TEXT NOT NULL,\n                PRIMARY KEY(run_id, sequence),\n                FOREIGN KEY(run_id) REFERENCES agent_runs(run_id)\n            )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "agent_runs",
+      "table_name": "agent_runs",
+      "source_sql": "CREATE TABLE agent_runs (\n                run_id TEXT PRIMARY KEY,\n                session_id TEXT NOT NULL,\n                status TEXT NOT NULL,\n                record_payload TEXT NOT NULL,\n                created_at TEXT NOT NULL,\n                updated_at TEXT NOT NULL\n            )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "agent_safety_reviews",
+      "table_name": "agent_safety_reviews",
+      "source_sql": "CREATE TABLE agent_safety_reviews (\n                review_id TEXT PRIMARY KEY,\n                run_id TEXT NOT NULL,\n                status TEXT NOT NULL,\n                review_payload TEXT NOT NULL,\n                created_at TEXT NOT NULL,\n                updated_at TEXT NOT NULL,\n                FOREIGN KEY(run_id) REFERENCES agent_runs(run_id)\n            )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "agent_session_context_messages",
+      "table_name": "agent_session_context_messages",
+      "source_sql": "CREATE TABLE agent_session_context_messages (session_id TEXT NOT NULL, seq INTEGER NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL, trace_id TEXT, PRIMARY KEY(session_id, seq))",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "agent_session_context_state",
+      "table_name": "agent_session_context_state",
+      "source_sql": "CREATE TABLE agent_session_context_state (session_id TEXT PRIMARY KEY, revision INTEGER NOT NULL, next_seq INTEGER NOT NULL, covered_seq INTEGER NOT NULL DEFAULT 0, summary_revision INTEGER NOT NULL DEFAULT 0, summary_metadata TEXT NOT NULL DEFAULT '{}')",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "agent_session_context_windows",
+      "table_name": "agent_session_context_windows",
+      "source_sql": "CREATE TABLE agent_session_context_windows (\n                session_id TEXT PRIMARY KEY,\n                token_budget INTEGER NOT NULL,\n                summary TEXT NOT NULL,\n                recent_messages TEXT NOT NULL,\n                token_estimate INTEGER NOT NULL,\n                updated_at TEXT NOT NULL,\n                FOREIGN KEY(session_id) REFERENCES agent_sessions(session_id)\n            )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "agent_session_effects",
+      "table_name": "agent_session_effects",
+      "source_sql": "CREATE TABLE agent_session_effects (\n                effect_id TEXT PRIMARY KEY,\n                session_id TEXT NOT NULL,\n                effect_type TEXT NOT NULL,\n                created_at TEXT NOT NULL,\n                FOREIGN KEY(session_id) REFERENCES agent_sessions(session_id)\n            )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "agent_session_messages",
+      "table_name": "agent_session_messages",
+      "source_sql": "CREATE TABLE agent_session_messages (\n                message_id TEXT PRIMARY KEY,\n                session_id TEXT NOT NULL,\n                role TEXT NOT NULL,\n                content TEXT NOT NULL,\n                payload TEXT NOT NULL,\n                created_at TEXT NOT NULL,\n                FOREIGN KEY(session_id) REFERENCES agent_sessions(session_id)\n            )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "agent_sessions",
+      "table_name": "agent_sessions",
+      "source_sql": "CREATE TABLE agent_sessions (\n                session_id TEXT PRIMARY KEY,\n                title TEXT NOT NULL,\n                status TEXT NOT NULL,\n                kind TEXT NOT NULL DEFAULT 'ordinary',\n                creation_source TEXT NOT NULL DEFAULT 'unknown'\n                    CHECK(creation_source IN ('user','assistant','system','unknown')),\n                creator_session_id TEXT,\n                metadata TEXT NOT NULL,\n                created_at TEXT NOT NULL,\n                updated_at TEXT NOT NULL\n            )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "agent_tool_invocations",
+      "table_name": "agent_tool_invocations",
+      "source_sql": "CREATE TABLE agent_tool_invocations (\n                invocation_id TEXT PRIMARY KEY,\n                run_id TEXT NOT NULL,\n                tool_name TEXT NOT NULL,\n                input_hash TEXT NOT NULL,\n                status TEXT NOT NULL,\n                result_payload TEXT,\n                claimed_at TEXT NOT NULL,\n                updated_at TEXT NOT NULL,\n                FOREIGN KEY(run_id) REFERENCES agent_runs(run_id)\n            )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "agent_ui_preferences",
+      "table_name": "agent_ui_preferences",
+      "source_sql": "CREATE TABLE agent_ui_preferences (\n                id INTEGER PRIMARY KEY CHECK (id = 1),\n                preferences TEXT NOT NULL,\n                updated_at TEXT NOT NULL\n            )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "agent_user_continuations",
+      "table_name": "agent_user_continuations",
+      "source_sql": "CREATE TABLE agent_user_continuations (\n                    command_id TEXT PRIMARY KEY,\n                    run_id TEXT NOT NULL,\n                    question_id TEXT NOT NULL,\n                    answer TEXT NOT NULL,\n                    created_at TEXT NOT NULL,\n                    FOREIGN KEY(run_id) REFERENCES agent_runs(run_id)\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "auth_accounts",
+      "table_name": "auth_accounts",
+      "source_sql": "CREATE TABLE auth_accounts (user_id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, disabled INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)",
+      "handling": "mysql",
+      "runtime_source": "app/domains/accounts.py:96"
+    },
+    {
+      "object_type": "table",
+      "name": "auth_login_throttle",
+      "table_name": "auth_login_throttle",
+      "source_sql": "CREATE TABLE auth_login_throttle (throttle_key TEXT PRIMARY KEY, window_start INTEGER NOT NULL, attempts INTEGER NOT NULL)",
+      "handling": "mysql",
+      "runtime_source": "app/domains/accounts.py:106"
+    },
+    {
+      "object_type": "table",
+      "name": "auth_sessions",
+      "table_name": "auth_sessions",
+      "source_sql": "CREATE TABLE auth_sessions (session_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE, csrf_hash TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0)",
+      "handling": "mysql",
+      "runtime_source": "app/domains/accounts.py:100"
+    },
+    {
+      "object_type": "table",
+      "name": "background_input_progress",
+      "table_name": "background_input_progress",
+      "source_sql": "CREATE TABLE background_input_progress(\n                job_id TEXT NOT NULL,input_id TEXT NOT NULL,completed_at TEXT NOT NULL,\n                PRIMARY KEY(job_id,input_id))",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "background_job_inputs",
+      "table_name": "background_job_inputs",
+      "source_sql": "CREATE TABLE background_job_inputs(\n                kind TEXT NOT NULL,scope_id TEXT NOT NULL,input_id TEXT NOT NULL,\n                job_id TEXT NOT NULL,PRIMARY KEY(kind,scope_id,input_id))",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "background_job_scopes",
+      "table_name": "background_job_scopes",
+      "source_sql": "CREATE TABLE background_job_scopes(kind TEXT NOT NULL,scope_id TEXT NOT NULL,PRIMARY KEY(kind,scope_id))",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "background_jobs",
+      "table_name": "background_jobs",
+      "source_sql": "CREATE TABLE background_jobs (\n                    job_id TEXT PRIMARY KEY,\n                    kind TEXT NOT NULL,\n                    scope_id TEXT NOT NULL,\n                    idempotency_key TEXT NOT NULL,\n                    payload_json TEXT NOT NULL,\n                    status TEXT NOT NULL CHECK(status IN ('queued','running','retry_wait','succeeded','failed','cancelled')),\n                    priority INTEGER NOT NULL DEFAULT 0,\n                    available_at TEXT NOT NULL,\n                    max_attempts INTEGER NOT NULL,\n                    attempts INTEGER NOT NULL DEFAULT 0,\n                    deadline TEXT,\n                    error_class TEXT,\n                    lease_owner TEXT,\n                    lease_expires_at TEXT,\n                    lease_epoch INTEGER NOT NULL DEFAULT 0,\n                    lease_recovery_count INTEGER NOT NULL DEFAULT 0,\n                    created_at TEXT NOT NULL,\n                    started_at TEXT,\n                    finished_at TEXT,\n                    updated_at TEXT NOT NULL,\n                    UNIQUE(kind, scope_id, idempotency_key)\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "background_pending_inputs",
+      "table_name": "background_pending_inputs",
+      "source_sql": "CREATE TABLE background_pending_inputs(\n                kind TEXT NOT NULL,scope_id TEXT NOT NULL,input_id TEXT NOT NULL,\n                created_at TEXT NOT NULL,PRIMARY KEY(kind,scope_id,input_id))",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "background_pending_watermarks",
+      "table_name": "background_pending_watermarks",
+      "source_sql": "CREATE TABLE background_pending_watermarks(\n                kind TEXT NOT NULL,scope_id TEXT NOT NULL,watermark_id TEXT NOT NULL,\n                payload_json TEXT NOT NULL,priority INTEGER NOT NULL,available_at TEXT NOT NULL,\n                max_attempts INTEGER NOT NULL,deadline TEXT,watermark_order INTEGER,updated_at TEXT NOT NULL,\n                PRIMARY KEY(kind,scope_id))",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "background_watermark_heads",
+      "table_name": "background_watermark_heads",
+      "source_sql": "CREATE TABLE background_watermark_heads(\n                kind TEXT NOT NULL,scope_id TEXT NOT NULL,watermark_order INTEGER NOT NULL,\n                watermark_id TEXT NOT NULL,updated_at TEXT NOT NULL,\n                PRIMARY KEY(kind,scope_id))",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "cloud_device_selections",
+      "table_name": "cloud_device_selections",
+      "source_sql": "CREATE TABLE cloud_device_selections (user_id TEXT NOT NULL, selection_key TEXT NOT NULL, selection TEXT NOT NULL, revision INTEGER NOT NULL, PRIMARY KEY (user_id, selection_key))",
+      "handling": "mysql",
+      "runtime_source": "app/domains/devices.py:124"
+    },
+    {
+      "object_type": "table",
+      "name": "cloud_devices",
+      "table_name": "cloud_devices",
+      "source_sql": "CREATE TABLE cloud_devices (device_id TEXT PRIMARY KEY, profile TEXT NOT NULL, token_hash TEXT UNIQUE NOT NULL, credential_version INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_seen TEXT, status TEXT NOT NULL DEFAULT 'unknown')",
+      "handling": "mysql",
+      "runtime_source": "app/domains/devices.py:124"
+    },
+    {
+      "object_type": "table",
+      "name": "codex_trace_events",
+      "table_name": "codex_trace_events",
+      "source_sql": "CREATE TABLE codex_trace_events (child_run_id TEXT NOT NULL, sequence INTEGER NOT NULL, created_at TEXT NOT NULL, method TEXT NOT NULL, thread_id TEXT, turn_id TEXT, item_id TEXT, request_id TEXT, payload_json TEXT NOT NULL, PRIMARY KEY (child_run_id, sequence))",
+      "handling": "mysql",
+      "runtime_source": "app/core/codex_trace.py:121"
+    },
+    {
+      "object_type": "table",
+      "name": "context_record_events",
+      "table_name": "context_record_events",
+      "source_sql": "CREATE TABLE context_record_events (event_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, head_revision INTEGER NOT NULL, change_json TEXT NOT NULL, created_at TEXT NOT NULL)",
+      "handling": "mysql",
+      "runtime_source": "app/storage/context_records.py:27"
+    },
+    {
+      "object_type": "table",
+      "name": "context_record_heads",
+      "table_name": "context_record_heads",
+      "source_sql": "CREATE TABLE context_record_heads (session_id TEXT PRIMARY KEY, revision INTEGER NOT NULL, covered_seq INTEGER NOT NULL, project_id TEXT, updated_at TEXT NOT NULL)",
+      "handling": "mysql",
+      "runtime_source": "app/storage/context_records.py:27"
+    },
+    {
+      "object_type": "table",
+      "name": "context_record_pending",
+      "table_name": "context_record_pending",
+      "source_sql": "CREATE TABLE context_record_pending (session_id TEXT PRIMARY KEY, target_seq INTEGER NOT NULL)",
+      "handling": "mysql",
+      "runtime_source": "app/storage/context_records.py:27"
+    },
+    {
+      "object_type": "table",
+      "name": "context_records",
+      "table_name": "context_records",
+      "source_sql": "CREATE TABLE context_records (session_id TEXT NOT NULL, record_id TEXT NOT NULL, revision INTEGER NOT NULL, content_json TEXT NOT NULL, PRIMARY KEY (session_id, record_id))",
+      "handling": "mysql",
+      "runtime_source": "app/storage/context_records.py:27"
+    },
+    {
+      "object_type": "table",
+      "name": "conversation_history_dirty",
+      "table_name": "conversation_history_dirty",
+      "source_sql": "CREATE TABLE conversation_history_dirty (\n                    session_id TEXT NOT NULL,\n                    seq INTEGER NOT NULL,\n                    PRIMARY KEY(session_id, seq)\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "conversation_history_fts_map",
+      "table_name": "conversation_history_fts_map",
+      "source_sql": "CREATE TABLE conversation_history_fts_map (\n                    rowid INTEGER PRIMARY KEY,\n                    session_id TEXT NOT NULL,\n                    seq INTEGER NOT NULL,\n                    source_hash TEXT NOT NULL,\n                    UNIQUE(session_id, seq)\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "conversation_history_index_state",
+      "table_name": "conversation_history_index_state",
+      "source_sql": "CREATE TABLE conversation_history_index_state (\n                    session_id TEXT PRIMARY KEY,\n                    last_seq INTEGER NOT NULL DEFAULT 0\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "conversation_semantic_dirty",
+      "table_name": "conversation_semantic_dirty",
+      "source_sql": "CREATE TABLE conversation_semantic_dirty (session_id TEXT NOT NULL, fingerprint TEXT NOT NULL, seq INTEGER NOT NULL, generation INTEGER NOT NULL, PRIMARY KEY (session_id, fingerprint, seq))",
+      "handling": "mysql",
+      "runtime_source": "app/domains/conversation_semantic.py:56"
+    },
+    {
+      "object_type": "table",
+      "name": "conversation_semantic_state",
+      "table_name": "conversation_semantic_state",
+      "source_sql": "CREATE TABLE conversation_semantic_state (session_id TEXT NOT NULL, fingerprint TEXT NOT NULL, watermark INTEGER NOT NULL DEFAULT 0, source_revision INTEGER NOT NULL DEFAULT 0, index_revision INTEGER NOT NULL DEFAULT 0, dimensions INTEGER, PRIMARY KEY (session_id, fingerprint))",
+      "handling": "mysql",
+      "runtime_source": "app/domains/conversation_semantic.py:56"
+    },
+    {
+      "object_type": "table",
+      "name": "conversation_semantic_vectors",
+      "table_name": "conversation_semantic_vectors",
+      "source_sql": "CREATE TABLE conversation_semantic_vectors (session_id TEXT NOT NULL, seq INTEGER NOT NULL, fingerprint TEXT NOT NULL, source_hash TEXT NOT NULL, vector BLOB NOT NULL, dimensions INTEGER NOT NULL, PRIMARY KEY (session_id, seq, fingerprint))",
+      "handling": "mysql",
+      "runtime_source": "app/domains/conversation_semantic.py:56"
+    },
+    {
+      "object_type": "table",
+      "name": "device_connection_authorizations",
+      "table_name": "device_connection_authorizations",
+      "source_sql": "CREATE TABLE device_connection_authorizations (node_id TEXT NOT NULL, user_id TEXT NOT NULL, authorization_epoch INTEGER NOT NULL, PRIMARY KEY (node_id, user_id))",
+      "handling": "mysql",
+      "runtime_source": "app/domains/device_connections.py:96"
+    },
+    {
+      "object_type": "table",
+      "name": "device_connection_grant_epochs",
+      "table_name": "device_connection_grant_epochs",
+      "source_sql": "CREATE TABLE device_connection_grant_epochs (grant_id TEXT PRIMARY KEY, authorization_epoch INTEGER NOT NULL)",
+      "handling": "mysql",
+      "runtime_source": "app/domains/device_connections.py:96"
+    },
+    {
+      "object_type": "table",
+      "name": "device_connection_grants",
+      "table_name": "device_connection_grants",
+      "source_sql": "CREATE TABLE device_connection_grants (grant_id TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, node_id TEXT NOT NULL, user_id TEXT NOT NULL, workspace_ids TEXT NOT NULL, expires_at REAL NOT NULL, consumed INTEGER NOT NULL DEFAULT 0, credential_version INTEGER)",
+      "handling": "mysql",
+      "runtime_source": "app/domains/device_connections.py:96"
+    },
+    {
+      "object_type": "table",
+      "name": "device_connection_session_epochs",
+      "table_name": "device_connection_session_epochs",
+      "source_sql": "CREATE TABLE device_connection_session_epochs (session_id TEXT PRIMARY KEY, authorization_epoch INTEGER NOT NULL)",
+      "handling": "mysql",
+      "runtime_source": "app/domains/device_connections.py:96"
+    },
+    {
+      "object_type": "table",
+      "name": "device_connection_session_policies",
+      "table_name": "device_connection_session_policies",
+      "source_sql": "CREATE TABLE device_connection_session_policies (session_id TEXT PRIMARY KEY, workspace_ids TEXT NOT NULL, allowed_paths TEXT NOT NULL DEFAULT '[]', node_id TEXT NOT NULL DEFAULT '', user_id TEXT NOT NULL DEFAULT '', authorization_epoch INTEGER NOT NULL DEFAULT 0)",
+      "handling": "mysql",
+      "runtime_source": "app/domains/device_connections.py:96"
+    },
+    {
+      "object_type": "table",
+      "name": "device_connection_sessions",
+      "table_name": "device_connection_sessions",
+      "source_sql": "CREATE TABLE device_connection_sessions (session_id TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, csrf_hash TEXT NOT NULL, node_id TEXT NOT NULL, user_id TEXT NOT NULL, workspace_ids TEXT NOT NULL, expires_at REAL NOT NULL, revoked INTEGER NOT NULL DEFAULT 0)",
+      "handling": "mysql",
+      "runtime_source": "app/domains/device_connections.py:96"
+    },
+    {
+      "object_type": "table",
+      "name": "device_connection_workspace_selections",
+      "table_name": "device_connection_workspace_selections",
+      "source_sql": "CREATE TABLE device_connection_workspace_selections (node_id TEXT NOT NULL, user_id TEXT NOT NULL, authorization_epoch INTEGER NOT NULL, workspace_id TEXT NOT NULL, path TEXT NOT NULL, created_at REAL NOT NULL, PRIMARY KEY (node_id, user_id, authorization_epoch, workspace_id))",
+      "handling": "mysql",
+      "runtime_source": "app/domains/device_connections.py:96"
+    },
+    {
+      "object_type": "table",
+      "name": "knowledge_access_audit",
+      "table_name": "knowledge_access_audit",
+      "source_sql": "CREATE TABLE knowledge_access_audit (\n                audit_id TEXT PRIMARY KEY,\n                query_id TEXT NOT NULL,\n                tool_name TEXT,\n                document_id TEXT,\n                chunk_id TEXT,\n                action TEXT NOT NULL,\n                result_count INTEGER NOT NULL DEFAULT 0,\n                policy_decision TEXT NOT NULL,\n                remote_data_sent INTEGER NOT NULL DEFAULT 0,\n                metadata TEXT NOT NULL,\n                created_at TEXT NOT NULL\n            )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "knowledge_chunks",
+      "table_name": "knowledge_chunks",
+      "source_sql": "CREATE TABLE knowledge_chunks (\n                chunk_id TEXT PRIMARY KEY,\n                document_id TEXT NOT NULL,\n                chunk_index INTEGER NOT NULL,\n                text TEXT NOT NULL,\n                char_count INTEGER NOT NULL,\n                token_estimate INTEGER NOT NULL,\n                source_ref TEXT NOT NULL,\n                sensitivity TEXT NOT NULL,\n                remote_policy TEXT NOT NULL,\n                metadata TEXT NOT NULL,\n                created_at TEXT NOT NULL,\n                FOREIGN KEY(document_id) REFERENCES knowledge_documents(document_id),\n                UNIQUE(document_id, chunk_index)\n            )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "knowledge_documents",
+      "table_name": "knowledge_documents",
+      "source_sql": "CREATE TABLE knowledge_documents (\n                document_id TEXT PRIMARY KEY,\n                source_id TEXT NOT NULL,\n                source_type TEXT NOT NULL,\n                title TEXT NOT NULL,\n                uri TEXT,\n                checksum TEXT NOT NULL,\n                mime_type TEXT NOT NULL,\n                status TEXT NOT NULL,\n                sensitivity TEXT NOT NULL,\n                remote_policy TEXT NOT NULL,\n                source_ref TEXT NOT NULL,\n                created_at TEXT NOT NULL,\n                updated_at TEXT NOT NULL,\n                indexed_at TEXT NOT NULL,\n                metadata TEXT NOT NULL,\n                FOREIGN KEY(source_id) REFERENCES knowledge_sources(source_id),\n                UNIQUE(source_id, uri, checksum)\n            )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "knowledge_embedding_records",
+      "table_name": "knowledge_embedding_records",
+      "source_sql": "CREATE TABLE knowledge_embedding_records (\n                vector_id INTEGER PRIMARY KEY AUTOINCREMENT,\n                index_key TEXT NOT NULL,\n                chunk_id TEXT NOT NULL,\n                chunk_checksum TEXT NOT NULL,\n                provider_name TEXT NOT NULL,\n                model_name TEXT NOT NULL,\n                dimensions INTEGER NOT NULL,\n                created_at TEXT NOT NULL,\n                updated_at TEXT NOT NULL,\n                UNIQUE(index_key, chunk_id),\n                FOREIGN KEY(chunk_id) REFERENCES knowledge_chunks(chunk_id)\n            )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "knowledge_sources",
+      "table_name": "knowledge_sources",
+      "source_sql": "CREATE TABLE knowledge_sources (\n                source_id TEXT PRIMARY KEY,\n                source_type TEXT NOT NULL,\n                display_name TEXT NOT NULL,\n                uri TEXT,\n                metadata TEXT NOT NULL,\n                status TEXT NOT NULL,\n                sensitivity TEXT NOT NULL,\n                remote_policy TEXT NOT NULL,\n                access_scope TEXT NOT NULL,\n                created_at TEXT NOT NULL,\n                updated_at TEXT NOT NULL\n            )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "llm_workload_budget_events",
+      "table_name": "llm_workload_budget_events",
+      "source_sql": "CREATE TABLE llm_workload_budget_events(\n                event_id INTEGER PRIMARY KEY AUTOINCREMENT, pool TEXT NOT NULL,\n                created_at TEXT NOT NULL, kind TEXT NOT NULL, reason TEXT NOT NULL,\n                revision INTEGER NOT NULL)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "llm_workload_pool_state",
+      "table_name": "llm_workload_pool_state",
+      "source_sql": "CREATE TABLE llm_workload_pool_state(\n                pool TEXT PRIMARY KEY, revision INTEGER NOT NULL DEFAULT 0,\n                reset_at TEXT NOT NULL DEFAULT '', opened_at TEXT, reason TEXT)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "llm_workload_quota_adoptions",
+      "table_name": "llm_workload_quota_adoptions",
+      "source_sql": "CREATE TABLE llm_workload_quota_adoptions(\n                task_id TEXT NOT NULL, scope_id TEXT NOT NULL,\n                compacted_tokens INTEGER NOT NULL, compacted_calls INTEGER NOT NULL,\n                PRIMARY KEY(task_id,scope_id))",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "llm_workload_quota_totals",
+      "table_name": "llm_workload_quota_totals",
+      "source_sql": "CREATE TABLE llm_workload_quota_totals(\n                scope_id TEXT PRIMARY KEY, total_tokens INTEGER NOT NULL,\n                total_calls INTEGER NOT NULL)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "llm_workload_quota_usage",
+      "table_name": "llm_workload_quota_usage",
+      "source_sql": "CREATE TABLE llm_workload_quota_usage(\n                call_id TEXT NOT NULL, scope_id TEXT NOT NULL,\n                PRIMARY KEY(call_id,scope_id))",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "llm_workload_usage",
+      "table_name": "llm_workload_usage",
+      "source_sql": "CREATE TABLE llm_workload_usage(\n                call_id TEXT PRIMARY KEY, pool TEXT NOT NULL, task_id TEXT,\n                created_at TEXT NOT NULL, expires_at TEXT NOT NULL, status TEXT NOT NULL,\n                input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL,\n                cost REAL NOT NULL, duration_seconds REAL, count_method TEXT NOT NULL, cost_known INTEGER NOT NULL DEFAULT 1, pricing_client TEXT, pricing_model TEXT, pricing_revision TEXT)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "mail_accounts",
+      "table_name": "mail_accounts",
+      "source_sql": "CREATE TABLE mail_accounts (\n                account_id TEXT PRIMARY KEY,\n                provider TEXT NOT NULL,\n                email_address TEXT NOT NULL,\n                display_name TEXT,\n                created_at TEXT NOT NULL,\n                updated_at TEXT NOT NULL,\n                UNIQUE(provider, email_address)\n            )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "mail_attachments",
+      "table_name": "mail_attachments",
+      "source_sql": "CREATE TABLE mail_attachments (\n                attachment_id TEXT PRIMARY KEY,\n                message_id TEXT NOT NULL,\n                external_id TEXT NOT NULL,\n                name TEXT NOT NULL,\n                content_type TEXT,\n                size INTEGER,\n                is_downloaded INTEGER NOT NULL DEFAULT 0,\n                local_path TEXT,\n                created_at TEXT NOT NULL,\n                FOREIGN KEY(message_id) REFERENCES mail_messages(message_id),\n                UNIQUE(message_id, external_id)\n            )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "mail_chunks",
+      "table_name": "mail_chunks",
+      "source_sql": "CREATE TABLE mail_chunks (\n                chunk_id TEXT PRIMARY KEY,\n                message_id TEXT NOT NULL,\n                chunk_index INTEGER NOT NULL,\n                text TEXT NOT NULL,\n                created_at TEXT NOT NULL,\n                FOREIGN KEY(message_id) REFERENCES mail_messages(message_id),\n                UNIQUE(message_id, chunk_index)\n            )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "mail_matter_links",
+      "table_name": "mail_matter_links",
+      "source_sql": "CREATE TABLE mail_matter_links (\n                matter_id TEXT NOT NULL,\n                message_id TEXT NOT NULL,\n                reason TEXT NOT NULL,\n                created_at TEXT NOT NULL,\n                PRIMARY KEY(matter_id, message_id),\n                FOREIGN KEY(matter_id) REFERENCES mail_matters(matter_id),\n                FOREIGN KEY(message_id) REFERENCES mail_messages(message_id)\n            )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "mail_matters",
+      "table_name": "mail_matters",
+      "source_sql": "CREATE TABLE mail_matters (\n                matter_id TEXT PRIMARY KEY,\n                title TEXT NOT NULL,\n                summary TEXT NOT NULL,\n                status TEXT NOT NULL,\n                priority TEXT NOT NULL,\n                created_at TEXT NOT NULL,\n                updated_at TEXT NOT NULL\n            )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "mail_messages",
+      "table_name": "mail_messages",
+      "source_sql": "CREATE TABLE mail_messages (\n                message_id TEXT PRIMARY KEY,\n                account_id TEXT NOT NULL,\n                external_id TEXT NOT NULL,\n                folder TEXT NOT NULL,\n                subject TEXT NOT NULL,\n                sender TEXT NOT NULL,\n                recipients TEXT NOT NULL,\n                cc TEXT NOT NULL,\n                received_at TEXT,\n                body_text TEXT NOT NULL,\n                created_at TEXT NOT NULL,\n                updated_at TEXT NOT NULL,\n                FOREIGN KEY(account_id) REFERENCES mail_accounts(account_id),\n                UNIQUE(account_id, external_id)\n            )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "mail_sync_state",
+      "table_name": "mail_sync_state",
+      "source_sql": "CREATE TABLE mail_sync_state (\n                provider TEXT NOT NULL,\n                account_id TEXT NOT NULL,\n                folder TEXT NOT NULL,\n                status TEXT NOT NULL,\n                last_sync_at TEXT NOT NULL,\n                next_link TEXT,\n                delta_link TEXT,\n                last_result_payload TEXT NOT NULL,\n                PRIMARY KEY(provider, account_id, folder),\n                FOREIGN KEY(account_id) REFERENCES mail_accounts(account_id)\n            )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "managed_session_links",
+      "table_name": "managed_session_links",
+      "source_sql": "CREATE TABLE managed_session_links (\n                    manager_session_id TEXT NOT NULL, task_session_id TEXT NOT NULL,\n                    run_id TEXT NOT NULL, command_id TEXT NOT NULL, created_at TEXT NOT NULL,\n                    PRIMARY KEY(manager_session_id, command_id)\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "management_commands",
+      "table_name": "management_commands",
+      "source_sql": "CREATE TABLE management_commands (\n                    manager_session_id TEXT NOT NULL, command_id TEXT NOT NULL,\n                    fingerprint TEXT NOT NULL, action TEXT NOT NULL,\n                    receipt TEXT NOT NULL, created_at TEXT NOT NULL,\n                    PRIMARY KEY(manager_session_id, command_id)\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "manager_assignment_proposals",
+      "table_name": "manager_assignment_proposals",
+      "source_sql": "CREATE TABLE manager_assignment_proposals (\n                    execution_id TEXT NOT NULL, command_id TEXT NOT NULL,\n                    manager_session_id TEXT NOT NULL, payload TEXT NOT NULL,\n                    PRIMARY KEY(execution_id,command_id)\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "manager_attention_policies",
+      "table_name": "manager_attention_policies",
+      "source_sql": "CREATE TABLE manager_attention_policies (\n                    session_id TEXT PRIMARY KEY, revision INTEGER NOT NULL,\n                    enabled INTEGER NOT NULL CHECK(enabled IN (0,1)), timezone TEXT NOT NULL,\n                    horizon_days INTEGER NOT NULL, scan_offset INTEGER NOT NULL DEFAULT 0\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "manager_attention_sweep_state",
+      "table_name": "manager_attention_sweep_state",
+      "source_sql": "CREATE TABLE manager_attention_sweep_state (\n                session_id TEXT PRIMARY KEY, next_due_at TEXT NOT NULL,\n                generation INTEGER NOT NULL DEFAULT 0 CHECK(generation>=0)\n            )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "manager_controllers",
+      "table_name": "manager_controllers",
+      "source_sql": "CREATE TABLE manager_controllers (\n                    session_id TEXT PRIMARY KEY REFERENCES agent_sessions(session_id),\n                    status TEXT NOT NULL DEFAULT 'paused' CHECK(status IN ('active','paused')),\n                    revision INTEGER NOT NULL DEFAULT 1 CHECK(revision >= 1),\n                    llm_client_name TEXT, llm_model TEXT,\n                    llm_answer_client_name TEXT, llm_answer_model TEXT,\n                    reasoning_level TEXT CHECK(reasoning_level IN ('off','low','high','max')),\n                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL\n                , default_execution_workspace TEXT)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "manager_defaults",
+      "table_name": "manager_defaults",
+      "source_sql": "CREATE TABLE manager_defaults (\n                    slot INTEGER PRIMARY KEY CHECK(slot = 1),\n                    session_id TEXT NOT NULL REFERENCES agent_sessions(session_id)\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "manager_delegate_report_proposals",
+      "table_name": "manager_delegate_report_proposals",
+      "source_sql": "CREATE TABLE manager_delegate_report_proposals (\n                    execution_id TEXT NOT NULL, command_id TEXT NOT NULL,\n                    delegate_id TEXT NOT NULL, run_id TEXT NOT NULL, kind TEXT NOT NULL,\n                    summary TEXT NOT NULL, evidence TEXT NOT NULL,\n                    PRIMARY KEY(execution_id,command_id)\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "manager_delegate_reports",
+      "table_name": "manager_delegate_reports",
+      "source_sql": "CREATE TABLE manager_delegate_reports (\n                    report_id TEXT PRIMARY KEY, delegate_id TEXT NOT NULL, run_id TEXT NOT NULL,\n                    command_id TEXT NOT NULL, kind TEXT NOT NULL, summary TEXT NOT NULL,\n                    evidence TEXT NOT NULL, created_at TEXT NOT NULL,\n                    UNIQUE(delegate_id,command_id)\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "manager_delegates",
+      "table_name": "manager_delegates",
+      "source_sql": "CREATE TABLE manager_delegates (\n                    delegate_id TEXT PRIMARY KEY, session_id TEXT NOT NULL UNIQUE,\n                    parent_session_id TEXT NOT NULL, objective TEXT NOT NULL,\n                    allowed_tools TEXT NOT NULL, workspace TEXT, kickoff_envelope TEXT NOT NULL,\n                    state TEXT NOT NULL CHECK(state IN ('active','completed','cancelled')),\n                    revision INTEGER NOT NULL DEFAULT 1,\n                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL\n                , safety_review_mode TEXT CHECK(safety_review_mode IN ('skip','llm','manual')))",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "manager_deliveries",
+      "table_name": "manager_deliveries",
+      "source_sql": "CREATE TABLE manager_deliveries (\n                    delivery_id TEXT PRIMARY KEY, session_id TEXT NOT NULL,\n                    execution_id TEXT NOT NULL UNIQUE, run_id TEXT NOT NULL,\n                    message_id TEXT NOT NULL, created_at TEXT NOT NULL\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "manager_delivery_policies",
+      "table_name": "manager_delivery_policies",
+      "source_sql": "CREATE TABLE manager_delivery_policies (\n                session_id TEXT PRIMARY KEY, revision INTEGER NOT NULL,\n                muted INTEGER NOT NULL CHECK(muted IN (0,1)), snooze_until TEXT,\n                allow_decisions INTEGER NOT NULL CHECK(allow_decisions IN (0,1)))",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "manager_executions",
+      "table_name": "manager_executions",
+      "source_sql": "CREATE TABLE manager_executions (\n                    execution_id TEXT PRIMARY KEY, session_id TEXT NOT NULL,\n                    run_id TEXT NOT NULL UNIQUE,\n                    status TEXT NOT NULL CHECK(status IN ('bound','completed','failed','superseded')),\n                    controller_revision INTEGER NOT NULL,\n                    event_ids TEXT NOT NULL CHECK(json_valid(event_ids)),\n                    goal_revisions TEXT NOT NULL CHECK(json_valid(goal_revisions)),\n                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "manager_goal_matter_links",
+      "table_name": "manager_goal_matter_links",
+      "source_sql": "CREATE TABLE manager_goal_matter_links (\n                    goal_id TEXT PRIMARY KEY, manager_session_id TEXT NOT NULL, matter_id TEXT NOT NULL\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "manager_goal_proposals",
+      "table_name": "manager_goal_proposals",
+      "source_sql": "CREATE TABLE manager_goal_proposals (\n                    execution_id TEXT NOT NULL, command_id TEXT NOT NULL,\n                    goal_id TEXT NOT NULL, args TEXT NOT NULL,\n                    PRIMARY KEY(execution_id,command_id), UNIQUE(execution_id,goal_id)\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "manager_goals",
+      "table_name": "manager_goals",
+      "source_sql": "CREATE TABLE manager_goals (\n                    goal_id TEXT PRIMARY KEY,\n                    session_id TEXT NOT NULL REFERENCES manager_controllers(session_id),\n                    status TEXT NOT NULL CHECK(status IN\n                        ('active','waiting','paused','completed','cancelled')),\n                    revision INTEGER NOT NULL DEFAULT 1 CHECK(revision >= 1),\n                    objective TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL\n                , next_wake_at TEXT, timer_generation INTEGER NOT NULL DEFAULT 1, wait_run_id TEXT)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "manager_inbox",
+      "table_name": "manager_inbox",
+      "source_sql": "CREATE TABLE manager_inbox (\n                    event_id INTEGER PRIMARY KEY AUTOINCREMENT,\n                    session_id TEXT NOT NULL, dedup_key TEXT NOT NULL,\n                    kind TEXT NOT NULL CHECK(kind IN ('timer','task_terminal')),\n                    goal_id TEXT, goal_revision INTEGER,\n                    payload TEXT NOT NULL CHECK(json_valid(payload) AND length(CAST(payload AS BLOB))<=4096),\n                    created_at TEXT NOT NULL, consumed_execution_id TEXT,\n                    UNIQUE(session_id,dedup_key)\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "manager_matter_attention_causes",
+      "table_name": "manager_matter_attention_causes",
+      "source_sql": "CREATE TABLE manager_matter_attention_causes (\n                    matter_id TEXT NOT NULL, revision INTEGER NOT NULL,\n                    cause_paths TEXT NOT NULL CHECK(json_valid(cause_paths) AND length(CAST(cause_paths AS BLOB))<=32768),\n                    PRIMARY KEY(matter_id,revision)\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "manager_notification_proposals",
+      "table_name": "manager_notification_proposals",
+      "source_sql": "CREATE TABLE manager_notification_proposals (\n                execution_id TEXT PRIMARY KEY REFERENCES manager_executions(execution_id),\n                session_id TEXT NOT NULL, run_id TEXT NOT NULL, command_id TEXT NOT NULL,\n                notify_user INTEGER NOT NULL CHECK(notify_user IN (0,1)), reason TEXT NOT NULL,\n                created_at TEXT NOT NULL, applied_at TEXT\n            )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "manager_queue_fairness",
+      "table_name": "manager_queue_fairness",
+      "source_sql": "CREATE TABLE manager_queue_fairness (\n                    manager_session_id TEXT PRIMARY KEY, last_served INTEGER NOT NULL\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "manager_queue_scheduler",
+      "table_name": "manager_queue_scheduler",
+      "source_sql": "CREATE TABLE manager_queue_scheduler (\n                    singleton INTEGER PRIMARY KEY CHECK(singleton=1), sequence INTEGER NOT NULL,\n                    scan_cursor INTEGER NOT NULL\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "manager_schedule_commands",
+      "table_name": "manager_schedule_commands",
+      "source_sql": "CREATE TABLE manager_schedule_commands (\n                    session_id TEXT NOT NULL, command_id TEXT NOT NULL, fingerprint TEXT NOT NULL,\n                    receipt TEXT NOT NULL, PRIMARY KEY(session_id,command_id)\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "manager_schedules",
+      "table_name": "manager_schedules",
+      "source_sql": "CREATE TABLE manager_schedules (\n                    schedule_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, goal_id TEXT NOT NULL,\n                    revision INTEGER NOT NULL CHECK(revision>=1), timezone TEXT NOT NULL,\n                    kind TEXT NOT NULL CHECK(kind IN ('one_shot','daily','weekly')),\n                    local_time TEXT, weekday INTEGER, run_at TEXT, expires_at TEXT,\n                    enabled INTEGER NOT NULL CHECK(enabled IN (0,1)), next_run_at TEXT,\n                    last_occurrence_at TEXT, last_outcome TEXT CHECK(last_outcome IN ('captured','skipped')),\n                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "manager_timer_causes",
+      "table_name": "manager_timer_causes",
+      "source_sql": "CREATE TABLE manager_timer_causes (\n                    goal_id TEXT NOT NULL, timer_generation INTEGER NOT NULL,\n                    cause_paths TEXT NOT NULL,\n                    PRIMARY KEY(goal_id,timer_generation)\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "manager_wake_counters",
+      "table_name": "manager_wake_counters",
+      "source_sql": "CREATE TABLE manager_wake_counters (\n                session_id TEXT PRIMARY KEY, generation INTEGER NOT NULL)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "manager_watch_commands",
+      "table_name": "manager_watch_commands",
+      "source_sql": "CREATE TABLE manager_watch_commands (\n                    session_id TEXT NOT NULL, command_id TEXT NOT NULL, fingerprint TEXT NOT NULL,\n                    receipt TEXT NOT NULL, PRIMARY KEY(session_id,command_id))",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "manager_watch_subscriptions",
+      "table_name": "manager_watch_subscriptions",
+      "source_sql": "CREATE TABLE manager_watch_subscriptions (\n                    session_id TEXT NOT NULL, watch_id TEXT NOT NULL, revision INTEGER NOT NULL,\n                    enabled INTEGER NOT NULL CHECK(enabled IN (0,1)), condition TEXT NOT NULL,\n                    goal_id TEXT, scope_version INTEGER NOT NULL, cursor INTEGER NOT NULL,\n                    PRIMARY KEY(session_id,watch_id))",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "manager_work_assignments",
+      "table_name": "manager_work_assignments",
+      "source_sql": "CREATE TABLE manager_work_assignments (\n                    manager_session_id TEXT NOT NULL, matter_id TEXT NOT NULL,\n                    run_id TEXT NOT NULL, matter_revision INTEGER NOT NULL,\n                    created_at TEXT NOT NULL,\n                    PRIMARY KEY(manager_session_id,matter_id,run_id)\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "manager_work_claims",
+      "table_name": "manager_work_claims",
+      "source_sql": "CREATE TABLE manager_work_claims (\n                    resource_key TEXT PRIMARY KEY, queue_id TEXT NOT NULL, run_id TEXT NOT NULL\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "manager_work_proposals",
+      "table_name": "manager_work_proposals",
+      "source_sql": "CREATE TABLE manager_work_proposals (\n                    execution_id TEXT NOT NULL, command_id TEXT NOT NULL,\n                    manager_session_id TEXT NOT NULL, payload TEXT NOT NULL,\n                    PRIMARY KEY(execution_id,command_id)\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "manager_work_queue",
+      "table_name": "manager_work_queue",
+      "source_sql": "CREATE TABLE manager_work_queue (\n                    queue_id TEXT PRIMARY KEY, manager_session_id TEXT NOT NULL,\n                    command_id TEXT NOT NULL, run_id TEXT NOT NULL UNIQUE,\n                    matter_id TEXT, matter_revision INTEGER,\n                    priority TEXT NOT NULL, deadline TEXT, claim_keys TEXT NOT NULL,\n                    state TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 1,\n                    issue TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,\n                    UNIQUE(manager_session_id,command_id)\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "manager_work_relations",
+      "table_name": "manager_work_relations",
+      "source_sql": "CREATE TABLE manager_work_relations (\n                    manager_session_id TEXT NOT NULL, source_matter_id TEXT NOT NULL,\n                    target_matter_id TEXT NOT NULL, relation TEXT NOT NULL,\n                    PRIMARY KEY(manager_session_id,source_matter_id,target_matter_id,relation)\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "manager_work_reviews",
+      "table_name": "manager_work_reviews",
+      "source_sql": "CREATE TABLE manager_work_reviews (\n                    manager_session_id TEXT NOT NULL, command_id TEXT NOT NULL,\n                    matter_id TEXT NOT NULL, run_id TEXT NOT NULL,\n                    matter_revision INTEGER NOT NULL, completion_revision INTEGER NOT NULL,\n                    verdict TEXT NOT NULL, evidence TEXT NOT NULL, summary TEXT NOT NULL,\n                    created_at TEXT NOT NULL,\n                    PRIMARY KEY(manager_session_id,command_id)\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "matter_changes",
+      "table_name": "matter_changes",
+      "source_sql": "CREATE TABLE matter_changes(sequence INTEGER PRIMARY KEY AUTOINCREMENT, matter_id TEXT NOT NULL)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "matter_management",
+      "table_name": "matter_management",
+      "source_sql": "CREATE TABLE matter_management (\n                    matter_id TEXT PRIMARY KEY, manager_session_id TEXT NOT NULL,\n                    purpose TEXT NOT NULL, responsible_party TEXT NOT NULL,\n                    next_action TEXT NOT NULL, wait_condition TEXT,\n                    management_state TEXT NOT NULL, revision INTEGER NOT NULL\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "matter_source_links",
+      "table_name": "matter_source_links",
+      "source_sql": "CREATE TABLE matter_source_links (\n                matter_id TEXT NOT NULL,\n                source_type TEXT NOT NULL,\n                source_id TEXT NOT NULL,\n                reason TEXT NOT NULL,\n                created_at TEXT NOT NULL,\n                PRIMARY KEY(matter_id, source_type, source_id),\n                FOREIGN KEY(matter_id) REFERENCES matters(matter_id)\n            )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "matters",
+      "table_name": "matters",
+      "source_sql": "CREATE TABLE matters (\n                matter_id TEXT PRIMARY KEY,\n                title TEXT NOT NULL,\n                summary TEXT NOT NULL,\n                status TEXT NOT NULL,\n                priority TEXT NOT NULL,\n                due_at TEXT,\n                tags TEXT NOT NULL,\n                metadata TEXT NOT NULL,\n                created_at TEXT NOT NULL,\n                updated_at TEXT NOT NULL\n            , revision INTEGER NOT NULL DEFAULT 1, visibility TEXT NOT NULL DEFAULT 'user' CHECK(visibility IN ('user','internal')), kind TEXT NOT NULL DEFAULT 'task', parent_matter_id TEXT, project_id TEXT, scheduled_on TEXT, scheduled_start TEXT, scheduled_end TEXT, inbox INTEGER NOT NULL DEFAULT 0, section TEXT NOT NULL DEFAULT '', sort_order REAL NOT NULL DEFAULT 0, sections TEXT NOT NULL DEFAULT '[]', deleted_at TEXT)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "memory_background_settings",
+      "table_name": "memory_background_settings",
+      "source_sql": "CREATE TABLE memory_background_settings(\n                id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL,\n                overrides TEXT NOT NULL, updated_at TEXT NOT NULL)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "memory_correction_fences",
+      "table_name": "memory_correction_fences",
+      "source_sql": "CREATE TABLE memory_correction_fences(\n                    watermark INTEGER NOT NULL, scope_id TEXT NOT NULL,\n                    selectors TEXT NOT NULL, hints TEXT NOT NULL,\n                    PRIMARY KEY(watermark, scope_id)\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "memory_entries",
+      "table_name": "memory_entries",
+      "source_sql": "CREATE TABLE memory_entries(\n                    memory_id TEXT PRIMARY KEY, memory_type TEXT NOT NULL, content TEXT NOT NULL,\n                    scope TEXT NOT NULL CHECK(scope IN ('global','project')),\n                    project_id TEXT, status TEXT NOT NULL CHECK(status IN\n                      ('candidate','active','retracted','superseded')),\n                    confidence REAL, sensitivity TEXT NOT NULL, expires_at TEXT,\n                    dedupe_key TEXT NOT NULL, version INTEGER NOT NULL,\n                    supersedes_id TEXT, extraction_model TEXT, metadata TEXT NOT NULL,\n                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,\n                    FOREIGN KEY(project_id) REFERENCES memory_projects(project_id),\n                    FOREIGN KEY(supersedes_id) REFERENCES memory_entries(memory_id),\n                    UNIQUE(scope, project_id, dedupe_key)\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "memory_entry_sources",
+      "table_name": "memory_entry_sources",
+      "source_sql": "CREATE TABLE memory_entry_sources(\n                    memory_id TEXT NOT NULL, source_id TEXT NOT NULL,\n                    PRIMARY KEY(memory_id, source_id),\n                    FOREIGN KEY(memory_id) REFERENCES memory_entries(memory_id),\n                    FOREIGN KEY(source_id) REFERENCES memory_sources(source_id)\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "memory_events",
+      "table_name": "memory_events",
+      "source_sql": "CREATE TABLE memory_events(\n                    event_id TEXT PRIMARY KEY, memory_id TEXT NOT NULL, version INTEGER NOT NULL,\n                    event_type TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL,\n                    FOREIGN KEY(memory_id) REFERENCES memory_entries(memory_id),\n                    UNIQUE(memory_id, version)\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "memory_feedback",
+      "table_name": "memory_feedback",
+      "source_sql": "CREATE TABLE memory_feedback(\n            feedback_id TEXT PRIMARY KEY,\n            action TEXT NOT NULL CHECK(action IN ('correct','discard')),\n            old_memory_id TEXT NOT NULL,\n            old_version INTEGER NOT NULL,\n            new_memory_id TEXT,\n            new_version INTEGER,\n            scope TEXT NOT NULL CHECK(scope IN ('global','project')),\n            project_id TEXT,\n            memory_type TEXT NOT NULL,\n            reason TEXT NOT NULL,\n            origin TEXT NOT NULL,\n            created_at TEXT NOT NULL,\n            old_content TEXT,\n            new_content TEXT,\n            old_confidence REAL,\n            extraction_model TEXT,\n            grounding TEXT,\n            redacted INTEGER NOT NULL DEFAULT 0 CHECK(redacted IN (0,1))\n        )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "memory_file_hashes",
+      "table_name": "memory_file_hashes",
+      "source_sql": "CREATE TABLE memory_file_hashes (path TEXT PRIMARY KEY, digest TEXT NOT NULL)",
+      "handling": "mysql",
+      "runtime_source": "app/core/memory_files.py:124"
+    },
+    {
+      "object_type": "table",
+      "name": "memory_learning_policies",
+      "table_name": "memory_learning_policies",
+      "source_sql": "CREATE TABLE memory_learning_policies(\n                    scope TEXT NOT NULL, scope_id TEXT NOT NULL,\n                    enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),\n                    updated_at TEXT NOT NULL,\n                    PRIMARY KEY(scope, scope_id)\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "memory_maintenance_state",
+      "table_name": "memory_maintenance_state",
+      "source_sql": "CREATE TABLE memory_maintenance_state(\n                    scope_id TEXT PRIMARY KEY, observed_signature TEXT NOT NULL,\n                    dirty_at TEXT NOT NULL, queued_key TEXT NOT NULL DEFAULT '',\n                    settled_signature TEXT NOT NULL DEFAULT '', last_completed_at TEXT,\n                    merged_count INTEGER NOT NULL DEFAULT 0, outcome TEXT)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "memory_merges",
+      "table_name": "memory_merges",
+      "source_sql": "CREATE TABLE memory_merges(\n                    merge_id TEXT PRIMARY KEY, target_memory_id TEXT NOT NULL,\n                    members TEXT NOT NULL, before_state TEXT NOT NULL,\n                    after_versions TEXT NOT NULL, after_statuses TEXT NOT NULL,\n                    created_at TEXT NOT NULL, undone_at TEXT\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "memory_pipeline_state",
+      "table_name": "memory_pipeline_state",
+      "source_sql": "CREATE TABLE memory_pipeline_state (id INTEGER PRIMARY KEY CHECK(id=1), baseline_rowid INTEGER NOT NULL)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "memory_project_paths",
+      "table_name": "memory_project_paths",
+      "source_sql": "CREATE TABLE memory_project_paths(\n                    path_key TEXT PRIMARY KEY, project_id TEXT NOT NULL,\n                    active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL,\n                    FOREIGN KEY(project_id) REFERENCES memory_projects(project_id)\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "memory_projects",
+      "table_name": "memory_projects",
+      "source_sql": "CREATE TABLE memory_projects(\n                    project_id TEXT PRIMARY KEY, created_at TEXT NOT NULL\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "memory_replication_claims",
+      "table_name": "memory_replication_claims",
+      "source_sql": "CREATE TABLE memory_replication_claims (fingerprint TEXT PRIMARY KEY, memory_id TEXT NOT NULL, managed_version INTEGER NOT NULL, protected INTEGER NOT NULL DEFAULT 0)",
+      "handling": "mysql",
+      "runtime_source": "app/domains/memory_replication.py:150"
+    },
+    {
+      "object_type": "table",
+      "name": "memory_replication_origins",
+      "table_name": "memory_replication_origins",
+      "source_sql": "CREATE TABLE memory_replication_origins (node_id TEXT NOT NULL, origin_id TEXT NOT NULL, revision INTEGER NOT NULL, memory_id TEXT, source_ids TEXT NOT NULL, payload TEXT NOT NULL, lifecycle TEXT NOT NULL, parent_origin_id TEXT, PRIMARY KEY (node_id, origin_id))",
+      "handling": "mysql",
+      "runtime_source": "app/domains/memory_replication.py:145"
+    },
+    {
+      "object_type": "table",
+      "name": "memory_replication_receipts",
+      "table_name": "memory_replication_receipts",
+      "source_sql": "CREATE TABLE memory_replication_receipts (node_id TEXT NOT NULL, mutation_id TEXT NOT NULL, payload TEXT NOT NULL, receipt TEXT NOT NULL, PRIMARY KEY (node_id, mutation_id))",
+      "handling": "mysql",
+      "runtime_source": "app/domains/memory_replication.py:153"
+    },
+    {
+      "object_type": "table",
+      "name": "memory_snapshots",
+      "table_name": "memory_snapshots",
+      "source_sql": "CREATE TABLE memory_snapshots(\n                    snapshot_id TEXT PRIMARY KEY, memory_id TEXT NOT NULL, version INTEGER NOT NULL,\n                    record TEXT NOT NULL, created_at TEXT NOT NULL,\n                    FOREIGN KEY(memory_id) REFERENCES memory_entries(memory_id),\n                    UNIQUE(memory_id, version)\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "memory_sources",
+      "table_name": "memory_sources",
+      "source_sql": "CREATE TABLE memory_sources(\n                    source_id TEXT PRIMARY KEY, source_type TEXT NOT NULL,\n                    source_ref TEXT NOT NULL, checksum TEXT, excerpt_start INTEGER,\n                    excerpt_end INTEGER, trusted_source INTEGER NOT NULL DEFAULT 0,\n                    status TEXT NOT NULL DEFAULT 'active', expires_at TEXT,\n                    metadata TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,\n                    UNIQUE(source_type, source_ref, checksum)\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "message_conversation_metadata",
+      "table_name": "message_conversation_metadata",
+      "source_sql": "CREATE TABLE message_conversation_metadata (\n            conversation_key TEXT PRIMARY KEY, platform_name TEXT, imported_display_name TEXT,\n            cache_provenance_json TEXT NOT NULL DEFAULT '{}', capture_epoch INTEGER,\n            user_alias TEXT, manual_display_name TEXT,\n            revision INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "message_history_attachments",
+      "table_name": "message_history_attachments",
+      "source_sql": "CREATE TABLE message_history_attachments (\n                attachment_id TEXT PRIMARY KEY, cache_key TEXT NOT NULL UNIQUE,\n                internal_message_id TEXT NOT NULL, conversation_key TEXT NOT NULL,\n                ordinal INTEGER NOT NULL, kind TEXT NOT NULL, file_name TEXT,\n                state TEXT NOT NULL DEFAULT 'pending', mime_type TEXT, size_bytes INTEGER,\n                sha256 TEXT, width INTEGER, height INTEGER, duration_ms INTEGER,\n                expires_at INTEGER, error_code TEXT, updated_at TEXT NOT NULL,\n                UNIQUE(internal_message_id,ordinal)\n            )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "message_history_batches",
+      "table_name": "message_history_batches",
+      "source_sql": "CREATE TABLE message_history_batches (\n                    job_id TEXT PRIMARY KEY, conversation_key TEXT NOT NULL, start_seq INTEGER NOT NULL,\n                    end_seq INTEGER NOT NULL, policy_revision INTEGER NOT NULL,\n                    expected_summary_revision INTEGER NOT NULL, batch_summary TEXT NOT NULL,\n                    summary TEXT NOT NULL,\n                    client_name TEXT, model TEXT, generation_calls INTEGER NOT NULL DEFAULT 0,\n                    usage_tokens INTEGER, prompt_version TEXT NOT NULL DEFAULT 'message-analysis-v1',\n                    created_at TEXT NOT NULL, UNIQUE(conversation_key,start_seq,end_seq,policy_revision)\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "message_history_conversations",
+      "table_name": "message_history_conversations",
+      "source_sql": "CREATE TABLE message_history_conversations (\n                    conversation_key TEXT PRIMARY KEY, next_seq INTEGER NOT NULL DEFAULT 1,\n                    covered_seq INTEGER NOT NULL DEFAULT 0, summary_revision INTEGER NOT NULL DEFAULT 0,\n                    rolling_summary TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL\n                , pipeline_version TEXT NOT NULL DEFAULT 'legacy-v1', baseline_start_seq INTEGER, local_signal_start_seq INTEGER, local_signal_seq INTEGER NOT NULL DEFAULT 0, generation_published_seq INTEGER NOT NULL DEFAULT 0, reading_covered_seq INTEGER, reading_baseline_start_seq INTEGER, digest_covered_seq INTEGER NOT NULL DEFAULT 0, analysis_baseline_floor_seq INTEGER, analysis_baseline_initialized INTEGER NOT NULL DEFAULT 0)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "message_history_fact_supersessions",
+      "table_name": "message_history_fact_supersessions",
+      "source_sql": "CREATE TABLE message_history_fact_supersessions (\n                    conversation_key TEXT NOT NULL, prior_fact_id TEXT NOT NULL, correction_fact_id TEXT NOT NULL,\n                    PRIMARY KEY(conversation_key,prior_fact_id,correction_fact_id)\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "message_history_facts",
+      "table_name": "message_history_facts",
+      "source_sql": "CREATE TABLE message_history_facts (\n                    fact_id TEXT PRIMARY KEY, conversation_key TEXT NOT NULL, batch_job_id TEXT NOT NULL,\n                    kind TEXT NOT NULL, text TEXT NOT NULL, source_message_ids_json TEXT NOT NULL,\n                    certainty TEXT NOT NULL, actor TEXT, time_text TEXT,\n                    supersedes_fact_ids_json TEXT NOT NULL, created_at TEXT NOT NULL\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "message_history_messages",
+      "table_name": "message_history_messages",
+      "source_sql": "CREATE TABLE message_history_messages (\n                    internal_message_id TEXT PRIMARY KEY, platform TEXT NOT NULL, account_id TEXT NOT NULL,\n                    provider_message_id TEXT NOT NULL, conversation_key TEXT NOT NULL, seq INTEGER NOT NULL,\n                    sender_id TEXT, sender_name TEXT, text TEXT NOT NULL, content_kind TEXT NOT NULL,\n                    sent_at INTEGER, timestamp_quality TEXT NOT NULL, received_at INTEGER NOT NULL,\n                    ingested_at TEXT NOT NULL, schema_version INTEGER NOT NULL DEFAULT 1, capture_epoch INTEGER, metadata_json TEXT NOT NULL DEFAULT '{}',\n                    UNIQUE(platform, account_id, provider_message_id),\n                    UNIQUE(conversation_key, seq)\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "message_history_policies",
+      "table_name": "message_history_policies",
+      "source_sql": "CREATE TABLE message_history_policies (\n                    conversation_key TEXT PRIMARY KEY, source_id TEXT NOT NULL UNIQUE,\n                    account_scope_id TEXT NOT NULL, platform TEXT NOT NULL, account_id TEXT NOT NULL,\n                    conversation_type TEXT NOT NULL, conversation_id TEXT NOT NULL,\n                    display_name TEXT, record_enabled INTEGER NOT NULL, analysis_enabled INTEGER NOT NULL,\n                    batch_size INTEGER NOT NULL, timezone TEXT NOT NULL, revision INTEGER NOT NULL,\n                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL, media_enabled INTEGER NOT NULL DEFAULT 0, capture_epoch INTEGER NOT NULL DEFAULT 1, analysis_epoch INTEGER NOT NULL DEFAULT 1, proposals_epoch INTEGER NOT NULL DEFAULT 1, processing_revision INTEGER NOT NULL DEFAULT 1, schedule_revision INTEGER NOT NULL DEFAULT 1, proposals_enabled INTEGER NOT NULL DEFAULT 0, local_signals_enabled INTEGER NOT NULL DEFAULT 1, minimum_import_version INTEGER NOT NULL DEFAULT 1, processing_schema_version INTEGER NOT NULL DEFAULT 1, min_interval_seconds INTEGER NOT NULL DEFAULT 300, max_wait_seconds INTEGER NOT NULL DEFAULT 900, max_batch_messages INTEGER NOT NULL DEFAULT 200, auto_analyze INTEGER NOT NULL DEFAULT 1,\n                    UNIQUE(platform, account_id, conversation_type, conversation_id)\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "message_matter_proposals",
+      "table_name": "message_matter_proposals",
+      "source_sql": "CREATE TABLE message_matter_proposals (\n                    proposal_id TEXT NOT NULL, revision INTEGER NOT NULL, conversation_key TEXT NOT NULL,\n                    action_key TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN\n                    ('pending','accepted','rejected','superseded','revoked')),\n                    content_json TEXT NOT NULL, evidence_json TEXT NOT NULL, evidence_digest TEXT NOT NULL,\n                    fences_json TEXT NOT NULL, preview_digest TEXT NOT NULL, content_digest TEXT NOT NULL,\n                    frozen_reason TEXT, related_proposal_id TEXT, matter_id TEXT,\n                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,\n                    PRIMARY KEY(proposal_id,revision))",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "message_proposal_applications",
+      "table_name": "message_proposal_applications",
+      "source_sql": "CREATE TABLE message_proposal_applications (\n                    proposal_id TEXT PRIMARY KEY, decision_id TEXT NOT NULL UNIQUE, action TEXT NOT NULL,\n                    matter_id TEXT NOT NULL, before_revision INTEGER, after_revision INTEGER NOT NULL,\n                    receipt_json TEXT NOT NULL, created_at TEXT NOT NULL)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "message_proposal_decisions",
+      "table_name": "message_proposal_decisions",
+      "source_sql": "CREATE TABLE message_proposal_decisions (\n                    decision_id TEXT PRIMARY KEY, proposal_id TEXT NOT NULL, revision INTEGER NOT NULL,\n                    payload_digest TEXT NOT NULL, payload_json TEXT NOT NULL, principal_id TEXT NOT NULL,\n                    action TEXT NOT NULL, created_at TEXT NOT NULL)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "message_reading_attention",
+      "table_name": "message_reading_attention",
+      "source_sql": "CREATE TABLE message_reading_attention(user_id TEXT NOT NULL,insight_id TEXT NOT NULL,revision INTEGER NOT NULL,viewed_revision INTEGER NOT NULL DEFAULT 0,dismissed_revision INTEGER NOT NULL DEFAULT 0,snoozed_until TEXT,updated_at TEXT NOT NULL,PRIMARY KEY(user_id,insight_id))",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "message_reading_badcases",
+      "table_name": "message_reading_badcases",
+      "source_sql": "CREATE TABLE message_reading_badcases (\n                badcase_id TEXT PRIMARY KEY, principal_id TEXT NOT NULL,\n                label TEXT NOT NULL, note TEXT NOT NULL, evidence_json TEXT NOT NULL,\n                evidence_digest TEXT NOT NULL, fences_json TEXT NOT NULL,\n                local_copy_consent INTEGER NOT NULL CHECK(local_copy_consent=1),\n                created_at TEXT NOT NULL)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "message_reading_batch_outputs",
+      "table_name": "message_reading_batch_outputs",
+      "source_sql": "CREATE TABLE message_reading_batch_outputs(job_id TEXT PRIMARY KEY,output_json TEXT NOT NULL,created_at TEXT NOT NULL)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "message_reading_checkpoint_archives",
+      "table_name": "message_reading_checkpoint_archives",
+      "source_sql": "CREATE TABLE message_reading_checkpoint_archives(family_id TEXT NOT NULL,recovery_count INTEGER NOT NULL,reason TEXT NOT NULL,checkpoint_json TEXT NOT NULL,created_at TEXT NOT NULL,PRIMARY KEY(family_id,recovery_count))",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "message_reading_checkpoints",
+      "table_name": "message_reading_checkpoints",
+      "source_sql": "CREATE TABLE message_reading_checkpoints(family_id TEXT PRIMARY KEY,cursor_json TEXT NOT NULL,checkpoint_json TEXT NOT NULL,input_digest TEXT NOT NULL,semantic_digest TEXT NOT NULL,revision INTEGER NOT NULL DEFAULT 1,updated_at TEXT NOT NULL)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "message_reading_configuration",
+      "table_name": "message_reading_configuration",
+      "source_sql": "CREATE TABLE message_reading_configuration (\n                        singleton INTEGER PRIMARY KEY CHECK(singleton=1),\n                        provider_hash TEXT NOT NULL, processing_hash TEXT NOT NULL,\n                        updated_at TEXT NOT NULL)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "message_reading_control",
+      "table_name": "message_reading_control",
+      "source_sql": "CREATE TABLE message_reading_control(service TEXT PRIMARY KEY,paused INTEGER NOT NULL,service_epoch INTEGER NOT NULL,revision INTEGER NOT NULL,updated_at TEXT NOT NULL)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "message_reading_control_events",
+      "table_name": "message_reading_control_events",
+      "source_sql": "CREATE TABLE message_reading_control_events(control_id TEXT NOT NULL,revision INTEGER NOT NULL,action TEXT NOT NULL,metadata_json TEXT NOT NULL,created_at TEXT NOT NULL,PRIMARY KEY(control_id,revision))",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "message_reading_detector_evidence",
+      "table_name": "message_reading_detector_evidence",
+      "source_sql": "CREATE TABLE message_reading_detector_evidence(insight_id TEXT NOT NULL,detector TEXT NOT NULL,input_digest TEXT NOT NULL,explanation_json TEXT NOT NULL,created_at TEXT NOT NULL,PRIMARY KEY(insight_id,detector,input_digest))",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "message_reading_digests",
+      "table_name": "message_reading_digests",
+      "source_sql": "CREATE TABLE message_reading_digests(conversation_key TEXT PRIMARY KEY,revision INTEGER NOT NULL,generated_at TEXT NOT NULL,covered_seq INTEGER NOT NULL,input_digest TEXT NOT NULL,content_json TEXT NOT NULL,stale INTEGER NOT NULL DEFAULT 0)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "message_reading_families",
+      "table_name": "message_reading_families",
+      "source_sql": "CREATE TABLE message_reading_families(family_id TEXT PRIMARY KEY,conversation_key TEXT NOT NULL,start_seq INTEGER NOT NULL,end_seq INTEGER NOT NULL,max_tokens INTEGER NOT NULL,max_calls INTEGER NOT NULL,revision INTEGER NOT NULL DEFAULT 1, recovery_count INTEGER NOT NULL DEFAULT 0,UNIQUE(conversation_key,start_seq))",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "message_reading_fragments",
+      "table_name": "message_reading_fragments",
+      "source_sql": "CREATE TABLE message_reading_fragments(family_id TEXT NOT NULL,cursor INTEGER NOT NULL,input_digest TEXT NOT NULL,semantic_digest TEXT NOT NULL,output_json TEXT NOT NULL,created_at TEXT NOT NULL,PRIMARY KEY(family_id,cursor,input_digest))",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "message_reading_insight_revisions",
+      "table_name": "message_reading_insight_revisions",
+      "source_sql": "CREATE TABLE message_reading_insight_revisions(insight_id TEXT NOT NULL,revision INTEGER NOT NULL,content_json TEXT NOT NULL,created_at TEXT NOT NULL,PRIMARY KEY(insight_id,revision))",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "message_reading_insights",
+      "table_name": "message_reading_insights",
+      "source_sql": "CREATE TABLE message_reading_insights(insight_id TEXT PRIMARY KEY,conversation_key TEXT NOT NULL,topic_id TEXT,revision INTEGER NOT NULL,kind TEXT NOT NULL,importance TEXT NOT NULL,certainty TEXT NOT NULL,text TEXT NOT NULL,content_json TEXT NOT NULL,dedup_key TEXT NOT NULL,updated_at TEXT NOT NULL,UNIQUE(conversation_key,dedup_key))",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "message_reading_intelligence",
+      "table_name": "message_reading_intelligence",
+      "source_sql": "CREATE TABLE message_reading_intelligence (conversation_key TEXT PRIMARY KEY,capture_epoch INTEGER NOT NULL,revision INTEGER NOT NULL,state_json TEXT NOT NULL,updated_at TEXT NOT NULL)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "message_reading_manifests",
+      "table_name": "message_reading_manifests",
+      "source_sql": "CREATE TABLE message_reading_manifests(job_id TEXT PRIMARY KEY,conversation_key TEXT NOT NULL,capture_epoch INTEGER NOT NULL,end_seq INTEGER NOT NULL,content_json TEXT NOT NULL,created_at TEXT NOT NULL)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "message_reading_profiles",
+      "table_name": "message_reading_profiles",
+      "source_sql": "CREATE TABLE message_reading_profiles(scope TEXT PRIMARY KEY,revision INTEGER NOT NULL,profile_json TEXT NOT NULL,updated_at TEXT NOT NULL)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "message_reading_schedules",
+      "table_name": "message_reading_schedules",
+      "source_sql": "CREATE TABLE message_reading_schedules(conversation_key TEXT PRIMARY KEY,pending_since TEXT,last_dispatch_at TEXT,next_due_at TEXT,active_work_id TEXT,revision INTEGER NOT NULL DEFAULT 1, last_scan_at TEXT, replay_through_seq INTEGER NOT NULL DEFAULT 0)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "message_reading_sources",
+      "table_name": "message_reading_sources",
+      "source_sql": "CREATE TABLE message_reading_sources(object_kind TEXT NOT NULL,object_id TEXT NOT NULL,revision INTEGER NOT NULL,message_id TEXT NOT NULL,conversation_key TEXT NOT NULL,batch_job_id TEXT,purpose TEXT NOT NULL,PRIMARY KEY(object_kind,object_id,revision,message_id))",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "message_reading_topic_revisions",
+      "table_name": "message_reading_topic_revisions",
+      "source_sql": "CREATE TABLE message_reading_topic_revisions(topic_id TEXT NOT NULL,revision INTEGER NOT NULL,batch_job_id TEXT NOT NULL,content_json TEXT NOT NULL,created_at TEXT NOT NULL,PRIMARY KEY(topic_id,revision))",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "message_reading_topics",
+      "table_name": "message_reading_topics",
+      "source_sql": "CREATE TABLE message_reading_topics(topic_id TEXT PRIMARY KEY,conversation_key TEXT NOT NULL,revision INTEGER NOT NULL,title TEXT NOT NULL,summary TEXT NOT NULL,details_json TEXT NOT NULL,first_seen INTEGER NOT NULL,last_seen INTEGER NOT NULL,updated_at TEXT NOT NULL)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "node_memory_replication_config",
+      "table_name": "node_memory_replication_config",
+      "source_sql": "CREATE TABLE node_memory_replication_config (slot INTEGER PRIMARY KEY, project_bindings TEXT NOT NULL)",
+      "handling": "mysql",
+      "runtime_source": "app/domains/memory_replication.py:384"
+    },
+    {
+      "object_type": "table",
+      "name": "node_memory_replication_heads",
+      "table_name": "node_memory_replication_heads",
+      "source_sql": "CREATE TABLE node_memory_replication_heads (origin_id TEXT PRIMARY KEY, revision INTEGER NOT NULL, collected_revision INTEGER NOT NULL DEFAULT 0, last_operation TEXT)",
+      "handling": "mysql",
+      "runtime_source": "app/domains/memory_replication.py:370"
+    },
+    {
+      "object_type": "table",
+      "name": "node_memory_replication_identity",
+      "table_name": "node_memory_replication_identity",
+      "source_sql": "CREATE TABLE node_memory_replication_identity (slot INTEGER PRIMARY KEY, hub_id TEXT, node_id TEXT)",
+      "handling": "mysql",
+      "runtime_source": "app/domains/memory_replication.py:366"
+    },
+    {
+      "object_type": "table",
+      "name": "node_memory_replication_outbox",
+      "table_name": "node_memory_replication_outbox",
+      "source_sql": "CREATE TABLE node_memory_replication_outbox (mutation_id TEXT PRIMARY KEY, origin_id TEXT NOT NULL, revision INTEGER NOT NULL, payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued', receipt TEXT, retry_order INTEGER NOT NULL DEFAULT 0, UNIQUE (origin_id, revision))",
+      "handling": "mysql",
+      "runtime_source": "app/domains/memory_replication.py:373"
+    },
+    {
+      "object_type": "table",
+      "name": "node_memory_replication_ownership",
+      "table_name": "node_memory_replication_ownership",
+      "source_sql": "CREATE TABLE node_memory_replication_ownership (origin_id TEXT PRIMARY KEY, hub_memory_id TEXT, revision INTEGER NOT NULL, owned INTEGER NOT NULL DEFAULT 0, blocked INTEGER NOT NULL DEFAULT 0, publication_status TEXT)",
+      "handling": "mysql",
+      "runtime_source": "app/domains/memory_replication.py:379"
+    },
+    {
+      "object_type": "table",
+      "name": "node_proposal_outbox",
+      "table_name": "node_proposal_outbox",
+      "source_sql": "CREATE TABLE node_proposal_outbox (proposal_id TEXT PRIMARY KEY, payload TEXT NOT NULL, submitted INTEGER NOT NULL DEFAULT 0, receipt TEXT)",
+      "handling": "mysql",
+      "runtime_source": "app/domains/node_outbox.py:18"
+    },
+    {
+      "object_type": "table",
+      "name": "project_profiles",
+      "table_name": "project_profiles",
+      "source_sql": "CREATE TABLE project_profiles(\n                    project_id TEXT PRIMARY KEY,\n                    name TEXT NOT NULL,\n                    revision INTEGER NOT NULL,\n                    created_at TEXT NOT NULL,\n                    updated_at TEXT NOT NULL\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "remote_execution_controls",
+      "table_name": "remote_execution_controls",
+      "source_sql": "CREATE TABLE remote_execution_controls (task_id TEXT NOT NULL, command_id TEXT NOT NULL, payload TEXT NOT NULL, applied INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, PRIMARY KEY (task_id, command_id))",
+      "handling": "mysql",
+      "runtime_source": "app/domains/remote_execution.py:214"
+    },
+    {
+      "object_type": "table",
+      "name": "remote_execution_decisions",
+      "table_name": "remote_execution_decisions",
+      "source_sql": "CREATE TABLE remote_execution_decisions (task_id TEXT NOT NULL, review_id TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY (task_id, review_id))",
+      "handling": "mysql",
+      "runtime_source": "app/domains/remote_execution.py:214"
+    },
+    {
+      "object_type": "table",
+      "name": "remote_execution_node_controls",
+      "table_name": "remote_execution_node_controls",
+      "source_sql": "CREATE TABLE remote_execution_node_controls (hub_id TEXT NOT NULL, task_id TEXT NOT NULL, command_id TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY (hub_id, task_id, command_id))",
+      "handling": "mysql",
+      "runtime_source": "app/integrations/remote_execution.py:54"
+    },
+    {
+      "object_type": "table",
+      "name": "remote_execution_node_tasks",
+      "table_name": "remote_execution_node_tasks",
+      "source_sql": "CREATE TABLE remote_execution_node_tasks (hub_id TEXT NOT NULL, task_id TEXT NOT NULL, fingerprint TEXT NOT NULL, fence TEXT NOT NULL, run_id TEXT NOT NULL UNIQUE, session_id TEXT NOT NULL, state TEXT NOT NULL, message_cursor INTEGER NOT NULL DEFAULT 0, event_cursor INTEGER NOT NULL DEFAULT 0, last_snapshot TEXT, pending_report TEXT, pending_cursor INTEGER, pending_event_cursor INTEGER, PRIMARY KEY (hub_id, task_id))",
+      "handling": "mysql",
+      "runtime_source": "app/integrations/remote_execution.py:41"
+    },
+    {
+      "object_type": "table",
+      "name": "remote_execution_progress_cursors",
+      "table_name": "remote_execution_progress_cursors",
+      "source_sql": "CREATE TABLE remote_execution_progress_cursors (task_id TEXT PRIMARY KEY, source_sequence INTEGER NOT NULL DEFAULT 0)",
+      "handling": "mysql",
+      "runtime_source": "app/domains/remote_execution.py:214"
+    },
+    {
+      "object_type": "table",
+      "name": "remote_execution_reports",
+      "table_name": "remote_execution_reports",
+      "source_sql": "CREATE TABLE remote_execution_reports (task_id TEXT NOT NULL, report_id TEXT NOT NULL, fingerprint TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (task_id, report_id))",
+      "handling": "mysql",
+      "runtime_source": "app/domains/remote_execution.py:214"
+    },
+    {
+      "object_type": "table",
+      "name": "remote_execution_tasks",
+      "table_name": "remote_execution_tasks",
+      "source_sql": "CREATE TABLE remote_execution_tasks (task_id TEXT PRIMARY KEY, owner_session_id TEXT NOT NULL, command_id TEXT NOT NULL, fingerprint TEXT NOT NULL, node_id TEXT NOT NULL, environment_id TEXT NOT NULL, workspace_id TEXT, target TEXT NOT NULL, payload TEXT NOT NULL, state TEXT NOT NULL, lease_epoch INTEGER NOT NULL DEFAULT 0, lease_hash TEXT, credential_version INTEGER, lease_expires_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE (owner_session_id, command_id))",
+      "handling": "mysql",
+      "runtime_source": "app/domains/remote_execution.py:214"
+    },
+    {
+      "object_type": "table",
+      "name": "remote_execution_workers",
+      "table_name": "remote_execution_workers",
+      "source_sql": "CREATE TABLE remote_execution_workers (node_id TEXT NOT NULL, environment_id TEXT NOT NULL, credential_version INTEGER NOT NULL, last_seen TEXT NOT NULL, PRIMARY KEY (node_id, environment_id))",
+      "handling": "mysql",
+      "runtime_source": "app/domains/remote_execution.py:214"
+    },
+    {
+      "object_type": "table",
+      "name": "runtime_events",
+      "table_name": "runtime_events",
+      "source_sql": "CREATE TABLE runtime_events (\n                event_id TEXT PRIMARY KEY,\n                event_type TEXT NOT NULL,\n                session_id TEXT NOT NULL,\n                context_id TEXT,\n                payload TEXT NOT NULL,\n                status TEXT NOT NULL,\n                error TEXT,\n                created_at TEXT NOT NULL\n            )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "session_admissions",
+      "table_name": "session_admissions",
+      "source_sql": "CREATE TABLE session_admissions (\n            session_id TEXT PRIMARY KEY,\n            run_id TEXT,\n            generation INTEGER NOT NULL DEFAULT 0 CHECK(generation >= 0)\n        )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "session_input_queues",
+      "table_name": "session_input_queues",
+      "source_sql": "CREATE TABLE session_input_queues (\n                    session_id TEXT PRIMARY KEY, paused INTEGER NOT NULL DEFAULT 0,\n                    watched_run_id TEXT, next_sequence INTEGER NOT NULL DEFAULT 1\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "session_inputs",
+      "table_name": "session_inputs",
+      "source_sql": "CREATE TABLE session_inputs (\n                    input_id TEXT PRIMARY KEY, session_id TEXT NOT NULL,\n                    client_message_id TEXT NOT NULL, message_id TEXT NOT NULL UNIQUE,\n                    sequence INTEGER NOT NULL, request_json TEXT NOT NULL,\n                    run_id TEXT, created_at TEXT NOT NULL, cancelled INTEGER NOT NULL DEFAULT 0,\n                    UNIQUE(session_id,client_message_id), UNIQUE(session_id,sequence)\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "shared_memory_mutations",
+      "table_name": "shared_memory_mutations",
+      "source_sql": "CREATE TABLE shared_memory_mutations (node_id TEXT NOT NULL, mutation_id TEXT NOT NULL, user_id TEXT NOT NULL, payload TEXT NOT NULL, receipt TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (node_id, mutation_id))",
+      "handling": "mysql",
+      "runtime_source": "app/domains/shared_memory_writes.py:95"
+    },
+    {
+      "object_type": "table",
+      "name": "shared_memory_outbox",
+      "table_name": "shared_memory_outbox",
+      "source_sql": "CREATE TABLE shared_memory_outbox (mutation_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued', receipt TEXT, created_at TEXT NOT NULL, rejection_reason TEXT)",
+      "handling": "mysql",
+      "runtime_source": "app/domains/shared_memory_writes.py:246"
+    },
+    {
+      "object_type": "table",
+      "name": "shared_memory_outbox_identity",
+      "table_name": "shared_memory_outbox_identity",
+      "source_sql": "CREATE TABLE shared_memory_outbox_identity (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), hub_id TEXT NOT NULL, node_id TEXT NOT NULL)",
+      "handling": "mysql",
+      "runtime_source": "app/domains/shared_memory_writes.py:241"
+    },
+    {
+      "object_type": "table",
+      "name": "shared_sync_heads",
+      "table_name": "shared_sync_heads",
+      "source_sql": "CREATE TABLE shared_sync_heads (kind TEXT NOT NULL, entity_key TEXT NOT NULL, version INTEGER NOT NULL, deleted INTEGER NOT NULL, PRIMARY KEY (kind, entity_key))",
+      "handling": "mysql",
+      "runtime_source": "app/domains/shared_sync.py:166"
+    },
+    {
+      "object_type": "table",
+      "name": "shared_sync_journal",
+      "table_name": "shared_sync_journal",
+      "source_sql": "CREATE TABLE shared_sync_journal (sequence INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, entity_key TEXT NOT NULL)",
+      "handling": "mysql",
+      "runtime_source": "app/domains/shared_sync.py:167"
+    },
+    {
+      "object_type": "table",
+      "name": "shared_sync_meta",
+      "table_name": "shared_sync_meta",
+      "source_sql": "CREATE TABLE shared_sync_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+      "handling": "mysql",
+      "runtime_source": "app/domains/shared_sync.py:165"
+    },
+    {
+      "object_type": "table",
+      "name": "shared_sync_proposals",
+      "table_name": "shared_sync_proposals",
+      "source_sql": "CREATE TABLE shared_sync_proposals (node_id TEXT NOT NULL, proposal_id TEXT NOT NULL, payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', PRIMARY KEY (node_id, proposal_id))",
+      "handling": "mysql",
+      "runtime_source": "app/domains/shared_sync.py:168"
+    },
+    {
+      "object_type": "table",
+      "name": "tool_origin_constraints",
+      "table_name": "tool_origin_constraints",
+      "source_sql": "CREATE TABLE tool_origin_constraints (kind TEXT NOT NULL, subject_id TEXT NOT NULL, constraint_id TEXT NOT NULL, PRIMARY KEY(kind,subject_id,constraint_id))",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "traces",
+      "table_name": "traces",
+      "source_sql": "CREATE TABLE traces (\n                trace_id TEXT PRIMARY KEY,\n                session_id TEXT NOT NULL,\n                context_id TEXT,\n                status TEXT NOT NULL,\n                events_payload TEXT NOT NULL,\n                verification_clues TEXT NOT NULL,\n                created_at TEXT NOT NULL\n            )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "watch_briefings",
+      "table_name": "watch_briefings",
+      "source_sql": "CREATE TABLE watch_briefings (\n                    briefing_id TEXT PRIMARY KEY,\n                    watch_id TEXT NOT NULL,\n                    occurrence_id TEXT NOT NULL UNIQUE,\n                    title TEXT NOT NULL,\n                    summary TEXT NOT NULL,\n                    changes_payload TEXT NOT NULL,\n                    unchanged_payload TEXT NOT NULL,\n                    unconfirmed_payload TEXT NOT NULL,\n                    decisions_payload TEXT NOT NULL,\n                    evidence_refs TEXT NOT NULL,\n                    content_fingerprint TEXT,\n                    created_at TEXT NOT NULL,\n                    read_at TEXT,\n                    FOREIGN KEY(watch_id) REFERENCES watches(watch_id),\n                    FOREIGN KEY(occurrence_id) REFERENCES watch_occurrences(occurrence_id)\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "watch_occurrences",
+      "table_name": "watch_occurrences",
+      "source_sql": "CREATE TABLE watch_occurrences (\n                    occurrence_id TEXT PRIMARY KEY,\n                    watch_id TEXT NOT NULL,\n                    scheduled_for TEXT NOT NULL,\n                    status TEXT NOT NULL CHECK(status IN ('pending','running','succeeded','failed','cancelled')),\n                    lease_owner TEXT,\n                    lease_expires_at TEXT,\n                    started_at TEXT,\n                    finished_at TEXT,\n                    run_id TEXT,\n                    error_category TEXT,\n                    evidence_refs TEXT NOT NULL DEFAULT '[]',\n                    content_fingerprint TEXT,\n                    scope_version INTEGER NOT NULL DEFAULT 1,\n                    created_at TEXT NOT NULL,\n                    updated_at TEXT NOT NULL,\n                    UNIQUE(watch_id, scheduled_for),\n                    FOREIGN KEY(watch_id) REFERENCES watches(watch_id)\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "watches",
+      "table_name": "watches",
+      "source_sql": "CREATE TABLE watches (\n                    watch_id TEXT PRIMARY KEY,\n                    title TEXT NOT NULL,\n                    goal TEXT NOT NULL,\n                    categories TEXT NOT NULL,\n                    scope TEXT NOT NULL,\n                    timezone TEXT NOT NULL,\n                    daily_time TEXT NOT NULL,\n                    starts_at TEXT,\n                    ends_at TEXT,\n                    importance_rules TEXT NOT NULL,\n                    delivery_policy TEXT NOT NULL,\n                    status TEXT NOT NULL CHECK(status IN ('active','paused','deleted')),\n                    version INTEGER NOT NULL DEFAULT 1,\n                    created_at TEXT NOT NULL,\n                    updated_at TEXT NOT NULL,\n                    deleted_at TEXT\n                )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "web_cache_index",
+      "table_name": "web_cache_index",
+      "source_sql": "CREATE TABLE web_cache_index (\n                artifact_id TEXT PRIMARY KEY, scope_key TEXT NOT NULL,\n                kind TEXT NOT NULL, source_key TEXT NOT NULL,\n                created REAL NOT NULL, expires REAL NOT NULL,\n                size_bytes INTEGER NOT NULL)",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "table",
+      "name": "web_search_quota",
+      "table_name": "web_search_quota",
+      "source_sql": "CREATE TABLE web_search_quota (month TEXT PRIMARY KEY, requests INTEGER NOT NULL)",
+      "handling": "mysql",
+      "runtime_source": "app/integrations/web_search.py:50"
+    },
+    {
+      "object_type": "table",
+      "name": "workspaces",
+      "table_name": "workspaces",
+      "source_sql": "CREATE TABLE workspaces (\n                workspace_id TEXT PRIMARY KEY,\n                workspace_path TEXT NOT NULL,\n                source_frontend TEXT,\n                status TEXT NOT NULL,\n                indexed_files INTEGER NOT NULL DEFAULT 0,\n                indexed_chunks INTEGER NOT NULL DEFAULT 0\n            )",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "trigger",
+      "name": "conversation_semantic_delete",
+      "table_name": null,
+      "source_sql": "CREATE TRIGGER conversation_semantic_delete\n                    AFTER DELETE ON agent_session_context_messages BEGIN\n                      INSERT INTO conversation_semantic_state(session_id,fingerprint,source_revision)\n                      SELECT OLD.session_id,fingerprint,1 FROM conversation_semantic_state\n                      WHERE session_id=OLD.session_id GROUP BY fingerprint\n                      ON CONFLICT(session_id,fingerprint) DO UPDATE SET source_revision=source_revision+1;\n                      INSERT INTO conversation_semantic_dirty(session_id,fingerprint,seq,generation)\n                      SELECT session_id,fingerprint,OLD.seq,source_revision FROM conversation_semantic_state\n                      WHERE session_id=OLD.session_id\n                      ON CONFLICT(session_id,fingerprint,seq) DO UPDATE SET generation=excluded.generation;\n                      INSERT INTO conversation_semantic_dirty(session_id,fingerprint,seq,generation)\n                      SELECT m.session_id,s.fingerprint,m.seq,s.source_revision FROM agent_session_context_messages m\n                      JOIN conversation_semantic_state s ON s.session_id=m.session_id\n                      WHERE m.session_id=OLD.session_id AND OLD.trace_id IS NOT NULL\n                        AND m.trace_id=OLD.trace_id AND m.role='agent'\n                      ON CONFLICT(session_id,fingerprint,seq) DO UPDATE SET generation=excluded.generation;\n                    END;",
+      "handling": "mysql",
+      "runtime_source": "app/domains/conversation_semantic.py:56"
+    },
+    {
+      "object_type": "trigger",
+      "name": "conversation_semantic_insert",
+      "table_name": null,
+      "source_sql": "CREATE TRIGGER conversation_semantic_insert\n                    AFTER INSERT ON agent_session_context_messages BEGIN\n                      INSERT INTO conversation_semantic_state(session_id,fingerprint,source_revision)\n                      SELECT NEW.session_id,fingerprint,1 FROM conversation_semantic_state\n                      WHERE session_id=NEW.session_id GROUP BY fingerprint\n                      ON CONFLICT(session_id,fingerprint) DO UPDATE SET source_revision=source_revision+1;\n                      INSERT INTO conversation_semantic_dirty(session_id,fingerprint,seq,generation)\n                      SELECT session_id,fingerprint,NEW.seq,source_revision FROM conversation_semantic_state\n                      WHERE session_id=NEW.session_id\n                      ON CONFLICT(session_id,fingerprint,seq) DO UPDATE SET generation=excluded.generation;\n                      INSERT INTO conversation_semantic_dirty(session_id,fingerprint,seq,generation)\n                      SELECT m.session_id,s.fingerprint,m.seq,s.source_revision FROM agent_session_context_messages m\n                      JOIN conversation_semantic_state s ON s.session_id=m.session_id\n                      WHERE m.session_id=NEW.session_id AND NEW.trace_id IS NOT NULL\n                        AND m.trace_id=NEW.trace_id AND m.role='agent'\n                      ON CONFLICT(session_id,fingerprint,seq) DO UPDATE SET generation=excluded.generation;\n                    END;",
+      "handling": "mysql",
+      "runtime_source": "app/domains/conversation_semantic.py:56"
+    },
+    {
+      "object_type": "trigger",
+      "name": "conversation_semantic_new_session",
+      "table_name": null,
+      "source_sql": "CREATE TRIGGER conversation_semantic_new_session\n                    AFTER INSERT ON agent_sessions BEGIN\n                      INSERT OR IGNORE INTO conversation_semantic_state(session_id,fingerprint)\n                      SELECT NEW.session_id,fingerprint FROM conversation_semantic_state\n                      GROUP BY fingerprint;\n                    END;",
+      "handling": "mysql",
+      "runtime_source": "app/domains/conversation_semantic.py:56"
+    },
+    {
+      "object_type": "trigger",
+      "name": "conversation_semantic_update",
+      "table_name": null,
+      "source_sql": "CREATE TRIGGER conversation_semantic_update\n                    AFTER UPDATE OF role,content,created_at,trace_id,session_id\n                    ON agent_session_context_messages BEGIN\n                      INSERT INTO conversation_semantic_state(session_id,fingerprint,source_revision)\n                      SELECT OLD.session_id,fingerprint,1 FROM conversation_semantic_state\n                      WHERE session_id=OLD.session_id GROUP BY fingerprint\n                      ON CONFLICT(session_id,fingerprint) DO UPDATE SET source_revision=source_revision+1;\n                      INSERT INTO conversation_semantic_dirty(session_id,fingerprint,seq,generation)\n                      SELECT session_id,fingerprint,OLD.seq,source_revision FROM conversation_semantic_state\n                      WHERE session_id=OLD.session_id\n                      ON CONFLICT(session_id,fingerprint,seq) DO UPDATE SET generation=excluded.generation;\n                      INSERT INTO conversation_semantic_dirty(session_id,fingerprint,seq,generation)\n                      SELECT m.session_id,s.fingerprint,m.seq,s.source_revision FROM agent_session_context_messages m\n                      JOIN conversation_semantic_state s ON s.session_id=m.session_id\n                      WHERE m.session_id=OLD.session_id AND OLD.trace_id IS NOT NULL\n                        AND m.trace_id=OLD.trace_id AND m.role='agent'\n                      ON CONFLICT(session_id,fingerprint,seq) DO UPDATE SET generation=excluded.generation;\n                      INSERT INTO conversation_semantic_state(session_id,fingerprint,source_revision)\n                      SELECT NEW.session_id,fingerprint,1 FROM conversation_semantic_state\n                      WHERE session_id=NEW.session_id GROUP BY fingerprint\n                      ON CONFLICT(session_id,fingerprint) DO UPDATE SET source_revision=source_revision+1;\n                      INSERT INTO conversation_semantic_dirty(session_id,fingerprint,seq,generation)\n                      SELECT session_id,fingerprint,NEW.seq,source_revision FROM conversation_semantic_state\n                      WHERE session_id=NEW.session_id\n                      ON CONFLICT(session_id,fingerprint,seq) DO UPDATE SET generation=excluded.generation;\n                      INSERT INTO conversation_semantic_dirty(session_id,fingerprint,seq,generation)\n                      SELECT m.session_id,s.fingerprint,m.seq,s.source_revision FROM agent_session_context_messages m\n                      JOIN conversation_semantic_state s ON s.session_id=m.session_id\n                      WHERE m.session_id=NEW.session_id AND NEW.trace_id IS NOT NULL\n                        AND m.trace_id=NEW.trace_id AND m.role='agent'\n                      ON CONFLICT(session_id,fingerprint,seq) DO UPDATE SET generation=excluded.generation;\n                    END;",
+      "handling": "mysql",
+      "runtime_source": "app/domains/conversation_semantic.py:56"
+    },
+    {
+      "object_type": "trigger",
+      "name": "matter_link_change_delete",
+      "table_name": "matter_source_links",
+      "source_sql": "CREATE TRIGGER matter_link_change_delete AFTER DELETE ON matter_source_links BEGIN INSERT INTO matter_changes(matter_id) VALUES(OLD.matter_id); END",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "trigger",
+      "name": "matter_link_change_insert",
+      "table_name": "matter_source_links",
+      "source_sql": "CREATE TRIGGER matter_link_change_insert AFTER INSERT ON matter_source_links BEGIN INSERT INTO matter_changes(matter_id) VALUES(NEW.matter_id); END",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "trigger",
+      "name": "matter_link_change_update",
+      "table_name": "matter_source_links",
+      "source_sql": "CREATE TRIGGER matter_link_change_update AFTER UPDATE ON matter_source_links BEGIN INSERT INTO matter_changes(matter_id) VALUES(NEW.matter_id); END",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "trigger",
+      "name": "matter_change_insert",
+      "table_name": "matters",
+      "source_sql": "CREATE TRIGGER matter_change_insert AFTER INSERT ON matters BEGIN INSERT INTO matter_changes(matter_id) VALUES(NEW.matter_id); END",
+      "handling": "mysql"
+    },
+    {
+      "object_type": "trigger",
+      "name": "matter_change_update",
+      "table_name": "matters",
+      "source_sql": "CREATE TRIGGER matter_change_update AFTER UPDATE ON matters BEGIN INSERT INTO matter_changes(matter_id) VALUES(NEW.matter_id); END",
+      "handling": "mysql"
+    }
+  ],
+  "ports": {
+    "partial_indexes": "nonunique partial indexes are widened to full nonunique indexes; query correctness is unchanged",
+    "expression_index": "idx_agent_runs_parent_run_id is represented by an invisible generated JSON scalar column plus a nonunique index",
+    "text_keys": "All other indexed SQLite TEXT fields used in a unique/primary key are converted to bounded VARCHAR at the InnoDB composite-key byte budget with CHECK constraints; nonunique text indexes use safe prefix indexes with postfilter; no prefix unique indexes are used. `memory_sources`, `knowledge_documents`, and `mail_sync_state` long composite unique keys use generated SHA-256 keys for every unbounded text component with collision-guard triggers; the full source tuple is retained in metadata.",
+    "long_uri_unique": {
+      "table": "knowledge_documents",
+      "source_columns": [
+        "source_id",
+        "uri",
+        "checksum"
+      ],
+      "physical_columns": [
+        "source_id",
+        "uri_key",
+        "checksum_key"
+      ],
+      "column": "uri",
+      "generated_column": "uri_key",
+      "guards": [
+        "lka_guard_knowledge_documents_uri_insert",
+        "lka_guard_knowledge_documents_uri_update"
+      ]
+    },
+    "fts": "FTS5 virtual tables and their 25 shadow tables are delegated to the native fulltext bootstrap; external FTS triggers are source-metadata-only",
+    "unbounded_unique_text_hashes": [
+      {
+        "table": "knowledge_documents",
+        "source_columns": [
+          "source_id",
+          "uri",
+          "checksum"
+        ],
+        "physical_columns": [
+          "source_id",
+          "uri_key",
+          "checksum_key"
+        ],
+        "column": "uri",
+        "generated_column": "uri_key",
+        "guards": [
+          "lka_guard_knowledge_documents_uri_insert",
+          "lka_guard_knowledge_documents_uri_update"
+        ]
+      },
+      {
+        "table": "memory_project_paths",
+        "source_columns": [
+          "path_key"
+        ],
+        "physical_columns": [
+          "path_key_hash"
+        ],
+        "column": "path_key",
+        "generated_column": "path_key_hash",
+        "guards": [
+          "lka_guard_memory_project_paths_path_key_insert",
+          "lka_guard_memory_project_paths_path_key_update"
+        ]
+      },
+      {
+        "table": "memory_sources",
+        "source_columns": [
+          "source_type",
+          "source_ref",
+          "checksum"
+        ],
+        "physical_columns": [
+          "source_type_key",
+          "source_ref_hash",
+          "checksum_key"
+        ],
+        "column": "source_ref",
+        "generated_column": "source_ref_hash",
+        "guards": [
+          "lka_guard_memory_sources_source_ref_insert",
+          "lka_guard_memory_sources_source_ref_update"
+        ]
+      },
+      {
+        "table": "mail_sync_state",
+        "source_columns": [
+          "provider",
+          "account_id",
+          "folder"
+        ],
+        "physical_columns": [
+          "provider_key",
+          "account_id_key",
+          "folder_hash"
+        ],
+        "column": "folder",
+        "generated_column": "folder_hash",
+        "guards": [
+          "lka_guard_mail_sync_state_folder_insert",
+          "lka_guard_mail_sync_state_folder_update"
+        ]
+      },
+      {
+        "table": "knowledge_documents",
+        "source_columns": [
+          "source_id",
+          "uri",
+          "checksum"
+        ],
+        "physical_columns": [
+          "source_id",
+          "uri_key",
+          "checksum_key"
+        ],
+        "column": "checksum",
+        "generated_column": "checksum_key",
+        "guards": [
+          "lka_guard_knowledge_documents_checksum_insert",
+          "lka_guard_knowledge_documents_checksum_update"
+        ]
+      },
+      {
+        "table": "memory_sources",
+        "source_columns": [
+          "source_type",
+          "source_ref",
+          "checksum"
+        ],
+        "physical_columns": [
+          "source_type_key",
+          "source_ref_hash",
+          "checksum_key"
+        ],
+        "column": "source_type",
+        "generated_column": "source_type_key",
+        "guards": [
+          "lka_guard_memory_sources_source_type_insert",
+          "lka_guard_memory_sources_source_type_update"
+        ]
+      },
+      {
+        "table": "memory_sources",
+        "source_columns": [
+          "source_type",
+          "source_ref",
+          "checksum"
+        ],
+        "physical_columns": [
+          "source_type_key",
+          "source_ref_hash",
+          "checksum_key"
+        ],
+        "column": "checksum",
+        "generated_column": "checksum_key",
+        "guards": [
+          "lka_guard_memory_sources_checksum_insert",
+          "lka_guard_memory_sources_checksum_update"
+        ]
+      },
+      {
+        "table": "mail_sync_state",
+        "source_columns": [
+          "provider",
+          "account_id",
+          "folder"
+        ],
+        "physical_columns": [
+          "provider_key",
+          "account_id_key",
+          "folder_hash"
+        ],
+        "column": "provider",
+        "generated_column": "provider_key",
+        "guards": [
+          "lka_guard_mail_sync_state_provider_insert",
+          "lka_guard_mail_sync_state_provider_update"
+        ]
+      },
+      {
+        "table": "mail_sync_state",
+        "source_columns": [
+          "provider",
+          "account_id",
+          "folder"
+        ],
+        "physical_columns": [
+          "provider_key",
+          "account_id_key",
+          "folder_hash"
+        ],
+        "column": "account_id",
+        "generated_column": "account_id_key",
+        "guards": [
+          "lka_guard_mail_sync_state_account_id_insert",
+          "lka_guard_mail_sync_state_account_id_update"
+        ]
+      }
+    ]
+  },
+  "expected_runtime_object_count": 261,
+  "runtime_declared_object_count": 55,
+  "excluded_separate_sqlite_tables": [
+    "replica_meta",
+    "replica_pages",
+    "replica_records",
+    "replica_sync_state"
+  ]
+}

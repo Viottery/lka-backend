@@ -38,7 +38,8 @@ class ScriptedProvider:
         raise AssertionError("private answer review must not stream draft deltas")
 
 
-def make_loop(tmp_path, writer_responses, reviewer_responses, *, max_reworks=2):
+def make_loop(tmp_path, writer_responses, reviewer_responses, *, max_reworks=2,
+              output_reserve_tokens=2048):
     writer = ScriptedProvider("writer", writer_responses)
     reviewer = ScriptedProvider("reviewer", reviewer_responses)
     registry = LLMClientRegistry()
@@ -46,9 +47,9 @@ def make_loop(tmp_path, writer_responses, reviewer_responses, *, max_reworks=2):
     registry.register_client(reviewer)
     config = LLMProviderConfig(default_client="reviewer", clients=[
         LLMClientConfig(name="writer", default_model="synthetic-model", context_window_tokens=100_000,
-                        output_reserve_tokens=2048),
+                        output_reserve_tokens=output_reserve_tokens),
         LLMClientConfig(name="reviewer", default_model="synthetic-model", context_window_tokens=100_000,
-                        output_reserve_tokens=2048, thinking_control="deepseek"),
+                        output_reserve_tokens=output_reserve_tokens, thinking_control="deepseek"),
     ])
     manager = InMemoryAgentRunManager()
     loop = turn.AgentTurnLoop(session_service=None, tool_executor=None,
@@ -145,13 +146,79 @@ def test_invalid_or_contradictory_review_fails_closed(tmp_path, bad):
     assert state.metadata["answer_review_approval_source"] == "llm"
 
 
-def test_review_uses_reasoning_client_low_effort_writer_uses_answer_client(tmp_path):
+def test_review_uses_reasoning_client_without_thinking_writer_uses_answer_client(tmp_path):
     loop, writer, reviewer, manager = make_loop(tmp_path, [response("draft")], [verdict()])
     with scope(manager):
         answer(loop, [])
     assert writer.requests[0].client_name == "writer"
     assert reviewer.requests[0].client_name == "reviewer"
+    assert reviewer.requests[0].thinking_enabled is False
+    assert reviewer.requests[0].reasoning_effort is None
+
+
+def test_review_falls_back_to_low_when_provider_cannot_disable_reasoning(tmp_path):
+    loop, _, reviewer, manager = make_loop(tmp_path, [response("draft")], [verdict()])
+    config = loop.llm_client.config.clients[1]
+    config.thinking_control = None
+    config.supports_reasoning_effort = True
+    with scope(manager):
+        answer(loop, [])
     assert reviewer.requests[0].reasoning_effort == "low"
+    assert reviewer.requests[0].thinking_enabled is None
+
+
+def test_pass_with_disclosed_gap_delivers_without_regeneration(tmp_path):
+    loop, writer, reviewer, manager = make_loop(tmp_path,
+        [response("The supplied excerpt confirms this part; the rest remains unverified.")],
+        [verdict(evidence_gap="Other source sections are unavailable and this is disclosed.")])
+    with scope(manager) as run:
+        delivered = answer(loop, [])
+    assert delivered.startswith("The supplied excerpt confirms")
+    assert len(writer.requests) == len(reviewer.requests) == 1
+    assert manager.get_run(run.run_id).metadata["answer_review_approval_source"] == "llm"
+    assert not any(e.type == "answer_degradation_started" for e in manager.list_events(run.run_id))
+
+
+def test_answer_review_and_degraded_generation_do_not_cap_reasoning_at_output_reserve(tmp_path):
+    loop, writer, reviewer, manager = make_loop(
+        tmp_path,
+        [response("Initial draft."), response("Supported partial result; remaining details are unavailable.")],
+        [response("truncated review", finish_reason="length"), verdict()],
+        output_reserve_tokens=8192,
+    )
+    with scope(manager) as run:
+        delivered = answer(loop, [])
+
+    assert delivered.startswith("Supported partial result")
+    assert manager.get_run(run.run_id).metadata["answer_review_degraded"] is True
+    assert [request.max_output_tokens for request in writer.requests] == [None, None]
+    assert [request.max_output_tokens for request in reviewer.requests] == [None, None]
+    events = manager.list_events(run.run_id)
+    assert any(event.type == "answer_degradation_started"
+               and event.payload.get("reason") == "answer_review_unavailable" for event in events)
+
+
+def test_truncated_review_and_degraded_review_never_publish_draft(tmp_path):
+    loop, writer, reviewer, manager = make_loop(
+        tmp_path,
+        [response("PRIVATE_DRAFT_SENTINEL"), response("PRIVATE_DEGRADED_SENTINEL")],
+        [response("truncated review", finish_reason="length"),
+         response("truncated degraded review", finish_reason="length")],
+    )
+    with scope(manager) as run:
+        delivered = answer(loop, [])
+
+    assert delivered.startswith("本地状态说明")
+    assert "PRIVATE_DRAFT_SENTINEL" not in delivered
+    assert "PRIVATE_DEGRADED_SENTINEL" not in delivered
+    events = manager.list_events(run.run_id)
+    assert not any(event.type == "answer_review_completed" for event in events)
+    assert not any(event.type == "final_answer" for event in events)
+    state = manager.get_run(run.run_id)
+    assert state.metadata["answer_review_degraded"] is True
+    assert state.metadata["answer_review_approval_source"] == "system_status_notice"
+    assert [request.max_output_tokens for request in writer.requests] == [None, None]
+    assert [request.max_output_tokens for request in reviewer.requests] == [None, None]
 
 
 def test_rework_limit_is_persistent_and_does_not_publish_rejected_draft(tmp_path):

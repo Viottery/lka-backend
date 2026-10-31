@@ -6,7 +6,13 @@ from contextlib import closing
 from datetime import UTC, datetime
 from uuid import uuid4
 
+from app.core.session_admission import SessionAdmissionStore
 from app.storage.commit_signals import notify_after_commit
+from app.storage.connections import is_mysql, lock_row
+
+
+def _begin_write(conn):
+    conn.execute("BEGIN" if is_mysql(conn) else "BEGIN IMMEDIATE")
 
 
 class ManagementConflictError(ValueError):
@@ -19,6 +25,7 @@ class ManagementPausedError(ManagementConflictError):
 
 _UNSET = object()
 _TERMINAL_RUNS = ("completed", "failed", "cancelled", "timed_out")
+_DEFAULT_MANAGER_LOCK = "__lka_manager_default__"
 
 
 class ManagementService:
@@ -44,6 +51,9 @@ class ManagementService:
         )] if manager else [tool.name for tool in tools if not management_tool(tool)]
 
     def ensure_schema(self):
+        with closing(self._conn()) as conn:
+            if is_mysql(conn):
+                return
         with closing(self._conn()) as conn, conn:
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS manager_controllers (
@@ -125,9 +135,21 @@ class ManagementService:
                                      llm_answer_client_name, llm_answer_model),
         )
         if make_default:
-            conn.execute("INSERT INTO manager_defaults(slot,session_id) VALUES(1,?) "
-                         "ON CONFLICT(slot) DO UPDATE SET session_id=excluded.session_id", (session_id,))
+            if is_mysql(conn):
+                conn.execute_native("INSERT INTO manager_defaults(slot,session_id) VALUES(1,%s) "
+                                    "ON DUPLICATE KEY UPDATE session_id=VALUES(session_id)", (session_id,))
+            else:
+                conn.execute("INSERT INTO manager_defaults(slot,session_id) VALUES(1,?) "
+                             "ON CONFLICT(slot) DO UPDATE SET session_id=excluded.session_id", (session_id,))
         return session_id
+
+    @staticmethod
+    def _lock_default_row_before_creation(conn):
+        if is_mysql(conn):
+            # Input acceptance takes this row FOR SHARE before it writes to the
+            # sync-journal tables. Acquire its exclusive lock before controller
+            # creation triggers can take the journal lock, keeping one lock order.
+            lock_row(conn, "manager_defaults", "slot", 1)
 
     @notify_after_commit
     def create(self, title=None, make_default=False, llm_client_name=None, llm_model=None, reasoning_level=None, default_execution_workspace=None,
@@ -140,7 +162,12 @@ class ManagementService:
         answer_model = self._model_value(llm_answer_model)
         reasoning = self._reasoning_value(reasoning_level)
         with closing(self._conn()) as conn, conn:
-            conn.execute("BEGIN IMMEDIATE")
+            _begin_write(conn)
+            if make_default and is_mysql(conn):
+                # A single explicit resource lock protects the absent default
+                # row under READ COMMITTED without serializing unrelated work.
+                SessionAdmissionStore.lock_session(conn, _DEFAULT_MANAGER_LOCK)
+                self._lock_default_row_before_creation(conn)
             session_id = self._create(conn, title=title, make_default=make_default,
                                       llm_client_name=client, llm_model=model, reasoning_level=reasoning, default_execution_workspace=workspace,
                                       llm_answer_client_name=answer_client, llm_answer_model=answer_model)
@@ -153,7 +180,9 @@ class ManagementService:
         # that original directory was removed after a successful creation.
         workspace = None if existing else self.resolve_execution_workspace(default_execution_workspace)
         with closing(self._conn()) as conn, conn:
-            conn.execute("BEGIN IMMEDIATE")
+            _begin_write(conn)
+            if is_mysql(conn):
+                SessionAdmissionStore.lock_session(conn, _DEFAULT_MANAGER_LOCK)
             row = conn.execute("SELECT session_id FROM manager_defaults WHERE slot=1").fetchone()
             if row:
                 session_id = row["session_id"]
@@ -162,18 +191,25 @@ class ManagementService:
                 if not session or session["kind"] != "manager" or session["status"] == "deleted":
                     raise ManagementConflictError("Default management session is unavailable; restore or explicitly replace it")
             else:
+                self._lock_default_row_before_creation(conn)
                 session_id = self._create(conn, title=self._title(None), make_default=True,
                                           llm_client_name=None, llm_model=None, default_execution_workspace=workspace)
         return self.get(session_id)
 
-    def get(self, session_id):
-        with closing(self._conn()) as conn:
-            row = conn.execute("SELECT c.* FROM manager_controllers c JOIN agent_sessions s "
-                               "ON s.session_id=c.session_id WHERE c.session_id=? "
-                               "AND s.kind='manager' AND s.status!='deleted'", (session_id,)).fetchone()
+    def get(self, session_id, *, conn=None):
+        """Read a manager and session using an optional caller-owned connection."""
+        if conn is None:
+            with closing(self._conn()) as owned:
+                return self._get_on_connection(owned, session_id)
+        return self._get_on_connection(conn, session_id)
+
+    def _get_on_connection(self, conn, session_id):
+        row = conn.execute("SELECT c.* FROM manager_controllers c JOIN agent_sessions s "
+                           "ON s.session_id=c.session_id WHERE c.session_id=? "
+                           "AND s.kind='manager' AND s.status!='deleted'", (session_id,)).fetchone()
         if row is None:
             raise KeyError(session_id)
-        session = self.session_service.get_session_or_none(session_id=session_id)
+        session = self.session_service.get_session_or_none(session_id=session_id, conn=conn)
         if session is None:
             raise KeyError(session_id)
         controller = dict(row)
@@ -228,7 +264,11 @@ class ManagementService:
         if reasoning_level is not _UNSET:
             values["reasoning_level"] = self._reasoning_value(reasoning_level)
         with closing(self._conn()) as conn, conn:
-            conn.execute("BEGIN IMMEDIATE")
+            _begin_write(conn)
+            SessionAdmissionStore.lock_session(conn, session_id)
+            controller = lock_row(conn, "manager_controllers", "session_id", session_id)
+            if controller is None:
+                raise KeyError(session_id)
             row = conn.execute("SELECT c.* FROM manager_controllers c JOIN agent_sessions s "
                                "ON s.session_id=c.session_id WHERE c.session_id=? "
                                "AND s.kind='manager' AND s.status!='deleted'", (session_id,)).fetchone()
@@ -238,8 +278,11 @@ class ManagementService:
                 raise ManagementConflictError("Management revision changed")
             assignments = [f"{name}=?" for name in values]
             assignments.extend(["revision=revision+1", "updated_at=?"])
-            conn.execute("UPDATE manager_controllers SET " + ",".join(assignments) + " WHERE session_id=?",
-                         [*values.values(), datetime.now(UTC).isoformat(), session_id])
+            changed = conn.execute("UPDATE manager_controllers SET " + ",".join(assignments) +
+                                   " WHERE session_id=? AND revision=?",
+                                   [*values.values(), datetime.now(UTC).isoformat(), session_id, expected_revision])
+            if changed.rowcount != 1:
+                raise ManagementConflictError("Management revision changed")
         return self.get(session_id)
 
     @staticmethod
@@ -248,6 +291,7 @@ class ManagementService:
         return row is not None and row["kind"] == "manager"
 
     def guard_delete(self, conn, session_id, only_if_empty=False):
+        SessionAdmissionStore.lock_session(conn, session_id)
         if not self._is_manager(conn, session_id):
             return
         if only_if_empty:

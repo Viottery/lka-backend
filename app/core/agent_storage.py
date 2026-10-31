@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from collections.abc import Callable
+from contextlib import AbstractContextManager, closing
 from contextvars import ContextVar
 from copy import deepcopy
 from datetime import UTC, datetime
@@ -12,8 +14,35 @@ from pathlib import Path
 from typing import Any
 
 from app.core.session_admission import TERMINAL_RUN_STATUSES, SessionAdmissionStore
-from app.storage.db import connect, init_db
+from app.storage.connections import connect_database, is_mysql, lock_row
+from app.storage.db import init_db
+from app.storage.mysql import MySQLIntegrityError
 from app.storage.sqlite_retry import persist_sqlite
+
+
+def connect(db_path):
+    """Open this store's configured authority with its usual named-row shape."""
+    conn = connect_database(db_path, timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _begin_write(conn):
+    conn.execute("BEGIN" if is_mysql(conn) else "BEGIN IMMEDIATE")
+
+
+def _lock_run_row(conn, run_id):
+    """Lock admission before the run row for root-state transitions."""
+    if is_mysql(conn):
+        owner = conn.execute("SELECT session_id,record_payload FROM agent_runs WHERE run_id=?", (run_id,)).fetchone()
+        if owner is not None:
+            try:
+                record = _json_load(owner["record_payload"])
+            except (KeyError, TypeError, ValueError):
+                record = {}
+            if record.get("parent_run_id") is None:
+                SessionAdmissionStore.lock_session(conn, owner["session_id"])
+    return lock_row(conn, "agent_runs", "run_id", run_id)
 
 _artifact_read_stack: ContextVar[tuple[tuple[str, str, str], ...]] = ContextVar("artifact_read_stack", default=())
 _MAX_ARTIFACT_LINEAGE_DEPTH = 16
@@ -74,8 +103,18 @@ class SqliteAgentRunStore:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
         self._lineage_required_producers: set[str] = set()
-        init_db(db_path)
+        with closing(connect_database(db_path)) as bootstrap_conn:
+            sqlite_authority = not is_mysql(bootstrap_conn)
+        if sqlite_authority:
+            init_db(db_path)
         with connect(self.db_path) as conn:
+            if is_mysql(conn):
+                # MySQL DDL is owned by the application schema registry. Running
+                # CREATE/ALTER here could implicitly commit a caller's transaction.
+                from app.storage.mysql_run_contracts import verify_native_run_upserts
+
+                verify_native_run_upserts(conn)
+                return
             SessionAdmissionStore.ensure_schema(conn)
             conn.execute("""CREATE TABLE IF NOT EXISTS agent_artifact_lineage (
                 artifact_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, artifact_hash TEXT NOT NULL,
@@ -102,8 +141,122 @@ class SqliteAgentRunStore:
 
     def save_run(self, record: dict[str, Any], *, updated_at: str) -> None:
         with connect(self.db_path) as conn:
-            conn.execute("BEGIN IMMEDIATE")
+            _begin_write(conn)
             self.save_run_in_transaction(conn, record, updated_at=updated_at)
+
+    @staticmethod
+    def _validate_cleanup_reason(reason: str) -> None:
+        if not isinstance(reason, str) or not reason.strip() or len(reason) > 500:
+            raise ValueError("reason must contain 1 to 500 characters")
+
+    @staticmethod
+    def _append_cleanup_event(conn, *, run_id: str, event_type: str, message: str,
+                              payload: dict[str, Any], created_at: str) -> None:
+        sequence = int(conn.execute(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM agent_run_events WHERE run_id=?",
+            (run_id,),
+        ).fetchone()[0])
+        event = {
+            "event_id": f"{run_id}_event_{sequence:06d}",
+            "run_id": run_id,
+            "sequence": sequence,
+            "type": event_type,
+            "stage": "system_cleanup",
+            "message": message,
+            "payload": payload,
+            "created_at": created_at,
+        }
+        conn.execute(
+            "INSERT INTO agent_run_events(run_id,sequence,event_payload,created_at) VALUES (?,?,?,?)",
+            (run_id, sequence, _json_dump(event), created_at),
+        )
+
+    def expire_terminal_safety_reviews(self, run_id: str, reason: str, expired_at: str) -> int:
+        """Expire pending reviews only after their owning run is terminal.
+
+        This is a system cleanup transition, not an approval or rejection. Review
+        rows and audit events commit together while holding the normal run lock.
+        """
+        self._validate_cleanup_reason(reason)
+        with connect(self.db_path) as conn:
+            _begin_write(conn)
+            run = _lock_run_row(conn, run_id)
+            if run is None:
+                raise KeyError(f"Agent run not found: {run_id}")
+            state = conn.execute("SELECT status FROM agent_runs WHERE run_id=?", (run_id,)).fetchone()
+            if state["status"] not in TERMINAL_RUN_STATUSES:
+                raise ValueError("Safety reviews can only be expired for terminal runs")
+            rows = conn.execute(
+                "SELECT review_id FROM agent_safety_reviews WHERE run_id=? AND status='pending' ORDER BY review_id",
+                (run_id,),
+            ).fetchall()
+            expired: list[str] = []
+            for candidate in rows:
+                review_row = lock_row(conn, "agent_safety_reviews", "review_id", candidate["review_id"])
+                if review_row is None or review_row["status"] != "pending":
+                    continue
+                review = _json_load(review_row["review_payload"])
+                review.update({
+                    "status": "expired",
+                    "decided_by": "system.terminal_cleanup",
+                    "decision_reason": reason,
+                    "decided_at": expired_at,
+                })
+                conn.execute(
+                    "UPDATE agent_safety_reviews SET status='expired',review_payload=?,updated_at=? "
+                    "WHERE review_id=? AND status='pending'",
+                    (_json_dump(review), expired_at, candidate["review_id"]),
+                )
+                expired.append(candidate["review_id"])
+            if expired:
+                self._append_cleanup_event(
+                    conn, run_id=run_id, event_type="safety_reviews_expired",
+                    message="Expired pending safety reviews for a terminal run.",
+                    payload={"review_ids": expired, "reason": reason, "expired_at": expired_at},
+                    created_at=expired_at,
+                )
+            conn.commit()
+            return len(expired)
+
+    def quarantine_terminal_tool_invocation(
+        self, invocation_id: str, reason: str, quarantined_at: str,
+    ) -> bool:
+        """Mark an unacknowledged effect unknown without inventing its result."""
+        self._validate_cleanup_reason(reason)
+        with connect(self.db_path) as conn:
+            _begin_write(conn)
+            invocation = conn.execute(
+                "SELECT run_id FROM agent_tool_invocations WHERE invocation_id=?", (invocation_id,),
+            ).fetchone()
+            if invocation is None:
+                raise KeyError(f"Tool invocation not found: {invocation_id}")
+            run_id = invocation["run_id"]
+            _lock_run_row(conn, run_id)
+            run = conn.execute("SELECT status FROM agent_runs WHERE run_id=?", (run_id,)).fetchone()
+            if run is None or run["status"] not in {"failed", "cancelled"}:
+                raise ValueError("Tool invocation quarantine requires a failed or cancelled run")
+            row = lock_row(conn, "agent_tool_invocations", "invocation_id", invocation_id)
+            if row is None:
+                raise KeyError(f"Tool invocation not found: {invocation_id}")
+            if row["status"] == "unknown" and row["result_payload"] is None:
+                conn.commit()
+                return False
+            if row["status"] != "executing" or row["result_payload"] is not None:
+                raise ValueError("Only executing invocations without a result can be quarantined")
+            conn.execute(
+                "UPDATE agent_tool_invocations SET status='unknown',updated_at=? "
+                "WHERE invocation_id=? AND status='executing' AND result_payload IS NULL",
+                (quarantined_at, invocation_id),
+            )
+            self._append_cleanup_event(
+                conn, run_id=run_id, event_type="tool_invocation_quarantined",
+                message="Quarantined an unacknowledged tool invocation as unknown.",
+                payload={"invocation_id": invocation_id, "reason": reason,
+                         "quarantined_at": quarantined_at, "outcome": "unknown"},
+                created_at=quarantined_at,
+            )
+            conn.commit()
+            return True
 
     def save_run_in_transaction(self, conn, record: dict[str, Any], *, updated_at: str) -> None:
         """Persist a run and its logical slot in the caller's write transaction.
@@ -111,36 +264,66 @@ class SqliteAgentRunStore:
         Does not begin, commit or close the connection. This lets a caller bind
         a newly created session, command, run and dispatch record atomically.
         """
-        existing = conn.execute("SELECT 1 FROM agent_runs WHERE run_id=?", (record["run_id"],)).fetchone()
-        if existing is None:
-            SessionAdmissionStore._existing_session(conn, record["session_id"])
-        if record.get("parent_run_id") is None and record["status"] not in TERMINAL_RUN_STATUSES:
-            SessionAdmissionStore.reserve(conn, record["session_id"], record["run_id"])
-        conn.execute(
-            """
-            INSERT INTO agent_runs(
-                run_id, session_id, status, record_payload, created_at, updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(run_id) DO UPDATE SET
-                session_id = excluded.session_id,
-                status = excluded.status,
-                record_payload = excluded.record_payload,
-                updated_at = excluded.updated_at
-            """,
-            (
-                record["run_id"],
-                record["session_id"],
-                record["status"],
-                _json_dump(record),
-                record["created_at"],
-                updated_at,
-            ),
+        if record.get("parent_run_id") is None:
+            SessionAdmissionStore.lock_session(conn, record["session_id"])
+        existing = lock_row(conn, "agent_runs", "run_id", record["run_id"])
+        needs_admission = (
+            record.get("parent_run_id") is None
+            and record["status"] not in TERMINAL_RUN_STATUSES
         )
-        SessionAdmissionStore.release_if_terminal(conn, record)
+        if existing is None and not needs_admission:
+            SessionAdmissionStore._existing_session(
+                conn, record["session_id"], schema_prepared=True,
+            )
+        if needs_admission:
+            SessionAdmissionStore.reserve(
+                conn, record["session_id"], record["run_id"], schema_prepared=True,
+            )
+        parameters = (
+            record["run_id"],
+            record["session_id"],
+            record["status"],
+            _json_dump(record),
+            record["created_at"],
+            updated_at,
+        )
+        if is_mysql(conn):
+            # Store construction validates run_id is the only conflicting business key.
+            # Native execution retains transaction/owner guards while avoiding
+            # SQLite upsert emulation and its metadata queries/savepoint.
+            conn.execute_native(
+                """
+                INSERT INTO agent_runs(
+                    run_id, session_id, status, record_payload, created_at, updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    session_id = VALUES(session_id),
+                    status = VALUES(status),
+                    record_payload = VALUES(record_payload),
+                    updated_at = VALUES(updated_at)
+                """,
+                parameters,
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO agent_runs(
+                    run_id, session_id, status, record_payload, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id) DO UPDATE SET
+                    session_id = excluded.session_id,
+                    status = excluded.status,
+                    record_payload = excluded.record_payload,
+                    updated_at = excluded.updated_at
+                """,
+                parameters,
+            )
+        SessionAdmissionStore.release_if_terminal(conn, record, schema_prepared=True)
 
     def reconcile_failed_dispatch_runs(self, *, limit: int = 20) -> list[dict[str, Any]]:
-        """Terminalize orphaned running roots whose latest dispatch job failed.
+        """Terminalize orphaned queued/running roots whose latest dispatch job failed.
 
         The job/run check, terminal record, event, and admission-slot release are
         committed together. No work is replayed by this recovery path.
@@ -153,7 +336,7 @@ class SqliteAgentRunStore:
             candidates = self._failed_dispatch_candidates(conn, limit)
             if not candidates:
                 return []
-            conn.execute("BEGIN IMMEDIATE")
+            _begin_write(conn)
             # Re-select after obtaining the writer slot so job/run ownership and
             # ordering decisions are based on one transaction snapshot.
             candidates = self._failed_dispatch_candidates(conn, limit)
@@ -164,14 +347,15 @@ class SqliteAgentRunStore:
                     continue
                 visited.add(run_id)
                 row = conn.execute(
-                    "SELECT record_payload FROM agent_runs WHERE run_id=? AND status='running'",
+                    "SELECT record_payload FROM agent_runs WHERE run_id=? AND status IN ('queued','running')",
                     (run_id,),
                 ).fetchone()
                 if row is None:
                     continue
                 record = _json_load(row["record_payload"])
                 metadata = record.get("metadata") or {}
-                if (record.get("status") != "running" or record.get("parent_run_id") is not None
+                if (record.get("status") not in {"queued", "running"}
+                        or record.get("parent_run_id") is not None
                         or record.get("result_snapshot") is not None
                         or metadata.get("completion_claimed") is True
                         or metadata.get("pause_requested") is True):
@@ -233,6 +417,156 @@ class SqliteAgentRunStore:
             conn.commit()
         return reconciled
 
+    def reconcile_unstarted_queued_runs(
+        self, *, recovery_guard: Callable[[str], AbstractContextManager[bool]],
+        older_than: str, limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Fail old queued roots only while an external guard proves they never started.
+
+        The guard must hold the per-run execution lock and prove both that no graph
+        is active and that no checkpoint exists. It is acquired before the DB
+        writer transaction and remains held through the atomic run/event/admission
+        commit. A lost dispatch is never replayed by this recovery path.
+        """
+        if not isinstance(older_than, str) or not older_than:
+            raise ValueError("older_than must be a timestamp")
+        if not callable(recovery_guard) or not 1 <= limit <= 100:
+            raise ValueError("recovery_guard and a limit between 1 and 100 are required")
+        with connect(self.db_path) as conn:
+            candidates = self._unstarted_queued_candidates(conn, older_than, limit)
+        reconciled: list[dict[str, Any]] = []
+        for candidate in candidates:
+            run_id = candidate["run_id"]
+            with recovery_guard(run_id) as safe_to_fail:
+                if safe_to_fail is not True:
+                    continue
+                now = datetime.now(UTC).isoformat()
+                with connect(self.db_path) as conn:
+                    try:
+                        _begin_write(conn)
+                        # Every root-state transition takes the admission anchor
+                        # before locking its run row on MySQL.
+                        SessionAdmissionStore.lock_session(conn, candidate["session_id"])
+                        lock_row(conn, "agent_runs", "run_id", run_id)
+                        row = conn.execute(
+                            "SELECT run_id,session_id,status,record_payload,created_at,updated_at "
+                            "FROM agent_runs WHERE run_id=?", (run_id,),
+                        ).fetchone()
+                        if row is None or row["updated_at"] != candidate["updated_at"]:
+                            conn.rollback()
+                            continue
+                        record = _json_load(row["record_payload"])
+                        if not self._is_unstarted_queued_root(record, row, older_than):
+                            conn.rollback()
+                            continue
+                        if self._run_has_dispatch_job(conn, run_id):
+                            conn.rollback()
+                            continue
+                        if conn.execute(
+                            "SELECT 1 FROM agent_tool_invocations WHERE run_id=? LIMIT 1", (run_id,),
+                        ).fetchone() is not None:
+                            conn.rollback()
+                            continue
+                        # A run with any preexisting event is not proven unstarted;
+                        # this also protects future event types from accidental replay.
+                        if conn.execute(
+                            "SELECT 1 FROM agent_run_events WHERE run_id=? LIMIT 1", (run_id,),
+                        ).fetchone() is not None:
+                            conn.rollback()
+                            continue
+                        metadata = record.get("metadata") or {}
+                        reason = "No durable dispatch job or execution evidence exists for this queued run."
+                        failed = {
+                            **record,
+                            "status": "failed",
+                            "failed_at": now,
+                            "error_type": "unstarted_dispatch_missing",
+                            "error": reason,
+                            "metadata": {
+                                **metadata,
+                                "unstarted_dispatch_reconciled_at": now,
+                                "unstarted_dispatch_recovery": "no_dispatch_job_no_checkpoint_no_tool_or_run_events",
+                            },
+                        }
+                        event = {
+                            "event_id": f"{run_id}_event_unstarted_reconcile",
+                            "run_id": run_id,
+                            "sequence": 1,
+                            "type": "run_failed",
+                            "stage": "run",
+                            "message": reason,
+                            "payload": {"error_type": "unstarted_dispatch_missing"},
+                            "created_at": now,
+                        }
+                        self.save_run_in_transaction(conn, failed, updated_at=now)
+                        conn.execute(
+                            "INSERT INTO agent_run_events(run_id,sequence,event_payload,created_at) "
+                            "VALUES (?,?,?,?)",
+                            (run_id, 1, _json_dump(self._event_for_storage(event)), now),
+                        )
+                        conn.commit()
+                        reconciled.append(failed)
+                    except Exception:
+                        conn.rollback()
+                        raise
+            if len(reconciled) >= limit:
+                break
+        return reconciled
+
+    @staticmethod
+    def _unstarted_queued_candidates(conn, older_than: str, limit: int):
+        rows = conn.execute(
+            "SELECT run_id,session_id,status,record_payload,created_at,updated_at FROM agent_runs "
+            "WHERE status='queued' AND created_at<=? "
+            "AND NOT EXISTS (SELECT 1 FROM background_jobs j WHERE j.kind='agent_dispatch' "
+            "AND json_extract(j.payload_json,'$.run_id')=agent_runs.run_id) "
+            "AND NOT EXISTS (SELECT 1 FROM agent_tool_invocations t WHERE t.run_id=agent_runs.run_id) "
+            "AND NOT EXISTS (SELECT 1 FROM agent_run_events e WHERE e.run_id=agent_runs.run_id) "
+            "ORDER BY created_at,run_id LIMIT ?",
+            (older_than, min(limit * 4, 400)),
+        ).fetchall()
+        candidates = []
+        for row in rows:
+            try:
+                record = _json_load(row["record_payload"])
+            except (TypeError, ValueError):
+                continue
+            if not SqliteAgentRunStore._is_unstarted_queued_root(record, row, older_than):
+                continue
+            candidates.append(row)
+        return candidates
+
+    @staticmethod
+    def _is_unstarted_queued_root(record: dict[str, Any], row: Any, older_than: str) -> bool:
+        metadata = record.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            return False
+        return bool(
+            row["status"] == "queued"
+            and record.get("status") == "queued"
+            and row["created_at"] <= older_than
+            and record.get("run_id") == row["run_id"]
+            and record.get("session_id") == row["session_id"]
+            and record.get("created_at") == row["created_at"]
+            and record.get("parent_run_id") is None
+            and record.get("result_snapshot") is None
+            and record.get("started_at") is None
+            and record.get("completed_at") is None
+            and record.get("failed_at") is None
+            and record.get("paused_at") is None
+            and record.get("cancelled_at") is None
+            and metadata.get("completion_claimed") is not True
+            and metadata.get("pause_requested") is not True
+            and metadata.get("cancel_requested") is not True
+        )
+
+    @staticmethod
+    def _run_has_dispatch_job(conn, run_id: str) -> bool:
+        return conn.execute(
+            "SELECT 1 FROM background_jobs WHERE kind='agent_dispatch' "
+            "AND json_extract(payload_json,'$.run_id')=? LIMIT 1", (run_id,),
+        ).fetchone() is not None
+
     @staticmethod
     def _failed_dispatch_candidates(conn, limit: int):
         return conn.execute(
@@ -240,7 +574,7 @@ class SqliteAgentRunStore:
                       j.error_class
                FROM background_jobs j JOIN agent_runs r
                  ON r.run_id=json_extract(j.payload_json,'$.run_id')
-               WHERE j.kind='agent_dispatch' AND j.status='failed' AND r.status='running'
+               WHERE j.kind='agent_dispatch' AND j.status='failed' AND r.status IN ('queued','running')
                  AND j.job_id=(
                    SELECT latest.job_id FROM background_jobs latest
                    WHERE latest.kind='agent_dispatch' AND latest.scope_id=j.scope_id
@@ -263,6 +597,11 @@ class SqliteAgentRunStore:
         """
         if not conn.in_transaction:
             raise ValueError("Atomic completion requires an existing transaction")
+        session_row = conn.execute("SELECT session_id FROM agent_runs WHERE run_id=?", (run_id,)).fetchone()
+        if session_row is None:
+            raise KeyError(run_id)
+        SessionAdmissionStore.lock_session(conn, session_row["session_id"])
+        lock_row(conn, "agent_runs", "run_id", run_id)
         row = conn.execute("SELECT record_payload FROM agent_runs WHERE run_id=?", (run_id,)).fetchone()
         if row is None:
             raise KeyError(run_id)
@@ -342,7 +681,8 @@ class SqliteAgentRunStore:
         """Atomically persist a child, its parent link, and lifecycle creation events."""
 
         with connect(self.db_path) as conn:
-            conn.execute("BEGIN IMMEDIATE")
+            _begin_write(conn)
+            _lock_run_row(conn, parent["run_id"])
             parent_row = conn.execute(
                 "SELECT record_payload FROM agent_runs WHERE run_id = ?",
                 (parent["run_id"],),
@@ -423,7 +763,13 @@ class SqliteAgentRunStore:
         if len(expected) != len(previous) or {record["run_id"] for record in updated} != set(expected):
             raise ValueError("Run control batch must update each expected run exactly once.")
         with connect(self.db_path) as conn:
-            conn.execute("BEGIN IMMEDIATE")
+            _begin_write(conn)
+            sessions = sorted({record["session_id"] for record in [*updated, *additions.values()]
+                               if record.get("parent_run_id") is None})
+            for session_id in sessions:
+                SessionAdmissionStore.lock_session(conn, session_id)
+            for run_id in sorted(expected):
+                lock_row(conn, "agent_runs", "run_id", run_id)
             for record in updated:
                 run_id = record["run_id"]
                 row = conn.execute(
@@ -482,6 +828,27 @@ class SqliteAgentRunStore:
         if not events:
             return
         def persist(conn):
+            _begin_write(conn)
+            for run_id in sorted({event["run_id"] for event in events}):
+                _lock_run_row(conn, run_id)
+            if is_mysql(conn):
+                # The managed schema has only the event identity plus an
+                # implicit AUTO_INCREMENT rowid as unique keys. Since this
+                # insert omits that rowid, only (run_id, sequence) can collide.
+                # Native execution retains the connection's transaction guard.
+                for event in events:
+                    conn.execute_native(
+                        "INSERT INTO agent_run_events(run_id, sequence, event_payload, created_at) "
+                        "VALUES (%s, %s, %s, %s) "
+                        "ON DUPLICATE KEY UPDATE event_payload = VALUES(event_payload)",
+                        (
+                            event["run_id"],
+                            event["sequence"],
+                            _json_dump(self._event_for_storage(event)),
+                            event["created_at"],
+                        ),
+                    )
+                return
             conn.executemany(
                 """
                 INSERT INTO agent_run_events(run_id, sequence, event_payload, created_at)
@@ -510,7 +877,8 @@ class SqliteAgentRunStore:
         """Atomically park a run and publish its user-facing question event."""
 
         with connect(self.db_path) as conn:
-            conn.execute("BEGIN IMMEDIATE")
+            _begin_write(conn)
+            _lock_run_row(conn, record["run_id"])
             row = conn.execute(
                 "SELECT record_payload FROM agent_runs WHERE run_id = ?",
                 (record["run_id"],),
@@ -579,7 +947,8 @@ class SqliteAgentRunStore:
         """Atomically park a parent on child questions without adding a question."""
 
         with connect(self.db_path) as conn:
-            conn.execute("BEGIN IMMEDIATE")
+            _begin_write(conn)
+            _lock_run_row(conn, parent_record["run_id"])
             row = conn.execute(
                 "SELECT record_payload FROM agent_runs WHERE run_id = ?",
                 (parent_record["run_id"],),
@@ -661,7 +1030,8 @@ class SqliteAgentRunStore:
         """Resume a child-question parent only after all referenced children unblock."""
 
         with connect(self.db_path) as conn:
-            conn.execute("BEGIN IMMEDIATE")
+            _begin_write(conn)
+            _lock_run_row(conn, parent_run_id)
             row = conn.execute(
                 "SELECT record_payload FROM agent_runs WHERE run_id = ?", (parent_run_id,)
             ).fetchone()
@@ -736,7 +1106,8 @@ class SqliteAgentRunStore:
         """
 
         with connect(self.db_path) as conn:
-            conn.execute("BEGIN IMMEDIATE")
+            _begin_write(conn)
+            _lock_run_row(conn, run_id)
             command = conn.execute(
                 "SELECT run_id, question_id, answer FROM agent_user_continuations WHERE command_id = ?",
                 (command_id,),
@@ -815,13 +1186,66 @@ class SqliteAgentRunStore:
             ).fetchone()
         return row["answer"] if row is not None else None
 
-    def list_events(self, run_id: str) -> list[dict[str, Any]]:
-        with connect(self.db_path) as conn:
+    def list_events(self, run_id: str, *, after_sequence: int = 0,
+                    limit: int | None = None) -> list[dict[str, Any]]:
+        if limit is not None and limit < 1:
+            raise ValueError("Event page limit must be positive")
+        with closing(connect(self.db_path)) as conn:
+            if limit is not None:
+                rows = conn.execute(
+                    "SELECT event_payload FROM agent_run_events WHERE run_id = ? AND sequence > ? "
+                    "ORDER BY sequence LIMIT ?",
+                    (run_id, after_sequence, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT event_payload FROM agent_run_events WHERE run_id = ? AND sequence > ? ORDER BY sequence",
+                    (run_id, after_sequence),
+                ).fetchall()
+        return [_json_load(row["event_payload"]) for row in rows]
+
+    def list_event_tail(self, run_id: str, *, limit: int) -> list[dict[str, Any]]:
+        """Read only the newest bounded event suffix for the manager hot cache."""
+        if limit < 1:
+            raise ValueError("Event tail limit must be positive")
+        with closing(connect(self.db_path)) as conn:
             rows = conn.execute(
-                "SELECT event_payload FROM agent_run_events WHERE run_id = ? ORDER BY sequence",
-                (run_id,),
+                "SELECT event_payload FROM (SELECT event_payload, sequence FROM agent_run_events "
+                "WHERE run_id = ? ORDER BY sequence DESC LIMIT ?) AS event_tail ORDER BY sequence",
+                (run_id, limit),
             ).fetchall()
         return [_json_load(row["event_payload"]) for row in rows]
+
+    def iter_events(self, run_id: str, *, through_sequence: int, after_sequence: int = 0):
+        """Stream a bounded read cursor for compact event-prefix reconstruction."""
+        with closing(connect(self.db_path)) as conn:
+            cursor = conn.execute(
+                "SELECT event_payload FROM agent_run_events WHERE run_id = ? AND sequence > ? AND sequence <= ? ORDER BY sequence",
+                (run_id, after_sequence, through_sequence),
+            )
+            try:
+                while rows := cursor.fetchmany(256):
+                    for row in rows:
+                        yield _json_load(row["event_payload"])
+            finally:
+                cursor.close()
+
+    def latest_event_sequence(self, run_id: str) -> int:
+        with closing(connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(sequence), 0) AS sequence FROM agent_run_events WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        return int(row["sequence"])
+
+    def latest_event(self, run_id: str, event_type: str) -> dict[str, Any] | None:
+        with closing(connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT event_payload FROM agent_run_events WHERE run_id = ? "
+                "AND json_extract(event_payload, '$.type') = ? ORDER BY sequence DESC LIMIT 1",
+                (run_id, event_type),
+            ).fetchone()
+        return _json_load(row["event_payload"]) if row is not None else None
 
     @staticmethod
     def _event_for_storage(event: dict[str, Any]) -> dict[str, Any]:
@@ -888,21 +1312,43 @@ class SqliteAgentRunStore:
         """List actionable manual reviews in global creation order.
 
         Terminal runs are ignored so abandoned confirmation requests cannot
-        block the queue. Run status is stored beside the payload for this join.
+        block the queue. Probe the indexed run status first so an empty queue
+        never scans the safety-review payload table. The second query still
+        checks run status authoritatively in case it changed between reads.
         """
         with connect(self.db_path) as conn:
-            rows = conn.execute(
-                """
-                SELECT review.review_payload
-                FROM agent_safety_reviews AS review
-                JOIN agent_runs AS run ON run.run_id = review.run_id
-                WHERE review.status = 'pending'
-                  AND json_extract(review.review_payload, '$.mode') = 'manual'
-                  AND run.status = 'waiting_confirmation'
-                ORDER BY review.created_at, review.review_id
-                """
+            run_rows = conn.execute(
+                "SELECT run_id FROM agent_runs WHERE status = ?",
+                ("waiting_confirmation",),
             ).fetchall()
-        return [_json_load(row["review_payload"]) for row in rows]
+            run_ids = [row["run_id"] for row in run_rows]
+            if not run_ids:
+                return []
+
+            rows: list[Any] = []
+            # Bound placeholders for MySQL while retaining the complete queue.
+            for offset in range(0, len(run_ids), 500):
+                batch = run_ids[offset:offset + 500]
+                placeholders = ", ".join("?" for _ in batch)
+                rows.extend(conn.execute(
+                    f"""
+                    SELECT review.review_payload, review.created_at, review.review_id
+                    FROM agent_safety_reviews AS review
+                    JOIN agent_runs AS run ON run.run_id = review.run_id
+                    WHERE review.status = 'pending'
+                      AND run.status = 'waiting_confirmation'
+                      AND review.run_id IN ({placeholders})
+                    """,
+                    batch,
+                ).fetchall())
+
+        actionable = []
+        for row in rows:
+            payload = _json_load(row["review_payload"])
+            if isinstance(payload, dict) and payload.get("mode") == "manual":
+                actionable.append((str(row["created_at"]), row["review_id"], payload))
+        actionable.sort(key=lambda item: (item[0], item[1]))
+        return [payload for _, _, payload in actionable]
 
     def decide_pending_review(
         self,
@@ -960,13 +1406,18 @@ class SqliteAgentRunStore:
             return event_payload
 
         with connect(self.db_path) as conn:
-            conn.execute("BEGIN IMMEDIATE")
+            _begin_write(conn)
             current_row = conn.execute(
                 "SELECT review_payload, status FROM agent_safety_reviews WHERE review_id = ?",
                 (review_id,),
             ).fetchone()
             if current_row is None:
                 raise KeyError(f"Safety review not found: {review_id}")
+            current = _json_load(current_row["review_payload"])
+            # Publication order is admission -> run -> review. Re-read the
+            # review after the run lock because another decision may have won.
+            _lock_run_row(conn, current["run_id"])
+            current_row = lock_row(conn, "agent_safety_reviews", "review_id", review_id)
             current = _json_load(current_row["review_payload"])
             if current_row["status"] != "pending":
                 persisted_event = None
@@ -1106,7 +1557,7 @@ class SqliteAgentRunStore:
             ).fetchone()
             if kept is None:
                 return 0
-            conn.execute("BEGIN IMMEDIATE")
+            _begin_write(conn)
             status = conn.execute("SELECT status FROM agent_runs WHERE run_id=?", (run_id,)).fetchone()
             if status is None or status["status"] not in TERMINAL_RUN_STATUSES:
                 return 0
@@ -1192,7 +1643,7 @@ class SqliteAgentRunStore:
             missing = missing_parts(conn)
             if not missing:
                 return
-            conn.execute("BEGIN IMMEDIATE")
+            _begin_write(conn)
             # A concurrent terminal cleanup may have removed parts after our
             # preflight. Revalidate before committing parts and manifest together.
             missing = missing_parts(conn)
@@ -1343,7 +1794,11 @@ class SqliteAgentRunStore:
     def list_session_progress(self, session_id: str, *, limit: int = 48) -> list[dict[str, Any]]:
         """Private, bounded index lookup; callers must revalidate each owning run."""
         with connect(self.db_path) as conn:
-            conn.execute("BEGIN")
+            # MySQL reads run in autocommit so a bounded cache lookup cannot
+            # hold a read transaction while loading artifact payloads. SQLite
+            # keeps its existing two-query snapshot behavior.
+            if not is_mysql(conn):
+                conn.execute("BEGIN")
             rows = conn.execute(
                 "SELECT a.artifact_id FROM agent_run_artifacts a JOIN agent_runs r ON r.run_id=a.run_id "
                 "WHERE a.kind='session_progress' AND r.session_id=? "
@@ -1357,7 +1812,9 @@ class SqliteAgentRunStore:
                 "SELECT artifact_id,payload FROM agent_run_artifacts WHERE artifact_id IN ("
                 + ",".join("?" for _ in ids) + ")", ids,
             )}
-        return [_json_load(payloads[key]) for key in ids]
+        # Concurrent pruning may remove an index candidate between the ID and
+        # payload reads. This is only a cache index; stale candidates are inert.
+        return [_json_load(payloads[key]) for key in ids if key in payloads]
 
     def claim_tool_invocation(
         self,
@@ -1372,24 +1829,29 @@ class SqliteAgentRunStore:
 
         input_hash = sha256(_json_dump(tool_input).encode("utf-8")).hexdigest()
         def persist(conn):
-            conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute(
-                """
-                SELECT run_id, tool_name, input_hash, status, result_payload
-                FROM agent_tool_invocations WHERE invocation_id = ?
-                """,
-                (invocation_id,),
-            ).fetchone()
+            _begin_write(conn)
+            _lock_run_row(conn, run_id)
+            row = lock_row(conn, "agent_tool_invocations", "invocation_id", invocation_id)
             if row is None:
-                conn.execute(
-                    """
-                    INSERT INTO agent_tool_invocations(
-                        invocation_id, run_id, tool_name, input_hash, status, claimed_at, updated_at
-                    ) VALUES (?, ?, ?, ?, 'executing', ?, ?)
-                    """,
-                    (invocation_id, run_id, tool_name, input_hash, claimed_at, claimed_at),
-                )
-                return {"status": "claimed"}
+                try:
+                    conn.execute(
+                        """
+                        INSERT INTO agent_tool_invocations(
+                            invocation_id, run_id, tool_name, input_hash, status, claimed_at, updated_at
+                        ) VALUES (?, ?, ?, ?, 'executing', ?, ?)
+                        """,
+                        (invocation_id, run_id, tool_name, input_hash, claimed_at, claimed_at),
+                    )
+                    return {"status": "claimed"}
+                except MySQLIntegrityError:
+                    if not is_mysql(conn):
+                        raise
+                    # Another claimant inserted the PK after our absent-row
+                    # read. The duplicate statement is rolled back by InnoDB;
+                    # re-read the winner and treat its in-flight effect as unknown.
+                    row = lock_row(conn, "agent_tool_invocations", "invocation_id", invocation_id)
+                    if row is None:
+                        raise
             if row["run_id"] != run_id or row["tool_name"] != tool_name or row["input_hash"] != input_hash:
                 return {"status": "conflict"}
             if row["status"] == "completed" and row["result_payload"] is not None:
@@ -1406,7 +1868,14 @@ class SqliteAgentRunStore:
     ) -> None:
         serialized = _json_dump(result)
         def persist(conn):
-            conn.execute("BEGIN IMMEDIATE")
+            _begin_write(conn)
+            # The result may only acknowledge an effect for the same durable
+            # run; the invocation row is the final lock in the fixed order.
+            invocation = conn.execute("SELECT run_id FROM agent_tool_invocations WHERE invocation_id=?",
+                                      (invocation_id,)).fetchone()
+            if invocation is not None:
+                _lock_run_row(conn, invocation["run_id"])
+            lock_row(conn, "agent_tool_invocations", "invocation_id", invocation_id)
             updated = conn.execute(
                 """
                 UPDATE agent_tool_invocations

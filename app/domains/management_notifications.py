@@ -88,6 +88,27 @@ class ManagementNotificationService:
             row = conn.execute("SELECT record_payload FROM agent_runs WHERE run_id=?", (run_id,)).fetchone()
             return self.projection(conn, json.loads(row[0])) if row else None
 
+    def __call__(self, run_id):
+        """Retain the legacy callable ``provider(run_id)`` integration contract."""
+        return self.for_run(run_id)
+
+    def for_run_record(self, record):
+        """Project only candidate management runs from a trusted run record.
+
+        Ordinary foreground answers can be ruled out from durable run metadata,
+        avoiding a second run-record lookup and management-table reads. Candidate
+        publication re-reads the durable run payload and current proposal state.
+        """
+        metadata = record.get("metadata", {}) if isinstance(record, dict) else {}
+        envelope = metadata.get("input_envelope", {})
+        if (not metadata.get("manager_execution_id") or record.get("parent_run_id")
+                or envelope.get("origin") != "background"):
+            return None
+        # The run manager record is only a negative applicability hint. For a
+        # candidate, re-read the durable run payload before projecting; manager
+        # records may be stale across provider/model/commit boundaries.
+        return self.for_run(record["run_id"])
+
     def decide_notification(self, context, *, command_id, notify_user, reason):
         if not context.safety_review_approved:
             raise ValueError("Notification decisions require the tool safety review gate")

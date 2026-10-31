@@ -617,6 +617,21 @@ class MailExpertExecutor:
         # there is no selected tokenizer here. Actual provider usage is charged
         # after every attempt, including the incomplete attempt.
         input_estimate = len((system + user).encode("utf-8")) + 128
+        context_capacity = None
+        if isinstance(self.llm_service, LLMService):
+            identity = self.llm_service._resolve_request_identity(LLMRequest(
+                client_name=client, model=model, messages=[], prompt_summary="mail expert budget",
+            ))
+            resolved = self.llm_service.config.resolve_model_config(*identity)
+            context_capacity = resolved.context_window_tokens if resolved is not None else None
+            # Use at least the shared service's own admission count, including
+            # tokenizer padding, or the remaining-output cap can make a request
+            # falsely exceed the same cumulative budget at the next boundary.
+            input_estimate = max(input_estimate, await asyncio.to_thread(self.llm_service._count_request, LLMRequest(
+                client_name=identity[0], model=identity[1],
+                messages=[LLMMessage(role="system", content=system), LLMMessage(role="user", content=user)],
+                prompt_summary="mail expert budget",
+            ), getattr(resolved, "tokenizer_json_path", None)))
         thinking_enabled = None
         snapshot_level = getattr(snapshot, "inference_reasoning_level", None)
         legacy_effort = getattr(snapshot, "inference_reasoning_effort", None)
@@ -646,9 +661,26 @@ class MailExpertExecutor:
         for attempt in range(2):
             if snapshot.budget.max_llm_calls is not None and usage.llm_calls >= snapshot.budget.max_llm_calls:
                 raise RuntimeError("Mail expert LLM-call budget exhausted.")
-            estimate = input_estimate + max_output_tokens
-            if snapshot.budget.max_tokens is not None and usage.estimated_tokens + estimate > snapshot.budget.max_tokens:
-                raise RuntimeError("Mail expert token budget exhausted.")
+            # Historical stage sizes are accounting estimates, not generation
+            # caps: hidden reasoning can consume them before any JSON is emitted.
+            # Only the explicitly frozen cumulative task budget limits output.
+            output_limit = None
+            reserve = max(8192, max_output_tokens)
+            if snapshot.budget.max_tokens is not None:
+                output_limit = snapshot.budget.max_tokens - usage.estimated_tokens - input_estimate
+                if output_limit <= 0:
+                    raise RuntimeError("Mail expert token budget exhausted.")
+                reserve = min(reserve, output_limit)
+            # Missing provider usage cannot leave an uncharged portion of an
+            # explicitly bounded request available to a later call.
+            estimate = input_estimate + (output_limit if output_limit is not None else reserve)
+            if (context_capacity is not None and snapshot.budget.max_tokens is not None
+                    and snapshot.budget.max_tokens - usage.estimated_tokens >= context_capacity):
+                # A multi-call budget larger than a model's entire context is
+                # not a valid single-call max_tokens value. The model's natural
+                # capacity already bounds this call within the task allowance.
+                output_limit = None
+                estimate = context_capacity
             self._check_active(snapshot.child_run_id)
             usage.llm_calls += 1
             started = time.monotonic()
@@ -657,7 +689,7 @@ class MailExpertExecutor:
                 response_mode=LLMResponseMode.JSON if json_mode else LLMResponseMode.TEXT,
                 messages=[LLMMessage(role="system", content=system), LLMMessage(role="user", content=user)],
                 prompt_summary=f"mail_expert_{stage}", require_json=json_mode,
-                max_output_tokens=max_output_tokens, thinking_enabled=thinking_enabled,
+                max_output_tokens=output_limit, thinking_enabled=thinking_enabled,
                 reasoning_level=reasoning_level, reasoning_effort=reasoning_effort,
                 metadata={"run_id": snapshot.child_run_id, "stage": stage,
                           "reasoning_policy": reasoning_policy,
@@ -694,7 +726,8 @@ class MailExpertExecutor:
             max_output_tokens = max(512, max_output_tokens * 2)
             self._event(snapshot.child_run_id, "generation_recovery", {
                 "stage": stage, "thinking_disabled": thinking_enabled is False,
-                "max_output_tokens": max_output_tokens,
+                "output_reserve_tokens": max_output_tokens,
+                "generation_limit": "remaining_task_budget_only",
             })
         raise RuntimeError(f"Mail expert LLM stage {stage} remained incomplete after bounded recovery.")
 

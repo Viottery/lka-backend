@@ -13,6 +13,7 @@ import math
 import random
 import sqlite3
 import threading
+import time
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -28,7 +29,13 @@ from app.core.llm.errors import (
     LLMTimeoutError,
 )
 from app.core.llm_workloads import BackgroundBudgetDeferred, BackgroundTaskBudgetExceeded
-from app.storage.sqlite_timing import connect_sqlite
+from app.storage.connections import connect_database, is_mysql
+from app.storage.sqlite_retry import begin_sqlite_write
+from app.storage.sqlite_write_queue import (
+    SqliteTransactionTimeoutError,
+    SqliteWriteAdmissionError,
+    SqliteWriteQueueError,
+)
 
 STATUSES = ("queued", "running", "retry_wait", "succeeded", "failed", "cancelled")
 _logger = logging.getLogger(__name__)
@@ -38,6 +45,28 @@ _ID_KEYS = frozenset({
     "id", "*_id", "*_ids", "revision", "*_revision", "*_epoch", "*_seq", "*_version", "limit", "offset",
     "mode", "*_mode", "force", "include_*", "*_count",
 })
+
+
+def _begin_write(conn):
+    if is_mysql(conn):
+        conn.execute("BEGIN")
+    else:
+        begin_sqlite_write(conn)
+
+
+def _execute_mysql(conn, sql: str, params=()):
+    return conn.execute_native(sql, tuple(params))
+
+
+def _insert_ignore(conn, table: str, columns: tuple[str, ...], values: tuple[Any, ...], key_column: str):
+    if is_mysql(conn):
+        names = ",".join(columns)
+        markers = ",".join("%s" for _ in columns)
+        _execute_mysql(conn, f"INSERT INTO {table}({names}) VALUES({markers}) "
+                       f"ON DUPLICATE KEY UPDATE {key_column}=VALUES({key_column})", values)
+    else:
+        markers = ",".join("?" for _ in columns)
+        conn.execute(f"INSERT OR IGNORE INTO {table}({','.join(columns)}) VALUES({markers})", values)
 
 
 def _utc(value: datetime | str | None, *, default: datetime | None = None) -> datetime | None:
@@ -97,20 +126,45 @@ class BackgroundJobStore:
         self.db_path = str(db_path)
         self.max_pending_jobs = max(1, max_pending_jobs)
         self._notify_lock = threading.Lock()
-        self._notifiers: set[Callable[[], None]] = set()
+        self._notifiers: dict[Callable[[], None], frozenset[str] | None] = {}
+        self._maintenance_lock = threading.Lock()
+        self._next_deadline_sweep = 0.0
+        self._next_deadline_sweeps: dict[tuple[str, ...], float] = {}
 
-    def add_notifier(self, callback: Callable[[], None]) -> None:
+    @staticmethod
+    def _lock_scope(conn, kind: str, scope_id: str):
+        if not is_mysql(conn):
+            return
+        _execute_mysql(conn, "SELECT kind,scope_id FROM background_job_scopes "
+                       "WHERE kind=%s AND scope_id=%s FOR UPDATE", (kind, scope_id)).fetchone()
+
+    @staticmethod
+    def _ensure_scope(conn, kind: str, scope_id: str):
+        if is_mysql(conn):
+            _execute_mysql(conn, "INSERT INTO background_job_scopes(kind,scope_id) VALUES(%s,%s) "
+                           "ON DUPLICATE KEY UPDATE scope_id=VALUES(scope_id)", (kind, scope_id))
+        else:
+            conn.execute("INSERT OR IGNORE INTO background_job_scopes(kind,scope_id) VALUES(?,?)",
+                         (kind, scope_id))
+        BackgroundJobStore._lock_scope(conn, kind, scope_id)
+
+    def add_notifier(self, callback: Callable[[], None], *, kinds: tuple[str, ...] | None = None) -> None:
+        """Register a wake callback; ``None`` kinds subscribes to all changes."""
+        scope = None if kinds is None else frozenset(kinds)
         with self._notify_lock:
-            self._notifiers.add(callback)
+            self._notifiers[callback] = scope
 
     def remove_notifier(self, callback: Callable[[], None]) -> None:
         with self._notify_lock:
-            self._notifiers.discard(callback)
+            self._notifiers.pop(callback, None)
 
-    def notify_committed(self) -> None:
+    def notify_committed(self, *, kinds: tuple[str, ...] | None = None) -> None:
         """Wake registered workers after a caller-owned transaction commits."""
         with self._notify_lock:
-            callbacks = tuple(self._notifiers)
+            callbacks = tuple(
+                callback for callback, subscribed in self._notifiers.items()
+                if kinds is None or subscribed is None or not subscribed.isdisjoint(kinds)
+            )
         for callback in callbacks:
             try:
                 callback()
@@ -148,37 +202,207 @@ class BackgroundJobStore:
                 "AND active.scope_id=w.scope_id AND active.status='running')" +
                 (" AND w.kind IN (" + ",".join("?" for _ in kinds) + ")" if kinds is not None else "") +
                 " UNION ALL SELECT deadline AS due FROM background_pending_watermarks WHERE deadline IS NOT NULL" +
-                (" AND kind IN (" + ",".join("?" for _ in kinds) + ")" if kinds is not None else "") + ")",
+                (" AND kind IN (" + ",".join("?" for _ in kinds) + ")" if kinds is not None else "") +
+                " UNION ALL SELECT p.created_at AS due FROM background_pending_inputs p WHERE "
+                "(SELECT count(*) FROM background_jobs WHERE status IN ('queued','running','retry_wait'))<? "
+                "AND NOT EXISTS (SELECT 1 FROM background_jobs active WHERE active.kind=p.kind "
+                "AND active.scope_id=p.scope_id AND active.status='running')" +
+                (" AND p.kind IN (" + ",".join("?" for _ in kinds) + ")" if kinds is not None else "") + ")",
                 [stamp, *params, stamp, *params, stamp, stamp, *params, *params,
-                 self.max_pending_jobs, *params, *params],
+                 self.max_pending_jobs, *params, *params, self.max_pending_jobs, *params],
             ).fetchone()
         return _utc(row[0]) if row and row[0] else None
 
-    def has_ready(self, *, kinds: tuple[str, ...] | None = None) -> bool:
+    @staticmethod
+    def _exact_job_filter(job_ids: tuple[str, ...] | None, column: str = "j.job_id") -> tuple[str, tuple[str, ...]]:
+        if job_ids is None:
+            return "", ()
+        if not isinstance(job_ids, tuple) or len(job_ids) > 128 or any(
+            not isinstance(value, str) or not value or len(value) > 256 for value in job_ids
+        ):
+            raise ValueError("job_ids must be a tuple of at most 128 bounded IDs")
+        if not job_ids:
+            return " AND 1=0", ()
+        return " AND " + column + " IN (" + ",".join("?" for _ in job_ids) + ")", job_ids
+
+    @staticmethod
+    def _deadline_scope(kinds: tuple[str, ...] | None) -> tuple[str, ...] | None:
+        return None if kinds is None else tuple(sorted(set(kinds)))
+
+    def _deadline_sweep_due(self, kinds: tuple[str, ...] | None = None) -> bool:
+        scope = self._deadline_scope(kinds)
+        with self._maintenance_lock:
+            due_at = self._next_deadline_sweep if scope is None else self._next_deadline_sweeps.get(scope, 0.0)
+            return time.monotonic() >= due_at
+
+    def _mark_deadline_sweep(self, kinds: tuple[str, ...] | None = None) -> None:
+        scope = self._deadline_scope(kinds)
+        with self._maintenance_lock:
+            due_at = time.monotonic() + 30
+            if scope is None:
+                self._next_deadline_sweep = due_at
+            else:
+                if len(self._next_deadline_sweeps) >= 128 and scope not in self._next_deadline_sweeps:
+                    self._next_deadline_sweeps.clear()
+                self._next_deadline_sweeps[scope] = due_at
+
+    def _has_expired_deadline(self, kinds: tuple[str, ...] | None,
+                              job_ids: tuple[str, ...] | None) -> bool:
+        kind_filter = " AND kind IN (" + ",".join("?" for _ in kinds) + ")" if kinds else ""
+        id_filter, id_params = self._exact_job_filter(job_ids, "job_id")
+        with self._connect() as conn:
+            expired_job = conn.execute(
+                "SELECT 1 FROM background_jobs WHERE status IN ('queued','running','retry_wait') "
+                "AND deadline IS NOT NULL AND deadline<=?" + kind_filter + id_filter + " LIMIT 1",
+                (_stamp(datetime.now(UTC)), *(kinds or ()), *id_params),
+            ).fetchone() is not None
+            if expired_job:
+                return True
+            if job_ids is not None:
+                return False
+            pending_kind_filter = " AND kind IN (" + ",".join("?" for _ in kinds) + ")" if kinds else ""
+            return conn.execute(
+                "SELECT 1 FROM background_pending_watermarks WHERE deadline IS NOT NULL AND deadline<=?" +
+                pending_kind_filter + " LIMIT 1",
+                (_stamp(datetime.now(UTC)), *(kinds or ())),
+            ).fetchone() is not None
+
+    def _expire_deadlines(self, conn, stamp: str, *, kinds: tuple[str, ...] | None,
+                          job_ids: tuple[str, ...] | None = None) -> int:
+        """Fail a bounded batch of expired jobs and discard expired pending watermarks."""
+        kind_filter = " AND kind IN (" + ",".join("?" for _ in kinds) + ")" if kinds else ""
+        if is_mysql(conn):
+            kind_sql = " AND kind IN (" + ",".join("%s" for _ in kinds) + ")" if kinds else ""
+            id_sql = " AND job_id IN (" + ",".join("%s" for _ in job_ids) + ")" if job_ids else ""
+            changed = 0
+            if job_ids is None:
+                pending_candidates = _execute_mysql(
+                    conn,
+                    "SELECT kind,scope_id FROM background_pending_watermarks WHERE deadline IS NOT NULL "
+                    "AND deadline<=%s" + kind_sql +
+                    " ORDER BY deadline,kind,scope_id LIMIT 32",
+                    (stamp, *(kinds or ())),
+                ).fetchall()
+                for candidate in pending_candidates:
+                    guard = _execute_mysql(
+                        conn,
+                        "SELECT kind,scope_id FROM background_job_scopes WHERE kind=%s AND scope_id=%s "
+                        "FOR UPDATE SKIP LOCKED",
+                        (candidate["kind"], candidate["scope_id"]),
+                    ).fetchone()
+                    if guard is None:
+                        continue
+                    pending = _execute_mysql(
+                        conn,
+                        "SELECT 1 FROM background_pending_watermarks WHERE kind=%s AND scope_id=%s "
+                        "AND deadline IS NOT NULL AND deadline<=%s FOR UPDATE",
+                        (candidate["kind"], candidate["scope_id"], stamp),
+                    ).fetchone()
+                    if pending is not None:
+                        changed += _execute_mysql(
+                            conn,
+                            "DELETE FROM background_pending_watermarks WHERE kind=%s AND scope_id=%s "
+                            "AND deadline IS NOT NULL AND deadline<=%s",
+                            (candidate["kind"], candidate["scope_id"], stamp),
+                        ).rowcount
+            expired = _execute_mysql(
+                conn,
+                "SELECT job_id FROM background_jobs WHERE status IN ('queued','retry_wait','running') "
+                "AND deadline IS NOT NULL AND deadline<=%s" + kind_sql + id_sql +
+                " ORDER BY deadline,job_id LIMIT 32 FOR UPDATE SKIP LOCKED",
+                (stamp, *(kinds or ()), *(job_ids or ())),
+            ).fetchall()
+            for item in expired:
+                changed += _execute_mysql(
+                    conn,
+                    "UPDATE background_jobs SET status='failed',error_class='deadline_exceeded',finished_at=%s,"
+                    "updated_at=%s,lease_owner=NULL,lease_expires_at=NULL WHERE job_id=%s "
+                    "AND status IN ('queued','retry_wait','running') AND deadline<=%s",
+                    (stamp, stamp, item["job_id"], stamp),
+                ).rowcount
+            return changed
+
+        changed = 0
+        if job_ids is None:
+            pending_kind_filter = " AND kind IN (" + ",".join("?" for _ in kinds) + ")" if kinds else ""
+            pending = conn.execute(
+                "SELECT kind,scope_id FROM background_pending_watermarks WHERE deadline IS NOT NULL "
+                "AND deadline<=?" + pending_kind_filter + " ORDER BY deadline,kind,scope_id LIMIT 32",
+                (stamp, *(kinds or ())),
+            ).fetchall()
+            for item in pending:
+                changed += conn.execute(
+                    "DELETE FROM background_pending_watermarks WHERE kind=? AND scope_id=? "
+                    "AND deadline IS NOT NULL AND deadline<=?",
+                    (item["kind"], item["scope_id"], stamp),
+                ).rowcount
+        expired = conn.execute(
+            "SELECT job_id FROM background_jobs WHERE status IN ('queued','retry_wait','running') "
+            "AND deadline IS NOT NULL AND deadline<=?" + kind_filter +
+            self._exact_job_filter(job_ids, "job_id")[0] +
+            " ORDER BY deadline,job_id LIMIT 32",
+            (stamp, *(kinds or ()), *self._exact_job_filter(job_ids, "job_id")[1]),
+        ).fetchall()
+        for item in expired:
+            changed += conn.execute(
+                "UPDATE background_jobs SET status='failed',error_class='deadline_exceeded',finished_at=?,"
+                "updated_at=?,lease_owner=NULL,lease_expires_at=NULL WHERE job_id=? "
+                "AND status IN ('queued','retry_wait','running') AND deadline<=?",
+                (stamp, stamp, item["job_id"], stamp),
+            ).rowcount
+        return changed
+
+    def maintain_expired(self, *, kinds: tuple[str, ...] = ("agent_dispatch",)) -> int:
+        """Rate-limited bounded deadline cleanup without claiming or materializing work."""
+        if not isinstance(kinds, tuple) or len(kinds) > 128 or any(
+            not isinstance(kind, str) or not kind or len(kind) > 256 for kind in kinds
+        ):
+            raise ValueError("kinds must contain bounded job kind names")
+        if not kinds or not self._deadline_sweep_due(kinds):
+            return 0
+        stamp = _stamp(datetime.now(UTC))
+        if not self._has_expired_deadline(kinds, None):
+            self._mark_deadline_sweep(kinds)
+            return 0
+        with self._connect() as conn:
+            _begin_write(conn)
+            changed = self._expire_deadlines(conn, stamp, kinds=kinds)
+            conn.commit()
+        self._mark_deadline_sweep(kinds)
+        return changed
+
+    def has_ready(self, *, kinds: tuple[str, ...] | None = None,
+                  job_ids: tuple[str, ...] | None = None) -> bool:
         kind_filter = ""
         now = _stamp(datetime.now(UTC))
-        params: list[Any] = [now, now, now]
+        params: list[Any] = [now, now, now, now]
         if kinds is not None:
             if not kinds:
                 return False
             kind_filter = " AND j.kind IN (" + ",".join("?" for _ in kinds) + ")"
             params.extend(kinds)
+        exact_filter, exact_params = self._exact_job_filter(job_ids)
+        params.extend(exact_params)
         with self._connect() as conn:
             ready = conn.execute(
-                "SELECT 1 FROM background_jobs j WHERE ((j.status IN ('queued','retry_wait') AND j.available_at<=?) "
-                "OR (j.status='running' AND j.lease_expires_at<=?)) "
+                "SELECT 1 FROM background_jobs j WHERE (((j.status IN ('queued','retry_wait') AND j.available_at<=?) "
+                "OR (j.status='running' AND j.lease_expires_at<=?)) AND (j.deadline IS NULL OR j.deadline>?)) "
                 "AND NOT EXISTS ("
                 "SELECT 1 FROM background_jobs active WHERE active.kind=j.kind AND active.scope_id=j.scope_id "
                 "AND active.job_id!=j.job_id AND active.status='running' AND active.lease_expires_at>?)" +
-                kind_filter + " LIMIT 1", params,
+                kind_filter + exact_filter + " LIMIT 1", params,
             ).fetchone() is not None
             if ready:
                 return True
+            if job_ids is not None:
+                return False
             # Claim performs terminal cleanup for expired deadlines even when
             # normal availability or a same-scope lease blocks execution.
-            if conn.execute(
+            if self._deadline_sweep_due(kinds) and conn.execute(
                 "SELECT 1 FROM background_jobs WHERE status IN ('queued','running','retry_wait') "
-                "AND deadline IS NOT NULL AND deadline<=? LIMIT 1", (now,),
+                "AND deadline IS NOT NULL AND deadline<=?" +
+                (" AND kind IN (" + ",".join("?" for _ in kinds) + ")" if kinds is not None else "") +
+                " LIMIT 1", (now, *(kinds or ())),
             ).fetchone() is not None:
                 return True
             # Backpressured watermarks are durable work too. Once capacity is
@@ -192,16 +416,29 @@ class BackgroundJobStore:
                 "AND active.scope_id=w.scope_id AND active.status='running')) "
                 "OR (w.deadline IS NOT NULL AND w.deadline<=?)) LIMIT 1",
                 [now, now, *(kinds or ()), self.max_pending_jobs, now],
+            ).fetchone() is not None or conn.execute(
+                "SELECT 1 FROM background_pending_inputs p WHERE "
+                "(SELECT count(*) FROM background_jobs WHERE status IN ('queued','running','retry_wait'))<? "
+                "AND NOT EXISTS (SELECT 1 FROM background_jobs active WHERE active.kind=p.kind "
+                "AND active.scope_id=p.scope_id AND active.status='running')" +
+                (" AND p.kind IN (" + ",".join("?" for _ in kinds) + ")" if kinds is not None else "") +
+                " LIMIT 1", (self.max_pending_jobs, *(kinds or ())),
             ).fetchone() is not None
 
     def _connect(self) -> sqlite3.Connection:
-        conn = connect_sqlite(self.db_path, timeout=10, isolation_level=None)
+        conn = connect_database(self.db_path, timeout=10.0)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA busy_timeout=10000")
         return conn
 
     def ensure_schema(self) -> None:
         with self._connect() as conn:
+            if is_mysql(conn):
+                # Core queue and guard tables are installed by the MySQL schema registry.
+                # Idempotently backfill scope anchors for rows predating the guard.
+                _execute_mysql(conn, "INSERT INTO background_job_scopes(kind,scope_id) "
+                               "SELECT DISTINCT kind,scope_id FROM background_jobs "
+                               "ON DUPLICATE KEY UPDATE scope_id=VALUES(scope_id)")
+                return
             # journal_mode is persistent database state and changing it needs
             # an exclusive lock. Check it during schema setup only; doing the
             # assignment on every short-lived connection needlessly contends
@@ -236,6 +473,8 @@ class BackgroundJobStore:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_background_jobs_ready ON background_jobs(status, available_at, priority DESC, created_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_background_jobs_lease ON background_jobs(status, lease_expires_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_background_jobs_finished ON background_jobs(status,finished_at)")
+            conn.execute("CREATE TABLE IF NOT EXISTS background_job_scopes(kind TEXT NOT NULL,scope_id TEXT NOT NULL,PRIMARY KEY(kind,scope_id))")
+            conn.execute("INSERT OR IGNORE INTO background_job_scopes(kind,scope_id) SELECT DISTINCT kind,scope_id FROM background_jobs")
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(background_jobs)")}
             if "lease_recovery_count" not in columns:
                 conn.execute(
@@ -268,14 +507,15 @@ class BackgroundJobStore:
             return {row[0] for row in conn.execute("SELECT input_id FROM background_input_progress WHERE job_id=?", (job_id,))}
 
     def complete_input(self, job_id: str, owner: str, epoch: int, input_id: str) -> bool:
-        now = _stamp(datetime.now(UTC))
         with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
+            _begin_write(conn)
+            now = _stamp(datetime.now(UTC))
             valid = conn.execute("SELECT 1 FROM background_jobs WHERE job_id=? AND lease_owner=? AND lease_epoch=? "
                                  "AND status='running' AND lease_expires_at>? AND (deadline IS NULL OR deadline>?)",
                                  (job_id, owner, epoch, now, now)).fetchone()
             if valid is not None:
-                conn.execute("INSERT OR IGNORE INTO background_input_progress VALUES(?,?,?)", (job_id, input_id, now))
+                _insert_ignore(conn, "background_input_progress", ("job_id", "input_id", "completed_at"),
+                               (job_id, input_id, now), "input_id")
             conn.commit()
             return valid is not None
 
@@ -285,6 +525,16 @@ class BackgroundJobStore:
             raise ValueError("invalid history compaction bounds")
         before = _stamp(datetime.now(UTC) - timedelta(days=retention_days))
         with self._connect() as conn:
+            if is_mysql(conn):
+                # Single-table UPDATE supports an ordered, bounded batch. MySQL
+                # rejects LIMIT inside IN and self-selecting UPDATE subqueries.
+                cursor = conn.execute_native(
+                    "UPDATE background_jobs SET payload_json='{}' "
+                    "WHERE status IN ('succeeded','failed','cancelled') "
+                    "AND finished_at<%s AND payload_json!='{}' ORDER BY finished_at,job_id LIMIT %s",
+                    (before, limit),
+                )
+                return cursor.rowcount
             cursor = conn.execute("UPDATE background_jobs SET payload_json='{}' WHERE job_id IN "
                                   "(SELECT job_id FROM background_jobs WHERE status IN ('succeeded','failed','cancelled') "
                                   "AND finished_at<? AND payload_json!='{}' ORDER BY finished_at LIMIT ?)", (before, limit))
@@ -307,6 +557,7 @@ class BackgroundJobStore:
     def _enqueue_grouped(self, kind: str, scope_id: str, input_id: str, *, conn: sqlite3.Connection,
                          debounce_seconds: float = 0, limit: int = 8) -> dict[str, Any]:
         """Coalesce a burst of source IDs without losing per-input idempotency."""
+        self._ensure_scope(conn, kind, scope_id)
         existing = conn.execute(
             "SELECT job_id FROM background_job_inputs WHERE kind=? AND scope_id=? AND input_id=?",
             (kind, scope_id, input_id),
@@ -331,8 +582,8 @@ class BackgroundJobStore:
         if row is None:
             count = conn.execute("SELECT COUNT(*) FROM background_jobs WHERE status IN ('queued','running','retry_wait')").fetchone()[0]
             if count >= self.max_pending_jobs:
-                conn.execute("INSERT OR IGNORE INTO background_pending_inputs VALUES(?,?,?,?)",
-                             (kind, scope_id, input_id, _stamp(datetime.now(UTC))))
+                _insert_ignore(conn, "background_pending_inputs", ("kind", "scope_id", "input_id", "created_at"),
+                               (kind, scope_id, input_id, _stamp(datetime.now(UTC))), "input_id")
                 return {"job_id": None, "status": "backpressured"}
             result = self.enqueue(kind, scope_id, input_id, {"message_ids": [input_id]},
                                   available_at=datetime.now(UTC) + timedelta(seconds=debounce_seconds),
@@ -340,7 +591,8 @@ class BackgroundJobStore:
             job_id = result["job_id"]
         else:
             job_id = row["job_id"]
-        conn.execute("INSERT OR IGNORE INTO background_job_inputs VALUES(?,?,?,?)", (kind,scope_id,input_id,job_id))
+        _insert_ignore(conn, "background_job_inputs", ("kind", "scope_id", "input_id", "job_id"),
+                       (kind, scope_id, input_id, job_id), "input_id")
         return self._public(conn.execute("SELECT * FROM background_jobs WHERE job_id=?", (job_id,)).fetchone())
 
     def enqueue_latest_watermark(
@@ -375,6 +627,7 @@ class BackgroundJobStore:
         old_factory = conn.row_factory
         conn.row_factory = sqlite3.Row
         try:
+            self._ensure_scope(conn, kind, scope_id)
             now = _stamp(datetime.now(UTC))
             head = conn.execute(
                 "SELECT watermark_order FROM background_watermark_heads WHERE kind=? AND scope_id=?",
@@ -399,26 +652,41 @@ class BackgroundJobStore:
                     return self._public(current, include_payload=True) or {
                         "job_id": None, "status": "stale_watermark_ignored",
                     }
+                values = (kind, scope_id, watermark_order, watermark_id, now)
+                if is_mysql(conn):
+                    _execute_mysql(conn, "INSERT INTO background_watermark_heads "
+                        "(kind,scope_id,watermark_order,watermark_id,updated_at) VALUES(%s,%s,%s,%s,%s) "
+                        "ON DUPLICATE KEY UPDATE watermark_order=VALUES(watermark_order),"
+                        "watermark_id=VALUES(watermark_id),updated_at=VALUES(updated_at)", values)
+                else:
+                    conn.execute(
+                        """INSERT INTO background_watermark_heads
+                           (kind,scope_id,watermark_order,watermark_id,updated_at) VALUES(?,?,?,?,?)
+                           ON CONFLICT(kind,scope_id) DO UPDATE SET watermark_order=excluded.watermark_order,
+                           watermark_id=excluded.watermark_id,updated_at=excluded.updated_at
+                           WHERE excluded.watermark_order>=background_watermark_heads.watermark_order""", values,
+                    )
+            watermark_values = (kind, scope_id, watermark_id, encoded, priority, available,
+                                max_attempts, _stamp(end) if end else None, watermark_order, now)
+            if is_mysql(conn):
+                _execute_mysql(conn, "INSERT INTO background_pending_watermarks "
+                    "(kind,scope_id,watermark_id,payload_json,priority,available_at,max_attempts,deadline,watermark_order,updated_at) "
+                    "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON DUPLICATE KEY UPDATE "
+                    "watermark_id=VALUES(watermark_id),payload_json=VALUES(payload_json),priority=VALUES(priority),"
+                    "available_at=VALUES(available_at),max_attempts=VALUES(max_attempts),deadline=VALUES(deadline),"
+                    "watermark_order=VALUES(watermark_order),updated_at=VALUES(updated_at)", watermark_values)
+                self._materialize_latest_watermarks_mysql(conn, limit=8, locked_scope=(kind, scope_id))
+            else:
                 conn.execute(
-                    """INSERT INTO background_watermark_heads
-                       (kind,scope_id,watermark_order,watermark_id,updated_at) VALUES(?,?,?,?,?)
-                       ON CONFLICT(kind,scope_id) DO UPDATE SET watermark_order=excluded.watermark_order,
-                       watermark_id=excluded.watermark_id,updated_at=excluded.updated_at
-                       WHERE excluded.watermark_order>=background_watermark_heads.watermark_order""",
-                    (kind, scope_id, watermark_order, watermark_id, now),
+                    """INSERT INTO background_pending_watermarks
+                       (kind,scope_id,watermark_id,payload_json,priority,available_at,max_attempts,deadline,watermark_order,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(kind,scope_id) DO UPDATE SET
+                       watermark_id=excluded.watermark_id,payload_json=excluded.payload_json,
+                       priority=excluded.priority,available_at=excluded.available_at,
+                       max_attempts=excluded.max_attempts,deadline=excluded.deadline,
+                       watermark_order=excluded.watermark_order,updated_at=excluded.updated_at""", watermark_values,
                 )
-            conn.execute(
-                """INSERT INTO background_pending_watermarks
-                   (kind,scope_id,watermark_id,payload_json,priority,available_at,max_attempts,deadline,watermark_order,updated_at)
-                   VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(kind,scope_id) DO UPDATE SET
-                   watermark_id=excluded.watermark_id,payload_json=excluded.payload_json,
-                   priority=excluded.priority,available_at=excluded.available_at,
-                   max_attempts=excluded.max_attempts,deadline=excluded.deadline,
-                   watermark_order=excluded.watermark_order,updated_at=excluded.updated_at""",
-                (kind, scope_id, watermark_id, encoded, priority, available, max_attempts,
-                 _stamp(end) if end else None, watermark_order, now),
-            )
-            self._materialize_latest_watermarks(conn, limit=8)
+                self._materialize_latest_watermarks(conn, limit=8)
             row = conn.execute(
                 "SELECT * FROM background_jobs WHERE kind=? AND scope_id=? "
                 "AND status IN ('queued','retry_wait','running') ORDER BY created_at DESC LIMIT 1",
@@ -435,56 +703,142 @@ class BackgroundJobStore:
             conn.row_factory = old_factory
 
     def _materialize_latest_watermarks(self, conn: sqlite3.Connection, *, limit: int) -> None:
+        if is_mysql(conn):
+            self._materialize_latest_watermarks_mysql(conn, limit=limit)
+            return
         rows = conn.execute(
             "SELECT * FROM background_pending_watermarks ORDER BY updated_at LIMIT ?", (limit,)
         ).fetchall()
         for item in rows:
             if item["deadline"] is not None and item["deadline"] <= _stamp(datetime.now(UTC)):
-                conn.execute(
-                    "DELETE FROM background_pending_watermarks WHERE kind=? AND scope_id=?",
-                    (item["kind"], item["scope_id"]),
-                )
-                continue
-            mutable = conn.execute(
-                "SELECT * FROM background_jobs WHERE kind=? AND scope_id=? "
-                "AND status IN ('queued','retry_wait') ORDER BY created_at DESC LIMIT 1",
-                (item["kind"], item["scope_id"]),
-            ).fetchone()
-            now = _stamp(datetime.now(UTC))
-            if mutable is not None:
-                conn.execute(
-                    "UPDATE background_jobs SET payload_json=?,priority=?,updated_at=? WHERE job_id=?",
-                    (item["payload_json"], item["priority"], now, mutable["job_id"]),
-                )
                 conn.execute("DELETE FROM background_pending_watermarks WHERE kind=? AND scope_id=?",
                              (item["kind"], item["scope_id"]))
                 continue
-            running = conn.execute(
-                "SELECT 1 FROM background_jobs WHERE kind=? AND scope_id=? AND status='running' LIMIT 1",
-                (item["kind"], item["scope_id"]),
-            ).fetchone()
+            mutable = conn.execute("SELECT * FROM background_jobs WHERE kind=? AND scope_id=? "
+                                   "AND status IN ('queued','retry_wait') ORDER BY created_at DESC LIMIT 1",
+                                   (item["kind"], item["scope_id"])).fetchone()
+            now = _stamp(datetime.now(UTC))
+            if mutable is not None:
+                conn.execute("UPDATE background_jobs SET payload_json=?,priority=?,updated_at=? WHERE job_id=?",
+                             (item["payload_json"], item["priority"], now, mutable["job_id"]))
+                conn.execute("DELETE FROM background_pending_watermarks WHERE kind=? AND scope_id=?",
+                             (item["kind"], item["scope_id"]))
+                continue
+            running = conn.execute("SELECT 1 FROM background_jobs WHERE kind=? AND scope_id=? "
+                                   "AND status='running' LIMIT 1", (item["kind"], item["scope_id"])).fetchone()
             if running is not None:
                 continue
-            count = conn.execute(
-                "SELECT COUNT(*) FROM background_jobs WHERE status IN ('queued','running','retry_wait')"
-            ).fetchone()[0]
+            count = conn.execute("SELECT COUNT(*) FROM background_jobs "
+                                 "WHERE status IN ('queued','running','retry_wait')").fetchone()[0]
             if count >= self.max_pending_jobs:
                 continue
             key = f"watermark:{item['watermark_id']}"
-            created = self.enqueue(
-                item["kind"], item["scope_id"], key, json.loads(item["payload_json"]),
-                priority=item["priority"], available_at=item["available_at"],
-                max_attempts=item["max_attempts"], deadline=item["deadline"], conn=conn,
-            )
+            created = self.enqueue(item["kind"], item["scope_id"], key, json.loads(item["payload_json"]),
+                                   priority=item["priority"], available_at=item["available_at"],
+                                   max_attempts=item["max_attempts"], deadline=item["deadline"], conn=conn)
             if created["status"] in _TERMINAL:
-                self.enqueue(
-                    item["kind"], item["scope_id"], f"{key}:{uuid4().hex}",
-                    json.loads(item["payload_json"]), priority=item["priority"],
-                    available_at=item["available_at"], max_attempts=item["max_attempts"],
-                    deadline=item["deadline"], conn=conn,
-                )
+                self.enqueue(item["kind"], item["scope_id"], f"{key}:{uuid4().hex}",
+                             json.loads(item["payload_json"]), priority=item["priority"],
+                             available_at=item["available_at"], max_attempts=item["max_attempts"],
+                             deadline=item["deadline"], conn=conn)
             conn.execute("DELETE FROM background_pending_watermarks WHERE kind=? AND scope_id=?",
                          (item["kind"], item["scope_id"]))
+
+    def _materialize_latest_watermarks_mysql(self, conn, *, limit: int,
+                                             locked_scope: tuple[str, str] | None = None) -> None:
+        if locked_scope is None:
+            rows = conn.execute("SELECT * FROM background_pending_watermarks "
+                                "ORDER BY kind,scope_id LIMIT ?", (limit,)).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM background_pending_watermarks WHERE kind=? AND scope_id=?",
+                                locked_scope).fetchall()
+        rows = sorted(rows, key=lambda row: (row["kind"], row["scope_id"]))
+        for candidate in rows:
+            if locked_scope is None:
+                guard = _execute_mysql(conn,
+                    "SELECT kind,scope_id FROM background_job_scopes WHERE kind=%s AND scope_id=%s "
+                    "FOR UPDATE SKIP LOCKED", (candidate["kind"], candidate["scope_id"]),
+                ).fetchone()
+                if guard is None:
+                    continue
+            item = conn.execute("SELECT * FROM background_pending_watermarks WHERE kind=? AND scope_id=?",
+                                (candidate["kind"], candidate["scope_id"])).fetchone()
+            if item is None:
+                continue
+            now = _stamp(datetime.now(UTC))
+            if item["deadline"] is not None and item["deadline"] <= now:
+                conn.execute("DELETE FROM background_pending_watermarks WHERE kind=? AND scope_id=?",
+                             (item["kind"], item["scope_id"]))
+                continue
+            mutable = conn.execute("SELECT * FROM background_jobs WHERE kind=? AND scope_id=? "
+                                   "AND status IN ('queued','retry_wait') ORDER BY created_at DESC LIMIT 1",
+                                   (item["kind"], item["scope_id"])).fetchone()
+            if mutable is not None:
+                conn.execute("UPDATE background_jobs SET payload_json=?,priority=?,updated_at=? WHERE job_id=?",
+                             (item["payload_json"], item["priority"], now, mutable["job_id"]))
+                conn.execute("DELETE FROM background_pending_watermarks WHERE kind=? AND scope_id=?",
+                             (item["kind"], item["scope_id"]))
+                continue
+            running = conn.execute("SELECT 1 FROM background_jobs WHERE kind=? AND scope_id=? "
+                                   "AND status='running' LIMIT 1", (item["kind"], item["scope_id"])).fetchone()
+            if running is not None:
+                continue
+            count = conn.execute("SELECT COUNT(*) FROM background_jobs "
+                                 "WHERE status IN ('queued','running','retry_wait')").fetchone()[0]
+            if count >= self.max_pending_jobs:
+                continue
+            key = f"watermark:{item['watermark_id']}"
+            created = self.enqueue(item["kind"], item["scope_id"], key, json.loads(item["payload_json"]),
+                                   priority=item["priority"], available_at=item["available_at"],
+                                   max_attempts=item["max_attempts"], deadline=item["deadline"], conn=conn)
+            if created.get("status") in _TERMINAL:
+                self.enqueue(item["kind"], item["scope_id"], f"{key}:{uuid4().hex}",
+                             json.loads(item["payload_json"]), priority=item["priority"],
+                             available_at=item["available_at"], max_attempts=item["max_attempts"],
+                             deadline=item["deadline"], conn=conn)
+            conn.execute("DELETE FROM background_pending_watermarks WHERE kind=? AND scope_id=?",
+                         (item["kind"], item["scope_id"]))
+
+    def _materialize_pending_inputs_mysql(self, conn, *, limit: int = 8) -> None:
+        candidates = conn.execute("SELECT kind,scope_id,input_id FROM background_pending_inputs "
+                                  "ORDER BY kind,scope_id,created_at,input_id LIMIT ?", (limit,)).fetchall()
+        for candidate in candidates:
+            guard = _execute_mysql(conn,
+                "SELECT kind,scope_id FROM background_job_scopes WHERE kind=%s AND scope_id=%s "
+                "FOR UPDATE SKIP LOCKED", (candidate["kind"], candidate["scope_id"]),
+            ).fetchone()
+            if guard is None:
+                continue
+            pending = conn.execute("SELECT 1 FROM background_pending_inputs WHERE kind=? AND scope_id=? AND input_id=?",
+                                   (candidate["kind"], candidate["scope_id"], candidate["input_id"])).fetchone()
+            if pending is None:
+                continue
+            result = self.enqueue_grouped(candidate["kind"], candidate["scope_id"], candidate["input_id"], conn=conn)
+            if result.get("job_id") is not None:
+                conn.execute("DELETE FROM background_pending_inputs WHERE kind=? AND scope_id=? AND input_id=?",
+                             (candidate["kind"], candidate["scope_id"], candidate["input_id"]))
+
+    def _materialize_pending_mysql(self, conn, *, limit: int = 8) -> None:
+        watermarks = conn.execute("SELECT kind,scope_id FROM background_pending_watermarks "
+                                  "ORDER BY kind,scope_id LIMIT ?", (limit,)).fetchall()
+        inputs = conn.execute("SELECT kind,scope_id FROM background_pending_inputs "
+                              "ORDER BY kind,scope_id,created_at,input_id LIMIT ?", (limit,)).fetchall()
+        scopes = sorted({(row["kind"], row["scope_id"]) for row in [*watermarks, *inputs]})
+        for kind, scope_id in scopes:
+            guard = _execute_mysql(conn,
+                "SELECT kind,scope_id FROM background_job_scopes WHERE kind=%s AND scope_id=%s "
+                "FOR UPDATE SKIP LOCKED", (kind, scope_id),
+            ).fetchone()
+            if guard is None:
+                continue
+            self._materialize_latest_watermarks_mysql(conn, limit=1, locked_scope=(kind, scope_id))
+            pending_ids = conn.execute("SELECT input_id FROM background_pending_inputs WHERE kind=? AND scope_id=? "
+                                       "ORDER BY created_at,input_id LIMIT ?", (kind, scope_id, limit)).fetchall()
+            for item in pending_ids:
+                result = self.enqueue_grouped(kind, scope_id, item["input_id"], conn=conn)
+                if result.get("job_id") is not None:
+                    conn.execute("DELETE FROM background_pending_inputs WHERE kind=? AND scope_id=? AND input_id=?",
+                                 (kind, scope_id, item["input_id"]))
 
     def enqueue(
         self,
@@ -517,22 +871,28 @@ class BackgroundJobStore:
             db.row_factory = sqlite3.Row
         try:
             if own:
-                db.execute("BEGIN IMMEDIATE")
-            db.execute(
-                """INSERT INTO background_jobs(job_id,kind,scope_id,idempotency_key,payload_json,status,
+                _begin_write(db)
+            self._ensure_scope(db, kind, scope_id)
+            insert_sql = """INSERT INTO background_jobs(job_id,kind,scope_id,idempotency_key,payload_json,status,
                     priority,available_at,max_attempts,deadline,created_at,updated_at)
                     VALUES(?,?,?,?,?,'queued',?,?,?,?,?,?)
-                    ON CONFLICT(kind,scope_id,idempotency_key) DO NOTHING""",
-                (uuid4().hex, kind, scope_id, idempotency_key, encoded, priority,
-                 _stamp(available), max_attempts, _stamp(end) if end else None, _stamp(now), _stamp(now)),
-            )
+                    ON CONFLICT(kind,scope_id,idempotency_key) DO NOTHING"""
+            params = (uuid4().hex, kind, scope_id, idempotency_key, encoded, priority,
+                      _stamp(available), max_attempts, _stamp(end) if end else None, _stamp(now), _stamp(now))
+            if is_mysql(db):
+                _execute_mysql(db, "INSERT INTO background_jobs(job_id,kind,scope_id,idempotency_key,payload_json,status,"
+                              "priority,available_at,max_attempts,deadline,created_at,updated_at) "
+                              "VALUES(%s,%s,%s,%s,%s,'queued',%s,%s,%s,%s,%s,%s) "
+                              "ON DUPLICATE KEY UPDATE job_id=VALUES(job_id)", params)
+            else:
+                db.execute(insert_sql, params)
             row = db.execute(
                 "SELECT * FROM background_jobs WHERE kind=? AND scope_id=? AND idempotency_key=?",
                 (kind, scope_id, idempotency_key),
             ).fetchone()
             if own:
                 db.commit()
-                self.notify_committed()
+                self.notify_committed(kinds=(kind,))
             return self._public(row)
         except Exception:
             if own:
@@ -555,6 +915,25 @@ class BackgroundJobStore:
 
     def claim(
         self, owner: str, lease_seconds: float, *, kinds: tuple[str, ...] | None = None,
+        job_ids: tuple[str, ...] | None = None,
+    ) -> dict[str, Any] | None:
+        return self._claim(owner, lease_seconds, kinds=kinds, job_ids=job_ids, already_probed=False)
+
+    def _claim_after_probe(
+        self, owner: str, lease_seconds: float, *, kinds: tuple[str, ...] | None = None,
+        job_ids: tuple[str, ...] | None = None,
+    ) -> dict[str, Any] | None:
+        """Claim after a caller's positive readiness/candidate probe.
+
+        The write transaction still rechecks candidates, lease ownership,
+        deadline and scope serialization. Only the redundant preflight read is
+        omitted; public ``claim`` retains its read-only idle fast path.
+        """
+        return self._claim(owner, lease_seconds, kinds=kinds, job_ids=job_ids, already_probed=True)
+
+    def _claim(
+        self, owner: str, lease_seconds: float, *, kinds: tuple[str, ...] | None = None,
+        job_ids: tuple[str, ...] | None = None, already_probed: bool,
     ) -> dict[str, Any] | None:
         if not isinstance(owner, str) or not owner or len(owner) > 256:
             raise ValueError("owner must be a non-empty string up to 256 chars")
@@ -565,42 +944,67 @@ class BackgroundJobStore:
                 return None
             if len(kinds) > 128 or any(not isinstance(kind, str) or not kind or len(kind) > 256 for kind in kinds):
                 raise ValueError("kinds must contain bounded job kind names")
+        exact_filter, exact_params = self._exact_job_filter(job_ids)
+        if job_ids == ():
+            return None
         kind_filter = "" if kinds is None else " AND j.kind IN (" + ",".join("?" for _ in kinds) + ")"
         now = datetime.now(UTC)
         stamp = _stamp(now)
         expiry = _stamp(now + timedelta(seconds=lease_seconds))
+        # Idle claims are read-only. The transaction below still rechecks all
+        # candidates and their lease/deadline state, so a concurrent enqueue
+        # between this probe and BEGIN remains safe.
+        sweep_deadlines = job_ids is None and self._deadline_sweep_due(kinds) and self._has_expired_deadline(kinds, job_ids)
+        if not already_probed and not self.has_ready(kinds=kinds, job_ids=job_ids):
+            return None
         with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
+            if is_mysql(conn):
+                result = self._claim_mysql(conn, owner, expiry, stamp, kinds, job_ids, sweep_deadlines)
+                if sweep_deadlines:
+                    self._mark_deadline_sweep(kinds)
+                return result
+            _begin_write(conn)
+            now = datetime.now(UTC)
+            stamp = _stamp(now)
+            expiry = _stamp(now + timedelta(seconds=lease_seconds))
             # Preserve overflow as cheap, durable source IDs. Materialize only
             # a bounded batch when execution capacity returns; no raw data lost.
-            pending = conn.execute("SELECT * FROM background_pending_inputs ORDER BY created_at LIMIT 8").fetchall()
-            for item in pending:
-                result = self.enqueue_grouped(item["kind"], item["scope_id"], item["input_id"], conn=conn)
-                if result.get("job_id") is None:
-                    break
-                conn.execute("DELETE FROM background_pending_inputs WHERE kind=? AND scope_id=? AND input_id=?",
-                             (item["kind"], item["scope_id"], item["input_id"]))
-            conn.execute(
-                """UPDATE background_jobs SET status='failed', error_class='deadline_exceeded',
-                   finished_at=?, updated_at=?, lease_owner=NULL, lease_expires_at=NULL
-                   WHERE status IN ('queued','retry_wait','running') AND deadline IS NOT NULL AND deadline<=?""",
-                (stamp, stamp, stamp),
-            )
-            self._materialize_latest_watermarks(conn, limit=8)
+            if sweep_deadlines:
+                self._expire_deadlines(conn, stamp, kinds=kinds, job_ids=job_ids)
+            backlog = conn.execute(
+                "SELECT 1 FROM background_pending_inputs LIMIT 1"
+            ).fetchone() is not None
+            backlog = backlog or conn.execute(
+                "SELECT 1 FROM background_pending_watermarks LIMIT 1"
+            ).fetchone() is not None
+            if backlog:
+                pending = conn.execute(
+                    "SELECT * FROM background_pending_inputs ORDER BY created_at LIMIT 8"
+                ).fetchall()
+                for item in pending:
+                    result = self.enqueue_grouped(item["kind"], item["scope_id"], item["input_id"], conn=conn)
+                    if result.get("job_id") is None:
+                        break
+                    conn.execute("DELETE FROM background_pending_inputs WHERE kind=? AND scope_id=? AND input_id=?",
+                                 (item["kind"], item["scope_id"], item["input_id"]))
+                self._materialize_latest_watermarks(conn, limit=8)
             row = conn.execute(
                 """SELECT j.job_id FROM background_jobs j
                    WHERE ((j.status IN ('queued','retry_wait') AND j.available_at<=?)
                       OR (j.status='running' AND j.lease_expires_at<=?))
+                   AND (j.deadline IS NULL OR j.deadline>?)
                    AND NOT EXISTS (SELECT 1 FROM background_jobs active
                        WHERE active.kind=j.kind AND active.scope_id=j.scope_id
                        AND active.job_id!=j.job_id AND active.status='running'
-                       AND active.lease_expires_at>?)""" + kind_filter + """
+                       AND active.lease_expires_at>?)""" + kind_filter + exact_filter + """
                    ORDER BY j.priority + MIN(10, CAST((julianday(?) - julianday(j.created_at))*1440 AS INTEGER)) DESC,
                        j.available_at, j.created_at LIMIT 1""",
-                (stamp, stamp, stamp, *(kinds or ()), stamp),
+                (stamp, stamp, stamp, stamp, *(kinds or ()), *exact_params, stamp),
             ).fetchone()
             if row is None:
                 conn.commit()
+                if sweep_deadlines:
+                    self._mark_deadline_sweep(kinds)
                 return None
             conn.execute(
                 """UPDATE background_jobs SET status='running', lease_owner=?, lease_expires_at=?,
@@ -611,14 +1015,85 @@ class BackgroundJobStore:
             )
             claimed = conn.execute("SELECT * FROM background_jobs WHERE job_id=?", (row["job_id"],)).fetchone()
             conn.commit()
+            if sweep_deadlines:
+                self._mark_deadline_sweep(kinds)
             return self._public(claimed, include_payload=True)
+
+    def _claim_mysql(self, conn, owner: str, expiry: str, stamp: str,
+                     kinds: tuple[str, ...] | None,
+                     job_ids: tuple[str, ...] | None = None,
+                     sweep_deadlines: bool = True) -> dict[str, Any] | None:
+        """Claim one job by serializing only its durable (kind,scope) lane."""
+        _begin_write(conn)
+        backlog = conn.execute("SELECT 1 FROM background_pending_inputs LIMIT 1").fetchone() is not None
+        backlog = backlog or conn.execute(
+            "SELECT 1 FROM background_pending_watermarks LIMIT 1"
+        ).fetchone() is not None
+        if backlog:
+            self._materialize_pending_mysql(conn, limit=8)
+        # Expiry work is deliberately bounded. It locks jobs only and never
+        # waits for a scope row, so it cannot reverse the scope -> job order.
+        if sweep_deadlines:
+            self._expire_deadlines(conn, stamp, kinds=kinds, job_ids=job_ids)
+
+        kind_sql = " AND kind IN (" + ",".join("%s" for _ in kinds) + ")" if kinds else ""
+        exact_sql = " AND job_id IN (" + ",".join("%s" for _ in job_ids) + ")" if job_ids else ""
+        scope_rows = _execute_mysql(conn,
+            "SELECT kind,scope_id,MAX(priority) AS priority,MIN(available_at) AS available_at,"
+            "MIN(created_at) AS created_at FROM background_jobs WHERE "
+            "(((status IN ('queued','retry_wait') AND available_at<=%s) OR "
+            "(status='running' AND lease_expires_at<=%s)) AND (deadline IS NULL OR deadline>%s))"
+            + kind_sql + exact_sql + " GROUP BY kind,scope_id ORDER BY priority DESC,available_at,created_at,kind,scope_id LIMIT 32",
+            (stamp, stamp, stamp, *(kinds or ()), *(job_ids or ())),
+        ).fetchall()
+        for scope in scope_rows:
+            guard = _execute_mysql(conn,
+                "SELECT kind,scope_id FROM background_job_scopes WHERE kind=%s AND scope_id=%s FOR UPDATE SKIP LOCKED",
+                (scope["kind"], scope["scope_id"]),
+            ).fetchone()
+            if guard is None:
+                continue
+            active = _execute_mysql(conn,
+                "SELECT job_id FROM background_jobs WHERE kind=%s AND scope_id=%s AND status='running' "
+                "AND lease_expires_at>%s LIMIT 1",
+                (scope["kind"], scope["scope_id"], stamp),
+            ).fetchone()
+            if active is not None:
+                continue
+            candidate = _execute_mysql(conn,
+                "SELECT * FROM background_jobs WHERE kind=%s AND scope_id=%s "
+                "AND (((status IN ('queued','retry_wait')) AND available_at<=%s) OR "
+                "(status='running' AND lease_expires_at<=%s)) AND (deadline IS NULL OR deadline>%s) "
+                + ("AND job_id IN (" + ",".join("%s" for _ in job_ids) + ") " if job_ids else "") +
+                "ORDER BY priority DESC,available_at,created_at,job_id LIMIT 1 FOR UPDATE SKIP LOCKED",
+                (scope["kind"], scope["scope_id"], stamp, stamp, stamp, *(job_ids or ())),
+            ).fetchone()
+            if candidate is None:
+                continue
+            recovery = 1 if candidate["status"] == "running" else 0
+            updated = _execute_mysql(conn,
+                "UPDATE background_jobs SET status='running',lease_owner=%s,lease_expires_at=%s,"
+                "lease_epoch=lease_epoch+1,attempts=attempts+1,"
+                "lease_recovery_count=lease_recovery_count+%s,started_at=COALESCE(started_at,%s),updated_at=%s "
+                "WHERE job_id=%s AND status=%s",
+                (owner, expiry, recovery, stamp, stamp, candidate["job_id"], candidate["status"]),
+            )
+            if updated.rowcount != 1:
+                continue
+            claimed = _execute_mysql(conn, "SELECT * FROM background_jobs WHERE job_id=%s",
+                                     (candidate["job_id"],)).fetchone()
+            conn.commit()
+            return self._public(claimed, include_payload=True)
+        conn.commit()
+        return None
 
     def heartbeat(self, job_id: str, owner: str, epoch: int, lease_seconds: float = 60) -> bool:
         if not math.isfinite(lease_seconds) or lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
         now = datetime.now(UTC)
         with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
+            _begin_write(conn)
+            now = datetime.now(UTC)
             expired = conn.execute(
                 """UPDATE background_jobs SET status='failed',error_class='deadline_exceeded',
                    finished_at=?,updated_at=?,lease_owner=NULL,lease_expires_at=NULL
@@ -644,8 +1119,9 @@ class BackgroundJobStore:
 
     def _finish(self, job_id: str, owner: str, epoch: int, *, status: str,
                 error_class: str | None = None, available_at: datetime | None = None) -> bool:
-        now = datetime.now(UTC)
         with self._connect() as conn:
+            _begin_write(conn)
+            now = datetime.now(UTC)
             cursor = conn.execute(
                 """UPDATE background_jobs SET status=?, error_class=?, available_at=COALESCE(?,available_at),
                    finished_at=?, updated_at=?, lease_owner=NULL, lease_expires_at=NULL
@@ -670,7 +1146,8 @@ class BackgroundJobStore:
             raise ValueError("error_class must be a short classification, not an exception message")
         now = datetime.now(UTC)
         with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
+            _begin_write(conn)
+            now = datetime.now(UTC)
             row = conn.execute(
                 "SELECT attempts,max_attempts,deadline FROM background_jobs WHERE job_id=? AND status='running' AND lease_owner=? AND lease_epoch=? AND lease_expires_at>? AND (deadline IS NULL OR deadline>?)",
                 (job_id, owner, epoch, _stamp(now), _stamp(now)),
@@ -737,7 +1214,7 @@ class BackgroundJobStore:
         now = datetime.now(UTC)
         stamp = _stamp(now)
         with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
+            _begin_write(conn)
             row = conn.execute("SELECT * FROM background_jobs WHERE job_id=?", (job_id,)).fetchone()
             if row is None:
                 conn.commit()
@@ -780,7 +1257,7 @@ class BackgroundJobStore:
         """Cancel with CAS; changing lease_epoch fences any running publisher."""
         now = _stamp(datetime.now(UTC))
         with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
+            _begin_write(conn)
             row = conn.execute("SELECT * FROM background_jobs WHERE job_id=?", (job_id,)).fetchone()
             if row is None:
                 conn.commit()
@@ -873,10 +1350,15 @@ class BackgroundJobStore:
             failures = conn.execute(
                 """SELECT error_class,COUNT(*) AS count FROM (
                        SELECT error_class FROM background_jobs
-                       WHERE error_class IS NOT NULL ORDER BY updated_at DESC LIMIT ?
+                       WHERE status='failed' AND error_class IS NOT NULL AND updated_at>=?
+                       ORDER BY updated_at DESC LIMIT ?
                    ) GROUP BY error_class ORDER BY count DESC,error_class LIMIT 20""",
-                (recent_failure_limit,),
+                (_stamp(now - timedelta(hours=24)), recent_failure_limit),
             ).fetchall()
+            failure_count = conn.execute(
+                "SELECT COUNT(*) FROM background_jobs WHERE status='failed' AND updated_at>=?",
+                (_stamp(now - timedelta(hours=24)),),
+            ).fetchone()[0]
             recovered = conn.execute(
                 "SELECT COALESCE(SUM(lease_recovery_count),0) AS count FROM background_jobs"
             ).fetchone()["count"]
@@ -891,6 +1373,8 @@ class BackgroundJobStore:
             "expired_running_lease_count": running,
             "lease_recovery_count": recovered,
             "recent_failure_categories": {row["error_class"]: row["count"] for row in failures},
+            "recent_failure_window_seconds": 86400,
+            "recent_failure_count": failure_count,
             "execution_duration_seconds": {
                 "count": len(seconds),
                 "average_seconds": sum(seconds) / len(seconds) if seconds else None,
@@ -934,9 +1418,10 @@ class BackgroundJobWorker:
         self.reconcile_seconds = max(0.1, reconcile_seconds)
         self._wake_condition = threading.Condition()
         self._wake_generation = 0
+        self._claim_probe = threading.local()
         self._next_reconcile = 0.0
         if scheduling_mode == "event":
-            self.store.add_notifier(self.notify)
+            self.store.add_notifier(self.notify, kinds=tuple(self.handlers))
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
         self._owner = f"background-{uuid4().hex}"
@@ -945,7 +1430,9 @@ class BackgroundJobWorker:
         worker_owner = owner or self._owner
         # Independent domain workers may share the durable queue. Never take
         # a job this worker cannot execute (including during lease recovery).
-        job = self.store.claim(worker_owner, self.lease_seconds, kinds=tuple(self.handlers))
+        job = (self.store._claim_after_probe(worker_owner, self.lease_seconds, kinds=tuple(self.handlers))
+               if getattr(self._claim_probe, "ready", False)
+               else self.store.claim(worker_owner, self.lease_seconds, kinds=tuple(self.handlers)))
         if job is None:
             return False
         handler = self.handlers.get(job["kind"])
@@ -998,7 +1485,7 @@ class BackgroundJobWorker:
         if was_event and mode != "event":
             self.store.remove_notifier(self.notify)
         elif not was_event and mode == "event":
-            self.store.add_notifier(self.notify)
+            self.store.add_notifier(self.notify, kinds=tuple(self.handlers))
         self.notify()
 
     def _wait_event(self, generation: int, *, error: bool = False) -> None:
@@ -1015,7 +1502,7 @@ class BackgroundJobWorker:
                     delay = reconcile_delay
                 else:
                     remaining = (due - datetime.now(UTC)).total_seconds()
-                    delay = min(reconcile_delay, max(0.05, remaining))
+                    delay = reconcile_delay if remaining <= 0 else min(reconcile_delay, max(0.05, remaining))
         with self._wake_condition:
             if generation == self._wake_generation and not self._stop.is_set():
                 self._wake_condition.wait(timeout=delay)
@@ -1028,7 +1515,12 @@ class BackgroundJobWorker:
                 if self.scheduling_mode == "event" and not self.store.has_ready(kinds=tuple(self.handlers)):
                     self._wait_event(generation)
                     continue
-                if not self.run_one(owner):
+                self._claim_probe.ready = self.scheduling_mode == "event"
+                try:
+                    worked = self.run_one(owner)
+                finally:
+                    self._claim_probe.ready = False
+                if not worked:
                     if self.scheduling_mode == "event":
                         self._wait_event(generation)
                     else:
@@ -1085,6 +1577,19 @@ def _classify_worker_error(exc: Exception) -> tuple[str, bool]:
         return "timeout", True
     if isinstance(exc, ConnectionError):
         return "connection_unavailable", True
+    # Do not repeat a handler that may already have called a model or tool.
+    # Admission-only recovery belongs at BEGIN, before that SQL body executes.
+    if isinstance(exc, SqliteWriteAdmissionError):
+        return f"database_queue_{exc.reason}", False
+    if isinstance(exc, SqliteTransactionTimeoutError):
+        return "database_transaction_expired", False
+    if isinstance(exc, SqliteWriteQueueError):
+        return "database_write_queue_error", False
+    mysql_category = getattr(exc, "error_category", None)
+    if isinstance(mysql_category, str) and mysql_category.startswith("mysql_"):
+        # MySQL errors may follow model/tool side effects or have an unknown
+        # commit result. Do not automatically replay the background handler.
+        return mysql_category, False
     if isinstance(exc, sqlite3.OperationalError):
         message = str(exc).lower()
         if "locked" in message or "busy" in message:

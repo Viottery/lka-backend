@@ -236,10 +236,10 @@ class ManagementQueueService:
             if not self.config.enabled or not self.tasks.durable_execution():
                 return 0
             cursor = conn.execute("SELECT scan_cursor FROM manager_queue_scheduler WHERE singleton=1").fetchone()[0]
-            rows = conn.execute("SELECT rowid AS scan_id,* FROM manager_work_queue WHERE state='pending' "
+            rows = conn.execute("SELECT rowid AS scan_id,manager_work_queue.* FROM manager_work_queue WHERE state='pending' "
                                 "AND rowid>? ORDER BY rowid LIMIT 256", (cursor,)).fetchall()
             if not rows:
-                rows = conn.execute("SELECT rowid AS scan_id,* FROM manager_work_queue WHERE state='pending' "
+                rows = conn.execute("SELECT rowid AS scan_id,manager_work_queue.* FROM manager_work_queue WHERE state='pending' "
                                     "ORDER BY rowid LIMIT 256").fetchall()
             if rows:
                 conn.execute("UPDATE manager_queue_scheduler SET scan_cursor=? WHERE singleton=1", (rows[-1]["scan_id"],))

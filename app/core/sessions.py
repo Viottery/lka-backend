@@ -6,11 +6,14 @@ import hashlib
 import inspect
 import json
 import sqlite3
+from collections import OrderedDict
 from collections.abc import Callable
 from contextlib import closing, contextmanager
 from contextvars import ContextVar
 from datetime import UTC, datetime
 from hashlib import sha1
+from threading import Event, Lock
+from time import monotonic
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -34,6 +37,18 @@ def _stable_id(prefix: str, *parts: str | None) -> str:
     text = "|".join(part or "" for part in parts)
     digest = sha1(text.encode("utf-8")).hexdigest()[:12]
     return f"{prefix}_{digest}"
+
+
+def _rollback_preserving_error(conn, original: Exception) -> None:
+    """Best-effort transaction cleanup that never replaces the operation error."""
+    try:
+        conn.rollback()
+    except Exception as cleanup_error:  # noqa: BLE001 - retain the original failure.
+        if hasattr(original, "add_note"):
+            original.add_note(
+                "Session transaction rollback cleanup failed "
+                f"({type(cleanup_error).__name__}); original error preserved."
+            )
 
 
 class AgentSession(BaseModel):
@@ -120,6 +135,19 @@ class AgentSessionDetail(BaseModel):
     messages: list[AgentSessionMessage]
 
 
+class AgentSessionState(BaseModel):
+    """Small polling projection; it deliberately omits metadata and message content."""
+
+    session_id: str
+    status: str
+    updated_at: str
+    latest_root_run_id: str | None = None
+    latest_root_run_status: str | None = None
+    latest_root_run_updated_at: str | None = None
+    input_queue_revision: str | None = None
+    revision: str
+
+
 class SessionHistoryCursorError(ValueError):
     """The requested message no longer belongs to this active history."""
 
@@ -156,6 +184,16 @@ class SessionService:
         self._turn_context_counter: ContextVar[PromptTokenCounter | None] = ContextVar(
             "session_context_counter", default=None
         )
+        self._state_cache: OrderedDict[str, tuple[float, str, AgentSessionState]] = OrderedDict()
+        self._state_cache_lock = Lock()
+        self._state_inflight: dict[str, Event] = {}
+        self._state_cache_ttl_seconds = 1.0
+        self._state_cache_capacity = 256
+        self.state_queue_revision = None
+        # This readiness belongs to this service instance and its connection
+        # factory. It is set only by prepare_context_schema after commit.
+        self._context_schema_lock = Lock()
+        self._context_schema_ready = False
 
     @contextmanager
     def use_context_token_counter(self, counter: PromptTokenCounter):
@@ -347,11 +385,11 @@ class SessionService:
             pattern = f"%{escaped_query}%"
             search_clause += """
                 AND (
-                    title LIKE ? ESCAPE '\\'
+                    LOWER(title) LIKE LOWER(?) ESCAPE '\\'
                     OR EXISTS (
                         SELECT 1 FROM agent_session_messages AS message
                         WHERE message.session_id = agent_sessions.session_id
-                          AND message.content LIKE ? ESCAPE '\\'
+                          AND LOWER(message.content) LIKE LOWER(?) ESCAPE '\\'
                     )
                 )
             """
@@ -599,8 +637,8 @@ class SessionService:
             if cursor.rowcount == 0:
                 raise KeyError(f"Session not found: {session_id}")
             conn.commit()
-        except Exception:
-            conn.rollback()
+        except Exception as exc:
+            _rollback_preserving_error(conn, exc)
             raise
         finally:
             conn.close()
@@ -655,8 +693,12 @@ class SessionService:
         finally:
             conn.close()
 
-    def get_session_or_none(self, *, session_id: str) -> AgentSession | None:
-        conn = self._conn_factory()
+    def get_session_or_none(
+        self, *, session_id: str, conn: sqlite3.Connection | None = None,
+    ) -> AgentSession | None:
+        owns_connection = conn is None
+        if conn is None:
+            conn = self._conn_factory()
         try:
             row = conn.execute(
                 """
@@ -668,8 +710,110 @@ class SessionService:
                 (session_id,),
             ).fetchone()
         finally:
-            conn.close()
+            if owns_connection:
+                conn.close()
         return self._session_from_row(row) if row else None
+
+    def get_session_state(self, *, session_id: str) -> AgentSessionState:
+        """Return a compact, short-lived projection for status polling.
+
+        Session existence and active status are checked on every call before
+        consulting the process-local cache. The cached projection contains no
+        message body, session metadata, approvals, grants, or quota state.
+        """
+        conn = self._conn_factory()
+        try:
+            session = conn.execute(
+                "SELECT session_id,status,updated_at FROM agent_sessions "
+                "WHERE session_id=? AND status!='deleted'",
+                (session_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        if session is None:
+            raise KeyError(f"Session not found: {session_id}")
+
+        while True:
+            now = monotonic()
+            with self._state_cache_lock:
+                cached = self._state_cache.get(session_id)
+                if (cached is not None
+                        and now - cached[0] < self._state_cache_ttl_seconds
+                        and cached[1] == session["updated_at"]):
+                    self._state_cache.move_to_end(session_id)
+                    return cached[2].model_copy(deep=True)
+                flight = self._state_inflight.get(session_id)
+                if flight is None:
+                    flight = Event()
+                    self._state_inflight[session_id] = flight
+                    leader = True
+                else:
+                    leader = False
+            if leader:
+                break
+            # Waiters recheck active-session status and the cache after the
+            # leader completes; the timeout prevents a stuck database call
+            # from pinning a request thread indefinitely.
+            flight.wait(timeout=2.0)
+            conn = self._conn_factory()
+            try:
+                session = conn.execute(
+                    "SELECT session_id,status,updated_at FROM agent_sessions "
+                    "WHERE session_id=? AND status!='deleted'",
+                    (session_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+            if session is None:
+                raise KeyError(f"Session not found: {session_id}")
+
+        state: AgentSessionState | None = None
+        try:
+            conn = self._conn_factory()
+            try:
+                row = conn.execute(
+                    "SELECT s.session_id,s.status,s.updated_at,r.run_id AS latest_root_run_id,"
+                    "r.status AS latest_root_run_status,r.updated_at AS latest_root_run_updated_at "
+                    "FROM agent_sessions s LEFT JOIN agent_runs r ON r.run_id=("
+                    "SELECT root.run_id FROM agent_runs root WHERE root.session_id=s.session_id "
+                    "AND json_extract(root.record_payload,'$.parent_run_id') IS NULL "
+                    "ORDER BY root.created_at DESC,root.run_id DESC LIMIT 1) "
+                    "WHERE s.session_id=? AND s.status!='deleted'",
+                    (session_id,),
+                ).fetchone()
+                queue_revision = (self.state_queue_revision(conn, session_id)
+                                  if row is not None and self.state_queue_revision is not None else None)
+            finally:
+                conn.close()
+            if row is None:
+                raise KeyError(f"Session not found: {session_id}")
+            revision_payload = json.dumps(
+                [row["session_id"], row["status"], row["updated_at"],
+                 row["latest_root_run_id"], row["latest_root_run_status"],
+                 row["latest_root_run_updated_at"], queue_revision],
+                ensure_ascii=False, separators=(",", ":"),
+            )
+            state = AgentSessionState(
+                session_id=str(row["session_id"]),
+                status=str(row["status"]),
+                updated_at=str(row["updated_at"]),
+                latest_root_run_id=row["latest_root_run_id"],
+                latest_root_run_status=row["latest_root_run_status"],
+                latest_root_run_updated_at=row["latest_root_run_updated_at"],
+                input_queue_revision=queue_revision,
+                revision=hashlib.sha256(revision_payload.encode("utf-8")).hexdigest()[:32],
+            )
+            return state.model_copy(deep=True)
+        finally:
+            with self._state_cache_lock:
+                if state is not None:
+                    self._state_cache[session_id] = (monotonic(), state.updated_at, state)
+                    self._state_cache.move_to_end(session_id)
+                    while len(self._state_cache) > self._state_cache_capacity:
+                        self._state_cache.popitem(last=False)
+                completed = self._state_inflight.pop(session_id, None)
+                if completed is not None:
+                    completed.set()
 
     @notify_after_commit
     def set_workspace(
@@ -707,6 +851,23 @@ class SessionService:
             raise RuntimeError(f"Failed to update session workspace: {session_id}")
         return updated
 
+    @staticmethod
+    def _message_parent(conn, session_id: str):
+        """Lock the parent before inserting FK children on MySQL.
+
+        Two child inserts otherwise acquire shared FK locks, then deadlock
+        while upgrading both locks for the parent's updated_at write. Higher
+        level callers retain their admission/task lock order; do not acquire a
+        new coordinator anchor from this late publication helper.
+        """
+        from app.storage.connections import is_mysql
+
+        if is_mysql(conn):
+            return conn.execute_native(
+                "SELECT status FROM agent_sessions WHERE session_id=%s FOR UPDATE", (session_id,),
+            ).fetchone()
+        return conn.execute("SELECT status FROM agent_sessions WHERE session_id=?", (session_id,)).fetchone()
+
     def append_message(
         self,
         *,
@@ -732,6 +893,12 @@ class SessionService:
         conn = self._conn_factory()
         try:
             conn.execute("BEGIN IMMEDIATE")
+            from app.storage.connections import is_mysql
+
+            if is_mysql(conn):
+                parent = self._message_parent(conn, session_id)
+                if parent is None or parent["status"] == "deleted":
+                    raise KeyError(f"Active session not found: {session_id}")
             conn.execute(
                 """
                 INSERT OR IGNORE INTO agent_session_messages(
@@ -763,8 +930,8 @@ class SessionService:
             if role == "agent" and persisted_message_callback is not None:
                 persisted_message_callback(conn, persisted)
             conn.commit()
-        except Exception:
-            conn.rollback()
+        except Exception as exc:
+            _rollback_preserving_error(conn, exc)
             raise
         finally:
             conn.close()
@@ -784,7 +951,7 @@ class SessionService:
             raise ValueError("A message publication requires an existing transaction")
         if not message_id:
             raise ValueError("A stable message_id is required")
-        session = conn.execute("SELECT status FROM agent_sessions WHERE session_id=?", (session_id,)).fetchone()
+        session = self._message_parent(conn, session_id)
         if session is None or session["status"] == "deleted":
             raise KeyError(f"Active session not found: {session_id}")
         previous = conn.execute("SELECT * FROM agent_session_messages WHERE message_id=?", (message_id,)).fetchone()
@@ -1354,8 +1521,8 @@ class SessionService:
                 finally:
                     conn.execute("RELEASE atomic_context_outbox")
             conn.commit()
-        except Exception:
-            conn.rollback()
+        except Exception as exc:
+            _rollback_preserving_error(conn, exc)
             raise
         finally:
             conn.close()
@@ -1484,6 +1651,34 @@ class SessionService:
         return updated
 
     def _ensure_context_state_table(self, conn: sqlite3.Connection) -> None:
+        if self._context_schema_ready:
+            return
+        # A lazy caller may already hold the database writer lock. Do not wait
+        # for the startup schema lock here: prepare_context_schema takes that
+        # lock before touching the database, which would invert lock order.
+        self._create_context_state_schema(conn)
+
+    def prepare_context_schema(self) -> None:
+        """Initialize this service's context tables before request traffic.
+
+        The ready flag is published only after the schema work commits. The
+        lower-level `_ensure_context_state_table` remains lazy for callers that
+        do not run an explicit startup preparation step.
+        """
+        if self._context_schema_ready:
+            return
+        with self._context_schema_lock:
+            if self._context_schema_ready:
+                return
+            conn = self._conn_factory()
+            try:
+                self._create_context_state_schema(conn)
+                conn.commit()
+            finally:
+                conn.close()
+            self._context_schema_ready = True
+
+    def _create_context_state_schema(self, conn: sqlite3.Connection) -> None:
         conn.execute("CREATE TABLE IF NOT EXISTS agent_session_context_state (session_id TEXT PRIMARY KEY, revision INTEGER NOT NULL, next_seq INTEGER NOT NULL, covered_seq INTEGER NOT NULL DEFAULT 0)")
         columns = {row[1] for row in conn.execute("PRAGMA table_info(agent_session_context_state)")}
         if "summary_revision" not in columns:
@@ -1601,8 +1796,8 @@ class SessionService:
             conn.execute("INSERT INTO agent_session_context_windows(session_id, token_budget, summary, recent_messages, token_estimate, updated_at) VALUES(?, ?, ?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET token_budget=excluded.token_budget, summary=excluded.summary, recent_messages=excluded.recent_messages, token_estimate=excluded.token_estimate, updated_at=excluded.updated_at", (session_id, budget, summary, json.dumps([m.model_dump(mode="json") for m in tail], ensure_ascii=False), estimate, _now_iso()))
             conn.commit()
             return True
-        except Exception:
-            conn.rollback()
+        except Exception as exc:
+            _rollback_preserving_error(conn, exc)
             raise
         finally:
             conn.close()

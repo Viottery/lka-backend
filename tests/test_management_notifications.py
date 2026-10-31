@@ -140,12 +140,20 @@ def test_silent_decision_preserves_existing_publication_fences(runtime, monkeypa
         assert conn.execute("SELECT applied_at FROM manager_notification_proposals").fetchone()[0] is None
 
 
-def test_foreground_cannot_decide_and_safety_review_is_required(runtime):
+def test_foreground_cannot_decide_and_safety_review_is_required(runtime, monkeypatch):
     sid, _ = timer(runtime)
     run = runtime.create_agent_run(session_id=sid, user_input="Ordinary user question", resumable=True)
     runtime.agent_run_manager.mark_running(run.run_id)
     context = ToolContext(session_id=sid, run_id=run.run_id, safety_review_approved=True)
     assert runtime.management_coordinator.notifications.for_run(run.run_id) is None
+    notifications = runtime.management_coordinator.notifications
+    original_conn = notifications._conn
+    monkeypatch.setattr(notifications, "_conn", lambda: pytest.fail("ordinary answer opened management storage"))
+    assert notifications.for_run_record(run.model_dump(mode="json")) is None
+    monkeypatch.setattr(runtime.agent_run_manager, "get_run", lambda _run_id: run)
+    assert runtime.agent_turn_loop._answer_publication(run.run_id) == {}
+    monkeypatch.setattr(notifications, "_conn", original_conn)
+    assert callable(notifications) and notifications(run.run_id) is None
     with pytest.raises(ManagementConflictError, match="background execution"):
         decide(runtime, context)
     context.safety_review_approved = False
@@ -154,6 +162,40 @@ def test_foreground_cannot_decide_and_safety_review_is_required(runtime):
     tool = management_notification_tools(runtime.management_coordinator.notifications)[0]
     assert tool.spec.read_only is False
     assert tool.spec.effect_domains == ("agent_control",)
+
+
+def test_deferred_answer_publication_only_hides_pending_events(runtime, monkeypatch):
+    sid, _ = timer(runtime)
+    run = runtime.create_agent_run(session_id=sid, user_input="deferred answer")
+    run = run.model_copy(update={
+        "metadata": {**run.metadata, "defer_answer_publication": True},
+    })
+    monkeypatch.setattr(runtime.agent_run_manager, "get_run", lambda _run_id: run)
+    projection = {"user_visible": True, "notification": {"decision_source": "explicit"}}
+    runtime.agent_turn_loop.answer_visibility_provider = lambda _run_id: projection
+
+    assert runtime.agent_turn_loop._answer_publication(run.run_id) == projection
+    assert runtime.agent_turn_loop._answer_publication(run.run_id, pending=True) == {
+        "user_visible": False,
+        "notification": projection["notification"],
+        "publication_pending": True,
+    }
+
+
+def test_candidate_run_record_is_only_a_hint_for_durable_projection(runtime):
+    _, _, run, _ = background(runtime)
+    cached_record = run.model_dump(mode="json")
+    assert cached_record["metadata"].get("manager_execution_id")
+
+    with closing(runtime._conn()) as conn, conn:
+        row = conn.execute("SELECT record_payload FROM agent_runs WHERE run_id=?", (run.run_id,)).fetchone()
+        durable = json.loads(row[0])
+        durable["metadata"].pop("manager_execution_id", None)
+        durable["metadata"]["input_envelope"] = {"origin": "foreground"}
+        conn.execute("UPDATE agent_runs SET record_payload=? WHERE run_id=?",
+                     (json.dumps(durable), run.run_id))
+
+    assert runtime.management_coordinator.notifications.for_run_record(cached_record) is None
 
 
 def test_decision_requires_exact_execution_run_session_binding(runtime):

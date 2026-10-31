@@ -7,7 +7,8 @@ import json
 import queue
 import threading
 import time
-from contextlib import nullcontext
+import weakref
+from contextlib import contextmanager, nullcontext
 from contextvars import copy_context
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -18,7 +19,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
-from app.core.agent_checkpoints import SqliteCheckpointRuntime
+from app.core.agent_checkpoints import MySQLCheckpointRuntime, SqliteCheckpointRuntime
 from app.core.agent_dispatch import AgentDispatchFenced
 from app.core.agent_runs import AgentRunCancelled, AgentRunRecord, AgentRunStatus
 from app.core.agent_storage import SqliteAgentRunStore
@@ -47,6 +48,11 @@ from app.core.agent_turn import (
     _turn_safety_review_mode,
 )
 from app.core.child_tool_audit import build_child_tool_audit
+from app.core.execution_admission import (
+    admitted_execution,
+    bind_execution_run,
+    retain_execution_for_worker,
+)
 from app.core.llm import LLMResponseMode
 from app.core.runtime_context import current_time_payload
 from app.core.safety import SafetyReviewMode, SafetyReviewRecord, SafetyReviewStatus
@@ -123,7 +129,7 @@ class AgentGraphRunner:
         turn_loop: Any,
         *,
         checkpointer: BaseCheckpointSaver | None = None,
-        checkpoint_runtime: SqliteCheckpointRuntime | None = None,
+        checkpoint_runtime: SqliteCheckpointRuntime | MySQLCheckpointRuntime | None = None,
         artifact_store: SqliteAgentRunStore | None = None,
         interrupt_after: list[str] | None = None,
     ) -> None:
@@ -131,7 +137,7 @@ class AgentGraphRunner:
         self.artifact_store, self.interrupt_after = artifact_store, interrupt_after
         self._lock = threading.RLock()
         self._execution_locks_guard = threading.Lock()
-        self._execution_locks: dict[str, threading.Lock] = {}
+        self._execution_locks: weakref.WeakValueDictionary[str, threading.Lock] = weakref.WeakValueDictionary()
         self._results: dict[str, AgentTurnResult] = {}
         self._errors: dict[str, Exception] = {}
         self._requests: dict[str, dict[str, Any]] = {}
@@ -211,9 +217,19 @@ class AgentGraphRunner:
         metadata = {**(kwargs.pop("initial_metadata", None) or {}), "orchestrator": "langgraph"}
         return self.turn_loop.create_run_for_turn(**kwargs, initial_metadata=metadata)
 
+    @property
+    def execution_admission(self):
+        return getattr(self.turn_loop, "execution_admission", None)
+
+    @property
+    def agent_run_manager(self):
+        return self.turn_loop.run_manager
+
+    @admitted_execution
     def run(self, **kwargs: Any) -> AgentTurnResult:
         run_id = self._resolve_run_id(**kwargs)
-        with self._execution_lease(run_id):
+        bind_execution_run(run_id)
+        with self._execution_scope(run_id):
             existing = self._run(run_id)
             if existing.status.value == "paused":
                 raise AgentTurnPaused(run_id)
@@ -238,14 +254,19 @@ class AgentGraphRunner:
                 raise RuntimeError(f"Cannot start Agent run {run_id} from {existing.status.value}.")
             if existing.parent_run_id is not None:
                 self.turn_loop.run_manager.mark_child_running(run_id)
-            self._invoke_sync(run_id=run_id, **kwargs)
+            try:
+                self._invoke_sync(run_id=run_id, **kwargs)
+            except Exception as exc:
+                self._fail_startup(run_id, exc)
+                raise
             return self._take_result(run_id)
 
     async def run_async(self, **kwargs: Any) -> AgentTurnResult:
         return await self._run_in_worker(self.run, **kwargs)
 
+    @admitted_execution
     def resume(self, run_id: str) -> AgentTurnResult:
-        with self._execution_lease(run_id):
+        with self._execution_scope(run_id):
             current = self._run(run_id)
             ancestor_id = current.parent_run_id
             while ancestor_id is not None:
@@ -285,7 +306,11 @@ class AgentGraphRunner:
             if current.metadata.get("checkpoint_boundary_resume"):
                 self.turn_loop.run_manager._update_run(run_id, status=current.status,
                                                       metadata_patch={"checkpoint_boundary_resume": False})
-            self._resume_sync(run_id, boundary_resume=boundary_resume)
+            try:
+                self._resume_sync(run_id, boundary_resume=boundary_resume)
+            except Exception as exc:
+                self._fail_startup(run_id, exc)
+                raise
             return self._take_result(run_id)
 
     def _execution_lease(self, run_id: str) -> threading.Lock:
@@ -297,6 +322,18 @@ class AgentGraphRunner:
         """
         with self._execution_locks_guard:
             return self._execution_locks.setdefault(run_id, threading.Lock())
+
+    @contextmanager
+    def _execution_scope(self, run_id: str):
+        """Keep a shared lease alive for the full call and release its request snapshot."""
+        lease = self._execution_lease(run_id)
+        with lease:
+            try:
+                yield
+            finally:
+                # Clear before releasing the lease, so a waiting same-run resume
+                # cannot have its newly restored request removed by this call.
+                self._requests.pop(run_id, None)
 
     async def resume_async(self, run_id: str) -> AgentTurnResult:
         return await self._run_in_worker(self.resume, run_id)
@@ -352,11 +389,16 @@ class AgentGraphRunner:
             maxsize=1
         )
 
+        permit = retain_execution_for_worker()
+
         def target() -> None:
             try:
                 result_queue.put((True, call(*args, **kwargs)))
             except BaseException as exc:  # noqa: BLE001 - propagate graph boundary failures.
                 result_queue.put((False, exc))
+            finally:
+                if permit is not None:
+                    permit.release()
 
         context = copy_context()
         worker = threading.Thread(
@@ -364,7 +406,12 @@ class AgentGraphRunner:
             name="lka-agent-graph",
             daemon=True,
         )
-        worker.start()
+        try:
+            worker.start()
+        except BaseException:
+            if permit is not None:
+                permit.release()
+            raise
         while True:
             try:
                 ok, value = result_queue.get_nowait()
@@ -437,7 +484,10 @@ class AgentGraphRunner:
         }
         # Compatibility hook used by recovery tests and internal callers.  The
         # public async entrypoint already dispatches to a worker thread.
-        self._invoke_graph_input(state, run_id)
+        # Compatibility hook used by recovery tests and internal callers.  Keep
+        # its request snapshot scoped just like the public runner entrypoints.
+        with self._execution_scope(run_id):
+            self._invoke_graph_input(state, run_id)
 
     def _invoke_sync(
         self,
@@ -1557,7 +1607,8 @@ class AgentGraphRunner:
             stage="answer",
             status="failed" if generation_failed else "partial" if missing or ws.completion_state.stop_reason or self.turn_loop._task_outcome(progress)["task_outcome"] == "incomplete" else "completed",
             message=self.turn_loop._short_text(answer),
-            persist=self._run(ws.run_id).metadata.get("defer_answer_publication") is not True,
+            persist=(self._run(ws.run_id).metadata.get("defer_answer_publication") is not True
+                     and not self._atomic_root_publication_available(ws.run_id)),
             metadata={
                 "answer": answer,
                 **({"missing_requirements": missing, "completion_stop_reason": ws.completion_state.stop_reason}
@@ -1591,6 +1642,11 @@ class AgentGraphRunner:
             )
         data["progress_events"] = self._dump(progress)
         return self._save(s, ws, data, "verified")
+
+    def _atomic_root_publication_available(self, run_id: str) -> bool:
+        return (self._run(run_id).parent_run_id is None
+                and self.turn_loop.run_manager.durable_store is not None
+                and callable(getattr(self.turn_loop.session_service, "record_context_exchange_in_transaction", None)))
 
     def _finalize(self, s: AgentGraphState) -> AgentGraphState:
         self.turn_loop._raise_if_cancel_requested()
@@ -1688,6 +1744,9 @@ class AgentGraphRunner:
             raise RuntimeError("Deferred answer publication requires a finalization handler to commit the result")
         if not self.turn_loop.run_manager.claim_completion(ws.run_id):
             self.turn_loop._raise_if_cancel_requested()
+            if self._run(ws.run_id).metadata.get("pause_requested"):
+                self.turn_loop.run_manager.acknowledge_pause(ws.run_id)
+                raise AgentTurnPaused(ws.run_id)
             raise RuntimeError(f"Agent run cannot claim completion: {ws.run_id}")
         final_run = self._run(ws.run_id)
         final_plan = final_run.metadata.get("multi_agent_plan")
@@ -1729,6 +1788,30 @@ class AgentGraphRunner:
                     "answer_chars": len(answer),
                     "log_path": str(log),
                 },
+            }
+
+        if self._atomic_root_publication_available(ws.run_id):
+            from app.core.agent_finalization import AgentPublicationPaused, publish_root_result
+
+            try:
+                publish_root_result(
+                    manager=self.turn_loop.run_manager, sessions=self.turn_loop.session_service,
+                    run_id=ws.run_id, result=result, snapshot=completed_snapshot,
+                    user_input=ws.user_input, input_role=self.turn_loop._turn_input_role(ws.run_id),
+                    message_payload=message_payload, token_budget=self.turn_loop.session_context_token_budget,
+                    background_enqueue=self.turn_loop.background_compaction_callback,
+                    message_callback=self.turn_loop.memory_answer_callback,
+                )
+            except AgentPublicationPaused as exc:
+                self.turn_loop.run_manager.acknowledge_pause(ws.run_id)
+                raise AgentTurnPaused(ws.run_id) from exc
+            with self._lock:
+                self._results[ws.run_id] = result
+            return {
+                "phase": "finalized", "status": "completed", "result_artifact_ref": ref,
+                "result_summary": {"run_id": ws.run_id, "answer_chars": len(answer),
+                                   "tool_event_count": len(result.tool_events), "log_path": result.log_path},
+                "run_snapshot": self._snapshot(self._run(ws.run_id)),
             }
 
         updated = self.turn_loop.session_service.record_context_exchange(
@@ -2074,9 +2157,42 @@ class AgentGraphRunner:
             safety_review_mode=self.turn_loop._safety_review_preference().value,
         )
 
+    def _fail_startup(self, run_id: str, exc: Exception) -> None:
+        """Close an accepted run when saver/compile fails before graph entry.
+
+        Paused/review states, committed results and another dispatch owner remain
+        untouched. No tool or model is retried by this cleanup.
+        """
+        if isinstance(exc, AgentDispatchFenced):
+            return
+        manager = self.turn_loop.run_manager
+        if manager.durable_store is not None:
+            record = manager.durable_store.load_run(run_id)
+            if record is not None:
+                manager.refresh_after_transaction(record)
+        current = manager.get_run(run_id)
+        if current is None or current.status.value not in {"queued", "running"}:
+            return
+        # Existing _fail handles errors *inside* graph execution. This boundary
+        # has no current-turn context, so target the explicit run ID.
+        for attempt in range(3):
+            try:
+                if current.parent_run_id is not None:
+                    manager.fail_child_run(run_id, error_type="execution_start_failed", error=str(exc))
+                else:
+                    manager.fail_run(run_id, error_type="execution_start_failed", error=str(exc))
+                break
+            except Exception as write_exc:
+                if not _is_temporary_sqlite_error(write_exc) or attempt == 2:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+        manager.append_event(run_id, type="run_failed", stage="startup",
+                             message="Agent execution could not start.",
+                             payload={"error_type": "execution_start_failed", "cause": type(exc).__name__})
+
     def _fail(self, run_id: str, exc: Exception) -> None:
         manager = self.turn_loop.run_manager
-        if isinstance(exc, AgentDispatchFenced):
+        if isinstance(exc, (AgentDispatchFenced, AgentTurnPaused)):
             # A lease owner may have been replaced while this graph was blocked
             # in I/O. Fence this execution only; the current owner or a later
             # lease recovery owns run status and checkpoint continuation.

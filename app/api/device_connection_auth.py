@@ -12,6 +12,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import Headers
 from starlette.responses import JSONResponse
 
+from app.api.database_errors import run_asgi_with_mysql_storage_errors
 from app.api.routes.distributed_client import is_workbench_asset_request
 from app.domains.device_connections import is_loopback
 
@@ -49,6 +50,9 @@ class DeviceConnectionAuthMiddleware:
         self.app = app
 
     async def __call__(self, scope, receive, send):
+        await run_asgi_with_mysql_storage_errors(self._dispatch, scope, receive, send)
+
+    async def _dispatch(self, scope, receive, send):
         if scope["type"] not in {"http", "websocket"}:
             return await self.app(scope, receive, send)
         service = getattr(scope["app"].state, "device_connection_service", None)

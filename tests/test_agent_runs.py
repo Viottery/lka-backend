@@ -677,6 +677,49 @@ def test_manual_review_queue_is_global_fifo_and_only_head_can_be_decided(tmp_pat
     assert first.list_pending_safety_reviews() == []
 
 
+def test_pending_review_queue_skips_review_table_when_no_waiting_runs(tmp_path):
+    store = SqliteAgentRunStore(tmp_path / "empty-approval-queue.sqlite3")
+    with connect(store.db_path) as conn:
+        conn.execute("DROP TABLE agent_safety_reviews")
+
+    # The fast path must return after the indexed run-status probe.
+    assert store.list_pending_reviews() == []
+
+
+def test_pending_review_queue_filters_mode_and_rechecks_terminal_run(tmp_path):
+    store = SqliteAgentRunStore(tmp_path / "filtered-approval-queue.sqlite3")
+    manager = InMemoryAgentRunManager(durable_store=store)
+
+    def add_run_and_review(index: int, mode: SafetyReviewMode) -> str:
+        run = manager.create_run(
+            session_id=f"filtered_queue_session_{index}", user_input="review",
+        )
+        manager.mark_running(run.run_id)
+        request = SafetyReviewRequest(
+            review_id=f"filtered_queue_review_{index}", run_id=run.run_id,
+            session_id=run.session_id, trace_id=run.trace_id,
+            invocation_id=f"filtered_queue_invocation_{index}",
+            tool_name="filesystem.edit_file", mode=mode,
+            reason="Write requires confirmation.",
+            created_at=f"2026-01-01T00:00:0{index}+00:00",
+        )
+        manager.create_safety_review(request)
+        if mode != SafetyReviewMode.MANUAL:
+            # Keep a pending non-manual row under a waiting run to exercise
+            # payload validation after the indexed SQL candidate query.
+            manager.mark_waiting_confirmation(run.run_id, request.review_id)
+        return run.run_id
+
+    add_run_and_review(1, SafetyReviewMode.MANUAL)
+    add_run_and_review(2, SafetyReviewMode.SKIP)
+    terminal_run = add_run_and_review(3, SafetyReviewMode.MANUAL)
+    manager.fail_run(terminal_run, error_type="RuntimeError", error="ended")
+
+    assert [review["review_id"] for review in store.list_pending_reviews()] == [
+        "filtered_queue_review_1",
+    ]
+
+
 def test_agent_run_manager_persists_cancel_request_and_flushes_token_events(tmp_path):
     store = SqliteAgentRunStore(tmp_path / "lka.sqlite3")
     first = InMemoryAgentRunManager(durable_store=store)

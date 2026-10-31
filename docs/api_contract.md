@@ -544,6 +544,25 @@ GET /sessions/{session_id}/runs?client_request_id=input-unique-id&limit=2
 `max` 可以映射为模型的最高可用档，审计会标明别名和实际生效档位。
 首次调用保存该运行的映射快照，后续恢复不受配置映射变化影响。
 
+会话状态的轻量读取使用 `GET /sessions/{session_id}/state`，返回 `session_id`、`status`、`updated_at`、
+`latest_root_run_id`、`latest_root_run_status`、`latest_root_run_updated_at`、可选的 `input_queue_revision` 和不透明 `revision`。
+响应包含 `ETag`，携带 `If-None-Match` 可得到 304；鉴权和活跃会话核验始终执行。
+展示投影缓存最多一秒，不含消息正文、元数据、审批、权限或预算，不能作为执行授权。
+`input_queue_revision` 非空时，整体修订也覆盖输入队列的接收序号、暂停与观察运行变化；
+它是展示标记，不含输入正文或审批结论。修订未变时（包括 304）可跳过历史、运行发现和输入快照重读。
+旧服务缺少该标记时仍须独立刷新输入队列；发送、恢复或不确定提交后立即核对回执，审批继续读真实状态。
+前端可据此发现运行，再接入现有运行事件流；历史内容使用已有消息分页接口。跨域响应暴露 `ETag`，
+前端的 workbench/cloud 代理也保留条件请求头和 304。
+
+普通 `POST /agent/turn` 和流式创建在执行容量满时、业务受理前返回 503：
+`{"detail":"agent_execution_capacity_full","accepted":false,"retry_safe":true}`，并提供 `Retry-After`。
+此响应对应的请求没有创建运行；已受理运行的其他失败仍应先查询原运行状态，不能据此自动重发。
+默认助理输入队列仍沿用 202 持久受理合同，不因执行满载丢弃输入。
+MySQL 热会话的写入准入队列满或等待超时时，会在该次写事务开始前返回 503，
+`detail` 为 `session_input_write_admission_full` 或 `session_input_write_admission_timeout`，
+并携带 `accepted:false`、`retry_safe:true`、`Retry-After:1`。这与持久输入队列容量已满的 409 不同；
+确认后的容量拒绝可以按相同消息 ID 重试，未知网络响应仍先查询回执。
+
 ### 会话文件附件
 
 先创建会话，再上传文件。`POST /sessions/{session_id}/attachments` 接收原始文件字节；
@@ -777,15 +796,17 @@ audit record 和本地日志路径均不属于正常 HTTP 响应；它们只保�
 - 展开工具时，`expanded_tools[*].input_schema` 会尽量暴露 required fields、allowed values
   和 examples。LLM decision prompt 要求模型严格遵循这些 schema；具体枚举值、示例和
   领域约束由对应 Tool Package schema 提供。
-- 每个 session 维护一个本地 context window，默认预算为 `65536` token。Agent prompt
-  只注入前文摘要和近期 user / agent 问答；完整工具调用、LLM prompt/output 和运行过程
+- 每个 session 维护一个本地 context window，Agent 历史输入预算默认 `32384` token，
+  可通过 `[agent].session_context_token_budget` 调整。Agent prompt
+  按会话类型注入意图摘要和近期历史，后台工作历史可含工具记录；完整原始工具调用、LLM prompt/output 和运行过程
   保存在本地 run log，不进入后续 prompt。
-- 全部输入 prompt 另有独立的 `131072` token 目标，不扩大 session 的 `65536` 历史预算。
+- 全部输入 prompt 另有独立的 `131072` token 目标，不扩大 Agent 的 `32384` 历史预算。
   实际安全输入上限还会扣除所选模型配置的输出预留和安全余量；未配置容量的远端模型
   会在发请求前明确报错。本地 tokenizer 可配置，未配置时以 UTF-8 字节上界估算。超额时先缩减旧观察、
   低相关记忆、较旧历史与可续读的指导文件预览；系统指令、当前任务、工具 schema 和
-  最近两条历史不被静默截断。未显式指定生成上限时，已配置模型的输出预留同时成为
-  该次请求的 `max_tokens`，使预留可执行；需更长回答应提高模型配置的预留和容量。
+  最近两条历史不被静默截断。普通 Agent 调用未显式指定生成上限时，输出预留仅用于
+  上下文装配和准入估算，不发送 `max_tokens`；仍受提供方默认值和容量约束。
+  明确的子任务累计预算和显式调用上限继续生效，实际用量按提供方回执记录。
   `llm_started` 事件带输入估算、上限及计数方法。
 - 每次 Agent turn 会把确定性的 `current_time` 注入 session context window，包含 UTC、
   本地时间、时区和当前日期；这让 LLM 能处理“今天/明天/8月5号之后”等相对时间。
@@ -965,7 +986,7 @@ PDF 页码从 1 开始，字符偏移从 0 开始；每次调用重新授权路�
 视觉模型调用的审计与用量位于工具结果的 `llm_call` 字段，目前不并入 Agent 的顶层
 `llm_events` 汇总；客户端统计模型总用量时须同时读取这两类记录。容量检查使用保守
 图片 token 估计；未配置模型容量时只能依赖提供方拒绝超限请求。
-视觉工具默认最多输出 1024 token，可显式设置为 128–4096；回复不完整或达到输出上限
+视觉工具默认不发送输出上限，可显式设置为 128–4096；回复不完整或达到输出上限
 时工具报告失败，保留部分内容和调用审计，避免把截断内容当成完整阅读。
 
 ### 7.2 `bash.read_session`
@@ -1150,6 +1171,8 @@ POST /agent/runs/{run_id}/replace
 provider 调用无法保证被强制中止，但其后续 graph node、工具和 finalize 副作用会在下一个节点
 边界被阻止。重连的回答类 `llm_delta` 保持 `content_snapshot` 字段兼容性，但 SQLite 只保存 delta 并在
 回放时重建快照。完成前会先 flush token delta，之后才发布 `run_completed`。
+SSE 内部每次读取最多128个事件，持续排空积压及终态尾部；事件顺序与重连游标不变。
+终态关闭前只等待本run的事件落盘，不因其他运行持续输出而等待全局写入队列排空。
 
 服务重启后，处于 `running` 状态且保留 LangGraph SQLite checkpoint 的 run 可由
 `POST /agent/runs/{run_id}/resume` 显式恢复。`waiting_confirmation` run 必须继续通过对应的
@@ -2361,6 +2384,26 @@ Agent 可展开 `web` 包，再调用只读 `web.search`（参数 `query`、`mod
 
 使用方式与缓存分工见 [日常使用](usage.md) 和 [系统说明](architecture.md)。
 
+`web.snapshot` 是独立的可选富内容工具，不改变 `web.find` 的快速文本查找路径。
+调用示例：`web.snapshot(url="https://example.org/event", wait_for_selector="#prices")`。
+恰好传一个 `url/ref_id/snapshot_id`；来源、刷新、文本分页与版本校验沿用 open 的约定。
+`wait_for_selector` 可选，等待 CSS 目标可见；`render_wait_ms` 默认 1000、范围 0–5000，
+在 DOMContentLoaded／目标可见后额外等待，全部包含在获取超时内，不保证异步数据已经完整。
+固定快照读取不能同时指定渲染等待选项。需安装浏览器并开启 `[web_search].browser_enabled`；
+缺失时明确失败。工具声明 `read_only=true`、`external_read`，沿用执行器审查和来源策略。
+
+结果包含正文、`projection`（表格行、控件及禁用状态、select 选项、链接、schema.org offers）、
+`render_observations`（请求数、字节数、阻断统计、等待与限制）、采集时间、哈希及 `snapshot_id`。
+offers 的 `available` 仅将显式 InStock／LimitedAvailability 映射为 true，SoldOut／OutOfStock
+映射为 false，其余 null；同时保留原始 availability、声明来源和证据范围。
+这是页面声明，可能是隐藏结构记录，不认证实时库存；价格和禁用按钮不能证明可售／售罄。
+正文末尾保留结构投影，压缩后的遗漏内容可通过 `web.open(snapshot_id, offset, max_chars)`
+或 `web.find(snapshot_id, query)` 本地续读。渲染与普通 HTTP 抽取使用不同 URL 缓存键，
+根会话／child 权限、过期、取消、刷新失败与不可变版本边界一致。
+抽取有正文 20 万字符、5000 DOM 节点和结构条数上限，截断显式报告；只覆盖主文档 DOM，
+不读取登录会话、提交表单、点击购买、解析 iframe 正文或识别 canvas／图片座位图。
+来源内容仍是非受信任资料；不能将渲染成功、找到文字或完整交付解释为余票核验通过。
+
 `POST /watches` 创建每日关注项，主体包含 `title`、`goal`、IANA `timezone`、本地 `daily_time`、`categories` 与显式 `scope`（如 `web_enabled`、`source_ids`、`account_ids`）。响应给出稳定 `watch_id`，不创建固定会话。每次触发都会产生新的 `Occurrence` 和独立 `session_id`，可以在那次会话继续通过通用 Agent 入口追问。`GET /watches`、`GET /watches/{watch_id}`、`PATCH /watches/{watch_id}`、`DELETE /watches/{watch_id}` 管理关注项；`POST /watches/{watch_id}/pause|resume|run-now` 控制触发，`GET /watches/{watch_id}/runs` 查询执行记录。
 
 `GET /watches/briefings?unread_only=true&watch_id=...` 是本地简报列表，`GET /watches/briefings/{briefing_id}` 取单条，`POST /watches/briefings/{briefing_id}/read` 标为已读。成功执行会把简报摘要写入该次执行的新会话，并在简报返回 `session_id`。前端推送尚未实现，可轮询简报或会话变化。计划任务只授予经工具注册表核对的只读 Child Agent 工具；任何私密账户数据与外部搜索混用须显式设置 `scope.allow_mixed_private_external=true`。搜索/网页证据尚不等于已核验的票务状态。
@@ -2381,6 +2424,10 @@ query string 传递 token；它们不暴露 LLM 密钥、原始 prompt、记忆�
   与消息导入协议的 schema_version 独立。
 - `GET /background/config/schema`：返回 memory/background/message_history 配置的 JSON Schema，
   前端可以获取类型、默认值和数值范围；模型目录沿用 `GET /agent/models`。
+- `GET /background/health` 的 `recent_failure_categories` 统计最近24小时内、最近最多20个
+  终态失败作业的分类；排除已成功、取消及重试中的作业。`recent_failure_count` 是该时间窗的
+  全部终态失败数，`recent_failure_window_seconds=86400` 标明窗口。累计失败仍由
+  `queue_depth_by_status.failed` 提供，不删除历史错误记录。
 - `GET /background/health` 的 `llm_workloads.budget_pools` 分别提供记忆、消息、I/O 池的
   `revision`、`reset_at`、`circuit_open`、`opened_at`、`reason` 及小时／日 tokens、calls。
   `last_24h` 保留历史统计，不因额度重置变成零；当前额度应查看 `budget_pools`。
@@ -3228,3 +3275,10 @@ status 为 accepted、withdrawn、conflict 或 stale，result 提供云端条目
 云端 `GET /sync/memory-records/conflicts?limit=100&offset=0` 使用账号身份，
 返回待核对的自动同步来源提案和当前状态及 next_offset；来源后续撤回后不再展示旧提案。
 该接口只读，核对后通过现有记忆领域接口明确更正；不会自动替用户选择矛盾内容。
+
+
+## 可选 MySQL 存储错误
+
+MySQL 主存储的数据库错误返回固定 `detail="database_operation_failed"`，并携带 `category`、`mysql_errno`、`mysql_sqlstate` 和 `retry_safe=false`。约束冲突返回 409，连接、锁等待、池耗尽、事务超时和所有权失效返回 503，未分类错误返回 500；响应不包含 SQL、绑定值或驱动原始消息。驱动无法提供 SQLSTATE 时该字段为 `null`。
+
+`mysql_commit_outcome_unknown` 表示提交结果无法确认，不能凭该响应自动重放写入、模型或工具调用。应使用原命令／请求的稳定 ID 查询持久结果。后台队列保留 MySQL 错误类别并停止自动重试；恢复仍遵守原租约、检查点和副作用审计合同。

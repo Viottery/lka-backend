@@ -32,7 +32,10 @@ from app.domains.memory_feedback import (
     record_feedback,
     relevant_feedback_rows,
 )
-from app.storage.sqlite_timing import connect_sqlite
+from app.storage.connections import connect_database as connect_sqlite
+from app.storage.connections import is_mysql
+from app.storage.mysql_fulltext import execute_fulltext
+from app.storage.sqlite_retry import begin_sqlite_write
 
 MemoryScope = Literal["global", "project"]
 MemoryStatus = Literal["candidate", "active", "retracted", "superseded"]
@@ -163,7 +166,6 @@ class MemoryService:
         try:
             conn.executescript(
                 """
-                PRAGMA foreign_keys=ON;
                 CREATE TABLE IF NOT EXISTS memory_projects(
                     project_id TEXT PRIMARY KEY, created_at TEXT NOT NULL
                 );
@@ -267,8 +269,8 @@ class MemoryService:
     def _connect(self) -> sqlite3.Connection:
         conn = connect_sqlite(self.db_path, timeout=10)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA busy_timeout=10000")
+        if not is_mysql(conn):
+            conn.execute("PRAGMA foreign_keys=ON")
         return conn
 
     def fence_prior_publication(
@@ -839,6 +841,101 @@ class MemoryService:
         """Compatibility alias for exact-ID active/source-valid lookup."""
         return self.get_active(memory_id)
 
+    def active_identities(
+        self, *, scope: MemoryScope, project_id: str | None = None,
+    ) -> list[tuple[str, int, str]]:
+        """Return identities having the same visibility as list()+get_active().
+
+        Consolidation signatures need only identity, revision and sensitivity.
+        This avoids hydrating source IDs and records once in list(), then again
+        in get_active(). Conflict review is resolved in one batched peer read.
+        """
+        if scope == "project" and not project_id:
+            return []
+        now = _now()
+        clauses = [
+            "e.scope=?", "e.status='active'", "(e.expires_at IS NULL OR e.expires_at>?)",
+            ("EXISTS (SELECT 1 FROM memory_entry_sources es JOIN memory_sources s USING(source_id) "
+            "WHERE es.memory_id=e.memory_id AND s.status='active' "
+            "AND (s.expires_at IS NULL OR s.expires_at>?) "
+            "AND (s.source_type!='node_memory_replica' OR "
+            "(json_extract(s.metadata,'$.published_status')='active' "
+            "AND coalesce(json_extract(s.metadata,'$.needs_review'),0)=0)))"),
+        ]
+        base_args: list[Any] = [scope, now, now]
+        if scope == "project":
+            clauses.append("e.project_id=?")
+            base_args.append(project_id)
+        conn = self._connect()
+        try:
+            identities: list[tuple[str, int, str]] = []
+            offset = 0
+            while True:
+                rows = conn.execute(
+                    "SELECT e.memory_id,e.version,e.sensitivity,e.scope,e.project_id,e.metadata "
+                    "FROM memory_entries e WHERE " + " AND ".join(clauses)
+                    + " ORDER BY e.updated_at DESC,e.memory_id LIMIT 1000 OFFSET ?", [*base_args, offset],
+                ).fetchall()
+                reviewed = self._effective_review_ids(conn, rows)
+                identities.extend(
+                    (str(row["memory_id"]), int(row["version"]), str(row["sensitivity"]))
+                    for row in rows if row["memory_id"] not in reviewed
+                )
+                if len(rows) < 1000:
+                    break
+                offset += len(rows)
+            return identities
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _effective_review_ids(conn: sqlite3.Connection, rows: list[sqlite3.Row]) -> set[str]:
+        """Batch the peer checks used by _effective_metadata for review flags."""
+        references: dict[str, list[tuple[sqlite3.Row, list[dict[str, str]]]]] = {}
+        reviewed: set[str] = set()
+        for row in rows:
+            metadata = json.loads(row["metadata"])
+            conflict_ids = metadata.get("conflict_ids")
+            if not metadata.get("needs_review"):
+                continue
+            if not isinstance(conflict_ids, list):
+                # _effective_metadata preserves an unresolved review flag when
+                # its peer list is malformed or absent.
+                reviewed.add(str(row["memory_id"]))
+                continue
+            hints = _valid_conflict_hints(metadata.get("conflict_hints"))
+            for conflict_id in conflict_ids:
+                references.setdefault(str(conflict_id), []).append((row, hints))
+        if not references:
+            return reviewed
+        now = _now()
+        peer_by_id: dict[str, sqlite3.Row] = {}
+        reference_ids = list(references)
+        for start in range(0, len(reference_ids), 500):
+            batch_ids = reference_ids[start:start + 500]
+            placeholders = ",".join("?" for _ in batch_ids)
+            peers = conn.execute(
+                "SELECT e.memory_id,e.scope,e.project_id,e.metadata FROM memory_entries e "
+                "WHERE e.memory_id IN (" + placeholders + ") "
+                "AND e.status='active' AND (e.expires_at IS NULL OR e.expires_at>?) "
+                "AND EXISTS (SELECT 1 FROM memory_entry_sources es JOIN memory_sources s USING(source_id) "
+                "WHERE es.memory_id=e.memory_id AND s.status='active' "
+                "AND (s.expires_at IS NULL OR s.expires_at>?))",
+                [*batch_ids, now, now],
+            ).fetchall()
+            peer_by_id.update((str(peer["memory_id"]), peer) for peer in peers)
+        for peer_id, owners in references.items():
+            peer = peer_by_id.get(peer_id)
+            if peer is None:
+                continue
+            peer_hints = _valid_conflict_hints(json.loads(peer["metadata"]).get("conflict_hints"))
+            for owner, own_hints in owners:
+                if owner["scope"] == peer["scope"] and owner["project_id"] == peer["project_id"] and any(
+                    _opposite_hints(left, right) for left in own_hints for right in peer_hints
+                ):
+                    reviewed.add(str(owner["memory_id"]))
+        return reviewed
+
     def list(self, *, scope: MemoryScope | None = None, project_id: str | None = None,
              statuses: tuple[MemoryStatus, ...] = ("active",), include_expired: bool = False,
              limit: int = 100, offset: int = 0) -> list[MemoryRecord]:
@@ -865,7 +962,18 @@ class MemoryService:
         conn = self._connect()
         try:
             rows = conn.execute("SELECT * FROM memory_entries WHERE " + " AND ".join(clauses) + " ORDER BY updated_at DESC,memory_id LIMIT ? OFFSET ?", args).fetchall()
-            return [self._record(conn,row) for row in rows]
+            source_map: dict[str, list[str]] = {str(row["memory_id"]): [] for row in rows}
+            if source_map:
+                ids = list(source_map)
+                for start in range(0, len(ids), 500):
+                    batch_ids = ids[start:start + 500]
+                    source_rows = conn.execute(
+                        "SELECT memory_id,source_id FROM memory_entry_sources WHERE memory_id IN ("
+                        + ",".join("?" for _ in batch_ids) + ") ORDER BY memory_id,source_id", batch_ids,
+                    ).fetchall()
+                    for source_row in source_rows:
+                        source_map[str(source_row["memory_id"])].append(str(source_row["source_id"]))
+            return [self._record(conn, row, source_ids=source_map[str(row["memory_id"])]) for row in rows]
         finally:
             conn.close()
 
@@ -890,7 +998,7 @@ class MemoryService:
                 # must never widen the query or bypass the scope filter.
                 fts_query = " ".join('"' + part.replace('"', '""') + '"'
                                      for part in terms.split()[:8])
-                fts_ids = [row[0] for row in conn.execute(
+                fts_ids = [row[0] for row in execute_fulltext(conn,
                     "SELECT memory_id FROM memory_entries_fts WHERE memory_entries_fts MATCH ? LIMIT 200",
                     (fts_query,),
                 )]
@@ -992,7 +1100,7 @@ class MemoryService:
         ]))
         conn = self._connect()
         try:
-            conn.execute("BEGIN IMMEDIATE")
+            begin_sqlite_write(conn)
             if publication_lease is not None:
                 self._validate_publication_lease(conn, publication_lease)
             prior = conn.execute("SELECT * FROM memory_merges WHERE merge_id=?", (merge_id,)).fetchone()
@@ -1586,8 +1694,9 @@ class MemoryService:
         except (ValueError, TypeError):
             return False
 
-    def _record(self,conn: sqlite3.Connection,row: sqlite3.Row) -> MemoryRecord:
-        source_ids=[str(r[0]) for r in conn.execute("SELECT source_id FROM memory_entry_sources WHERE memory_id=? ORDER BY source_id",(row["memory_id"],))]
+    def _record(self,conn: sqlite3.Connection,row: sqlite3.Row, *, source_ids: list[str] | None = None) -> MemoryRecord:
+        if source_ids is None:
+            source_ids=[str(r[0]) for r in conn.execute("SELECT source_id FROM memory_entry_sources WHERE memory_id=? ORDER BY source_id",(row["memory_id"],))]
         return MemoryRecord(memory_id=row["memory_id"],memory_type=row["memory_type"],content=row["content"],scope=row["scope"],project_id=row["project_id"],status=row["status"],confidence=row["confidence"],sensitivity=row["sensitivity"],source_ids=source_ids,expires_at=row["expires_at"],version=row["version"],supersedes_id=row["supersedes_id"],created_at=row["created_at"],updated_at=row["updated_at"],metadata=self._effective_metadata(conn, row))
 
 

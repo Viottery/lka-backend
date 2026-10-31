@@ -34,6 +34,18 @@ def connections(tmp_path):
     cfg = DeviceConnectionConfig(enabled=True, node_id="pc", workspace_roots={"project": str(tmp_path)},
                                  allowed_origins=["https://pc.test.ts.net"], session_ttl_seconds=300)
     node = DeviceConnectionService(node_factory, cfg, clock=lambda: clock[0])
+    with node_factory() as conn:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS agent_sessions(session_id TEXT PRIMARY KEY,title TEXT,status TEXT,kind TEXT,
+                creation_source TEXT,creator_session_id TEXT,metadata TEXT,created_at TEXT,updated_at TEXT);
+            CREATE TABLE IF NOT EXISTS agent_runs(run_id TEXT PRIMARY KEY,session_id TEXT,status TEXT);
+            CREATE TABLE IF NOT EXISTS managed_session_links(manager_session_id TEXT,task_session_id TEXT);
+        """)
+        conn.execute("INSERT OR REPLACE INTO agent_sessions VALUES(?,?,?,?,?,?,?,?,?)",
+                     ("ordinary", "ordinary", "active", "ordinary", "user", None,
+                      json.dumps({"workspace": {"backend_path": str(tmp_path), "path": str(tmp_path),
+                                                "platform": "linux"}}),
+                      "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"))
     return SimpleNamespace(hub=hub, node=node, devices=devices, device=device, clock=clock,
                            hub_factory=hub_factory, node_factory=node_factory, root=tmp_path)
 
@@ -119,6 +131,8 @@ def test_connection_poll_requires_its_explicit_scope(connections):
 
 def test_direct_session_policy_is_persisted_and_cannot_widen(connections):
     f = connections
+    with f.node_factory() as conn:
+        conn.execute("INSERT INTO agent_runs VALUES('active-run','ordinary','running')")
     grant, _ = install(f)
     token = f.node.redeem(grant["grant"])["token"]
     principal = f.node.authenticate(token)
@@ -135,12 +149,13 @@ def test_direct_session_policy_is_persisted_and_cannot_widen(connections):
 def node_app(f):
     with f.node_factory() as conn:
         conn.executescript("""
-            CREATE TABLE agent_sessions(session_id TEXT PRIMARY KEY,title TEXT,status TEXT,kind TEXT,
+            CREATE TABLE IF NOT EXISTS agent_sessions(session_id TEXT PRIMARY KEY,title TEXT,status TEXT,kind TEXT,
                 creation_source TEXT,creator_session_id TEXT,metadata TEXT,created_at TEXT,updated_at TEXT);
-            CREATE TABLE managed_session_links(manager_session_id TEXT,task_session_id TEXT);
+            CREATE TABLE IF NOT EXISTS managed_session_links(manager_session_id TEXT,task_session_id TEXT);
         """)
         for identity, kind, source, creator, metadata in (
-            ("ordinary", "ordinary", "user", None, {}),
+            ("ordinary", "ordinary", "user", None,
+             {"workspace": {"backend_path": str(f.root), "path": str(f.root), "platform": "linux"}}),
             ("manager", "manager", "user", None, {}),
             ("assistant", "ordinary", "assistant", "manager", {}),
             ("linked", "ordinary", "user", None, {}),
@@ -149,7 +164,7 @@ def node_app(f):
             ("outside", "ordinary", "user", None,
              {"workspace": {"backend_path": "/unapproved", "path": "/unapproved", "platform": "linux"}}),
         ):
-            conn.execute("INSERT INTO agent_sessions VALUES(?,?,?,?,?,?,?,?,?)",
+            conn.execute("INSERT OR REPLACE INTO agent_sessions VALUES(?,?,?,?,?,?,?,?,?)",
                          (identity, identity, "active", kind, source, creator, json.dumps(metadata),
                           "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"))
         conn.execute("INSERT INTO managed_session_links VALUES('manager','linked')")
@@ -322,8 +337,13 @@ def test_product_node_gzip_filters_json_and_preserves_stream_revocation(connecti
     get_settings.cache_clear()
     try:
         app = create_app()
-        app.state.device_connection_service = f.node
         store = app.state.runtime.session_service
+        # The node authorization policy and product sessions must share the
+        # runtime database. A separate node.sqlite3 would make session lookup
+        # and policy binding observe different stores.
+        f.node = DeviceConnectionService(store._conn_factory, f.node.config,
+                                         clock=lambda: f.clock[0])
+        app.state.device_connection_service = f.node
         ordinary = store.create_session(title="Visible", metadata={"padding": "ordinary " * 1000}).session
         manager = store.create_session(title="Manager secret").session
         with store._conn_factory() as conn:
@@ -334,7 +354,9 @@ def test_product_node_gzip_filters_json_and_preserves_stream_revocation(connecti
         hidden.append(store.create_session(title="Cloud secret", metadata={"remote_execution": {"hub_id": "hub"}}).session.session_id)
         hidden.append(store.create_session(title="Outside secret", metadata={"workspace": {
             "path": "/unapproved", "backend_path": "/unapproved", "platform": "linux"}}).session.session_id)
-        grant, _ = install(f)
+        grant = f.hub.issue_grant("admin", "pc")
+        page = f.hub.pending_grants(f.devices.authenticate(f.device["token"]))
+        f.node.install_grants(page["items"])
         connection = f.node.redeem(grant["grant"])
         first = "data: " + "synthetic " * 1000 + "\n\n"
         produced = []

@@ -212,7 +212,7 @@ def test_context_answer_recovers_empty_or_truncated_reply(tmp_path, stream, firs
     assert all(e.stage == "context_answer" for e in events)
     assert provider.requests[1].thinking_enabled is False
     assert provider.requests[1].response_mode == LLMResponseMode.TEXT
-    assert provider.requests[0].max_output_tokens == provider.requests[1].max_output_tokens == 1024
+    assert provider.requests[0].max_output_tokens is provider.requests[1].max_output_tokens is None
 
 
 def test_context_answer_recovery_exhaustion_raises_instead_of_claiming_no_tools(tmp_path):
@@ -238,7 +238,7 @@ def test_incomplete_answer_regenerates_once_with_same_cap_and_full_audit(tmp_pat
         assert answer(loop, events) == "replacement answer"
         audit = [e for e in manager.list_events(run.run_id) if e.type == "llm_completed"]
     assert len(provider.requests) == len(events) == len(audit) == 2
-    assert provider.requests[0].max_output_tokens == provider.requests[1].max_output_tokens == 1024
+    assert provider.requests[0].max_output_tokens is provider.requests[1].max_output_tokens is None
     assert provider.requests[0].thinking_enabled is None
     assert provider.requests[1].thinking_enabled is False
     assert [e.payload["budget_token_count"] for e in audit] == [1400, 1400]

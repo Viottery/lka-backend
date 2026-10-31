@@ -245,6 +245,9 @@ def analyze(request: Request, conversation_key: str) -> dict[str, Any]:
         return {"jobs": [], "status": "paused"}
     try:
         jobs = runtime.message_history.schedule_pending(conversation_key, force=True)
+        coordinator = getattr(runtime, "message_analysis", None)
+        if coordinator is not None:
+            coordinator.notify_committed()
     except (AttributeError, ValueError, KeyError):
         raise _failure() from None
     if not jobs:

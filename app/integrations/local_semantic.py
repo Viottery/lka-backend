@@ -413,6 +413,7 @@ def build_local_semantic_components(
     query_prefix: str,
     normalize_embeddings: bool,
     local_files_only: bool,
+    storage_backend: str = "sqlite",
 ) -> tuple[EmbeddingProvider | None, SemanticIndex | None]:
     """Build configured local components while keeping runtime independent of implementations."""
 
@@ -429,6 +430,13 @@ def build_local_semantic_components(
         normalized=normalize_embeddings,
         local_files_only=local_files_only,
     )
+    if storage_backend == "mysql":
+        from app.integrations.mysql_semantic import MySQLVectorSemanticIndex
+
+        return provider, MySQLVectorSemanticIndex(
+            conn_factory=conn_factory,
+            model_info=provider.model_info,
+        )
     return provider, SQLiteVecSemanticIndex(
         conn_factory=conn_factory,
         model_info=provider.model_info,

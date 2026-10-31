@@ -4,6 +4,8 @@ import json
 
 import pytest
 
+from app.core.llm import LLMMessage, LLMRequest
+from app.core.llm.openai_compatible import OpenAICompatibleLLMClient
 from app.core.safety import SafetyReviewMode, SafetyReviewRequest
 from tests.test_answer_generation_recovery_quality import make_loop, response, scope
 
@@ -19,7 +21,7 @@ def review(loop, manager, run, events):
 
 
 @pytest.mark.parametrize("stream", [False, True])
-def test_safety_output_unset_at_provider_but_normal_stage_reserve_still_enforced(tmp_path, stream):
+def test_output_reserve_does_not_cap_safety_or_normal_generation(tmp_path, stream):
     approval = json.dumps({"approve": True, "reason": "The requested directory inspection is read-only."})
     loop, provider, manager = make_loop(tmp_path, [response(approval), response("normal stage")])
     events = []
@@ -30,7 +32,7 @@ def test_safety_output_unset_at_provider_but_normal_stage_reserve_still_enforced
         assert provider.requests[0].max_output_tokens is None
         loop._complete_text_with_retry(stage="route", system_prompt="Route the task", user_prompt="inspect",
             prompt_summary="normal control", max_output_tokens=None, llm_events=events)
-    assert provider.requests[1].max_output_tokens == 1024
+    assert provider.requests[1].max_output_tokens is None
     assert events[0].output_token_count == 900  # More than the former 512 cap.
 
 
@@ -63,3 +65,15 @@ def test_child_safety_review_still_obeys_explicit_task_budget(tmp_path):
         result = review(loop, manager, run, [])
     assert result.status == "approved"
     assert 0 < provider.requests[0].max_output_tokens <= 10000
+
+
+def test_unlimited_request_omits_output_limits_from_actual_wire_payload():
+    client = OpenAICompatibleLLMClient(name="offline", provider_name="offline",
+        base_url="https://invalid.example/v1", api_key="offline", default_model="test")
+    request = LLMRequest(messages=[LLMMessage(role="user", content="Reply")], prompt_summary="offline")
+    for stream in (False, True):
+        payload = json.loads(client._build_request(request, stream=stream).data)
+        assert "max_tokens" not in payload
+        assert "max_output_tokens" not in payload
+        capped = request.model_copy(update={"max_output_tokens": 37})
+        assert json.loads(client._build_request(capped, stream=stream).data)["max_tokens"] == 37

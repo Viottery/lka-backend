@@ -24,7 +24,8 @@ from typing import Any
 from uuid import uuid4
 
 from app.core.llm.errors import LLMClientError
-from app.storage.sqlite_timing import connect_sqlite
+from app.storage.connections import connect_database as connect_sqlite
+from app.storage.connections import is_mysql, mysql_config_for
 
 _BACKGROUND_POOLS = {"background_memory", "background_message", "background_io", "background_agent"}
 _logger = logging.getLogger(__name__)
@@ -173,6 +174,7 @@ class LLMWorkloadController:
         self.daily_cost_limit = daily_cost_limit
         self.input_price, self.output_price = input_cost_per_million, output_cost_per_million
         self._guard = threading.Lock()
+        self._mysql_maintenance_at = 0.0
         self._active: Counter[str] = Counter()
         self._interactive_waiters = 0
         self._cooldown_until = 0.0
@@ -185,6 +187,8 @@ class LLMWorkloadController:
                 input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL,
                 cost REAL NOT NULL, duration_seconds REAL, count_method TEXT NOT NULL)""")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_llm_usage_time ON llm_workload_usage(created_at,pool)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_llm_usage_reserved_expiry "
+                         "ON llm_workload_usage(expires_at) WHERE status='reserved'")
             conn.execute("""CREATE TABLE IF NOT EXISTS llm_workload_pool_state(
                 pool TEXT PRIMARY KEY, revision INTEGER NOT NULL DEFAULT 0,
                 reset_at TEXT NOT NULL DEFAULT '', opened_at TEXT, reason TEXT)""")
@@ -215,6 +219,33 @@ class LLMWorkloadController:
             conn.execute("""INSERT OR IGNORE INTO llm_workload_quota_totals
                 SELECT 'task:' || task_id,SUM(input_tokens+output_tokens),COUNT(*)
                 FROM llm_workload_usage WHERE task_id IS NOT NULL GROUP BY task_id""")
+
+    @staticmethod
+    def _lock_budgets(conn, *, pools=(), scopes=()) -> None:
+        """Serialize only intersecting budget scopes, in a stable lock order.
+
+        READ COMMITTED does not protect an aggregate from concurrent inserts.
+        Materialized anchors cover empty ledgers as well as existing usage.
+        Pool anchors precede sorted quota anchors in every accounting writer.
+        """
+        if not is_mysql(conn):
+            return
+        for pool in sorted(set(pools)):
+            conn.execute_native(
+                "INSERT INTO llm_workload_pool_state(pool) VALUES(%s) "
+                "ON DUPLICATE KEY UPDATE pool=VALUES(pool)", (pool,),
+            )
+            conn.execute_native(
+                "SELECT pool FROM llm_workload_pool_state WHERE pool=%s FOR UPDATE", (pool,),
+            ).fetchone()
+        for scope in sorted(set(scopes)):
+            conn.execute_native(
+                "INSERT INTO llm_workload_quota_totals(scope_id,total_tokens,total_calls) VALUES(%s,0,0) "
+                "ON DUPLICATE KEY UPDATE scope_id=VALUES(scope_id)", (scope,),
+            )
+            conn.execute_native(
+                "SELECT scope_id FROM llm_workload_quota_totals WHERE scope_id=%s FOR UPDATE", (scope,),
+            ).fetchone()
 
     @staticmethod
     def _quotas(workload: Workload) -> tuple[BudgetQuota, ...]:
@@ -261,6 +292,8 @@ class LLMWorkloadController:
         tasks = tuple(dict.fromkeys(task_ids))
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            self._lock_budgets(conn, pools=(*_BACKGROUND_POOLS, "interactive"),
+                               scopes=(*scopes, *("task:" + task for task in tasks)))
             placeholders = ",".join("?" for _ in tasks)
             rows = conn.execute(
                 f"SELECT call_id,task_id,input_tokens+output_tokens AS tokens FROM llm_workload_usage WHERE task_id IN ({placeholders})",
@@ -305,6 +338,7 @@ class LLMWorkloadController:
             raise ValueError("invalid workload attribution")
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            self._lock_budgets(conn, pools=(*_BACKGROUND_POOLS, "interactive"))
             for task_id in dict.fromkeys(task_ids):
                 conn.execute("UPDATE llm_workload_usage SET pool=? WHERE task_id=? AND pool!='interactive'", (pool, task_id))
 
@@ -323,6 +357,7 @@ class LLMWorkloadController:
         now = datetime.now(UTC).isoformat()
         with self._guard, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            self._lock_budgets(conn, pools=expected_revisions)
             for pool, revision in expected_revisions.items():
                 state = conn.execute("SELECT revision FROM llm_workload_pool_state WHERE pool=?", (pool,)).fetchone()
                 reserved = conn.execute("SELECT 1 FROM llm_workload_usage WHERE pool=? AND status='reserved' AND expires_at>? LIMIT 1", (pool, now)).fetchone()
@@ -402,29 +437,87 @@ class LLMWorkloadController:
             return None
         return self._cost(incoming, outgoing)
 
-    def _reserve(self, ticket: UsageTicket) -> None:
+    def prune_mysql_usage(self, *, limit: int = 500) -> int:
+        """Bounded ledger retention, outside individual reservation transactions.
+
+        Historical usage remains represented in durable quota totals/adoptions.
+        Every accounting writer takes pool anchors first, so a maintenance batch
+        can safely compact settled rows without a global database write queue.
+        """
+        if mysql_config_for(self.db_path) is None:
+            return 0
+        limit = max(1, min(int(limit), 1000))
         now = datetime.now(UTC)
+        cutoff = (now - timedelta(days=90)).isoformat()
         with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            # Counters need only rolling windows. Retain three months of
-            # payload-free diagnostics, not an unbounded billing ledger.
-            cutoff = (now - timedelta(days=90)).isoformat()
-            # Preserve the attribution of already-charged links before deleting
-            # detail. A later adoption must not charge these same calls again.
-            conn.execute("""INSERT INTO llm_workload_quota_adoptions
+            candidate = conn.execute(
+                "SELECT 1 FROM llm_workload_usage WHERE (created_at<? AND status!='reserved') "
+                "OR (status='reserved' AND expires_at<=?) LIMIT 1", (cutoff, now.isoformat()),
+            ).fetchone()
+            if candidate is None:
+                return 0
+            conn.execute("BEGIN")
+            self._lock_budgets(conn, pools=(*_BACKGROUND_POOLS, "interactive"))
+            expired = conn.execute(
+                "SELECT call_id FROM llm_workload_usage WHERE status='reserved' AND expires_at<=? "
+                "ORDER BY expires_at,call_id LIMIT ?", (now.isoformat(), limit),
+            ).fetchall()
+            for row in expired:
+                conn.execute("UPDATE llm_workload_usage SET status='estimated' WHERE call_id=? AND status='reserved'",
+                             (row[0],))
+            rows = conn.execute(
+                "SELECT call_id FROM llm_workload_usage WHERE created_at<? AND status!='reserved' "
+                "ORDER BY created_at,call_id LIMIT ?", (cutoff, limit),
+            ).fetchall()
+            if not rows:
+                return 0
+            ids = tuple(row[0] for row in rows)
+            placeholders = ",".join("?" for _ in ids)
+            conn.execute(f"""INSERT INTO llm_workload_quota_adoptions
                 SELECT u.task_id,q.scope_id,SUM(u.input_tokens+u.output_tokens),COUNT(*)
                 FROM llm_workload_usage u JOIN llm_workload_quota_usage q ON q.call_id=u.call_id
-                WHERE u.created_at<? AND u.status!='reserved' AND u.task_id IS NOT NULL
+                WHERE u.call_id IN ({placeholders}) AND u.task_id IS NOT NULL
                 GROUP BY u.task_id,q.scope_id
                 ON CONFLICT(task_id,scope_id) DO UPDATE
                 SET compacted_tokens=compacted_tokens+excluded.compacted_tokens,
-                compacted_calls=compacted_calls+excluded.compacted_calls""", (cutoff,))
-            conn.execute("""DELETE FROM llm_workload_quota_usage WHERE call_id IN
-                (SELECT call_id FROM llm_workload_usage WHERE created_at<? AND status!='reserved')""", (cutoff,))
-            conn.execute("DELETE FROM llm_workload_usage WHERE created_at<? AND status!='reserved'", (cutoff,))
-            # A killed process cannot retain a reservation forever. Expired
-            # dispatched calls stay charged conservatively, never free retries.
-            conn.execute("UPDATE llm_workload_usage SET status='estimated' WHERE status='reserved' AND expires_at<=?", (now.isoformat(),))
+                compacted_calls=compacted_calls+excluded.compacted_calls""", ids)
+            conn.execute(f"DELETE FROM llm_workload_quota_usage WHERE call_id IN ({placeholders})", ids)
+            conn.execute(f"DELETE FROM llm_workload_usage WHERE call_id IN ({placeholders})", ids)
+            return len(rows)
+
+    def _reserve(self, ticket: UsageTicket) -> None:
+        if mysql_config_for(self.db_path) is not None:
+            with self._guard:
+                maintenance_due = time.monotonic() >= self._mysql_maintenance_at
+                if maintenance_due:
+                    self._mysql_maintenance_at = time.monotonic() + 900
+            if maintenance_due:
+                self.prune_mysql_usage()
+        now = datetime.now(UTC)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._lock_budgets(conn, pools=(ticket.workload.pool,),
+                               scopes=(quota.scope_id for quota in self._quotas(ticket.workload)))
+            if not is_mysql(conn):
+                # Counters need only rolling windows. Retain three months of
+                # payload-free diagnostics, not an unbounded billing ledger.
+                cutoff = (now - timedelta(days=90)).isoformat()
+                # Preserve the attribution of already-charged links before deleting
+                # detail. A later adoption must not charge these same calls again.
+                conn.execute("""INSERT INTO llm_workload_quota_adoptions
+                    SELECT u.task_id,q.scope_id,SUM(u.input_tokens+u.output_tokens),COUNT(*)
+                    FROM llm_workload_usage u JOIN llm_workload_quota_usage q ON q.call_id=u.call_id
+                    WHERE u.created_at<? AND u.status!='reserved' AND u.task_id IS NOT NULL
+                    GROUP BY u.task_id,q.scope_id
+                    ON CONFLICT(task_id,scope_id) DO UPDATE
+                    SET compacted_tokens=compacted_tokens+excluded.compacted_tokens,
+                    compacted_calls=compacted_calls+excluded.compacted_calls""", (cutoff,))
+                conn.execute("""DELETE FROM llm_workload_quota_usage WHERE call_id IN
+                    (SELECT call_id FROM llm_workload_usage WHERE created_at<? AND status!='reserved')""", (cutoff,))
+                conn.execute("DELETE FROM llm_workload_usage WHERE created_at<? AND status!='reserved'", (cutoff,))
+                # A killed process cannot retain a reservation forever. Expired
+                # dispatched calls stay charged conservatively, never free retries.
+                conn.execute("UPDATE llm_workload_usage SET status='estimated' WHERE status='reserved' AND expires_at<=?", (now.isoformat(),))
             tokens = ticket.input_tokens + ticket.output_tokens
             reason = self._circuit_reason(conn, ticket, now, tokens)
             if reason:
@@ -489,6 +582,8 @@ class LLMWorkloadController:
         if not ticket.dispatched:
             with self._connect() as conn:
                 conn.execute("BEGIN IMMEDIATE")
+                self._lock_budgets(conn, pools=(ticket.workload.pool,),
+                                   scopes=(quota.scope_id for quota in self._quotas(ticket.workload)))
                 old = conn.execute("SELECT input_tokens+output_tokens FROM llm_workload_usage WHERE call_id=?", (ticket.call_id,)).fetchone()
                 if old is not None:
                     conn.execute("""UPDATE llm_workload_quota_totals SET total_tokens=total_tokens-?,total_calls=total_calls-1
@@ -506,6 +601,8 @@ class LLMWorkloadController:
         outgoing = output_actual if valid(output_actual) else ticket.output_tokens
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            self._lock_budgets(conn, pools=(ticket.workload.pool,),
+                               scopes=(quota.scope_id for quota in self._quotas(ticket.workload)))
             old = conn.execute("SELECT input_tokens+output_tokens FROM llm_workload_usage WHERE call_id=?", (ticket.call_id,)).fetchone()
             if old is not None:
                 conn.execute("""UPDATE llm_workload_quota_totals SET total_tokens=total_tokens+?

@@ -11,9 +11,11 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.core.session_admission import SessionAdmissionStore
 from app.domains.management import ManagementConflictError
 from app.domains.management_goals import _instant
 from app.storage.commit_signals import notify_after_commit
+from app.storage.connections import is_mysql, lock_row
 
 
 def _json(value):
@@ -130,6 +132,9 @@ class ManagementScheduleService:
 
     def ensure_schema(self):
         self.goals.ensure_schema()
+        with closing(self._conn()) as conn:
+            if is_mysql(conn):
+                return
         with closing(self._conn()) as conn, conn:
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS manager_schedules (
@@ -165,7 +170,8 @@ class ManagementScheduleService:
         instant = _instant(now)
         stamp = instant.isoformat()
         with closing(self._conn()) as conn, conn:
-            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("BEGIN" if is_mysql(conn) else "BEGIN IMMEDIATE")
+            SessionAdmissionStore.lock_session(conn, session_id)
             if authority_check is not None:
                 authority_check(conn)
             self.goals._manager(conn, session_id)
@@ -179,10 +185,13 @@ class ManagementScheduleService:
             goal = conn.execute("SELECT session_id FROM manager_goals WHERE goal_id=?", (args.goal_id,)).fetchone()
             if goal is None or goal["session_id"] != session_id:
                 raise ValueError("Goal must belong to this management session")
+            goal_row = lock_row(conn, "manager_goals", "goal_id", args.goal_id)
+            if goal_row is None or goal_row["session_id"] != session_id:
+                raise ValueError("Goal must belong to this management session")
             if args.enabled and not self.goals.enabled_in_transaction(conn, args.goal_id):
                 raise ManagementConflictError("Goal is not enabled")
             schedule_id = args.schedule_id or "schedule_" + sha256(_json([session_id, command_id]).encode()).hexdigest()[:32]
-            old = conn.execute("SELECT * FROM manager_schedules WHERE schedule_id=?", (schedule_id,)).fetchone()
+            old = lock_row(conn, "manager_schedules", "schedule_id", schedule_id)
             if old is not None and old["session_id"] != session_id:
                 raise KeyError(schedule_id)
             if old is None and args.expected_revision is not None:
@@ -198,10 +207,25 @@ class ManagementScheduleService:
             values = (schedule_id, session_id, args.goal_id, revision, args.timezone, args.kind,
                       args.local_time, args.weekday, args.run_at, args.expires_at, int(args.enabled),
                       upcoming.isoformat() if upcoming else None, old["created_at"] if old else stamp, stamp)
-            conn.execute("INSERT INTO manager_schedules(schedule_id,session_id,goal_id,revision,timezone,kind,local_time,weekday,run_at,expires_at,enabled,next_run_at,created_at,updated_at) "
-                         "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(schedule_id) DO UPDATE SET "
-                         "goal_id=excluded.goal_id,revision=excluded.revision,timezone=excluded.timezone,kind=excluded.kind,local_time=excluded.local_time,weekday=excluded.weekday,run_at=excluded.run_at,expires_at=excluded.expires_at,enabled=excluded.enabled,next_run_at=excluded.next_run_at,last_occurrence_at=NULL,last_outcome=NULL,updated_at=excluded.updated_at",
-                         values)
+            if is_mysql(conn):
+                if old is None:
+                    conn.execute("INSERT INTO manager_schedules(schedule_id,session_id,goal_id,revision,timezone,kind,local_time,weekday,run_at,expires_at,enabled,next_run_at,created_at,updated_at) "
+                                 "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", values)
+                else:
+                    changed = conn.execute(
+                        "UPDATE manager_schedules SET goal_id=?,revision=?,timezone=?,kind=?,local_time=?,weekday=?,run_at=?,expires_at=?,enabled=?,next_run_at=?,last_occurrence_at=NULL,last_outcome=NULL,updated_at=? "
+                        "WHERE schedule_id=? AND session_id=? AND revision=?",
+                        (args.goal_id, revision, args.timezone, args.kind, args.local_time, args.weekday,
+                         args.run_at, args.expires_at, int(args.enabled), upcoming.isoformat() if upcoming else None,
+                         stamp, schedule_id, session_id, old["revision"]),
+                    )
+                    if changed.rowcount != 1:
+                        raise ManagementConflictError("Schedule revision changed")
+            else:
+                conn.execute("INSERT INTO manager_schedules(schedule_id,session_id,goal_id,revision,timezone,kind,local_time,weekday,run_at,expires_at,enabled,next_run_at,created_at,updated_at) "
+                             "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(schedule_id) DO UPDATE SET "
+                             "goal_id=excluded.goal_id,revision=excluded.revision,timezone=excluded.timezone,kind=excluded.kind,local_time=excluded.local_time,weekday=excluded.weekday,run_at=excluded.run_at,expires_at=excluded.expires_at,enabled=excluded.enabled,next_run_at=excluded.next_run_at,last_occurrence_at=NULL,last_outcome=NULL,updated_at=excluded.updated_at",
+                             values)
             result = {"command_id": command_id, "status": "configured", "snapshot_kind": "command_commit",
                       "schedule": self._view(conn.execute("SELECT * FROM manager_schedules WHERE schedule_id=?", (schedule_id,)).fetchone())}
             conn.execute("INSERT INTO manager_schedule_commands VALUES(?,?,?,?)", (session_id, command_id, fingerprint, _json(result)))
@@ -239,6 +263,9 @@ class ManagementScheduleService:
     def tick(self, now=None):
         """Capture at most the latest due occurrence and atomically advance its watermark."""
         instant = _instant(now)
+        mysql_result = self._mysql_tick(instant)
+        if mysql_result is not None:
+            return mysql_result
         count = 0
         with closing(self._conn()) as probe:
             due_exists = probe.execute(
@@ -271,4 +298,61 @@ class ManagementScheduleService:
                 conn.execute("UPDATE manager_schedules SET next_run_at=?,last_occurrence_at=?,last_outcome=?,updated_at=? WHERE schedule_id=?",
                              (upcoming.isoformat() if upcoming else None, occurrence.isoformat() if occurrence else None,
                               outcome, instant.isoformat(), row["schedule_id"]))
+        return count
+
+    def _mysql_tick(self, instant):
+        """Process bounded due schedules with per-session resource locks."""
+        with closing(self._conn()) as conn:
+            if not is_mysql(conn):
+                return None
+            candidates = conn.execute(
+                "SELECT schedule_id,session_id,goal_id FROM manager_schedules "
+                "WHERE enabled=1 AND next_run_at IS NOT NULL AND next_run_at<=? "
+                "ORDER BY next_run_at,schedule_id LIMIT 32", (instant.isoformat(),),
+            ).fetchall()
+        count = 0
+        for candidate in candidates:
+            sid, schedule_id, goal_id = candidate["session_id"], candidate["schedule_id"], candidate["goal_id"]
+            with closing(self._conn()) as conn, conn:
+                conn.execute("BEGIN")
+                try:
+                    SessionAdmissionStore.lock_session(conn, sid)
+                    controller = lock_row(conn, "manager_controllers", "session_id", sid)
+                    goal = lock_row(conn, "manager_goals", "goal_id", goal_id)
+                    row = lock_row(conn, "manager_schedules", "schedule_id", schedule_id)
+                    if (controller is None or goal is None or row is None or row["session_id"] != sid
+                            or row["goal_id"] != goal_id or not row["enabled"]
+                            or row["next_run_at"] is None or _instant(row["next_run_at"]) > instant):
+                        conn.commit()
+                        continue
+                    session = conn.execute("SELECT status FROM agent_sessions WHERE session_id=?", (sid,)).fetchone()
+                    policy = dict(row)
+                    occurrence = _occurrence(policy, instant, future=False, inclusive=True)
+                    upcoming = next_occurrence(policy, instant)
+                    expired = row["expires_at"] is not None and _instant(row["expires_at"]) <= instant
+                    eligible = (not expired and controller["status"] == "active" and session is not None
+                                and session["status"] != "deleted" and goal["status"] in {"active", "waiting"}
+                                and self.goals.enabled_in_transaction(conn, goal_id))
+                    outcome = "skipped"
+                    if eligible and occurrence is not None and occurrence >= _instant(row["next_run_at"]):
+                        occurrence_id = occurrence.isoformat()
+                        payload = {"schedule_id": schedule_id, "schedule_revision": row["revision"],
+                                   "occurrence": occurrence_id, "timer_generation": goal["timer_generation"]}
+                        count += self.goals._event(
+                            conn, sid, f"schedule:{schedule_id}:{row['revision']}:{occurrence_id}",
+                            "timer", payload, instant.isoformat(), goal_id, goal["revision"],
+                        )
+                        outcome = "captured"
+                    changed = conn.execute(
+                        "UPDATE manager_schedules SET next_run_at=?,last_occurrence_at=?,last_outcome=?,updated_at=? "
+                        "WHERE schedule_id=? AND session_id=? AND revision=? AND next_run_at=?",
+                        (upcoming.isoformat() if upcoming else None, occurrence.isoformat() if occurrence else None,
+                         outcome, instant.isoformat(), schedule_id, sid, row["revision"], row["next_run_at"]),
+                    )
+                    if changed.rowcount != 1:
+                        raise ManagementConflictError("Schedule revision changed")
+                    conn.commit()
+                except BaseException:
+                    conn.rollback()
+                    raise
         return count

@@ -614,7 +614,7 @@ class DeviceConnectionService:
                         continue
                     if (stat.S_ISDIR(metadata.st_mode) and not is_link_or_reparse(metadata)
                             and (not query or query.casefold() in entry.name.casefold())):
-                        directories.append({"name": entry.name, "path": str(Path(entry.path))})
+                        directories.append({"name": entry.name, "path": str(target / entry.name)})
         except OSError as exc:
             raise PermissionError("directory cannot be listed") from exc
         directories.sort(key=lambda item: item["name"].casefold())

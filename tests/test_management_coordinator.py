@@ -1,5 +1,6 @@
 """Offline acceptance of durable management wake and fenced publication."""
 import asyncio
+import json
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
@@ -67,6 +68,18 @@ def finalize(runtime, run, *, notify_user=True):
         message_payload={"run_id": run.run_id}, message_id="test_answer_" + run.run_id,
         context_effect_id="test_context_" + run.run_id, token_budget=1000, background_enqueue=None,
     )
+
+
+def passing_answer_review():
+    return json.dumps({"faithful": True, "hallucination_free": True, "request_aligned": True,
+                       "decision": "pass", "issues": [], "revision_instructions": "", "evidence_gap": ""})
+
+
+def assert_answer_review_passed(runtime, run_id, client):
+    review = next(e for e in runtime.agent_run_manager.list_events(run_id)
+                  if e.type == "answer_review_completed")
+    assert review.payload["decision"] == "pass"
+    assert [call["metadata"]["stage"] for call in client.calls].count("answer_review") == 1
 
 
 def test_capture_while_paused_and_explicit_autonomy_opt_in(runtime):
@@ -177,6 +190,7 @@ def test_bound_before_restart_executes_original_and_publishes_once(runtime):
             operation("tool_call", tool_name="management.decide_notification", tool_input={
                 "command_id": "restart-notification", "notify_user": True, "reason": "The requested timer check is complete."}),
             operation("final_answer", reason="Report timer check"), "Checked after restart.",
+            passing_answer_review(),
         ])
         reopened.agent_turn_loop.llm_client = client
         assert reopened.agent_dispatch.run_one()
@@ -191,6 +205,7 @@ def test_bound_before_restart_executes_original_and_publishes_once(runtime):
         types = [e.type for e in reopened.agent_run_manager.list_events(original.run_id)]
         assert types.count("final_answer") == 1
         assert types.index("final_answer") < types.index("run_completed")
+        assert_answer_review_passed(reopened, original.run_id, client)
         messages = reopened.session_service.get_session(session_id=sid).messages
         assert [m.role for m in messages] == ["tool", "agent"]
         assert messages[-1].message_id == deliveries[0]["message_id"]
@@ -264,6 +279,7 @@ def test_real_harness_stages_goal_tool_and_publishes(runtime):
         operation("tool_call", tool_name="management.decide_notification", tool_input={
             "command_id": "goal-notification", "notify_user": True, "reason": "The requested goal check is complete."}),
         operation("final_answer", reason="One-shot check is complete"), "The check is complete.",
+        passing_answer_review(),
     ])
     runtime.agent_turn_loop.llm_client = client
     assert runtime.agent_dispatch.run_one()
@@ -271,6 +287,7 @@ def test_real_harness_stages_goal_tool_and_publishes(runtime):
     assert current.status.value == "completed", (current.error_type, current.error)
     assert runtime.management_goals.get_goal(sid, goal["goal_id"])["status"] == "completed"
     assert len(runtime.management_goals.list_deliveries(sid)["deliveries"]) == 1
+    assert_answer_review_passed(runtime, run.run_id, client)
 
 
 def test_interactive_goal_command_idempotency_and_long_objective_paging(runtime):
@@ -481,9 +498,11 @@ def test_harness_control_fence_does_not_emit_formal_final_answer(runtime):
     sid, _ = timer(runtime)
     runtime.management_coordinator.tick()
     run = bind(runtime)
-    runtime.agent_turn_loop.llm_client = ScriptedClient([
+    client = ScriptedClient([
         operation("final_answer", reason="Prepare a report"), "This must not be published.",
+        passing_answer_review(),
     ])
+    runtime.agent_turn_loop.llm_client = client
     finalize_handler = runtime.agent_turn_loop.finalization_handler
     def pause_before_commit(*args, **kwargs):
         runtime.management_service.update(sid, expected_revision=2, status="paused")
@@ -493,6 +512,7 @@ def test_harness_control_fence_does_not_emit_formal_final_answer(runtime):
     assert runtime.agent_run_manager.get_run(run.run_id).status.value == "cancelled"
     types = [e.type for e in runtime.agent_run_manager.list_events(run.run_id)]
     assert "final_answer" not in types and "run_completed" not in types
+    assert_answer_review_passed(runtime, run.run_id, client)
     assert runtime.management_goals.list_deliveries(sid)["deliveries"] == []
     assert all(m.role != "agent" for m in runtime.session_service.get_session(session_id=sid).messages)
 
@@ -508,11 +528,14 @@ def test_task_terminal_wakes_manager_to_read_result_without_user_poll(runtime):
         command_id="terminal-report", purpose="Calculate the synthetic result",
     )
     runtime.agent_run_manager.complete_run(foreground.run_id)
-    runtime.agent_turn_loop.llm_client = ScriptedClient([
+    task_client = ScriptedClient([
         operation("final_answer", reason="Synthetic task is complete"), "SYNTHETIC_RESULT_713",
+        passing_answer_review(),
     ])
+    runtime.agent_turn_loop.llm_client = task_client
     assert runtime.agent_dispatch.run_one()
     assert runtime.agent_run_manager.get_run(receipt["run_id"]).status.value == "completed"
+    assert_answer_review_passed(runtime, receipt["run_id"], task_client)
     assert runtime.management_coordinator.tick() == {"captured": 1, "scheduled": 1}
     manager = bind(runtime)
     client = ScriptedClient([
@@ -521,11 +544,13 @@ def test_task_terminal_wakes_manager_to_read_result_without_user_poll(runtime):
         operation("tool_call", tool_name="management.decide_notification", tool_input={
             "command_id": "result-notification", "notify_user": True, "reason": "The user requested this task result."}),
         operation("final_answer", reason="The task result was read"), "Task result: SYNTHETIC_RESULT_713",
+        passing_answer_review(),
     ])
     runtime.agent_turn_loop.llm_client = client
     assert runtime.agent_dispatch.run_one()
     current = runtime.agent_run_manager.get_run(manager.run_id)
     assert current.status.value == "completed", (current.error_type, current.error)
+    assert_answer_review_passed(runtime, manager.run_id, client)
     assert "SYNTHETIC_RESULT_713" in client.calls[-1]["user_prompt"]
     delivery = runtime.management_goals.list_deliveries(sid)["deliveries"][0]
     assert delivery["run_id"] == manager.run_id

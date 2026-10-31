@@ -895,7 +895,7 @@ def test_agent_turn_maintains_recent_session_context_window(tmp_path, monkeypatc
     assert all("input_token_estimate_delta" in event.payload for event in completed)
     assert fake_llm.route_contexts[0]["recent_messages"] == []
     second_context = fake_llm.route_contexts[1]
-    assert second_context["token_budget"] == 65_536
+    assert second_context["token_budget"] == 32_384
     assert second_context["token_estimate"] > 0
     assert [message["role"] for message in second_context["recent_messages"]] == [
         "user",
@@ -2155,7 +2155,13 @@ class _ContextAwareLLM:
         temperature: float = 0.0,
         max_output_tokens: int | None = None,
     ) -> LLMResponse:
-        if "Choose at most one tool package" in system_prompt:
+        if prompt_summary == "final_answer_content_review":
+            draft = json.loads(user_prompt)["draft_answer"]
+            assert "ICA学生签证" in draft
+            content = json.dumps({"faithful": True, "hallucination_free": True,
+                "request_aligned": True, "decision": "pass", "issues": [],
+                "revision_instructions": "", "evidence_gap": ""})
+        elif "Choose at most one tool package" in system_prompt:
             payload = json.loads(user_prompt)
             self.route_contexts.append(payload["session_context_window"])
             content = json.dumps(

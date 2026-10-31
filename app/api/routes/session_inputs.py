@@ -1,15 +1,16 @@
 """Local user acceptance and inspection of durable session input queues."""
 from __future__ import annotations
 
-from contextlib import closing
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.api.routes.memories import require_local_memory_control
 from app.core.session_inputs import SessionInputConflict
 from app.domains.session_attachments import SessionAttachmentError
+from app.storage.keyed_write_admission import KeyedWriteAdmissionError
 
 router = APIRouter(prefix='/sessions/{session_id}/inputs', tags=['session inputs'],
                    dependencies=[Depends(require_local_memory_control)])
@@ -49,6 +50,11 @@ class ResumeSessionInputs(BaseModel):
 def _call(request, operation, session_id, **kwargs):
     try:
         return getattr(request.app.state.runtime.session_inputs, operation)(session_id, **kwargs)
+    except KeyedWriteAdmissionError as exc:
+        return JSONResponse(status_code=503, headers={"Retry-After": "1"}, content={
+            "detail": "session_input_write_admission_"+exc.reason,
+            "accepted": False, "retry_safe": True,
+        })
     except KeyError as exc:
         raise HTTPException(404, 'session_or_attachment_not_found') from exc
     except SessionInputConflict as exc:
@@ -61,29 +67,6 @@ def _call(request, operation, session_id, **kwargs):
 
 @router.post('', status_code=202)
 def submit_input(session_id: str, payload: SubmitSessionInput, request: Request):
-    runtime = request.app.state.runtime
-    with closing(runtime._conn()) as conn:
-        prior = conn.execute("SELECT 1 FROM session_inputs WHERE session_id=? AND client_message_id=?",
-                             (session_id, payload.client_message_id)).fetchone()
-    validator = getattr(runtime, "validate_agent_reasoning_selection", None)
-    answer_validator = getattr(runtime, "validate_agent_answer_selection", None)
-    if prior is None and callable(answer_validator):
-        try:
-            answer_validator(
-                session_id=session_id, attachment_ids=payload.attachment_ids,
-                llm_answer_client_name=payload.llm.answer_client_name if payload.llm else None,
-                llm_answer_model=payload.llm.answer_model if payload.llm else None,
-                resolve_preference=True,
-            )
-        except ValueError as exc:
-            raise HTTPException(422, str(exc)) from exc
-    if prior is None and callable(validator):
-        try:
-            validator(session_id=session_id,
-                      requested=payload.llm.reasoning_level if payload.llm else None,
-                      attachment_ids=payload.attachment_ids)
-        except ValueError as exc:
-            raise HTTPException(422, str(exc)) from exc
     return _call(request, 'submit', session_id, **payload.model_dump())
 
 

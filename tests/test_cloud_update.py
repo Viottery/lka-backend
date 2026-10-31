@@ -47,6 +47,14 @@ def make_db(data_dir, *, run_status=None):
     return path
 
 
+@pytest.fixture(autouse=True)
+def use_synthetic_active_sqlite_service(monkeypatch):
+    monkeypatch.setattr(
+        update_cloud, "_service_process_state",
+        lambda c: ({"LKA_STORAGE_BACKEND": "sqlite"}, Path(c["backend"])),
+    )
+
+
 def candidate_plan(c, *, previous=None, target=None):
     candidate = Path(c["releases"]) / "candidate-1"
     for component in ("backend", "frontend"):
@@ -146,13 +154,75 @@ def test_apply_refuses_active_tasks_before_stopping_service(monkeypatch, tmp_pat
     assert not (Path(c["state"]) / "transaction.json").exists()
 
 
+def test_mysql_backend_is_detected_from_active_environment_and_config_files(monkeypatch, tmp_path):
+    c = make_config(tmp_path)
+    monkeypatch.setattr(
+        update_cloud, "_service_process_state",
+        lambda _c: ({"LKA_STORAGE_BACKEND": "mysql"}, tmp_path),
+    )
+    assert update_cloud.effective_storage_backend(c) == "mysql"
+
+    monkeypatch.setattr(
+        update_cloud, "_service_process_state",
+        lambda _c: ({"LKA_STORAGE_BACKEND": "sqlite"}, tmp_path),
+    )
+    Path(c["env_file"]).write_text("LKA_STORAGE_BACKEND=mysql\n")
+    assert update_cloud.effective_storage_backend(c) == "mysql"
+
+    Path(c["env_file"]).write_text("LKA_STORAGE_BACKEND=sqlite\n")
+    Path(c["config_file"]).write_text('[storage]\nbackend = "mysql"\n')
+    assert update_cloud.effective_storage_backend(c) == "mysql"
+
+
+def test_unknown_storage_backend_fails_closed(monkeypatch, tmp_path):
+    c = make_config(tmp_path)
+    monkeypatch.setattr(
+        update_cloud, "_service_process_state",
+        lambda _c: ({"LKA_STORAGE_BACKEND": "unexpected"}, tmp_path),
+    )
+    with pytest.raises(update_cloud.UpdateError, match="Cannot determine active storage"):
+        update_cloud.require_sqlite_backend(c)
+
+
+def test_mysql_storage_blocks_sqlite_idle_prepare_and_apply_before_work(monkeypatch, tmp_path):
+    c = make_config(tmp_path)
+    monkeypatch.setattr(
+        update_cloud, "_service_process_state",
+        lambda _c: ({"LKA_STORAGE_BACKEND": "mysql"}, tmp_path),
+    )
+    monkeypatch.setattr(update_cloud.sqlite3, "connect", lambda *_a, **_kw: pytest.fail("SQLite must not open"))
+    with pytest.raises(update_cloud.UpdateError, match="MySQL storage is active"):
+        update_cloud.idle(c)
+
+    monkeypatch.setattr(update_cloud, "current", lambda _c: pytest.fail("prepare must stop before current"))
+    with pytest.raises(update_cloud.UpdateError, match="MySQL storage is active"):
+        update_cloud.prepare(c, {})
+
+    service_calls = []
+    monkeypatch.setattr(update_cloud, "service", lambda _c, action: service_calls.append(action))
+    with pytest.raises(update_cloud.UpdateError, match="MySQL storage is active"):
+        update_cloud.apply(c)
+    assert service_calls == []
+    assert not (Path(c["state"]) / "transaction.json").exists()
+
+
+def test_stopped_service_second_idle_check_uses_previously_verified_sqlite_backend(monkeypatch, tmp_path):
+    c = make_config(tmp_path)
+    make_db(c["data"])
+    monkeypatch.setattr(
+        update_cloud, "_service_process_state",
+        lambda _c: pytest.fail("stopped service has no live process to inspect"),
+    )
+    update_cloud.require_idle(c, verify_backend=False)
+
+
 def test_apply_creates_verified_backup_before_switch(monkeypatch, tmp_path):
     c = make_config(tmp_path)
     make_db(c["data"])
     plan = candidate_plan(c)
     monkeypatch.setattr(update_cloud, "current", lambda _c: plan["previous"])
     monkeypatch.setattr(update_cloud, "checkout", lambda *_a, **_kw: None)
-    monkeypatch.setattr(update_cloud, "require_idle", lambda _c: None)
+    monkeypatch.setattr(update_cloud, "require_idle", lambda _c, **_kwargs: None)
     monkeypatch.setattr(update_cloud.shutil, "disk_usage", lambda _p: type("Usage", (), {"free": 10**12})())
     events = []
     monkeypatch.setattr(update_cloud, "service", lambda _c, action: events.append(("service", action)))
@@ -199,7 +269,7 @@ def test_health_failure_rolls_back_code_only_and_keeps_live_database(monkeypatch
     plan = candidate_plan(c, previous=previous)
     monkeypatch.setattr(update_cloud, "current", lambda _c: plan["previous"])
     monkeypatch.setattr(update_cloud, "checkout", lambda *_a, **_kw: None)
-    monkeypatch.setattr(update_cloud, "require_idle", lambda _c: None)
+    monkeypatch.setattr(update_cloud, "require_idle", lambda _c, **_kwargs: None)
     monkeypatch.setattr(update_cloud.shutil, "disk_usage", lambda _p: type("Usage", (), {"free": 10**12})())
     events = []
     monkeypatch.setattr(update_cloud, "service", lambda _c, action: events.append(action))

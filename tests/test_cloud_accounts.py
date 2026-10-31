@@ -33,6 +33,9 @@ def application(service):
     app = FastAPI()
     app.state.account_service = service
     app.state.device_service = None
+    app.state.runtime = SimpleNamespace(health=lambda: {
+        "status": "ok", "service": "local-knowledge-agent-os",
+    })
     app.include_router(router)
     app.add_middleware(AccountAuthMiddleware)
 
@@ -84,6 +87,55 @@ def test_cookie_login_csrf_logout(service, admin):
             assert (await web.post("/write", headers=valid)).status_code == 200
             assert (await web.post("/auth/logout", headers=valid)).status_code == 204
             assert (await web.get("/secret")).status_code == 401
+    asyncio.run(scenario())
+
+
+def test_authenticated_health_reports_runtime_readiness_without_private_fields(service):
+    async def scenario():
+        app = application(service)
+        calls = []
+
+        def health():
+            calls.append(True)
+            return {
+                "status": "ok", "service": "local-knowledge-agent-os",
+                "version": "private-version", "deployment_id": "private-deployment",
+                "storage_backend": "mysql",
+            }
+
+        app.state.runtime.health = health
+        async with client(app) as web:
+            response = await web.get("/health")
+            assert response.status_code == 200
+            assert response.json() == {"status": "ok", "service": "local-knowledge-agent-os"}
+            assert response.headers["cache-control"] == "no-store"
+            head = await web.head("/health")
+            assert head.status_code == 200
+            assert head.content == b""
+        assert len(calls) == 2
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("health", [
+    {"status": "unavailable", "service": "local-knowledge-agent-os", "storage_backend": "mysql"},
+    RuntimeError("owner unavailable"),
+])
+def test_authenticated_health_returns_unavailable_when_runtime_is_not_ready(service, health):
+    async def scenario():
+        app = application(service)
+        if isinstance(health, Exception):
+            def get_health():
+                raise health
+        else:
+            get_health = lambda: health
+        app.state.runtime.health = get_health
+        async with client(app) as web:
+            response = await web.get("/health")
+            assert response.status_code == 503
+            assert response.json() == {
+                "status": "unavailable", "service": "local-knowledge-agent-os",
+            }
+            assert response.headers["cache-control"] == "no-store"
     asyncio.run(scenario())
 
 

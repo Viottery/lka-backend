@@ -23,11 +23,20 @@ class ScriptedClient:
         self.calls = Counter()
         self.contexts = []
         self.search = False
+        self.review_calls = 0
+        self.turn_calls = 0
+        self.review_lock = threading.Lock()
 
     def complete_text(self, *, system_prompt, user_prompt, prompt_summary, **kwargs):
         self.calls[prompt_summary.split()[0]] += 1
         payload = json.loads(user_prompt)
-        if "Choose at most one tool package" in system_prompt:
+        if kwargs.get("metadata", {}).get("stage") == "answer_review":
+            with self.review_lock:
+                self.review_calls += 1
+            value = {"faithful": True, "hallucination_free": True,
+                     "request_aligned": True, "decision": "pass", "issues": [],
+                     "revision_instructions": ""}
+        elif "Choose at most one tool package" in system_prompt:
             value = {"selected_package": "memory" if self.search else None, "reason": "synthetic"}
         elif "Choose the next single action" in system_prompt:
             searched = any(o.get("tool_name") == "memory.search" for o in payload["observations"])
@@ -89,6 +98,7 @@ allow_remote_extraction=false
         yield runtime, client, worker
     finally:
         runtime.stop()
+        assert client.review_calls == client.turn_calls
         print(f"runtime_quality elapsed={time.monotonic()-started:.3f}s "
               f"scripted_calls={sum(client.calls.values())} "
               f"stages={dict(client.calls)} "
@@ -102,8 +112,13 @@ def turn(runtime, session, text, *, project=None):
         runtime.session_service.set_workspace(session_id=session, workspace=SessionWorkspace(
             path=str(project), backend_path=str(project), platform="linux",
         ))
+    client = runtime.agent_turn_loop.llm_client
+    with client.review_lock:
+        previous_reviews = client.review_calls
+        client.turn_calls += 1
     result = runtime.run_agent_turn(session_id=session, user_input=text)
     assert result.answer and result.run_id
+    assert client.review_calls >= previous_reviews + 1
     return result
 
 

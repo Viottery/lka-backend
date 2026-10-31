@@ -575,3 +575,22 @@ def test_path_aliases_share_queue_and_same_thread_nested_write_fails_fast(tmp_pa
     uri_a.rollback()
     uri_a.close()
     uri_b.close()
+
+
+def test_write_callsite_accepts_symlink_and_resolved_release_roots(monkeypatch):
+    from types import SimpleNamespace
+
+    from app.storage import sqlite_write_queue as queue
+
+    monkeypatch.setattr(queue, '_SOURCE_PREFIXES', (
+        '/opt/lka-releases/backend-release/', '/opt/lka-backend/',
+    ))
+    def frame(filename, name, line, back=None):
+        return SimpleNamespace(f_code=SimpleNamespace(co_filename=filename, co_name=name),
+                               f_lineno=line, f_back=back)
+    caller = frame('/opt/lka-backend/app/core/sessions.py', 'append_message', 42)
+    wrapper = frame('/opt/lka-releases/backend-release/app/storage/sqlite_write_queue.py', 'execute', 88, caller)
+    monkeypatch.setattr(queue, 'sys', SimpleNamespace(_getframe=lambda _depth: wrapper))
+    assert queue._write_callsite() == {
+        'file': 'app/core/sessions.py', 'function': 'append_message', 'line': 42,
+    }

@@ -15,6 +15,8 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.storage.connections import is_mysql, lock_row
+
 BoundedIdentifier = Annotated[str, Field(min_length=1, max_length=200)]
 
 Scope = Literal[
@@ -121,7 +123,11 @@ class DeviceService:
         self.config = config
         self.remote_execution_enabled = False
         with self._connection() as conn:
-            conn.executescript("""
+            if is_mysql(conn):
+                for table in ("cloud_devices", "cloud_device_selections"):
+                    conn.execute(f"SELECT 1 FROM `{table}` LIMIT 0")
+            else:
+                conn.executescript("""
                 CREATE TABLE IF NOT EXISTS cloud_devices (
                     device_id TEXT PRIMARY KEY, profile TEXT NOT NULL, token_hash TEXT UNIQUE NOT NULL,
                     credential_version INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0,
@@ -130,7 +136,7 @@ class DeviceService:
                 CREATE TABLE IF NOT EXISTS cloud_device_selections (
                     user_id TEXT NOT NULL, selection_key TEXT NOT NULL, selection TEXT NOT NULL,
                     revision INTEGER NOT NULL, PRIMARY KEY(user_id, selection_key));
-            """)
+                """)
 
     @contextmanager
     def _connection(self, *, write=False):
@@ -214,15 +220,18 @@ class DeviceService:
             raise ValueError("device identity is immutable")
         data = payload.model_dump(exclude={"expected_revision"})
         with self._connection(write=True) as conn:
-            self._check_revision(conn, device_id, payload.expected_revision)
-            conn.execute(
-                "UPDATE cloud_devices SET profile=?,revision=revision+1,updated_at=? WHERE device_id=?",
-                (json.dumps(data), self._now(), device_id),
+            row = self._check_revision(conn, device_id, payload.expected_revision, lock=True)
+            changed = conn.execute(
+                "UPDATE cloud_devices SET profile=?,revision=revision+1,updated_at=? WHERE device_id=? AND revision=?",
+                (json.dumps(data), self._now(), device_id, row["revision"]),
             )
+            if changed.rowcount != 1:
+                raise DeviceConflictError("device revision conflict")
         return self.get(device_id)
 
-    def _check_revision(self, conn, device_id, revision):
-        row = conn.execute("SELECT * FROM cloud_devices WHERE device_id=?", (device_id,)).fetchone()
+    def _check_revision(self, conn, device_id, revision, *, lock=False):
+        row = (lock_row(conn, "cloud_devices", "device_id", device_id) if lock else
+               conn.execute("SELECT * FROM cloud_devices WHERE device_id=?", (device_id,)).fetchone())
         if row is None:
             raise KeyError(device_id)
         if row["revision"] != revision:
@@ -232,22 +241,26 @@ class DeviceService:
     def revoke(self, device_id, expected_revision):
         self._enabled()
         with self._connection(write=True) as conn:
-            self._check_revision(conn, device_id, expected_revision)
-            conn.execute(
-                "UPDATE cloud_devices SET revoked=1,credential_version=credential_version+1,revision=revision+1,updated_at=? WHERE device_id=?",
-                (self._now(), device_id),
+            row = self._check_revision(conn, device_id, expected_revision, lock=True)
+            changed = conn.execute(
+                "UPDATE cloud_devices SET revoked=1,credential_version=credential_version+1,revision=revision+1,updated_at=? WHERE device_id=? AND revision=?",
+                (self._now(), device_id, row["revision"]),
             )
+            if changed.rowcount != 1:
+                raise DeviceConflictError("device revision conflict")
         return self.get(device_id)
 
     def rotate(self, device_id, expected_revision):
         self._enabled()
         token = secrets.token_urlsafe(48)
         with self._connection(write=True) as conn:
-            self._check_revision(conn, device_id, expected_revision)
-            conn.execute(
-                "UPDATE cloud_devices SET token_hash=?,credential_version=credential_version+1,revision=revision+1,updated_at=? WHERE device_id=?",
-                (self._hash(token), self._now(), device_id),
+            row = self._check_revision(conn, device_id, expected_revision, lock=True)
+            changed = conn.execute(
+                "UPDATE cloud_devices SET token_hash=?,credential_version=credential_version+1,revision=revision+1,updated_at=? WHERE device_id=? AND revision=?",
+                (self._hash(token), self._now(), device_id, row["revision"]),
             )
+            if changed.rowcount != 1:
+                raise DeviceConflictError("device revision conflict")
         return {**self.get(device_id), "token": token}
 
     def authenticate(self, token: str):
@@ -261,12 +274,12 @@ class DeviceService:
                 return None
             return {**self._record(row), "credential_version": row["credential_version"]}
 
-    def require_node(self, conn, principal: dict, scope: str | None = None):
+    def require_node(self, conn, principal: dict, scope: str | None = None, *, lock=False):
         """Call inside the same write transaction as the node's operation."""
         self._enabled()
-        row = conn.execute(
-            "SELECT * FROM cloud_devices WHERE device_id=?", (principal.get("node_id"),)
-        ).fetchone()
+        row = (lock_row(conn, "cloud_devices", "device_id", principal.get("node_id")) if lock else
+               conn.execute("SELECT * FROM cloud_devices WHERE device_id=?",
+                            (principal.get("node_id"),)).fetchone())
         if (
             row is None
             or row["revoked"]
@@ -282,7 +295,7 @@ class DeviceService:
         if status not in ("online", "busy", "idle", "degraded"):
             raise ValueError("unsupported node status")
         with self._connection(write=True) as conn:
-            profile = self.require_node(conn, principal, "heartbeat")
+            profile = self.require_node(conn, principal, "heartbeat", lock=True)
             if environment_id and environment_id not in {
                 s["environment_id"] for s in profile["systems"]
             }:
@@ -299,17 +312,34 @@ class DeviceService:
         if not user_id or not selection_key or len(selection_key) > 200:
             raise ValueError("selection owner/key required")
         with self._connection(write=True) as conn:
-            row = conn.execute(
-                "SELECT revision FROM cloud_device_selections WHERE user_id=? AND selection_key=?",
-                (user_id, selection_key),
-            ).fetchone()
+            initial = payload.model_dump_json(exclude={"expected_revision"})
+            if is_mysql(conn):
+                conn.execute_native(
+                    "INSERT IGNORE INTO `cloud_device_selections` "
+                    "(`user_id`,`selection_key`,`selection`,`revision`) VALUES(%s,%s,%s,0)",
+                    (user_id, selection_key, initial),
+                )
+            else:
+                conn.execute(
+                    "INSERT OR IGNORE INTO cloud_device_selections VALUES(?,?,?,0)",
+                    (user_id, selection_key, initial),
+                )
+            if is_mysql(conn):
+                row = conn.execute(
+                    "SELECT revision FROM cloud_device_selections WHERE user_id=? AND selection_key=? FOR UPDATE",
+                    (user_id, selection_key),
+                )
+            else:
+                row = conn.execute(
+                    "SELECT revision FROM cloud_device_selections WHERE user_id=? AND selection_key=?",
+                    (user_id, selection_key),
+                )
+            row = row.fetchone()
             revision = row["revision"] if row else 0
             if payload.expected_revision != revision:
                 raise DeviceConflictError("selection revision conflict")
-            for device_id in payload.allowed_device_ids:
-                device = conn.execute(
-                    "SELECT * FROM cloud_devices WHERE device_id=?", (device_id,)
-                ).fetchone()
+            for device_id in sorted(payload.allowed_device_ids):
+                device = lock_row(conn, "cloud_devices", "device_id", device_id)
                 if device is None or device["revoked"]:
                     raise ValueError("allowed device is not active")
             conn.execute(

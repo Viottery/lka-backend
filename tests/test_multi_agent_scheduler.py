@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 
 import pytest
 
@@ -11,6 +12,7 @@ from app.core.agent_runs import (
     InMemoryAgentRunManager,
 )
 from app.core.context_driver import ContextDriver
+from app.core.execution_admission import ExecutionAdmission
 from app.core.multi_agent import (
     FailureDetail,
     Plan,
@@ -27,7 +29,11 @@ from app.core.multi_agent import (
     VerificationStatus,
 )
 from app.core.multi_agent_aggregation import ConfirmationState
-from app.core.multi_agent_scheduler import MultiAgentScheduler, SchedulerContext
+from app.core.multi_agent_scheduler import (
+    MultiAgentScheduler,
+    SchedulerContext,
+    _SchedulerCapacityLease,
+)
 
 
 def _step(step_id: str, *deps: str) -> PlanStep:
@@ -635,6 +641,140 @@ def test_parent_cancellation_propagates_to_running_child() -> None:
     child_id = asyncio.run(run_and_cancel())
     assert manager.get_run(parent.run_id).status == AgentRunStatus.CANCELLED
     assert manager.get_run(child_id).status == AgentRunStatus.CANCELLED
+
+
+def test_retired_nested_capacity_lease_does_not_reacquire_late_slots() -> None:
+    global_slots = threading.BoundedSemaphore(1)
+    session_slots = threading.BoundedSemaphore(1)
+    assert global_slots.acquire(blocking=False)
+    assert session_slots.acquire(blocking=False)
+    lease = _SchedulerCapacityLease(global_slots, session_slots)
+    assert lease.release()
+
+    # Another task owns both slots while the suspended nested executor is
+    # waiting to reacquire them.
+    assert global_slots.acquire(blocking=False)
+    assert session_slots.acquire(blocking=False)
+    checked = asyncio.Event()
+
+    async def reacquire_late():
+        def check_active():
+            checked.set()
+
+        return await lease.acquire(check_active)
+
+    async def scenario():
+        task = asyncio.create_task(reacquire_late())
+        await checked.wait()
+        await asyncio.sleep(0)
+        lease.retire()  # Outer child timed out while its graph thread continued.
+        global_slots.release()
+        session_slots.release()
+        assert await asyncio.wait_for(task, timeout=1) is False
+
+    asyncio.run(scenario())
+    assert global_slots.acquire(blocking=False)
+    assert session_slots.acquire(blocking=False)
+    session_slots.release()
+    global_slots.release()
+
+
+def test_nested_scheduler_depth_two_reuses_single_global_slot() -> None:
+    manager, parent, _, context = _active_parent(_step("outer"))
+
+    class NestedExecutor(FakeChildExecutor):
+        scheduler: MultiAgentScheduler
+
+        async def execute(self, *, child_run_id, snapshot, views, **kwargs):
+            child = self.manager.get_run(child_run_id)
+            if child.step_id != "outer":
+                return await super().execute(
+                    child_run_id=child_run_id, snapshot=snapshot, views=views, **kwargs,
+                )
+            self.manager.attach_child_context(
+                child_run_id,
+                snapshot=snapshot.model_dump(mode="json"),
+                views=views.model_dump(mode="json"),
+            )
+            self.manager.mark_child_running(child_run_id)
+            nested_plan = Plan(
+                correlation_id=child.trace_id,
+                plan_id="nested-single-slot",
+                parent_run_id=child.run_id,
+                session_id=child.session_id,
+                objective="Nested work.",
+                steps=(
+                    PlanStep(
+                        correlation_id=child.trace_id,
+                        step_id="root_coordinator",
+                        objective="Coordinate nested work.",
+                        output_contract="Nested result.",
+                        status=PlanStepStatus.RUNNING,
+                    ),
+                    _step("inner"),
+                ),
+                status=PlanStatus.RUNNING,
+            )
+            self.manager.record_multi_agent_plan(
+                child.run_id, event_type="nested_plan_created",
+                payload={"plan_id": nested_plan.plan_id},
+                plan=nested_plan.model_dump(mode="json"),
+            )
+            nested = await asyncio.wait_for(
+                self.scheduler.execute_plan_async(child.run_id, context=context), timeout=2,
+            )
+            assert nested.status == "completed"
+            self.manager.complete_child_run(child_run_id, result_snapshot={"answer": "nested"})
+            return self._task_result(child, TaskResultStatus.COMPLETED, "nested")
+
+    executor = NestedExecutor(manager)
+    scheduler = MultiAgentScheduler(
+        run_manager=manager, child_executor=executor,
+        max_concurrency=1, max_global_concurrency=1,
+    )
+    executor.scheduler = scheduler
+    result = asyncio.run(asyncio.wait_for(
+        scheduler.execute_plan_async(parent.run_id, context=context), timeout=3,
+    ))
+
+    assert result.status == "completed"
+    assert {run.step_id for run in manager.child_tree(parent.run_id)} == {"outer", "inner"}
+
+
+def test_individually_cancelled_child_stops_waiting_for_execution_permit() -> None:
+    manager, parent, _, context = _active_parent(_step("cancel_while_waiting"))
+    executor = FakeChildExecutor(manager)
+    scheduler = MultiAgentScheduler(run_manager=manager, child_executor=executor)
+    scheduler.execution_admission = ExecutionAdmission(
+        total=3, interactive_reserved=1, children=1,
+    )
+    occupied = scheduler.execution_admission.try_acquire("child", key="other")
+    assert occupied is not None
+
+    async def run_and_cancel_waiting_child():
+        task = asyncio.create_task(scheduler.execute_plan_async(parent.run_id, context=context))
+        for _ in range(200):
+            children = manager.get_run(parent.run_id).child_run_ids
+            if children:
+                child_id = children[0]
+                # Let the scheduler reach its child-admission wait loop.
+                await asyncio.sleep(0.05)
+                manager.cancel_run(child_id, reason="cancel during admission wait")
+                result = await asyncio.wait_for(task, timeout=1)
+                return child_id, result
+            await asyncio.sleep(0.005)
+        task.cancel()
+        raise AssertionError("Scheduler did not prepare the child run")
+
+    try:
+        child_id, result = asyncio.run(run_and_cancel_waiting_child())
+    finally:
+        occupied.close()
+
+    assert manager.get_run(child_id).status == AgentRunStatus.CANCELLED
+    assert result.status == "cancelled"
+    assert executor.calls == []
+    assert manager.get_run(parent.run_id).status == AgentRunStatus.RUNNING
 
 
 def test_manual_retry_requires_latest_failed_attempt_and_reschedules_step() -> None:

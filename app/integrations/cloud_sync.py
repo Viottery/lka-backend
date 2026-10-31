@@ -159,3 +159,5 @@ class CloudReplicaSynchronizer:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=self.config.request_timeout_seconds + 1)
+            if self._thread.is_alive():
+                raise RuntimeError("Cloud replica synchronizer did not drain; runtime ownership retained")

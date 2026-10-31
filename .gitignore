@@ -36,3 +36,7 @@ scratch/
 /temp.md
 evals/reports/*.json
 evals/reports/*.md
+
+# Local runtime state and generated browser/native test assets.
+/.runtime/
+/deployment-manifest.json

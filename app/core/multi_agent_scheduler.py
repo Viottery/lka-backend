@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import threading
 from collections.abc import Awaitable, Callable
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from hashlib import sha1
 from typing import Any
@@ -20,6 +22,7 @@ from app.core.context_driver import (
     ContextViewMode,
     EvidenceCandidate,
 )
+from app.core.execution_admission import child_execution_scope, suspend_execution
 from app.core.multi_agent import (
     GENERAL_AGENT_ID,
     ForkPolicy,
@@ -47,6 +50,98 @@ from app.core.multi_agent_aggregation import (
     verify_aggregate,
 )
 from app.core.multi_agent_replan import replay_plan_patch_history
+
+
+class _SchedulerCapacityLease:
+    """Reentrant ownership of local scheduler slots across nested plans."""
+
+    def __init__(self, global_slots, session_slots):
+        self.global_slots = global_slots
+        self.session_slots = session_slots
+        self.held = True
+        self.retired = False
+        self._lock = threading.Lock()
+
+    def release(self) -> bool:
+        """Temporarily yield the slots; return false if already retired."""
+        with self._lock:
+            if self.retired or not self.held:
+                return False
+            self.held = False
+            self.session_slots.release()
+            self.global_slots.release()
+            return True
+
+    def retire(self) -> None:
+        """Permanently close this lease and release any currently held slots."""
+        with self._lock:
+            self.retired = True
+            if not self.held:
+                return
+            self.held = False
+            self.session_slots.release()
+            self.global_slots.release()
+
+    async def acquire(self, check_active) -> bool:
+        with self._lock:
+            if self.retired:
+                return False
+            if self.held:
+                return True
+        while True:
+            check_active()
+            with self._lock:
+                if self.retired:
+                    return False
+                if self.held:
+                    return True
+            if self.global_slots.acquire(blocking=False):
+                break
+            await asyncio.sleep(0.05)
+        session_acquired = False
+        try:
+            while True:
+                check_active()
+                with self._lock:
+                    if self.retired:
+                        self.global_slots.release()
+                        return False
+                    if self.held:
+                        self.global_slots.release()
+                        return True
+                if self.session_slots.acquire(blocking=False):
+                    session_acquired = True
+                    break
+                await asyncio.sleep(0.05)
+            # Recheck parent cancellation after obtaining both slots. If the
+            # outer execution timed out while this copy was suspended, discard
+            # the tentative acquisition instead of publishing stale ownership.
+            check_active()
+        except BaseException:
+            if session_acquired:
+                self.session_slots.release()
+            self.global_slots.release()
+            raise
+        with self._lock:
+            if self.retired:
+                self.session_slots.release()
+                self.global_slots.release()
+                return False
+            if self.held:
+                self.session_slots.release()
+                self.global_slots.release()
+                return True
+            self.held = True
+            return True
+
+
+_active_scheduler_capacity: ContextVar[_SchedulerCapacityLease | None] = ContextVar(
+    "lka_scheduler_capacity", default=None,
+)
+
+
+class _ChildCancelledBeforeAdmission(Exception):
+    """A directly cancelled child stopped waiting for local capacity."""
 
 
 class MultiAgentScheduleResult(BaseModel):
@@ -112,6 +207,7 @@ class MultiAgentScheduler:
         self.max_global_concurrency = max_global_concurrency
         self.max_retries = max_retries
         self.executor_guard = executor_guard
+        self.execution_admission = None
         self._parent_locks: dict[str, threading.Lock] = {}
         self._admission_guard = threading.Lock()
         self._global_slots = threading.BoundedSemaphore(max_global_concurrency)
@@ -164,6 +260,27 @@ class MultiAgentScheduler:
                 f"Inference profile changed after PlanStep was frozen: {step.inference_profile_id}"
             )
         return profile
+
+    @asynccontextmanager
+    async def _suspend_nested_capacity(self, parent_run_id: str):
+        """Yield this child task's scheduler slots while its own plan forks.
+
+        The context variable is copied into the graph worker thread, so nested
+        scheduler calls can release the outer child's local semaphores before
+        waiting for descendants. ExecutionAdmission is suspended separately.
+        """
+        lease = _active_scheduler_capacity.get()
+        if lease is None:
+            yield
+            return
+        if not lease.release():
+            yield
+            return
+        # An exception or cancellation means the child is unwinding; skip
+        # reacquisition so the run_one finally block can release safely.
+        yield
+        if not await lease.acquire(lambda: self._assert_parent_active(parent_run_id)):
+            raise asyncio.CancelledError("Enclosing child execution has ended")
 
     def _executor_for(self, step: PlanStep) -> Any:
         return self._resolved_executor(step)[1]
@@ -447,9 +564,10 @@ class MultiAgentScheduler:
                 if unresolved:
                     failed = tuple(
                         step.step_id for step in unresolved
-                        if step.status in {PlanStepStatus.FAILED, PlanStepStatus.BLOCKED, PlanStepStatus.CANCELLED}
+                        if step.status in {PlanStepStatus.FAILED, PlanStepStatus.BLOCKED}
                     )
-                    status = "failed" if failed else "running"
+                    cancelled = any(step.status == PlanStepStatus.CANCELLED for step in unresolved)
+                    status = "failed" if failed else "cancelled" if cancelled else "running"
                     self._save_plan(parent_run_id, plan, "multi_agent_schedule_progress", {"status": status})
                     return self._result(
                         plan,
@@ -556,6 +674,8 @@ class MultiAgentScheduler:
                     )
                 acquired_global = False
                 acquired_session = False
+                capacity_lease = None
+                capacity_token = None
                 try:
                     if self.run_manager.get_run(parent_run_id).metadata.get("pause_requested"):
                         return attempt, self._blocked_result(child, step, "Task tree paused.", code="paused")
@@ -567,6 +687,8 @@ class MultiAgentScheduler:
                         self._assert_parent_active(parent_run_id)
                         await asyncio.sleep(0.05)
                     acquired_session = True
+                    capacity_lease = _SchedulerCapacityLease(self._global_slots, session_slot)
+                    capacity_token = _active_scheduler_capacity.set(capacity_lease)
                     definition, _ = self._resolved_executor(step)
                     denial = self.executor_guard(child, definition) if self.executor_guard else None
                     if denial:
@@ -649,15 +771,49 @@ class MultiAgentScheduler:
                                                      metadata_patch={"executor_active": False})
                         if current.status == AgentRunStatus.QUEUED and current.metadata.get("pause_requested"):
                             self.run_manager.acknowledge_pause(child.run_id)
-                    if acquired_session:
-                        session_slot.release()
-                    if acquired_global:
-                        self._global_slots.release()
+                    if capacity_token is not None:
+                        _active_scheduler_capacity.reset(capacity_token)
+                    if capacity_lease is not None:
+                        capacity_lease.retire()
+                    else:
+                        if acquired_session:
+                            session_slot.release()
+                        if acquired_global:
+                            self._global_slots.release()
                 return attempt, result.model_copy(update={"attempt": attempt})
 
-            tasks = [asyncio.create_task(run_one(step, child, values)) for step, child, values in prepared]
+            async def admitted_child(step, child, values):
+                attempt = values[0]
+
+                def check_child_eligible():
+                    self._assert_parent_active(parent_run_id)
+                    current = self.run_manager.get_run(child.run_id)
+                    if (current is None or current.status == AgentRunStatus.CANCELLED
+                            or self.run_manager.is_cancel_requested(child.run_id)):
+                        raise _ChildCancelledBeforeAdmission
+
+                try:
+                    async with child_execution_scope(
+                        self.execution_admission, child.run_id, check_child_eligible,
+                    ):
+                        return await run_one(step, child, values)
+                except _ChildCancelledBeforeAdmission:
+                    current = self.run_manager.get_run(child.run_id)
+                    if current is not None and current.status == AgentRunStatus.CANCELLED:
+                        result = self._blocked_result(
+                            child, step, "Child run was cancelled before execution.", code="cancelled",
+                        ).model_copy(update={"status": TaskResultStatus.CANCELLED})
+                    else:
+                        result = self._blocked_result(
+                            child, step, "Child run stopped before execution.", code="cancelled",
+                        )
+                    return attempt, result
+
             try:
-                outcomes = await self._gather_with_parent_cancellation(tasks, parent_run_id)
+                async with suspend_execution(), self._suspend_nested_capacity(parent_run_id):
+                    tasks = [asyncio.create_task(admitted_child(step, child, values))
+                             for step, child, values in prepared]
+                    outcomes = await self._gather_with_parent_cancellation(tasks, parent_run_id)
             except asyncio.CancelledError:
                 self._cancel_children(parent_run_id)
                 raise
@@ -938,7 +1094,12 @@ class MultiAgentScheduler:
         parent = self.run_manager.get_run(parent_run_id)
         if (
             parent is None
-            or parent.status == AgentRunStatus.CANCELLED
+            or parent.status in {
+                AgentRunStatus.COMPLETED,
+                AgentRunStatus.FAILED,
+                AgentRunStatus.CANCELLED,
+                AgentRunStatus.TIMED_OUT,
+            }
             or self.run_manager.is_cancel_requested(parent_run_id)
         ):
             raise asyncio.CancelledError

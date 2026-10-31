@@ -1,5 +1,6 @@
 """Offline FIFO, recovery, admission, and local HTTP contracts for user inputs."""
 import asyncio
+import json
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import UTC, datetime
@@ -18,8 +19,13 @@ from app.core.local_config import LocalAppConfig
 from app.core.runtime import LocalKnowledgeAgentRuntime
 from app.core.safety import SafetyReviewMode
 from app.core.session_admission import SessionBusyError
-from app.core.session_inputs import SessionInputConflict
+from app.core.session_inputs import SessionInputConflict, SessionInputQueue
 from tests.test_unified_entry_quality import ScriptedClient, operation
+
+SYNTHETIC_REVIEW_PASS = (
+    '{"faithful":true,"hallucination_free":true,"request_aligned":true,'
+    '"decision":"pass","issues":[],"revision_instructions":""}'
+)
 
 
 @pytest.fixture
@@ -139,8 +145,50 @@ def test_empty_session_input_tick_does_not_enter_any_write_transaction(runtime, 
     monkeypatch.setattr(runtime.session_inputs, '_bind', lambda _sid: pytest.fail('idle queue bound'))
     runtime.session_inputs.tick()
     assert any(sql.lstrip().upper().startswith('SELECT') for sql in statements)
+    assert not any('json_extract' in sql.casefold() for sql in statements)
     assert not any(sql.lstrip().upper().startswith(('BEGIN IMMEDIATE', 'INSERT', 'UPDATE', 'DELETE'))
                    for sql in statements)
+
+
+def test_candidate_user_run_predicate_preserves_json_coalesce_semantics():
+    def row(metadata):
+        return {'record_payload': json.dumps({'metadata': metadata})}
+
+    assert SessionInputQueue._candidate_is_user_run(
+        row({'input_envelope': {'origin': None}})
+    )
+    assert SessionInputQueue._candidate_is_user_run(
+        row({'session_input_id': False, 'input_envelope': {'origin': 'system'}})
+    )
+    assert not SessionInputQueue._candidate_is_user_run(
+        row({'input_envelope': {'origin': 'system'}})
+    )
+
+
+def test_candidate_recovery_limit_scans_sparse_queue_until_match(runtime):
+    runtime.session_inputs.ensure_schema()
+    with closing(runtime.session_inputs._conn()) as conn:
+        for session_id in ('candidate-page-a', 'candidate-page-b', 'candidate-page-c'):
+            conn.execute(
+                'INSERT INTO session_input_queues(session_id) VALUES(?)', (session_id,)
+            )
+        conn.execute(
+            "INSERT INTO session_inputs(input_id,session_id,client_message_id,message_id,sequence,"
+            "request_json,run_id,created_at,cancelled) VALUES(?,?,?,?,?,?,?,?,0)",
+            ('input-c', 'candidate-page-c', 'client-c', 'message-c', 1, '{}', None,
+             '2026-10-31T00:00:00+00:00'),
+        )
+        conn.commit()
+
+        assert runtime.session_inputs._candidate_ids(
+            conn, after='', upper='candidate-page-c', limit=1,
+        ) == ['candidate-page-c']
+        assert runtime.session_inputs._candidate_ids(
+            conn, after='candidate-page-b', upper='candidate-page-b', limit=1,
+        ) == []
+        assert runtime.session_inputs._candidate_ids(
+            conn, after='candidate-page-b', upper='candidate-page-c', limit=1,
+        ) == ['candidate-page-c']
 
 
 @pytest.mark.parametrize('finished', [False, True])
@@ -357,8 +405,8 @@ def test_revoked_attachment_preflight_fails_and_pauses_without_stranding_root(ru
 def test_real_graph_reuses_accepted_history_and_retains_trace_lookup(runtime):
     session_id = sid(runtime)
     first = submit(runtime, session_id, 'one', 'First question')
-    client = ScriptedClient([operation('final_answer', reason='Answer first'), 'First answer',
-                             operation('final_answer', reason='Answer second'), 'Second answer'])
+    client = ScriptedClient([operation('final_answer', reason='Answer first'), 'First answer', SYNTHETIC_REVIEW_PASS,
+                             operation('final_answer', reason='Answer second'), 'Second answer', SYNTHETIC_REVIEW_PASS])
     runtime.agent_turn_loop.llm_client = client
     runtime.session_inputs.tick()
     first_run = input_run(runtime, session_id)
@@ -377,6 +425,7 @@ def test_real_graph_reuses_accepted_history_and_retains_trace_lookup(runtime):
     assert [m.content for m in messages if m.role == 'user'] == ['First question', 'Second question']
     assert [m.content for m in messages if m.role == 'agent'] == ['First answer', 'Second answer']
     assert all(item['status'] == 'completed' for item in runtime.session_inputs.snapshot(session_id)['inputs'])
+    assert [call['metadata']['stage'] for call in client.calls].count('answer_review') == 2
 
 
 def test_default_switch_preserves_accepted_original_queue_and_disallows_new_input(runtime):
@@ -608,7 +657,7 @@ def test_replacement_dispatch_reuses_accepted_history_and_options(runtime, monke
     new = input_run(runtime, session_id)
     assert new.metadata['session_input_options']['safety_review_mode'] == 'manual'
     assert new.metadata['session_input_options']['llm'] == {'response_mode': 'text'}
-    client = ScriptedClient([operation('final_answer', reason='Answer'), 'New answer'])
+    client = ScriptedClient([operation('final_answer', reason='Answer'), 'New answer', SYNTHETIC_REVIEW_PASS])
     runtime.agent_turn_loop.llm_client = client
     assert runtime.agent_dispatch.run_one()
     assert runtime.agent_run_manager.get_run(new.run_id).status == AgentRunStatus.COMPLETED
@@ -619,6 +668,7 @@ def test_replacement_dispatch_reuses_accepted_history_and_options(runtime, monke
     assert [m.content for m in messages if m.role == 'agent'] == ['New answer']
     assert client.calls
     assert 'replacement_handoff' in client.calls[0]['user_prompt']
+    assert any(call['metadata']['stage'] == 'answer_review' for call in client.calls)
 
 
 def test_replacement_full_request_retry_survives_completion_default_switch_and_restart(runtime, monkeypatch):

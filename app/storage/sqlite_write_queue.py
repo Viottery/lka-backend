@@ -34,6 +34,10 @@ _PERSISTENT_PRAGMAS = frozenset({
 })
 _COMMAND_PRAGMAS = frozenset({"optimize", "wal_checkpoint", "incremental_vacuum"})
 _SOURCE_PREFIX = os.path.normcase(str(Path(__file__).resolve().parents[2]) + os.sep)
+_SOURCE_PREFIXES = tuple(dict.fromkeys((
+    _SOURCE_PREFIX,
+    os.path.normcase(str(Path(__file__).absolute().parents[2]) + os.sep),
+)))
 
 
 def _write_callsite():
@@ -43,8 +47,10 @@ def _write_callsite():
             if frame is None:
                 break
             filename = os.path.normcase(frame.f_code.co_filename)
-            if filename.startswith(_SOURCE_PREFIX):
-                relative = filename[len(_SOURCE_PREFIX):].replace(os.sep, "/")
+            for prefix in _SOURCE_PREFIXES:
+                if not filename.startswith(prefix):
+                    continue
+                relative = filename[len(prefix):].replace(os.sep, "/")
                 if relative not in {"app/storage/sqlite_write_queue.py", "app/storage/sqlite_timing.py",
                                     "app/storage/sqlite_retry.py"}:
                     return {"file": relative, "function": frame.f_code.co_name, "line": frame.f_lineno}
@@ -79,6 +85,18 @@ def _log_queue_failure(conn, reason, age_seconds=None):
 
 class SqliteWriteQueueError(sqlite3.OperationalError):
     """Application write admission or transaction safety limit was exceeded."""
+
+
+class SqliteWriteAdmissionError(SqliteWriteQueueError):
+    """No write permission was acquired; the rejected transaction never began."""
+
+    def __init__(self, reason: str):
+        messages = {"full": "SQLite write queue is full",
+                    "wait_timeout": "SQLite write queue wait timed out"}
+        if reason not in messages:
+            raise ValueError("invalid SQLite admission failure reason")
+        self.reason = reason
+        super().__init__(messages[reason])
 
 
 class SqliteTransactionTimeoutError(SqliteWriteQueueError):
@@ -200,7 +218,7 @@ class _DatabaseQueue:
         with self.condition:
             if len(self.waiters) >= self.capacity:
                 _log_queue_failure(conn, "full")
-                raise SqliteWriteQueueError("SQLite write queue is full")
+                raise SqliteWriteAdmissionError("full")
             self.waiters.append(ticket)
         started = time.monotonic()
         deadline = started + conn._write_policy.wait_seconds
@@ -211,7 +229,7 @@ class _DatabaseQueue:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         _log_queue_failure(conn, "wait_timeout")
-                        raise SqliteWriteQueueError("SQLite write queue wait timed out")
+                        raise SqliteWriteAdmissionError("wait_timeout")
                     ticket.condition.wait(remaining)
                 self.waiters.popleft()
                 self.owner = conn

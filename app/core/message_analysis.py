@@ -55,7 +55,7 @@ from app.domains.message_reading_selection import (
 from app.domains.message_reading_selection import (
     select_message_candidates,
 )
-from app.storage.sqlite_timing import connect_sqlite
+from app.storage.connections import connect_database as connect_sqlite
 from app.tool_packages import message_reading_analysis as reading_v3
 
 LOG = logging.getLogger(__name__)
@@ -374,6 +374,8 @@ class MessageAnalysisCoordinator:
             worker_count=config.worker_count,
             lease_seconds=600,
             poll_seconds=1,
+            scheduling_mode="event",
+            reconcile_seconds=30,
             recover=service.schedule_pending,
         )
 
@@ -414,10 +416,18 @@ class MessageAnalysisCoordinator:
     def start(self) -> None:
         # Raw history is the durable pending-input ledger: a crash between
         # import and enqueue cannot drop a batch. Policy-disabled scopes skip.
+        pending = self.service.schedule_pending()
+        if pending:
+            self.store.notify_committed()
         self.worker.start()
 
+    def notify_committed(self) -> None:
+        """Wake the analysis worker after a caller-owned enqueue transaction commits."""
+        self.store.notify_committed()
+
     def stop(self) -> None:
-        self.worker.stop()
+        if self.worker.stop() is False:
+            raise RuntimeError("Message analysis workers did not drain; runtime ownership retained")
 
     def _selected_client(self) -> SelectedBackgroundClient:
         if self.llm_client is None:
@@ -592,7 +602,27 @@ class MessageAnalysisCoordinator:
 
     def _call_once(self, client, kwargs, input_tokens):
         if isinstance(self.llm_client, LLMService):
-            return complete_text_in_worker(client, **kwargs)
+            # The configured generation/recovery size remains a planner and
+            # admission estimate. For the real shared service, only a finite
+            # remaining task allowance becomes a provider output cap.
+            request = dict(kwargs)
+            from app.core.background_llm import _service_prompt_estimate
+
+            admission_input = max(input_tokens, _service_prompt_estimate(client, request))
+            remaining = client.remaining_job_tokens()
+            if remaining is None:
+                request.pop("max_output_tokens", None)
+            else:
+                from app.core.background_llm import _service_output_cap
+
+                output_cap = _service_output_cap(client, remaining, admission_input)
+                if output_cap is None:
+                    request.pop("max_output_tokens", None)
+                elif output_cap <= 0:
+                    raise BackgroundTaskBudgetExceeded("message_analysis_token_budget_exhausted")
+                else:
+                    request["max_output_tokens"] = output_cap
+            return complete_text_in_worker(client, **request)
 
         # Synthetic/legacy adapters still use the authoritative shared ledger.
         async def run():
@@ -1354,12 +1384,23 @@ class _AnalysisWorker(BackgroundJobWorker):
         self._next_recovery = 0.0
         self._recovery_guard = threading.Lock()
 
-    def run_one(self, owner: str | None = None) -> bool:
+    def _recover_if_due(self) -> None:
         with self._recovery_guard:
-            if time.monotonic() >= self._next_recovery:
-                self._next_recovery = time.monotonic() + 30
-                try:
-                    self._recover()
-                except Exception as exc:  # noqa: BLE001 - retain durable raw input for a later sweep.
-                    LOG.warning("message_analysis_schedule_failed (%s)", type(exc).__name__)
+            if time.monotonic() < self._next_recovery:
+                return
+            self._next_recovery = time.monotonic() + self.reconcile_seconds
+        try:
+            pending = self._recover()
+        except Exception as exc:  # noqa: BLE001 - retain durable raw input for a later sweep.
+            LOG.warning("message_analysis_schedule_failed (%s)", type(exc).__name__)
+            return
+        if pending:
+            self.store.notify_committed()
+
+    def _wait_event(self, generation: int, *, error: bool = False) -> None:
+        self._recover_if_due()
+        super()._wait_event(generation, error=error)
+
+    def run_one(self, owner: str | None = None) -> bool:
+        self._recover_if_due()
         return super().run_one(owner)

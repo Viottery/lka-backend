@@ -241,6 +241,22 @@ def test_session_search_and_offset_pagination_cover_full_history(tmp_path, monke
     )
     assert len(first_page.sessions) == len(second_page.sessions) == 3
 
+    title_match = service.create_session(title="CaseProbeAlpha title 100%_").session
+    body_match = service.create_session(title="Unrelated title").session
+    service.append_message(
+        session_id=body_match.session_id, role="user", content="BodyProbeAlpha text",
+    )
+    wildcard_decoy = service.create_session(title="Title 100XX").session
+    assert {item.session_id for item in service.list_sessions(q="caseprobealpha").sessions} == {
+        title_match.session_id,
+    }
+    assert {item.session_id for item in service.list_sessions(q="bodyprobealpha").sessions} == {
+        body_match.session_id,
+    }
+    literal_matches = {item.session_id for item in service.list_sessions(q="%_").sessions}
+    assert literal_matches == {title_match.session_id}
+    assert wildcard_decoy.session_id not in literal_matches
+
 
 def test_session_rename_persists_custom_title_and_rejects_deleted_or_missing(
     tmp_path, monkeypatch

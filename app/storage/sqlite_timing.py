@@ -117,6 +117,8 @@ class TimingRecorder:
                 "elapsed_ms": round(elapsed_ms, 4), "success": error is None,
                 "sqlite_error": getattr(error, "sqlite_errorname", None),
                 "sqlite_errorcode": getattr(error, "sqlite_errorcode", None),
+                "error_type": type(error).__name__ if error is not None else None,
+                "write_queue_reason": getattr(error, "reason", None),
                 "thread_id": threading.get_ident(),
                 "error_callsite": _error_callsite() if error is not None else None,
                 "request_id": context.request_id if context else None,

@@ -53,7 +53,8 @@ class InspectImageTool:
                                      "question": {"type": "string", "minLength": 1, "maxLength": 8000},
                                      "expected_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
                                      "client_name": {"type": "string"}, "model": {"type": "string"},
-                                     "max_output_tokens": {"type": "integer", "minimum": 128, "maximum": 4096}}},
+                                     "max_output_tokens": {"type": "integer", "minimum": 128, "maximum": 4096,
+                                                           "description": "Optional explicit output cap. Omit to use provider defaults; thinking and answer may share this budget."}}},
         output_schema={"content": "string", "provenance": "object", "llm_call": "object"},
     )
 
@@ -81,8 +82,9 @@ class InspectImageTool:
             question = invocation.input.get("question")
             if not isinstance(question, str) or not question.strip() or len(question) > 8000:
                 raise ValueError("question must contain 1 to 8000 characters.")
-            output_limit = invocation.input.get("max_output_tokens", 1024)
-            if type(output_limit) is not int or not 128 <= output_limit <= 4096:
+            output_limit = invocation.input.get("max_output_tokens")
+            if ("max_output_tokens" in invocation.input
+                    and (type(output_limit) is not int or not 128 <= output_limit <= 4096)):
                 raise ValueError("max_output_tokens must be an integer between 128 and 4096.")
             policy = self.policy.for_session_workspace(context.workspace_root)
             path = policy.resolve(str(invocation.input.get("path") or ""), allow_outside=True)

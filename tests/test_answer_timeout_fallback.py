@@ -28,6 +28,19 @@ from tests.test_answer_generation_recovery_quality import (
 image_runtime = _image_runtime
 
 
+def test_answer_default_uses_provider_timeout_and_preserves_explicit_deadlines(tmp_path, monkeypatch):
+    loop, _, _ = make_loop(tmp_path, [])
+    monkeypatch.setattr(loop, "_remaining_execution_seconds", lambda: None)
+    assert loop._model_network_timeout("answer") is None
+    assert loop._model_network_timeout("context_answer") is None
+    loop.answer_timeout_seconds = 60
+    assert loop._model_network_timeout("answer") == 60
+    monkeypatch.setattr(loop, "_remaining_execution_seconds", lambda: 10)
+    assert loop._model_network_timeout("answer") == 10
+    loop.answer_timeout_seconds = None
+    assert loop._model_network_timeout("answer") == 10
+
+
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("provider_timeout,expected", [(180, 60), (20, 20)])
 def test_answer_timeout_metadata_reaches_real_transport(monkeypatch, stream, provider_timeout, expected):
@@ -82,7 +95,7 @@ def test_timeout_switches_default_once_with_audit_and_same_evidence(tmp_path, st
     assert selected.requests[0].messages == fallback.requests[0].messages
     assert [e.client_name for e in events] == ["selected", "default"]
     assert events[0].error_category == "timeout"
-    assert all(p.requests[0].metadata["network_timeout_seconds"] == 60 for p in (selected, fallback))
+    assert all("network_timeout_seconds" not in p.requests[0].metadata for p in (selected, fallback))
 
 
 def test_timeout_prefers_primary_over_global_default_and_keeps_frozen_policy(tmp_path):
@@ -118,14 +131,14 @@ def test_fallback_timeout_is_not_retried_even_with_large_attempt_limit(tmp_path,
     assert not any(e.type == "final_answer" for e in manager.list_events(run.run_id))
 
 
-def test_fallback_uses_own_output_reserve_and_native_reasoning(tmp_path):
+def test_fallback_leaves_output_unset_and_preserves_native_reasoning(tmp_path):
     loop, selected, manager = make_loop(tmp_path, [LLMTimeoutError("timeout")], selected_thinking="deepseek")
     loop.llm_client.config.clients[0].output_reserve_tokens = 256
     fallback = default_provider(loop, [response()])
     with scope(manager):
         assert answer(loop, []) == "complete answer"
-    assert selected.requests[0].max_output_tokens == 1024
-    assert fallback.requests[0].max_output_tokens == 256
+    assert selected.requests[0].max_output_tokens is None
+    assert fallback.requests[0].max_output_tokens is None
     assert fallback.requests[0].thinking_enabled is None
     assert fallback.requests[0].metadata["inference_selection_source"] == "timeout_fallback"
 
@@ -239,6 +252,7 @@ def test_answer_fallback_refits_smaller_window_from_original_evidence(tmp_path):
 def test_real_turn_timeout_fallback_does_not_repeat_write_tool(image_runtime, tmp_path):
     env = image_runtime
     writes = tmp_path / "isolated-write-receipts.txt"
+    reviews = []
 
     class WriteOnce:
         spec = ToolSpec(name="filesystem.timeout_test_write", type="function", package="filesystem",
@@ -255,6 +269,11 @@ def test_real_turn_timeout_fallback_does_not_repeat_write_tool(image_runtime, tm
 
     def primary_answer(request):
         stage = request.metadata.get("stage")
+        if stage == "answer_review":
+            reviews.append(stage)
+            return json.dumps({"faithful": True, "hallucination_free": True,
+                               "request_aligned": True, "decision": "pass", "issues": [],
+                               "revision_instructions": ""})
         if stage == "route":
             return json.dumps({"selected_package": "filesystem", "reason": "Save receipt."})
         if stage in {"decision", "decision_repair"}:
@@ -282,6 +301,7 @@ def test_real_turn_timeout_fallback_does_not_repeat_write_tool(image_runtime, tm
     assert result.answer == "The receipt was saved exactly once."
     assert writes.read_text(encoding="utf-8") == "saved exactly once\n"
     assert len(writer.requests) == 1
+    assert reviews == ["answer_review"]
     assert run.metadata["answer_timeout_fallback"]["client_name"] == env.provider.name
     assert len([e for e in env.runtime.agent_run_manager.list_events(run.run_id)
                 if e.type == "answer_model_fallback_started"]) == 1

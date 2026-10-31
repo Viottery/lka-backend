@@ -10,6 +10,11 @@ from typing import Any
 
 from app.core.llm import LLMService
 from app.core.llm.errors import LLMClientError, LLMTimeoutError
+from app.core.llm.models import (
+    LLMMessage,
+    LLMRequest,
+    LLMTextBlock,
+)
 
 
 class SelectedBackgroundClient:
@@ -27,7 +32,8 @@ class SelectedBackgroundClient:
         self.request_timeout_seconds = request_timeout_seconds
 
     def complete_text(self, **kwargs: Any) -> Any:
-        if not self.limit_output_tokens:
+        preserve_budget_cap = bool(kwargs.pop("_background_budget_output_cap", False))
+        if not self.limit_output_tokens and not preserve_budget_cap:
             kwargs.pop("max_output_tokens", None)
         if isinstance(self.client, LLMService):
             kwargs.update(client_name=self.client_name, model=self.model)
@@ -118,34 +124,84 @@ def recover_generation(
         recovery_output_tokens if recovery_output_tokens is not None
         else getattr(client, "recovery_output_tokens", 8192)
     )
+    real_service = isinstance(client, LLMService) or (
+        isinstance(client, SelectedBackgroundClient) and isinstance(client.client, LLMService)
+    )
     output_budget = getattr(client, "supports_output_budget", None)
-    if ((callable(output_budget) and output_budget()) or
-            (not callable(output_budget) and _accepts_keyword(client, "max_output_tokens"))):
-        kwargs.setdefault("max_output_tokens", initial_output_tokens)
-    recovery_output_tokens = reserve_tokens if reserve_tokens is not None else recovery_output_tokens
+    can_set_output_budget = (
+        real_service
+        or (callable(output_budget) and output_budget())
+        or (not callable(output_budget) and _accepts_keyword(client, "max_output_tokens"))
+    )
+    explicit_output_limit = isinstance(kwargs.get("max_output_tokens"), int) and not isinstance(
+        kwargs.get("max_output_tokens"), bool
+    )
     prompt_estimate = _estimate_prompt_tokens(kwargs)
-    if total_tokens_budget is not None and prompt_estimate + kwargs.get("max_output_tokens", initial_output_tokens) > total_tokens_budget:
+    if real_service:
+        prompt_estimate = max(prompt_estimate, _service_prompt_estimate(client, kwargs))
+    available = _remaining_job_tokens(client) if real_service else None
+    if total_tokens_budget is not None:
+        available = min(available, total_tokens_budget) if available is not None else total_tokens_budget
+    ignore_stage_limit = isinstance(client, SelectedBackgroundClient) and not client.limit_output_tokens
+    if real_service and can_set_output_budget:
+        output_cap = _service_output_cap(client, available, prompt_estimate)
+        if ignore_stage_limit:
+            if output_cap is not None:
+                kwargs["max_output_tokens"] = output_cap
+                kwargs["_background_budget_output_cap"] = True
+            else:
+                kwargs.pop("max_output_tokens", None)
+                kwargs.pop("_background_budget_output_cap", None)
+        elif explicit_output_limit:
+            if output_cap is not None and output_cap < kwargs["max_output_tokens"]:
+                kwargs["max_output_tokens"] = output_cap
+                if isinstance(client, SelectedBackgroundClient):
+                    kwargs["_background_budget_output_cap"] = True
+        elif output_cap is not None:
+            kwargs["max_output_tokens"] = output_cap
+            if isinstance(client, SelectedBackgroundClient):
+                kwargs["_background_budget_output_cap"] = True
+    elif can_set_output_budget and not explicit_output_limit:
+        if not real_service:
+            kwargs.setdefault("max_output_tokens", initial_output_tokens)
+    recovery_output_tokens = reserve_tokens if reserve_tokens is not None else recovery_output_tokens
+    initial_reservation = _output_reservation(kwargs, initial_output_tokens)
+    if (total_tokens_budget is not None and not real_service
+            and prompt_estimate + initial_reservation > total_tokens_budget):
         from app.core.llm_workloads import BackgroundTaskBudgetExceeded
 
         raise BackgroundTaskBudgetExceeded("background_generation_budget_exceeded")
     response = complete_text_in_worker(client, **kwargs)
     charged = response_usage_tokens(response)
-    charged = charged if charged is not None else prompt_estimate + kwargs.get("max_output_tokens", initial_output_tokens)
+    charged = charged if charged is not None else prompt_estimate + initial_reservation
     attempts = 1
     if not _incomplete(response) or recovery_output_tokens <= 0:
         _mark_recovery(response, attempts=attempts, recovered=False, tokens=charged)
         return response
-    if total_tokens_budget is not None and total_tokens_budget - charged < prompt_estimate + recovery_output_tokens:
-        _mark_recovery(response, attempts=attempts, recovered=False, tokens=charged)
-        return response
     remaining = getattr(client, "remaining_job_tokens", None)
-    if callable(remaining):
-        available = remaining()
-        # The first call has already been charged in the authoritative ledger.
-        # Non-ledger wrappers are checked against the explicit call reserve below.
-        if available is not None and available < prompt_estimate + recovery_output_tokens:
+    available = _remaining_job_tokens(client)
+    if total_tokens_budget is not None:
+        total_remaining = max(0, total_tokens_budget - charged)
+        available = min(available, total_remaining) if available is not None else total_remaining
+    if real_service:
+        if available is not None:
+            if available <= prompt_estimate:
+                _mark_recovery(response, attempts=attempts, recovered=False, tokens=charged)
+                return response
+            recovery_cap = _service_output_cap(client, available, prompt_estimate)
+        else:
+            recovery_cap = None
+    else:
+        recovery_cap = recovery_output_tokens
+        if total_tokens_budget is not None and total_tokens_budget - charged < prompt_estimate + recovery_output_tokens:
             _mark_recovery(response, attempts=attempts, recovered=False, tokens=charged)
             return response
+    # The first call has already been charged in the authoritative ledger.
+    # Non-ledger wrappers are checked against the explicit call reserve below.
+    if (callable(remaining) and not real_service and available is not None
+            and available < prompt_estimate + recovery_output_tokens):
+        _mark_recovery(response, attempts=attempts, recovered=False, tokens=charged)
+        return response
     retry = dict(kwargs)
     retry["metadata"] = {
         **(retry.get("metadata") or {}),
@@ -154,14 +210,133 @@ def recover_generation(
     supports = getattr(client, "supports_thinking_control", None)
     if callable(supports) and supports():
         retry["thinking_enabled"] = False
-    if ((callable(output_budget) and output_budget()) or
-            (not callable(output_budget) and _accepts_keyword(client, "max_output_tokens"))):
-        retry["max_output_tokens"] = recovery_output_tokens
+    if can_set_output_budget:
+        if real_service:
+            if ignore_stage_limit:
+                if recovery_cap is not None:
+                    retry["max_output_tokens"] = recovery_cap
+                    retry["_background_budget_output_cap"] = True
+                else:
+                    retry.pop("max_output_tokens", None)
+                    retry.pop("_background_budget_output_cap", None)
+            elif explicit_output_limit:
+                retry_cap = kwargs["max_output_tokens"]
+                if recovery_cap is not None:
+                    retry_cap = min(retry_cap, recovery_cap)
+                retry["max_output_tokens"] = retry_cap
+                if isinstance(client, SelectedBackgroundClient) and retry_cap < kwargs["max_output_tokens"]:
+                    retry["_background_budget_output_cap"] = True
+            elif recovery_cap is not None:
+                retry["max_output_tokens"] = recovery_cap
+                if isinstance(client, SelectedBackgroundClient):
+                    retry["_background_budget_output_cap"] = True
+            else:
+                retry.pop("max_output_tokens", None)
+                retry.pop("_background_budget_output_cap", None)
+        else:
+            retry["max_output_tokens"] = recovery_output_tokens
     recovered = complete_text_in_worker(client, **retry)
     retry_cost = response_usage_tokens(recovered)
-    charged += retry_cost if retry_cost is not None else prompt_estimate + recovery_output_tokens
+    retry_reservation = _output_reservation(retry, recovery_output_tokens)
+    charged += retry_cost if retry_cost is not None else prompt_estimate + retry_reservation
     _mark_recovery(recovered, attempts=2, recovered=not _incomplete(recovered), tokens=charged)
     return recovered
+
+
+def _output_reservation(kwargs: dict[str, Any], fallback: int) -> int:
+    value = kwargs.get("max_output_tokens")
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else fallback
+
+
+def _remaining_job_tokens(client: Any) -> int | None:
+    remaining = getattr(client, "remaining_job_tokens", None)
+    if callable(remaining):
+        return remaining()
+    service = client if isinstance(client, LLMService) else None
+    if service is None or service.workloads is None:
+        return None
+    from app.core.llm_workloads import current_workload
+
+    workload = current_workload()
+    if not workload.task_id or not workload.max_tokens:
+        return None
+    with service.workloads._connect() as conn:
+        used = conn.execute(
+            "SELECT COALESCE(SUM(input_tokens+output_tokens),0) FROM llm_workload_usage WHERE task_id=?",
+            (workload.task_id,),
+        ).fetchone()[0]
+    return max(0, workload.max_tokens - used)
+
+
+def _service_output_cap(client: Any, available: int | None, prompt_estimate: int) -> int | None:
+    """Bound a service request by task and route capacity, never by estimates alone."""
+    service = client if isinstance(client, LLMService) else client.client
+    client_name, model = _service_identity(client, service)
+    resolved = service.config.resolve_model_config(client_name, model)
+    context = getattr(resolved, "context_window_tokens", None) if resolved is not None else None
+    context_cap = None
+    context_room = None
+    if context is not None:
+        context_room = context - prompt_estimate - 4096
+        configured_reserve = (
+            getattr(resolved, "output_reserve_tokens", None)
+            or getattr(service.config, "output_reserve_tokens", None)
+            or 8192
+        )
+        if context_room <= 0:
+            from app.core.llm_workloads import BackgroundTaskBudgetExceeded
+
+            raise BackgroundTaskBudgetExceeded("background_generation_context_capacity_exhausted")
+        # Only add a capacity-derived cap when the service's default admission
+        # reserve would otherwise exceed the route's remaining context.
+        if context_room < configured_reserve:
+            context_cap = context_room
+    budget_cap = None
+    if available is not None and (context is None or available < context):
+        budget_cap = available - prompt_estimate
+        if context_room is not None:
+            budget_cap = min(budget_cap, context_room)
+        if budget_cap <= 0:
+            from app.core.llm_workloads import BackgroundTaskBudgetExceeded
+
+            raise BackgroundTaskBudgetExceeded("background_generation_budget_exceeded")
+    caps = [cap for cap in (budget_cap, context_cap) if cap is not None]
+    return min(caps) if caps else None
+
+
+def _service_identity(client: Any, service: LLMService) -> tuple[str | None, str]:
+    client_name = getattr(client, "client_name", None) or service.config.default_client
+    if not client_name:
+        registered = service.registry.list_clients()
+        client_name = registered[0].name if registered else None
+    model = getattr(client, "model", None)
+    if not model:
+        provider = service.registry.get(client_name) if client_name else None
+        model = getattr(provider, "default_model", None) or service.config.model
+    return client_name, model
+
+
+def _service_prompt_estimate(client: Any, kwargs: dict[str, Any]) -> int:
+    service = client if isinstance(client, LLMService) else client.client
+    client_name, model = _service_identity(client, service)
+    resolved = service.config.resolve_model_config(client_name, model)
+    user_content = kwargs.get("user_prompt", "")
+    image_blocks = kwargs.get("image_blocks") or []
+    audio_blocks = kwargs.get("audio_blocks") or []
+    if image_blocks or audio_blocks:
+        user_content = [LLMTextBlock(text=str(user_content)), *image_blocks, *audio_blocks]
+    request = LLMRequest(
+        client_name=client_name,
+        model=model,
+        messages=[
+            LLMMessage(role="system", content=str(kwargs.get("system_prompt", ""))),
+            LLMMessage(role="user", content=user_content),
+        ],
+        prompt_summary=str(kwargs.get("prompt_summary", "background_generation")),
+        tools=kwargs.get("tools") or [],
+    )
+    path = getattr(resolved, "tokenizer_json_path", None) if resolved is not None else None
+    return service._count_request(request, path)
 
 
 def _mark_recovery(response: Any, *, attempts: int, recovered: bool, tokens: int) -> None:

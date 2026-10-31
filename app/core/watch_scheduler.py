@@ -144,6 +144,8 @@ class WatchScheduler:
                 pass
         for thread in self._threads:
             thread.join(timeout=3)
+        if any(thread.is_alive() for thread in self._threads):
+            raise RuntimeError("Watch scheduler workers did not drain; runtime ownership retained")
         self._threads.clear()
 
     def enqueue_due(self, *, now: datetime | None = None) -> int:

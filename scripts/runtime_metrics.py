@@ -9,6 +9,7 @@ import logging
 import logging.handlers
 import math
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -70,7 +71,7 @@ def _timestamp(record):
         return None
 
 
-def aggregate_logs(data_dir: Path, window_seconds: int, now: datetime | None = None):
+def aggregate_logs(data_dir: Path, window_seconds: int, now: datetime | None = None, *, include_sqlite=True):
     now = now or datetime.now(UTC)
     start = now - timedelta(seconds=window_seconds)
     errors: list[str] = []
@@ -83,7 +84,7 @@ def aggregate_logs(data_dir: Path, window_seconds: int, now: datetime | None = N
     intervals = {}
     for path in existing[:MAX_LOG_FILES]:
         for r in _read_records(path, errors):
-            if r.get("kind") not in {"sqlite_summary", "http"}:
+            if r.get("kind") not in ({"sqlite_summary", "http"} if include_sqlite else {"http"}):
                 continue
             ts = _timestamp(r)
             if ts is None or ts > now:
@@ -149,7 +150,7 @@ def aggregate_logs(data_dir: Path, window_seconds: int, now: datetime | None = N
             "http_sampled_records": {**dict(http), "is_complete_request_count": False,
                                      "warning": "sampled/biased records; do not interpret as total requests or RPS"},
             "coverage": {"summary_intervals": accepted,
-            "sqlite_summary_status": "available" if accepted else "unavailable",
+            "sqlite_summary_status": ("available" if accepted else "unavailable") if include_sqlite else "not_applicable",
             "deduplicated_records": duplicate_count,
             "excluded_records": dict(excluded), "log_files_considered": len(existing[:MAX_LOG_FILES]),
             "available_log_files": [p.name for p in existing[:MAX_LOG_FILES]],
@@ -220,10 +221,18 @@ def health(url):
             if len(body) > 1024: return {"status": "unavailable", "reason": "body_too_large"}
             try: payload = json.loads(body)
             except (ValueError, UnicodeDecodeError): return {"status": "unavailable", "reason": "invalid_health_response"}
+            public = {}
+            backend = payload.get("storage_backend") if isinstance(payload, dict) else None
+            if backend in {"sqlite", "mysql"}:
+                public["storage_backend"] = backend
+            deployment_id = payload.get("deployment_id") if isinstance(payload, dict) else None
+            if isinstance(deployment_id, str) and re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", deployment_id):
+                public["deployment_id"] = deployment_id
             if (response.status != 200 or not isinstance(payload, dict) or payload.get("status") != "ok"
                     or payload.get("service") != "local-knowledge-agent-os"):
-                return {"status": "unavailable", "reason": "unhealthy_response", "http_status": response.status}
-            return {"status": "available", "http_status": response.status}
+                return {"status": "unavailable", "reason": "unhealthy_response",
+                        "http_status": response.status, **public}
+            return {"status": "available", "http_status": response.status, **public}
     except (urllib.error.URLError, TimeoutError, OSError):
         return {"status": "unavailable"}
 
@@ -271,19 +280,124 @@ def sample(args):
         if output == data_resolved or data_resolved in output.parents:
             raise ValueError("output cannot be inside data directory")
     now = datetime.now(UTC)
-    log = aggregate_logs(data, args.window_seconds, now)
+    health_result = health(args.health_url) if args.health_url else None
+    mysql_config = getattr(args, "mysql_connection_file", None)
+    health_backend = health_result.get("storage_backend") if health_result else None
+    mysql_mode = mysql_config is not None or health_backend == "mysql"
+    log = aggregate_logs(data, args.window_seconds, now, include_sqlite=not mysql_mode)
     db_path = data / "lka.sqlite3"
     try: disk = {"available_bytes": shutil.disk_usage(data).free}
     except OSError: disk = {"available_bytes": None}
+    if mysql_mode:
+        storage = {"database_bytes": None, "wal_bytes": None, **disk}
+    else:
+        storage = {"database_bytes": _file_size(db_path),
+                   "wal_bytes": _file_size(Path(str(db_path)+"-wal"), missing=0),
+                   **disk}
     result = {"schema": "lka.runtime_metrics", "version": 1, "generated_at": now.isoformat(),
               "window_seconds": args.window_seconds, "window_start": (now-timedelta(seconds=args.window_seconds)).isoformat(),
-              "coverage": log.pop("coverage"), "errors": log.pop("errors"), "metrics": log,
-              "storage": {"database_bytes": _file_size(db_path),
-                          "wal_bytes": _file_size(Path(str(db_path)+"-wal"), missing=0),
-                          **disk}}
-    if args.database_state: result["database_state"] = database_state(db_path)
-    if args.health_url: result["health"] = health(args.health_url)
+              "coverage": log.pop("coverage"), "errors": log.pop("errors"), "metrics": log}
+    if health_result is not None:
+        result["health"] = health_result
+    if mysql_mode:
+        result["metrics"] = {**result["metrics"], "sqlite": {}}
+        storage.update({"backend": "mysql", "wal_bytes": None,
+                        "database_size_approximate": True,
+                        "database_size_basis": "information_schema_data_length_plus_index_length"})
+        if mysql_config is None:
+            storage["database_bytes"] = None
+            state = {"status": "unavailable", "reason": "mysql_connection_config_missing"}
+            mysql_status = {}
+        else:
+            state, database_size, mysql_status = mysql_database_state(mysql_config, include_queue=args.database_state)
+            storage["database_bytes"] = database_size
+        if args.database_state or mysql_config is None or state.get("status") != "available":
+            result["database_state"] = state
+        if mysql_status:
+            result["mysql_global_status"] = mysql_status
+        result["storage"] = storage
+    else:
+        result["storage"] = storage
+        if args.database_state:
+            result["database_state"] = database_state(db_path)
     return result
+
+
+def mysql_database_state(connection_file: Path, *, include_queue=True):
+    """Read only bounded MySQL status without constructing the LKA runtime."""
+    try:
+        if os.name != "nt":
+            mode = connection_file.stat().st_mode & 0o777
+            if mode & 0o077:
+                return ({"status": "unavailable", "reason": "mysql_config_permissions_invalid"}, None, {})
+        config = json.loads(connection_file.read_text(encoding="utf-8"))
+        if not isinstance(config, dict) or not {"host", "port", "user", "password", "database"}.issubset(config):
+            return ({"status": "unavailable", "reason": "mysql_config_invalid"}, None, {})
+        host, user, password, database = (config[key] for key in ("host", "user", "password", "database"))
+        port = config["port"]
+        if (not all(isinstance(value, str) and value for value in (host, user, database))
+                or not isinstance(password, str) or isinstance(port, bool) or not isinstance(port, int)
+                or not 1 <= port <= 65535):
+            return ({"status": "unavailable", "reason": "mysql_config_invalid"}, None, {})
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return ({"status": "unavailable", "reason": "mysql_config_unavailable"}, None, {})
+
+    try:
+        import pymysql
+    except ImportError:
+        return ({"status": "unavailable", "reason": "mysql_driver_unavailable"}, None, {})
+    try:
+        connection = pymysql.connect(
+            host=host, port=port, user=user, password=password, database=database,
+            connect_timeout=1, read_timeout=2, write_timeout=2, autocommit=True,
+            charset="utf8mb4",
+        )
+    except (OSError, TimeoutError, pymysql.MySQLError):
+        return ({"status": "unavailable", "reason": "mysql_connection_failed"}, None, {})
+    try:
+        with closing(connection), connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT /*+ MAX_EXECUTION_TIME(2000) */ SUM(DATA_LENGTH + INDEX_LENGTH) "
+                "FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA=%s",
+                (database,),
+            )
+            size_row = cursor.fetchone()
+            database_size = int(size_row[0]) if size_row and size_row[0] is not None else None
+            state = {"status": "available"}
+            if include_queue:
+                cursor.execute(
+                    "SELECT /*+ MAX_EXECUTION_TIME(2000) */ status,COUNT(*) FROM agent_runs GROUP BY status"
+                )
+                state["runs_by_status"] = {str(status): int(count) for status, count in cursor.fetchall()}
+                cursor.execute(
+                    "SELECT /*+ MAX_EXECUTION_TIME(2000) */ COUNT(*) FROM session_inputs "
+                    "WHERE run_id IS NULL AND cancelled=0"
+                )
+                state["pending_unbound_inputs"] = int(cursor.fetchone()[0])
+                cursor.execute(
+                    "SELECT /*+ MAX_EXECUTION_TIME(2000) */ COUNT(*),COALESCE(SUM(paused=1),0) "
+                    "FROM session_input_queues"
+                )
+                queues, paused = cursor.fetchone()
+                state["input_queues"] = {"queues": int(queues), "paused_queues": int(paused)}
+            global_status = {}
+            try:
+                cursor.execute(
+                    "SHOW GLOBAL STATUS WHERE Variable_name IN "
+                    "('Threads_connected','Threads_running','Questions','Slow_queries')"
+                )
+                for name, value in cursor.fetchall():
+                    try:
+                        global_status[str(name)] = int(value)
+                    except (TypeError, ValueError):
+                        continue
+            except (OSError, TimeoutError, pymysql.MySQLError):
+                # Optional counters may be unavailable to a read-only account;
+                # omit them instead of fabricating zero values.
+                pass
+            return state, database_size, global_status
+    except (OSError, TimeoutError, ValueError, TypeError, pymysql.MySQLError):
+        return ({"status": "unavailable", "reason": "mysql_read_failed"}, None, {})
 
 
 def _file_size(path, *, missing=None):
@@ -303,6 +417,8 @@ def main():
     p.add_argument("--history", type=Path, help="Append private JSONL; rotate at 10 MiB, retain three backups. Single collector only.")
     p.add_argument("--database-state", action="store_true")
     p.add_argument("--health-url", type=validate_health_url)
+    p.add_argument("--mysql-connection-file", type=Path,
+                   help="Private MySQL JSON for explicit read-only runtime metrics")
     args = p.parse_args()
     if args.window_seconds <= 0: p.error("--window-seconds must be positive")
     if args.output and args.history and args.output.resolve() == args.history.resolve():

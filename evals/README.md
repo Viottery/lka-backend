@@ -31,6 +31,87 @@ coverage status and the literal-search/read fallback.
 
 ## Event scheduling transport benchmark
 
+Run explicit offline regression targets without loading personal `.env` or runtime
+configuration:
+
+```bash
+.venv/bin/python scripts/run_isolated_tests.py tests/test_run_change_signals.py \
+  tests/test_memory_identity_projection.py tests/test_background_job_idle_claim.py
+```
+
+Use `--source-root /path/to/frozen-checkout` before targets to compare a frozen
+revision. The runner creates temporary import-time data and selects mock models;
+select offline tests only. Use `scripts/run_mysql_tests.py` and a separate test
+schema for opt-in real-MySQL tests.
+
+For synthetic foreground/background/device replay with SQL counts and optional
+run-manager lock diagnostics:
+
+```bash
+.venv/bin/python scripts/benchmark_database_replay.py --source-root . \
+  --data-dir /tmp/lka-db-replay-new --arm new-sqlite --duration 300 \
+  --measure-run-lock --output docs/_engineering/db-replay.json
+```
+
+The replay shares `benchmark_realistic_usage.py`'s synthetic model fixture and
+incremental device cursors. Initialization is excluded; drain is reported
+separately. MySQL requires a separately migrated disposable schema and its
+private connection file, as documented below. `--mysql-server-pid` optionally
+samples the whole local database process CPU/I/O; other clients can contribute,
+so this is not exclusive workload attribution. Lock instrumentation reports
+outermost scopes only. SQL probes affect timings: compare equal work and keep
+clean HTTP latency measurements separate. Use the same replay/metrics scripts,
+fresh data, and sequential runs on both revisions. Do not mix old repeated-page
+samples with cursor-advancing replay results.
+
+For foreground API latency without SQL probes, use the isolated loopback harness:
+
+```bash
+.venv/bin/python scripts/benchmark_access_latency.py --source-root . \
+  --data-dir /tmp/lka-api-latency-new --samples 24 --model-delay-ms 100 \
+  --output docs/_engineering/api-latency.json
+```
+
+It uses a fresh data directory, mock models, real account/device authentication,
+serial and four-lane turns, bounded history/sync reads, and six SSE requests.
+Background LLM work is disabled; normal schedulers remain active. Model sleep is
+fixed per call and is not real provider latency. SSE first-event timing is not
+TTFT; a fixture without visible answer deltas reports that metric unavailable.
+Percentiles use nearest rank; p99 is the maximum for these small samples, not an
+SLO. Repeated initial sync pages are explicitly a page microbenchmark, separate
+from cursor-advancing incremental pulls. Startup, seed and warmup are excluded.
+Use `--orchestrator langgraph` to include checkpoints. Optional `--backend mysql
+--mysql-connection-file /path/to/private/runtime.json` requires a migrated test/lab
+schema with empty business tables; the harness never resets existing data. Run
+arms sequentially and retain failed/preflight receipts separately from valid
+comparisons. The harness does not enable the unified decision loop, use tools,
+or establish production latency, semantic quality or maximum capacity.
+Add `--raw-samples` to retain numeric latency samples for combining repeated
+arms; compute percentiles from the combined samples rather than averaging p95s.
+
+Two complementary synthetic profiles cover idle consumers and retained stream
+snapshots:
+
+```bash
+.venv/bin/python scripts/benchmark_online_idle_profile.py --source-root . \
+  --data-dir /tmp/lka-idle-profile-new --duration 120 \
+  --output docs/_engineering/idle-profile.json
+.venv/bin/python scripts/benchmark_run_memory.py --source-root . \
+  --data-dir /tmp/lka-stream-cache-new \
+  --output docs/_engineering/stream-cache.json
+```
+
+The first uses approximate normalized online route frequencies, two authenticated
+nodes, advancing sync cursors and empty task queues. Every selected endpoint is
+validated before measurement; any model call or failed request fails the run.
+Its SQL-instrumented timings exclude production history size, tailnet and TLS.
+The second replays at most 20 runs with 256 deltas of 512 bytes each, checks
+durable prefix restoration and measures retained snapshot bytes in a separate
+process. It measures cache retention, not production memory consumption. Both
+require fresh data directories; the MySQL idle profile also needs a separately
+migrated disposable schema. Neither script loads personal history or calls a
+provider.
+
 `scripts/benchmark_event_scheduling.py` starts an isolated loopback HTTP backend
 with disposable SQLite data and a fixed 50 ms execution stub. It never loads
 private configuration or calls a model or tool. Output must use an ignored

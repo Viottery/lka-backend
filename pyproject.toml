@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lka-backend"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local Knowledge Agent OS native Windows and Linux backend"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -28,10 +28,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+browser = ["playwright>=1.48.0,<2.0.0"]
 dev = [
   "pytest>=8.0.0",
   "httpx>=0.27.0",
   "ruff>=0.6.0",
+]
+mysql = [
+    "langgraph-checkpoint-mysql[aiomysql,pymysql]>=3,<4",
+    "pymysql[rsa]>=1.1.1,<1.2",
+    "sqlglot>=27,<31",
 ]
 
 [project.scripts]

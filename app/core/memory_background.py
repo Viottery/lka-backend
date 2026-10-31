@@ -36,7 +36,8 @@ from app.domains.memory import (
     MemoryService,
     MemorySourceInput,
 )
-from app.storage.sqlite_timing import connect_sqlite
+from app.storage.connections import connect_database as connect_sqlite
+from app.storage.sqlite_retry import begin_sqlite_write
 
 
 def _bounded_compaction_refs(refs) -> tuple[list[str], bool]:
@@ -175,6 +176,7 @@ class MemoryBackgroundCoordinator:
                     "memory_consolidate": self._bounded_consolidate, "context_records": self._bounded_atomic_context},
             worker_count=worker_count,
             lease_seconds=600, poll_seconds=1,
+            scheduling_mode="event", reconcile_seconds=30,
         )
         self._saved_worker_handlers: dict[str, Any] | None = None
         self._context_only = False
@@ -200,6 +202,10 @@ class MemoryBackgroundCoordinator:
             return
         self.store.enqueue_grouped("memory_extract", message.session_id, message.message_id,
                                    conn=conn, debounce_seconds=self.debounce_seconds)
+
+    def notify_committed(self) -> None:
+        """Wake memory jobs after their caller-owned transaction commits."""
+        self.store.notify_committed()
 
     def _bounded_extract(self, job):
         with workload_scope("background_memory", task_id=job["job_id"], max_tokens=self.max_job_tokens or None):
@@ -229,6 +235,7 @@ class MemoryBackgroundCoordinator:
     def recover_atomic_context(self):
         if self.atomic_context_store is None:
             return 0
+        queued = 0
         with self.session_service._conn_factory() as conn:
             rows = conn.execute("SELECT p.session_id,p.target_seq FROM context_record_pending p "
                 "JOIN agent_sessions s ON s.session_id=p.session_id AND s.status='active' "
@@ -242,7 +249,10 @@ class MemoryBackgroundCoordinator:
                 "OR json_extract(j.payload_json,'$.target_seq')>=p.target_seq)) LIMIT 32").fetchall()
             for row in rows:
                 self.enqueue_atomic_context(row["session_id"], row["target_seq"], conn=conn, delay=False)
-        return len(rows)
+                queued += 1
+        if queued:
+            self.notify_committed()
+        return queued
 
     def _bounded_atomic_context(self, job):
         from app.core.context_reconcile import propose_delta, select_prefix
@@ -284,7 +294,7 @@ class MemoryBackgroundCoordinator:
         file_status = self.learning.sync(records)
         with connect_sqlite(self.db_path, timeout=10) as conn:
             conn.row_factory = sqlite3.Row
-            conn.execute("BEGIN IMMEDIATE")
+            begin_sqlite_write(conn)
             self.memory._validate_publication_lease(
                 conn, (job["job_id"], job["lease_owner"], job["lease_epoch"]))
             conn.execute("UPDATE memory_maintenance_state SET settled_signature=?,last_completed_at=?,merged_count=?,outcome=? WHERE scope_id=?",
@@ -303,16 +313,37 @@ class MemoryBackgroundCoordinator:
     def enqueue_maintenance(self, *, scope: str = "global", project_id: str | None = None, force: bool = False):
         if scope not in {"global", "project"} or (scope == "project") != bool(project_id):
             raise ValueError("invalid maintenance scope")
-        if not self.consolidation_enabled or not self.memory.learning_enabled(scope="global") or not self.memory.learning_enabled(scope=scope, project_id=project_id):
+        # learning_enabled(scope=...) already applies the global master gate.
+        if not self.consolidation_enabled or not self.memory.learning_enabled(scope=scope, project_id=project_id):
             return {"status": "disabled", "job_id": None}
         if len(list(self.memory.list(scope=scope, project_id=project_id, limit=2))) < 2:
             return {"status": "not_needed", "job_id": None}
         scope_id = "global" if scope == "global" else "project:" + project_id
         signature = self.consolidator.signature(scope, project_id)
         now = datetime.now(UTC)
+        # Unchanged maintenance checks need no write permission. Changed
+        # signatures enter the transaction below to update debounce state.
+        if not force:
+            with connect_sqlite(self.db_path, timeout=10) as conn:
+                conn.row_factory = sqlite3.Row
+                observed = conn.execute(
+                    "SELECT * FROM memory_maintenance_state WHERE scope_id=?", (scope_id,),
+                ).fetchone()
+            if observed is not None and observed["observed_signature"] == signature:
+                dirty = signature != observed["settled_signature"]
+                elapsed = ((now - datetime.fromisoformat(observed["last_completed_at"])).total_seconds()
+                           if observed["last_completed_at"] else float("inf"))
+                if ((dirty and (now - datetime.fromisoformat(observed["dirty_at"])).total_seconds()
+                     < self.consolidation_debounce_seconds)
+                        or (not dirty and elapsed < self.consolidation_interval_seconds)):
+                    return {"status": "waiting", "job_id": None}
+                period = int(now.timestamp() // self.consolidation_interval_seconds)
+                if observed["queued_key"] == f"{signature}:{period}":
+                    return {"status": "already_scheduled", "job_id": None}
         with connect_sqlite(self.db_path, timeout=10) as conn:
             conn.row_factory = sqlite3.Row
-            conn.execute("BEGIN IMMEDIATE")
+            begin_sqlite_write(conn)
+            now = datetime.now(UTC)
             state = conn.execute("SELECT * FROM memory_maintenance_state WHERE scope_id=?", (scope_id,)).fetchone()
             if state is None:
                 conn.execute("INSERT INTO memory_maintenance_state(scope_id,observed_signature,dirty_at) VALUES(?,?,?)",
@@ -335,7 +366,8 @@ class MemoryBackgroundCoordinator:
                 {"project_id": project_id} if project_id else {}, conn=conn, priority=-5,
                 max_attempts=3, watermark_order=time.time_ns())
             conn.execute("UPDATE memory_maintenance_state SET queued_key=? WHERE scope_id=?", (key, scope_id))
-            return result
+        self.notify_committed()
+        return result
 
     def schedule_maintenance(self):
         with connect_sqlite(self.db_path, timeout=10) as conn:
@@ -1012,13 +1044,20 @@ class MemoryBackgroundCoordinator:
                 conn.commit()
             finally:
                 conn.close()
+        if queued:
+            self.notify_committed()
         return queued
 
     def stop(self) -> None:
         self._maintenance_stop.set()
         if self._maintenance_thread is not None:
             self._maintenance_thread.join(timeout=5)
-        self.worker.stop()
+        worker_stopped = self.worker.stop()
+        if self._maintenance_thread is not None and self._maintenance_thread.is_alive():
+            raise RuntimeError("Memory maintenance did not drain; runtime ownership retained")
+        if worker_stopped is False:
+            raise RuntimeError("Memory background workers did not drain; runtime ownership retained")
+        self._maintenance_thread = None
         if self._saved_worker_handlers is not None:
             self.worker.handlers = self._saved_worker_handlers
             self._saved_worker_handlers = None

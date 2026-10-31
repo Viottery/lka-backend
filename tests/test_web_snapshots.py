@@ -85,7 +85,7 @@ def web(tmp_path):
     def call(name, inputs, ctx=None):
         call_context = ctx or context()
         invocation_id = f"tool-{next(sequence)}"
-        if registry.get_tool_or_none(name) is not None and name in {"web.open", "web.find", "web.search"}:
+        if registry.get_tool_or_none(name) is not None and name in {"web.open", "web.find", "web.search", "web.snapshot"}:
             review = run_manager.create_safety_review(SafetyReviewRequest(
                 review_id=f"review-{invocation_id}", run_id=call_context.run_id,
                 session_id=call_context.session_id, trace_id=f"trace-{call_context.run_id}",

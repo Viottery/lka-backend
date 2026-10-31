@@ -12,11 +12,12 @@ from app.integrations.web_search import (
     PublicPageFetcher,
     WebSearchError,
 )
+from app.integrations.web_snapshot import RenderedPageFetcher
 from app.tool_packages.web_resources import WebResources
 
 WEB_PACKAGE = ToolPackageSpec(
     name="web",
-    description="Search public web/news results and read bounded public web page text.",
+    description="Search public web/news, read public page text, or render rich DOM snapshots of JS pages.",
     risk="low",
     requires_expansion=True,
     routing_hints=["Use for current public web information or reading a specific public web page."],
@@ -27,6 +28,7 @@ WEB_PACKAGE = ToolPackageSpec(
         "web.search returns compact provider snippets immediately, without fetching result pages or an extra summary model call. A search_id can reread the saved search with view=full; ref_id identifies a candidate URL, not verified page content.",
         "web.open initially returns a bounded overview, optional query-related original excerpts, and outline. Its snapshot_id fixes the full bounded readable extraction. Continue with snapshot_id plus offset/max_chars or use web.find on that snapshot: these reads do not refetch. Different excerpts are not consecutive text. Inspect omitted_context/context_complete before drawing condition-dependent conclusions.",
         "Use web.find(snapshot_id, query) for literal location even beyond the initial overview. Read around snippet_start/context_start using web.open(snapshot_id, offset, max_chars). Prefer snapshot_id over URL for stable continuation; expected_text_sha256 rejects revision mixing.",
+        "For a JS-rendered public page, explicitly use web.snapshot(url/ref_id). Optional wait_for_selector waits for a visible CSS target and render_wait_ms sets bounded settling. Rendering costs a browser launch; ordinary open/find never renders automatically. Reuse snapshot_id for local find/open afterwards. projection contains DOM rows, controls and schema.org offers; available=null means unknown, disabled controls do not prove sold-out stock, and declared offers do not prove live inventory. Login, POST APIs, clicks, canvas/image seat maps and iframe content are not supported.",
         "URL reads may reuse a recent scoped snapshot. For latest news/ticket status, choose refresh=true or max_age_seconds=0. Refresh creates a new snapshot; fetched_at is source collection time, cache_read_at is local read time, and neither is publication time. Failed refresh is not current evidence. Session snapshots support follow-up; child snapshots are isolated to that child run. Expired/evicted fixed references fail without silently fetching.",
         "web.find no_literal_match means only the exact case-insensitive phrase is absent, not that the topic is absent. On the first zero-match page, recovery_preview supplies at most 1200 characters from the same extraction: bounded query-token contexts or a page prefix. These are nonphrase, nonsemantic excerpts, not verification or full-source review. Tokens are Unicode word runs, without CJK segmentation. offset_exhausted means prior matches exist but this match page is past the end. Use returned source offsets/hash if additional context is necessary; rereading the same cached zero-match result cannot supply missing text.",
         "Search results are candidates, not proof of completeness or current ticket availability. Cite source URLs and distinguish publication time from fetch time.",
@@ -34,7 +36,7 @@ WEB_PACKAGE = ToolPackageSpec(
         "web.open/web.find network_observations record only this fetch's actual redirect hops and selected response header prefixes. They do not diagnose why a search snippet differs. cache_origin=not_determined remains unknown even when Age or Cache-Control is present; do not invent cache or redirect causes.",
     ],
     observation_cache={
-        "tool_names": ["web.search", "web.open", "web.find"],
+        "tool_names": ["web.search", "web.open", "web.find", "web.snapshot"],
         "ttl_seconds": 300, "version": "web-snapshot-v1",
         "description": "Reuse bounded historical web evidence and snapshot references; not proof of latest state.",
     },
@@ -64,9 +66,9 @@ def _page_output_schema(fields, *, extra=None):
     }
     properties.update(extra or {})
     properties["extraction_method"] = {"type": "string", "allowed_values": [
-        "visible_html", "plain_text", "hidden_structured_data_title_fallback"]}
+        "visible_html", "plain_text", "hidden_structured_data_title_fallback", "rendered_dom"]}
     properties["rendered_visibility"] = {"type": "string", "allowed_values": [
-        "visible_text", "not_applicable_plain_text", "alternative_hidden_structured_text"]}
+        "visible_text", "not_applicable_plain_text", "alternative_hidden_structured_text", "rendered_main_document"]}
     return properties
 
 
@@ -361,6 +363,58 @@ class WebFindTool(_WebResourceContract):
                           status="completed", output={**output, "untrusted_data": True})
 
 
+class WebSnapshotTool(_WebResourceContract):
+    spec = WebOpenTool.spec.model_copy(update={
+        "name": "web.snapshot",
+        "description": (
+            "Render a public HTTPS page with JavaScript and return bounded readable text plus a rich DOM "
+            "projection of tables, controls, links and schema.org offers. Provide exactly one URL, search "
+            "ref_id or existing snapshot_id. Opt-in browser setup required; startup and rendering add cost. "
+            "Optional wait_for_selector is a visible CSS target; render_wait_ms (default 1000, max 5000) "
+            "allows bounded settling after DOMContentLoaded. No login, profile, cookies, clicks, forms, "
+            "POST APIs, iframe content or image/canvas interpretation. Offer available is true/false only "
+            "for explicit schema.org stock declarations, null otherwise; never proof of live inventory. "
+            "Disabled controls are UI state, not sold-out evidence. Rendering may be incomplete. "
+            "Use web.find(snapshot_id, query) or web.open(snapshot_id, offset) for cheap local continuation. "
+            "refresh=true collects a new version; a cache read is historical evidence."
+        ),
+        "input_schema": {"type": "object", "properties": {
+            **WebOpenTool.spec.input_schema["properties"],
+            "wait_for_selector": {"type": "string", "minLength": 1, "maxLength": 300},
+            "render_wait_ms": {"type": "integer", "minimum": 0, "maximum": 5000},
+        }},
+        "output_schema": {**WebOpenTool.spec.output_schema,
+                          "projection": {"type": "object"}, "render_observations": {"type": "object"}},
+        "output_preview_priority_fields": ["text", "projection", "snapshot_id", "text_sha256", "url",
+            "fetched_at", "extraction_complete", "render_observations", "offset", "next_offset", "has_more"],
+        "output_evidence_roles": [*WebOpenTool.spec.output_evidence_roles,
+            {"path": "/projection", "role": "source_content"},
+            {"path": "/render_observations", "role": "transport_metadata"}],
+    })
+
+    def __init__(self, renderer: RenderedPageFetcher, resources: WebResources | None = None):
+        self.renderer = renderer
+        self.resources = resources
+
+    def invoke(self, *, invocation: ToolInvocation, context: ToolContext) -> ToolResult:
+        try:
+            if self.resources is None:
+                raise ValueError("Rich snapshots require scoped web snapshot storage.")
+            inputs = invocation.input
+            if inputs.get("snapshot_id") and any(key in inputs for key in ("wait_for_selector", "render_wait_ms")):
+                raise ValueError("snapshot_id fixes an extraction; omit rendering options.")
+            fetcher = self.renderer.options(wait_for_selector=inputs.get("wait_for_selector"),
+                                            settle_ms=inputs.get("render_wait_ms", 1000))
+            output = self.resources.open(fetcher, inputs, context, tool_name=self.spec.name)
+            if output.get("extraction_method") != "rendered_dom":
+                raise ValueError("This is a plain-text snapshot; use web.open/find or render its URL.")
+            return ToolResult(invocation_id=invocation.invocation_id, tool_name=self.spec.name,
+                              status="completed", output=output)
+        except (WebSearchError, WebCacheError, TypeError, ValueError) as exc:
+            return ToolResult(invocation_id=invocation.invocation_id, tool_name=self.spec.name,
+                              status="failed", error=str(exc))
+
+
 def register_web_tools(registry, *, api_key: str | None, quota: BraveSearchQuota | None = None,
                        conn_factory=None, config=None) -> None:
     """Register this package and its tools; runtime wiring remains an explicit caller choice."""
@@ -380,3 +434,5 @@ def register_web_tools(registry, *, api_key: str | None, quota: BraveSearchQuota
     registry.register_tool(WebSearchTool(BraveSearchAdapter(api_key, quota=quota), resources))
     registry.register_tool(WebOpenTool(fetcher, resources))
     registry.register_tool(WebFindTool(fetcher, resources))
+    registry.register_tool(WebSnapshotTool(RenderedPageFetcher(
+        enabled=bool(config and config.browser_enabled)), resources))

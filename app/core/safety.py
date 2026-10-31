@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from collections import OrderedDict
 from enum import Enum
 from hashlib import sha1
 from typing import Any, Literal
@@ -26,6 +27,7 @@ class SafetyReviewStatus(str, Enum):
     PENDING = "pending"
     APPROVED = "approved"
     REJECTED = "rejected"
+    EXPIRED = "expired"
 
 
 class SafetyReviewDecision(str, Enum):
@@ -90,10 +92,17 @@ class SafetyReviewQueueConflict(ValueError):
 class InMemorySafetyReviewStore:
     """Thread-safe local safety review store for current in-memory Agent runs."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, decided_cache_limit: int | None = None) -> None:
+        if decided_cache_limit is not None and (
+            type(decided_cache_limit) is not int or decided_cache_limit < 1
+        ):
+            raise ValueError("decided_cache_limit must be a positive integer or None")
         self._condition = threading.Condition(threading.RLock())
         self._reviews: dict[str, SafetyReviewRecord] = {}
         self._run_reviews: dict[str, list[str]] = {}
+        self._decided_cache_limit = decided_cache_limit
+        self._decided_lru: OrderedDict[str, None] = OrderedDict()
+        self._active_waiters: dict[str, int] = {}
 
     def create(self, request: SafetyReviewRequest) -> SafetyReviewRecord:
         with self._condition:
@@ -119,12 +128,16 @@ class InMemorySafetyReviewStore:
             self._reviews[record.review_id] = record
             if record.review_id not in self._run_reviews.setdefault(record.run_id, []):
                 self._run_reviews[record.run_id].append(record.review_id)
+            self._track_decided_locked(record)
             self._condition.notify_all()
         return record
 
     def get(self, review_id: str) -> SafetyReviewRecord | None:
         with self._condition:
-            return self._reviews.get(review_id)
+            record = self._reviews.get(review_id)
+            if record is not None:
+                self._touch_decided_locked(record)
+            return record
 
     def list_for_run(self, run_id: str) -> list[SafetyReviewRecord]:
         with self._condition:
@@ -155,6 +168,7 @@ class InMemorySafetyReviewStore:
                 raise KeyError(f"Safety review not found: {review_id}")
             updated = current.model_copy(update={"llm_output": llm_output})
             self._reviews[review_id] = updated
+            self._track_decided_locked(updated)
             self._condition.notify_all()
             return updated
 
@@ -187,6 +201,7 @@ class InMemorySafetyReviewStore:
                 }
             )
             self._reviews[review_id] = updated
+            self._track_decided_locked(updated)
             self._condition.notify_all()
             return updated
 
@@ -197,19 +212,75 @@ class InMemorySafetyReviewStore:
         timeout_seconds: float | None = None,
         cancel_check: Any | None = None,
     ) -> SafetyReviewRecord:
-        while True:
-            # Decision routes acquire the run-manager lock before this store's
-            # lock; check cancellation outside the store lock to avoid inversion.
-            if cancel_check is not None and cancel_check():
+        with self._condition:
+            self._active_waiters[review_id] = self._active_waiters.get(review_id, 0) + 1
+        try:
+            while True:
+                # Decision routes acquire the run-manager lock before this store's
+                # lock; check cancellation outside the store lock to avoid inversion.
+                if cancel_check is not None and cancel_check():
+                    with self._condition:
+                        current = self._reviews.get(review_id)
+                        if current is None:
+                            raise KeyError(f"Safety review not found: {review_id}")
+                        return current
                 with self._condition:
                     current = self._reviews.get(review_id)
                     if current is None:
                         raise KeyError(f"Safety review not found: {review_id}")
-                    return current
+                    if current.status != SafetyReviewStatus.PENDING:
+                        self._touch_decided_locked(current)
+                        return current
+                    self._condition.wait(timeout=timeout_seconds or 0.5)
+        finally:
             with self._condition:
-                current = self._reviews.get(review_id)
-                if current is None:
-                    raise KeyError(f"Safety review not found: {review_id}")
-                if current.status != SafetyReviewStatus.PENDING:
-                    return current
-                self._condition.wait(timeout=timeout_seconds or 0.5)
+                remaining = self._active_waiters.get(review_id, 0) - 1
+                if remaining > 0:
+                    self._active_waiters[review_id] = remaining
+                else:
+                    self._active_waiters.pop(review_id, None)
+                self._evict_decided_locked()
+
+    def trim_decided_cache(self) -> None:
+        """Trim only after the durable review update has committed."""
+        with self._condition:
+            self._evict_decided_locked()
+
+    def _track_decided_locked(self, record: SafetyReviewRecord) -> None:
+        if self._decided_cache_limit is None:
+            return
+        if record.status == SafetyReviewStatus.PENDING:
+            self._decided_lru.pop(record.review_id, None)
+            return
+        self._decided_lru.pop(record.review_id, None)
+        self._decided_lru[record.review_id] = None
+
+    def _touch_decided_locked(self, record: SafetyReviewRecord) -> None:
+        if self._decided_cache_limit is None or record.status == SafetyReviewStatus.PENDING:
+            return
+        if record.review_id in self._decided_lru:
+            self._decided_lru.move_to_end(record.review_id)
+
+    def _evict_decided_locked(self) -> None:
+        if self._decided_cache_limit is None:
+            return
+        while len(self._decided_lru) > self._decided_cache_limit:
+            review_id = next(
+                (candidate for candidate in self._decided_lru
+                 if not self._active_waiters.get(candidate, 0)),
+                None,
+            )
+            if review_id is None:
+                # Active waiters pin their decisions until they have consumed them.
+                return
+            self._decided_lru.pop(review_id)
+            record = self._reviews.pop(review_id, None)
+            if record is not None:
+                run_reviews = self._run_reviews.get(record.run_id)
+                if run_reviews is not None:
+                    try:
+                        run_reviews.remove(review_id)
+                    except ValueError:
+                        pass
+                    if not run_reviews:
+                        self._run_reviews.pop(record.run_id, None)

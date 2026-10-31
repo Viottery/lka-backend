@@ -6,6 +6,7 @@ import time
 from app.core.agent_runs import AgentRunStatus, InMemoryAgentRunManager
 from app.core.context_driver import ToolView
 from app.core.multi_agent import SideEffectLevel
+from app.core.safety import SafetyReviewDecision, SafetyReviewMode, SafetyReviewRequest
 from app.core.tools import (
     ToolContext,
     ToolExecutor,
@@ -14,6 +15,35 @@ from app.core.tools import (
     ToolResult,
     ToolSpec,
 )
+
+
+def _approved_context(manager, run, invocation_id, tool_name, tool_input, *, tool_view=None):
+    review_id = f"review:{run.run_id}:{invocation_id}"
+    manager.create_safety_review(SafetyReviewRequest(
+        review_id=review_id,
+        run_id=run.run_id,
+        session_id=run.session_id,
+        trace_id=run.trace_id,
+        invocation_id=invocation_id,
+        tool_name=tool_name,
+        tool_input=tool_input,
+        mode=SafetyReviewMode.SKIP,
+        reason="Approved test invocation.",
+        created_at=run.created_at,
+    ))
+    manager.decide_safety_review(
+        review_id=review_id,
+        decision=SafetyReviewDecision.APPROVE,
+        decided_by="test",
+        reason="Approved test invocation.",
+    )
+    return ToolContext(
+        session_id=run.session_id,
+        run_id=run.run_id,
+        safety_review_approved=True,
+        safety_review_id=review_id,
+        tool_view=tool_view,
+    )
 
 
 class _CountingTool:
@@ -68,15 +98,16 @@ def test_tool_executor_enforces_child_tool_call_budget_from_durable_events() -> 
         side_effect_level=SideEffectLevel.READ,
         max_tool_calls=1,
     )
-    context = ToolContext(session_id=child.session_id, run_id=child.run_id, tool_view=view)
+    first_context = _approved_context(manager, child, "first", "test.count", {}, tool_view=view)
+    second_context = _approved_context(manager, child, "second", "test.count", {}, tool_view=view)
 
     manager.append_event(child.run_id, "tool_started", "Started", stage="tool")
     first = executor.execute(
-        invocation_id="first", tool_name="test.count", tool_input={}, context=context
+        invocation_id="first", tool_name="test.count", tool_input={}, context=first_context
     )
     manager.append_event(child.run_id, "tool_started", "Started", stage="tool")
     second = executor.execute(
-        invocation_id="second", tool_name="test.count", tool_input={}, context=context
+        invocation_id="second", tool_name="test.count", tool_input={}, context=second_context
     )
 
     assert first.status == "completed"
@@ -114,17 +145,18 @@ def test_tool_executor_records_resource_lock_wait_without_lock_key() -> None:
     registry.register_tool(_ResourceLockedWriteTool())
     executor = ToolExecutor(registry)
     executor.run_manager = manager
-    context = ToolContext(
-        session_id=run.session_id,
-        run_id=run.run_id,
-        safety_review_approved=True,
+    uncontended_context = _approved_context(
+        manager, run, "uncontended", "test.resource_write", {"target": "private-target"},
+    )
+    contended_context = _approved_context(
+        manager, run, "contended", "test.resource_write", {"target": "private-target"},
     )
 
     uncontended = executor.execute(
         invocation_id="uncontended",
         tool_name="test.resource_write",
         tool_input={"target": "private-target"},
-        context=context,
+        context=uncontended_context,
     )
     assert uncontended.status == "completed"
     assert not any("resource_lock_wait" in event.type for event in manager.list_events(run.run_id))
@@ -138,7 +170,7 @@ def test_tool_executor_records_resource_lock_wait_without_lock_key() -> None:
                 invocation_id="contended",
                 tool_name="test.resource_write",
                 tool_input={"target": "private-target"},
-                context=context,
+                context=contended_context,
             )
         )
     )

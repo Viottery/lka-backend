@@ -1,6 +1,7 @@
 from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
 from app.api.routes.memories import require_local_memory_control
@@ -16,6 +17,7 @@ from app.api.schemas import (
 )
 from app.core.sessions import (
     AgentSessionMessagePage,
+    AgentSessionState,
     SessionCreationSource,
     SessionHistoryCursorError,
     SessionMessageView,
@@ -104,6 +106,27 @@ def restore_session(session_id: str, request: Request) -> SessionDetailResponse:
         raise HTTPException(status_code=404, detail=f"Deleted session not found: {session_id}")
     result = request.app.state.runtime.get_session(session_id=session_id)
     return SessionDetailResponse(**result.model_dump())
+
+
+@router.get("/{session_id}/state", response_model=AgentSessionState)
+def get_session_state(session_id: str, request: Request) -> Response:
+    """Read compact session status without loading its history or metadata."""
+    try:
+        state = request.app.state.runtime.session_service.get_session_state(session_id=session_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Session not found") from exc
+    etag = f'"{state.revision}"'
+    headers = {
+        "ETag": etag,
+        "Cache-Control": "private, no-cache, must-revalidate",
+    }
+    validators = {
+        value.strip() for value in request.headers.get("if-none-match", "").split(",")
+        if value.strip()
+    }
+    if "*" in validators or etag in validators or f"W/{etag}" in validators:
+        return Response(status_code=304, headers=headers)
+    return JSONResponse(content=state.model_dump(mode="json"), headers=headers)
 
 
 @router.get("/{session_id}", response_model=AgentSessionMessagePage | SessionDetailResponse)

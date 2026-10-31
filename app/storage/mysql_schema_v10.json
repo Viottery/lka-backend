@@ -1,0 +1,19 @@
+{
+  "format": 1,
+  "version": 10,
+  "migration_name": "background_watermark_order_signed64",
+  "columns": [
+    {
+      "table": "background_watermark_heads",
+      "column": "watermark_order",
+      "nullable": false,
+      "mysql_type": "BIGINT"
+    },
+    {
+      "table": "background_pending_watermarks",
+      "column": "watermark_order",
+      "nullable": true,
+      "mysql_type": "BIGINT"
+    }
+  ]
+}

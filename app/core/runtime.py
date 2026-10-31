@@ -6,7 +6,7 @@ import asyncio
 import json
 import sqlite3
 import threading
-from contextlib import closing, nullcontext
+from contextlib import closing, contextmanager, nullcontext
 from datetime import UTC, datetime
 from hashlib import sha1, sha256
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -17,7 +17,10 @@ from app.api.schemas import (
     CapabilityItem,
     WorkspaceIndexResponse,
 )
-from app.core.agent_checkpoints import create_sqlite_checkpoint_runtime
+from app.core.agent_checkpoints import (
+    create_mysql_checkpoint_runtime,
+    create_sqlite_checkpoint_runtime,
+)
 from app.core.agent_executors import AgentDefinition, AgentExecutorRegistry, MockWorkflowExecutor
 from app.core.agent_graph import AgentGraphRunner
 from app.core.agent_runner import AgentTurnRunner
@@ -37,6 +40,7 @@ from app.core.codex_workspace import CodexWorkspaceFactory
 from app.core.config import Settings
 from app.core.context import ContextAssembler
 from app.core.context_driver import ContextViews, EvidenceCandidate
+from app.core.execution_admission import ExecutionAdmission, admitted_execution, bind_execution_run
 from app.core.instruction_files import InstructionFiles
 from app.core.llm import LLMRequest, LLMResponseMode, MockLLMClient, build_text_llm_client
 from app.core.llm.errors import LLMClientError
@@ -135,6 +139,7 @@ from app.integrations.outlook import (
 from app.integrations.web_search import BraveSearchQuota
 from app.platform import FilesystemScanner, PathResolver, ScanOptions, detect_platform
 from app.platform.python_environment import ManagedPythonEnvironment
+from app.storage.connections import is_mysql
 from app.storage.db import connect, get_db_path, init_db
 from app.storage.sqlite_write_queue import WriteQueuePolicy, configure_write_queue_defaults
 from app.tool_packages.attachments import ATTACHMENTS_PACKAGE, create_attachment_tools
@@ -245,6 +250,11 @@ class LocalKnowledgeAgentRuntime:
     def __init__(self, settings: Settings) -> None:
         from app.platform.runtime_owner import RuntimeOwner
 
+        self.execution_admission = ExecutionAdmission(
+            total=settings.agent_execution_concurrency,
+            interactive_reserved=settings.agent_execution_interactive_reserved,
+            children=settings.agent_child_execution_concurrency,
+        )
         self.local_app_config = settings.load_local_config()
         # Validate before the ownership lock creates any data-directory files.
         local_data = settings.data_dir.expanduser().resolve(strict=False)
@@ -255,10 +265,22 @@ class LocalKnowledgeAgentRuntime:
         self._runtime_owner = RuntimeOwner(settings.data_dir)
         if not self._runtime_owner.acquire():
             raise RuntimeError("Runtime data directory is already owned by another backend")
+        self._mysql_owner = None
+        mysql_config = settings.mysql_config()
+        if mysql_config is not None:
+            from app.storage.mysql_owner import MySQLCoordinatorOwner
+
+            self._mysql_owner = MySQLCoordinatorOwner(mysql_config)
         try:
+            if self._mysql_owner is not None and not self._mysql_owner.acquire():
+                raise RuntimeError("MySQL database is already owned by another coordinator")
             # Schema setup and recovery baselines can write too. A running
             # backend must fence those before a second runtime is constructed.
             self._initialize(settings)
+        except BaseException:
+            if self._mysql_owner is not None:
+                self._mysql_owner.release()
+            raise
         finally:
             self._runtime_owner.release()
 
@@ -278,6 +300,12 @@ class LocalKnowledgeAgentRuntime:
             transaction_seconds=settings.db_write_transaction_seconds,
         ))
         self.db_path = get_db_path(settings.data_dir)
+        self._mysql_config = settings.mysql_config()
+        if self._mysql_config is not None:
+            from app.storage.connections import configure_mysql
+
+            configure_mysql(self.db_path, self._mysql_config,
+                            transaction_guard=self._mysql_owner.guard_transaction)
         init_db(self.db_path)
         self.memory_settings_base = self.local_app_config.model_copy(deep=True)
         self.memory_settings_store = MemorySettingsStore(self._conn)
@@ -405,6 +433,7 @@ class LocalKnowledgeAgentRuntime:
         embedding_config = self.local_app_config.embedding
         embedding_provider, semantic_index = build_local_semantic_components(
             conn_factory=self._conn,
+            storage_backend=settings.storage_backend,
             enabled=embedding_config.enabled,
             provider_name=embedding_config.provider,
             index_provider_name=embedding_config.index_provider,
@@ -688,12 +717,7 @@ class LocalKnowledgeAgentRuntime:
             conversation_history_tools,
         )
 
-        conn = self._conn()
-        try:
-            self.session_service._ensure_context_state_table(conn)
-            conn.commit()
-        finally:
-            conn.close()
+        self.session_service.prepare_context_schema()
         self.conversation_history = ConversationHistoryService(self._conn)
         self.conversation_history.ensure_schema()
         history_config = self.local_app_config.conversation_history
@@ -753,6 +777,7 @@ class LocalKnowledgeAgentRuntime:
             log_dir=self.settings.data_dir / "agent_logs",
             max_decision_steps=self.local_app_config.agent.max_decision_steps,
             llm_max_attempts=self.local_app_config.llm.max_attempts,
+            session_context_token_budget=self.local_app_config.agent.session_context_token_budget,
             answer_timeout_seconds=self.local_app_config.agent.answer_timeout_seconds,
             answer_timeout_fallback_enabled=self.local_app_config.agent.answer_timeout_fallback_enabled,
             answer_review_enabled=self.local_app_config.agent.answer_review_enabled,
@@ -797,6 +822,7 @@ class LocalKnowledgeAgentRuntime:
                 MemoryPreTurnGate(self.memory_service) if memory_config.enabled else None
             ),
         )
+        self.agent_turn_loop.execution_admission = self.execution_admission
         self.agent_turn_loop.multi_agent_max_retries = self.local_app_config.agent.multi_agent_max_retries
         self.agent_turn_runner: AgentTurnRunner = self.agent_turn_loop
         self._resumable_runner_lock = threading.Lock()
@@ -805,9 +831,7 @@ class LocalKnowledgeAgentRuntime:
             checkpointer = None
             checkpoint_runtime = None
             if self.local_app_config.agent.checkpoint_backend == "sqlite":
-                checkpoint_runtime = create_sqlite_checkpoint_runtime(
-                    self.settings.data_dir / "agent_checkpoints.sqlite3"
-                )
+                checkpoint_runtime = self._create_checkpoint_runtime()
             self.agent_turn_runner = AgentGraphRunner(
                 self.agent_turn_loop,
                 checkpointer=checkpointer,
@@ -963,7 +987,11 @@ class LocalKnowledgeAgentRuntime:
             request_pause=lambda run: self.interrupt_agent_run(run.run_id),
             scheduling_mode=settings.scheduling_mode,
             reconcile_seconds=settings.scheduling_reconcile_seconds,
+            execution_admission=self.execution_admission,
+            recovery_guard=self._unstarted_run_recovery_guard,
         )
+        self.execution_admission.on_available = self.agent_dispatch.notify
+        self.multi_agent_scheduler.execution_admission = self.execution_admission
         self.agent_turn_loop.execution_guard = self.agent_dispatch.check_run
         self.managed_tasks = ManagedTaskService(
             self._conn, sessions=self.session_service, management=self.management_service,
@@ -989,17 +1017,24 @@ class LocalKnowledgeAgentRuntime:
                 else self.platform.name,
             }
         from app.core.session_inputs import SessionInputQueue
+        from app.storage.keyed_write_admission import KeyedWriteAdmission
 
+        input_write_admission = (KeyedWriteAdmission(
+            capacity=settings.db_write_queue_capacity, wait_seconds=settings.db_write_queue_wait_seconds,
+        ) if self._mysql_config is not None else None)
         self.session_inputs = SessionInputQueue(
             self._conn, sessions=self.session_service, run_store=self.agent_run_store,
             dispatcher=self.agent_dispatch, authorize=self._authorize_session_input,
             policy=self._session_run_policy, validate_attachments=self.prepare_agent_attachment_input,
             validate_answer_selection=self.validate_agent_answer_selection,
             accepted_answer_selection=self.management_service.input_answer_selection,
+            validate_selection=self.validate_agent_input_selection,
             replace=self.replace_agent_run,
             batch_attachments_fit=self._session_input_batch_attachments_fit,
+            write_admission=input_write_admission,
         )
         self.session_inputs.ensure_schema()
+        self.session_service.state_queue_revision = self.session_inputs.state_revision
         from app.domains.management_goals import ManagementGoalService
         from app.experts.management import ManagementCoordinator
 
@@ -1092,7 +1127,7 @@ class LocalKnowledgeAgentRuntime:
         self.management_coordinator.work_queue = self.management_queue
         self.agent_turn_loop.execution_guard = self.management_coordinator.check_run
         self.agent_turn_loop.finalization_handler = self.management_coordinator.finalize
-        self.agent_turn_loop.answer_visibility_provider = self.management_coordinator.notifications.for_run
+        self.agent_turn_loop.answer_visibility_provider = self.management_coordinator.notifications
         self.managed_tasks.guard = self.management_coordinator.check_run
         self.managed_tasks.goals = self.management_goals
         from app.domains.management_history import ManagementHistoryService
@@ -1303,6 +1338,12 @@ class LocalKnowledgeAgentRuntime:
         self.management_coordinator.worker.configure_scheduling(
             settings.scheduling_mode, settings.scheduling_reconcile_seconds,
         )
+        self.memory_background.worker.configure_scheduling(
+            settings.scheduling_mode, settings.scheduling_reconcile_seconds,
+        )
+        self.message_analysis.worker.configure_scheduling(
+            settings.scheduling_mode, settings.scheduling_reconcile_seconds,
+        )
         self.agent_run_manager.on_state_change = self._run_state_committed
         self.managed_tasks.on_change = self._task_state_committed
         self.session_service.on_change = self._session_state_committed
@@ -1319,11 +1360,14 @@ class LocalKnowledgeAgentRuntime:
         self._management_state_committed()
 
     def _session_state_committed(self):
+        self.memory_background.notify_committed()
         if self.settings.scheduling_mode != "poll":
             self.scheduler.request_rescan("inputs")
         self._management_state_committed()
 
     def _run_state_committed(self, record):
+        if record.status.value == "completed":
+            self.memory_background.notify_committed()
         self.session_inputs.notify(record.session_id)
         self.agent_dispatch.notify()
         if (self.local_app_config.management.enabled and self.settings.scheduling_mode != "poll"
@@ -1418,18 +1462,31 @@ class LocalKnowledgeAgentRuntime:
     def _authorize_session_input(self, conn, session_id, *, accepting=False):
         from app.core.session_inputs import SessionInputConflict
 
-        row = conn.execute('SELECT kind,status FROM agent_sessions WHERE session_id=?', (session_id,)).fetchone()
-        if row is None or row['status'] == 'deleted':
+        session = conn.execute(
+            "SELECT kind,status FROM agent_sessions WHERE session_id=?", (session_id,),
+        ).fetchone()
+        if session is None or session['status'] == 'deleted':
             raise KeyError(session_id)
         if (not self.local_app_config.management.enabled
                 or self.local_app_config.agent.checkpoint_backend != 'sqlite'):
             raise SessionInputConflict('session_input_queue_disabled')
-        if row['kind'] != 'manager' or self.management_delegates.get_for_session(conn, session_id) is not None:
+        if session['kind'] != 'manager':
             raise SessionInputConflict('session_input_queue_requires_default_manager')
-        default = conn.execute('SELECT session_id FROM manager_defaults WHERE slot=1').fetchone()
-        is_default = default is not None and default[0] == session_id
-        accepted = conn.execute('SELECT 1 FROM session_input_queues WHERE session_id=?', (session_id,)).fetchone()
-        if not is_default and (accepting or accepted is None):
+        if accepting and is_mysql(conn):
+            # The default may change concurrently. Hold its singleton row share
+            # lock through acceptance commit, without serializing SQLite.
+            conn.execute_native(
+                "SELECT session_id FROM manager_defaults WHERE slot=1 FOR SHARE",
+            ).fetchone()
+        row = conn.execute(
+            "SELECT EXISTS(SELECT 1 FROM manager_delegates d WHERE d.session_id=?) AS delegated,"
+            "EXISTS(SELECT 1 FROM manager_defaults d WHERE d.slot=1 AND d.session_id=?) AS is_default,"
+            "EXISTS(SELECT 1 FROM session_input_queues q WHERE q.session_id=?) AS accepted",
+            (session_id, session_id, session_id),
+        ).fetchone()
+        if row['delegated']:
+            raise SessionInputConflict('session_input_queue_requires_default_manager')
+        if not row['is_default'] and (accepting or not row['accepted']):
             raise SessionInputConflict('session_input_queue_requires_default_manager')
 
     def _after_session_delete(self, conn, session_id):
@@ -1499,20 +1556,66 @@ class LocalKnowledgeAgentRuntime:
         ui_reasoning_source = "default"
         ui_answer_client_name = None
         ui_answer_model = None
-        try:
-            with closing(self._conn()) as conn:
+        manager_controller = None
+        manager_delegate_policy = None
+        ordinary_frozen_record = None
+        with closing(self._conn()) as conn:
+            try:
                 preference = conn.execute("SELECT preferences FROM agent_ui_preferences WHERE id=1").fetchone()
-            if preference:
-                preferences = json.loads(preference[0])
-                value = preferences.get("reasoning_level")
-                if value in {"off", "low", "high", "max"}:
-                    ui_reasoning_level = value
-                    ui_reasoning_source = "ui_default"
-                ui_answer_client_name = preferences.get("llm_answer_client") or None
-                ui_answer_model = preferences.get("llm_answer_model") or None
-        except (sqlite3.Error, ValueError, TypeError, AttributeError):
-            pass
-        session = self.session_service.get_session_or_none(session_id=session_id)
+                if preference:
+                    preferences = json.loads(preference[0])
+                    value = preferences.get("reasoning_level")
+                    if value in {"off", "low", "high", "max"}:
+                        ui_reasoning_level = value
+                        ui_reasoning_source = "ui_default"
+                    ui_answer_client_name = preferences.get("llm_answer_client") or None
+                    ui_answer_model = preferences.get("llm_answer_model") or None
+            except (sqlite3.Error, ValueError, TypeError, AttributeError):
+                pass
+            session = self.session_service.get_session_or_none(session_id=session_id, conn=conn)
+            if session is not None and session.kind == "manager":
+                manager_controller = self.management_service.get(session_id, conn=conn)["controller"]
+                delegates = getattr(self, "management_delegates", None)
+                if delegates is not None and delegates.get_for_session(conn, session_id) is not None:
+                    manager_delegate_policy = delegates.policy_for_session(conn, session_id)
+            elif getattr(self, "management_delegates", None) is not None:
+                row = conn.execute("SELECT r.record_payload FROM agent_runs r "
+                                   "JOIN managed_session_links l ON l.task_session_id=r.session_id "
+                                   "WHERE r.session_id=? ORDER BY r.created_at DESC,r.run_id DESC LIMIT 1",
+                                   (session_id,)).fetchone()
+                if row:
+                    ordinary_frozen_record = row[0]
+
+        if session is not None and session.kind == "manager":
+            if manager_delegate_policy is not None:
+                return SessionRunPolicy.model_validate(manager_delegate_policy)
+            controller = manager_controller
+            from app.domains.management_role import supervisor_instructions
+
+            return SessionRunPolicy(
+                role_instructions=supervisor_instructions(
+                    active=controller["status"] == "active",
+                    autonomous_enabled=(self.local_app_config.management.enabled
+                                        and self.local_app_config.management.autonomous_enabled),
+                    attention_sweep_interval_seconds=(
+                        self.local_app_config.management.attention_sweep_interval_seconds
+                    ),
+                ),
+                read_only_tools=[tool.name for tool in self.tool_registry.list_tools()
+                                 if tool.package != "management" and not tool.name.startswith("management.")
+                                 and tool.name not in self.management_service.DIRECT_WRITE_TOOLS],
+                allow_default_workspace=False, allowed_tools=self.management_service.allowed_tool_names(
+                    self.tool_registry.list_tools(), manager=True, active=controller["status"] == "active",
+                ), allow_fork=False,
+                llm_client_name=controller["llm_client_name"], llm_model=controller["llm_model"],
+                llm_answer_client_name=controller.get("llm_answer_client_name"),
+                llm_answer_model=controller.get("llm_answer_model"),
+                llm_reasoning_level=controller.get("reasoning_level") or ui_reasoning_level,
+                llm_reasoning_source="controller" if controller.get("reasoning_level") else ui_reasoning_source,
+                safety_review_mode=self.local_app_config.management.safety_review_mode,
+                safety_review_policy=self.local_app_config.management.safety_review_policy,
+            )
+
         connections = getattr(self, "device_connection_service", None)
         if connections is not None and (session is None or session.kind != "manager"):
             direct_policy = connections.session_policy(session_id)
@@ -1527,16 +1630,8 @@ class LocalKnowledgeAgentRuntime:
                     ),
                 )
         if session is None or session.kind != "manager":
-            delegates = getattr(self, "management_delegates", None)
-            if delegates is not None:
-                with closing(self._conn()) as conn:
-                    row = conn.execute("SELECT r.record_payload FROM agent_runs r "
-                                       "JOIN managed_session_links l ON l.task_session_id=r.session_id "
-                                       "WHERE r.session_id=? ORDER BY r.created_at DESC,r.run_id DESC LIMIT 1",
-                                       (session_id,)).fetchone()
-                    if row:
-                        frozen = json.loads(row[0])["metadata"]["session_policy"]
-                        return SessionRunPolicy.model_validate(frozen)
+            if ordinary_frozen_record is not None:
+                return SessionRunPolicy.model_validate(json.loads(ordinary_frozen_record)["metadata"]["session_policy"])
             return SessionRunPolicy(llm_reasoning_level=ui_reasoning_level,
                                     llm_reasoning_source=ui_reasoning_source,
                                     llm_answer_client_name=ui_answer_client_name,
@@ -1546,40 +1641,7 @@ class LocalKnowledgeAgentRuntime:
             )) if self.local_app_config.management.enabled else SessionRunPolicy(
                 llm_reasoning_level=ui_reasoning_level, llm_reasoning_source=ui_reasoning_source,
                 llm_answer_client_name=ui_answer_client_name, llm_answer_model=ui_answer_model)
-        controller = self.management_service.get(session_id)["controller"]
-        delegates = getattr(self, "management_delegates", None)
-        if delegates is not None:
-            with closing(self._conn()) as conn:
-                delegate = delegates.get_for_session(conn, session_id)
-            if delegate is not None:
-                with closing(self._conn()) as conn:
-                    policy = delegates.policy_for_session(conn, session_id)
-                return SessionRunPolicy.model_validate(policy)
-        from app.domains.management_role import supervisor_instructions
-
-        return SessionRunPolicy(
-            role_instructions=supervisor_instructions(
-                active=controller["status"] == "active",
-                autonomous_enabled=(self.local_app_config.management.enabled
-                                    and self.local_app_config.management.autonomous_enabled),
-                attention_sweep_interval_seconds=(
-                    self.local_app_config.management.attention_sweep_interval_seconds
-                ),
-            ),
-            read_only_tools=[tool.name for tool in self.tool_registry.list_tools()
-                             if tool.package != "management" and not tool.name.startswith("management.")
-                             and tool.name not in self.management_service.DIRECT_WRITE_TOOLS],
-            allow_default_workspace=False, allowed_tools=self.management_service.allowed_tool_names(
-                self.tool_registry.list_tools(), manager=True, active=controller["status"] == "active",
-            ), allow_fork=False,
-            llm_client_name=controller["llm_client_name"], llm_model=controller["llm_model"],
-            llm_answer_client_name=controller.get("llm_answer_client_name"),
-            llm_answer_model=controller.get("llm_answer_model"),
-            llm_reasoning_level=controller.get("reasoning_level") or ui_reasoning_level,
-            llm_reasoning_source="controller" if controller.get("reasoning_level") else ui_reasoning_source,
-            safety_review_mode=self.local_app_config.management.safety_review_mode,
-            safety_review_policy=self.local_app_config.management.safety_review_policy,
-        )
+        raise RuntimeError("Manager policy dispatch should have returned from the shared-connection path")
 
     def _backfill_session_projects(self) -> None:
         """Associate legacy folder sessions without changing their order or history."""
@@ -1664,6 +1726,8 @@ class LocalKnowledgeAgentRuntime:
                 # while a scheduling transaction may still be running.
                 self._stop_services()
                 self._runtime_owner.release()
+                if self._mysql_owner is not None:
+                    self._mysql_owner.release()
                 self._runtime_closed = True
                 raise
             self._runtime_started = True
@@ -1686,7 +1750,6 @@ class LocalKnowledgeAgentRuntime:
         if self.remote_execution_worker is not None:
             self.remote_execution_worker.start()
         self._run_startup_mail_sync()
-        self._start_background_mail_sync()
         self.watch_scheduler.start()
         memory_config = self.local_app_config.memory
         if memory_config.enabled:
@@ -1715,6 +1778,8 @@ class LocalKnowledgeAgentRuntime:
             self._runtime_started = False
             self._runtime_closed = True
             self._runtime_owner.release()
+            if self._mysql_owner is not None:
+                self._mysql_owner.release()
 
     def _stop_services(self) -> None:
         if not self.scheduler.stop(timeout=self.settings.scheduling_stop_seconds):
@@ -1739,6 +1804,8 @@ class LocalKnowledgeAgentRuntime:
         self._mail_sync_stop_event.set()
         if self._mail_sync_thread and self._mail_sync_thread.is_alive():
             self._mail_sync_thread.join(timeout=5)
+            if self._mail_sync_thread.is_alive():
+                raise RuntimeError("Mail synchronization did not drain; runtime ownership retained")
         self._mail_sync_thread = None
         close_runner = getattr(self.agent_turn_runner, "close", None)
         if callable(close_runner):
@@ -1749,37 +1816,40 @@ class LocalKnowledgeAgentRuntime:
 
     def _run_startup_mail_sync(self) -> None:
         config = self.local_app_config.mail.outlook
-        if not config.enabled or not config.startup_sync_enabled:
+        startup_sync = config.enabled and config.startup_sync_enabled
+        background_sync = (
+            config.enabled and config.background_sync_enabled
+            and config.sync_interval_seconds > 0
+        )
+        if not startup_sync:
             self.last_mail_sync_result = {
                 "provider": "outlook",
                 "status": "skipped",
                 "trigger": "startup",
                 "reason": "Outlook startup sync is disabled.",
             }
+        if not startup_sync and not background_sync:
             return
-        self._sync_outlook_mail_safely(trigger="startup")
-
-    def _start_background_mail_sync(self) -> None:
-        config = self.local_app_config.mail.outlook
-        if (
-            not config.enabled
-            or not config.background_sync_enabled
-            or config.sync_interval_seconds <= 0
-            or (self._mail_sync_thread is not None and self._mail_sync_thread.is_alive())
-        ):
+        if self._mail_sync_thread is not None and self._mail_sync_thread.is_alive():
             return
 
         self._mail_sync_stop_event.clear()
         self._mail_sync_thread = threading.Thread(
-            target=self._background_mail_sync_loop,
+            target=self._mail_sync_worker,
+            args=(startup_sync, background_sync, config.sync_interval_seconds),
             name="lka-outlook-sync",
             daemon=True,
         )
         self._mail_sync_thread.start()
 
-    def _background_mail_sync_loop(self) -> None:
-        config = self.local_app_config.mail.outlook
-        while not self._mail_sync_stop_event.wait(config.sync_interval_seconds):
+    def _mail_sync_worker(
+        self, startup_sync: bool, background_sync: bool, interval_seconds: int,
+    ) -> None:
+        if startup_sync:
+            self._sync_outlook_mail_safely(trigger="startup")
+        if not background_sync:
+            return
+        while not self._mail_sync_stop_event.wait(interval_seconds):
             self._sync_outlook_mail_safely(trigger="background")
 
     def _sync_outlook_mail_safely(self, *, trigger: str) -> None:
@@ -1818,6 +1888,10 @@ class LocalKnowledgeAgentRuntime:
         }
         if self.settings.deployment_id:
             payload["deployment_id"] = self.settings.deployment_id
+        if self.settings.storage_backend == "mysql":
+            payload["storage_backend"] = "mysql"
+            if self._mysql_owner is None or not self._mysql_owner.is_active:
+                payload["status"] = "unavailable"
         return payload
 
     def _upsert_workspace(
@@ -1965,6 +2039,7 @@ class LocalKnowledgeAgentRuntime:
     def prepare_agent_attachment_input(
         self, *, session_id: str | None, attachment_ids: list[str] | None,
         llm_client_name: str | None = None, llm_model: str | None = None,
+        frozen_policy: SessionRunPolicy | None = None,
     ) -> list[str]:
         """Freeze session-local file references before creating a foreground run."""
         if attachment_ids is None:
@@ -1996,9 +2071,10 @@ class LocalKnowledgeAgentRuntime:
             llm_client_name, llm_model = self.resolve_agent_input_model(
                 session_id=session_id, attachment_ids=attachment_ids,
                 llm_client_name=llm_client_name, llm_model=llm_model,
+                frozen_policy=frozen_policy,
             )
             if llm_client_name is None and llm_model is None:
-                policy = self.session_service.run_policy(session_id)
+                policy = frozen_policy or self.session_service.run_policy(session_id)
                 llm_client_name, llm_model = policy.llm_client_name, policy.llm_model
         supports = getattr(self.agent_llm_client, "supports_vision", None)
         if includes_images and (not callable(supports) or not supports(client_name=llm_client_name, model=llm_model)):
@@ -2008,6 +2084,7 @@ class LocalKnowledgeAgentRuntime:
     def resolve_agent_input_model(
         self, *, session_id: str | None, attachment_ids: list[str],
         llm_client_name: str | None = None, llm_model: str | None = None,
+        frozen_policy: SessionRunPolicy | None = None,
     ) -> tuple[str | None, str | None]:
         has_images, has_audio = self._agent_input_modalities(session_id, attachment_ids)
         if not (has_images or has_audio):
@@ -2017,7 +2094,7 @@ class LocalKnowledgeAgentRuntime:
                 raise SessionAttachmentError("Audio model is unavailable.")
             return llm_client_name, llm_model
         if llm_client_name is None and llm_model is None and session_id:
-            policy = self.session_service.run_policy(session_id)
+            policy = frozen_policy or self.session_service.run_policy(session_id)
             llm_client_name, llm_model = policy.llm_client_name, policy.llm_model
         try:
             identity = self.agent_llm_client.resolve_input_identity(
@@ -2036,7 +2113,8 @@ class LocalKnowledgeAgentRuntime:
         return "image" in kinds, "audio" in kinds
 
     def _resolve_answer_input_model(self, *, session_id, attachment_ids,
-                                    client_name, model, primary_client_name=None):
+                                    client_name, model, primary_client_name=None,
+                                    frozen_policy: SessionRunPolicy | None = None):
         if (client_name is None and model is None) or not isinstance(self.agent_llm_client, LLMService):
             return client_name, model
         has_images, has_audio = self._agent_input_modalities(session_id, attachment_ids)
@@ -2045,7 +2123,8 @@ class LocalKnowledgeAgentRuntime:
         if client_name is None:
             client_name = primary_client_name
             if client_name is None and session_id:
-                client_name = self.session_service.run_policy(session_id).llm_client_name
+                policy = frozen_policy or self.session_service.run_policy(session_id)
+                client_name = policy.llm_client_name
         try:
             return self.agent_llm_client.resolve_input_identity(
                 client_name=client_name, model=model, has_images=has_images, has_audio=has_audio,
@@ -2054,7 +2133,8 @@ class LocalKnowledgeAgentRuntime:
             raise ValueError(str(exc)) from exc
 
     def _prepare_agent_turn_input(self, *, session_id, attachment_ids, llm_client_name, llm_model,
-                                  llm_answer_client_name, llm_answer_model, existing_run_id):
+                                  llm_answer_client_name, llm_answer_model, existing_run_id,
+                                  frozen_policy: SessionRunPolicy | None = None):
         """Resolve final input before graph entry, including a newly frozen queue batch."""
         run = self.agent_run_manager.get_run(existing_run_id) if existing_run_id else None
         if run is not None and llm_client_name is None and llm_model is None:
@@ -2074,25 +2154,30 @@ class LocalKnowledgeAgentRuntime:
         attachment_ids = self.prepare_agent_attachment_input(
             session_id=session_id, attachment_ids=attachment_ids,
             llm_client_name=llm_client_name, llm_model=llm_model,
+            frozen_policy=frozen_policy,
         )
         llm_client_name, llm_model = self.resolve_agent_input_model(
             session_id=session_id, attachment_ids=attachment_ids,
             llm_client_name=llm_client_name, llm_model=llm_model,
+            frozen_policy=frozen_policy,
         )
         llm_answer_client_name, llm_answer_model = self.resolve_agent_answer_model(
             session_id=session_id, requested_client=llm_answer_client_name,
             requested_model=llm_answer_model, existing_run_id=existing_run_id,
+            frozen_policy=frozen_policy,
         )
         if run is None or run.status == AgentRunStatus.QUEUED:
             llm_answer_client_name, llm_answer_model = self._resolve_answer_input_model(
                 session_id=session_id, attachment_ids=attachment_ids,
                 client_name=llm_answer_client_name, model=llm_answer_model,
                 primary_client_name=llm_client_name,
+                frozen_policy=frozen_policy,
             )
         self.validate_agent_answer_selection(
             session_id=session_id, llm_answer_client_name=llm_answer_client_name,
             llm_answer_model=llm_answer_model, primary_client_name=llm_client_name,
             attachment_ids=attachment_ids,
+            frozen_policy=frozen_policy,
         )
         if run is not None and run.status == AgentRunStatus.QUEUED and any(self._agent_input_modalities(session_id, attachment_ids)):
             # Final answer routing reads durable metadata before ContextVars. Update
@@ -2110,6 +2195,33 @@ class LocalKnowledgeAgentRuntime:
                     "llm_answer_model": llm_answer_model,
                 })
         return attachment_ids, llm_client_name, llm_model, llm_answer_client_name, llm_answer_model
+
+    def _preflight_agent_turn(self, *, session_id, attachment_ids, llm_client_name, llm_model,
+                              llm_answer_client_name, llm_answer_model, existing_run_id,
+                              llm_reasoning_level):
+        """Share one policy read across this synchronous selection operation.
+
+        The run creation path still reads current policy for admission. No
+        connection or policy cache survives across requests or model waiting.
+        Existing runs continue to use their durable frozen selection.
+        """
+        policy = (self.session_service.run_policy(session_id)
+                  if session_id and existing_run_id is None else None)
+        if policy is not None:
+            policy = policy.model_copy(deep=True)
+        prepared = self._prepare_agent_turn_input(
+            session_id=session_id, attachment_ids=attachment_ids,
+            llm_client_name=llm_client_name, llm_model=llm_model,
+            llm_answer_client_name=llm_answer_client_name, llm_answer_model=llm_answer_model,
+            existing_run_id=existing_run_id, frozen_policy=policy,
+        )
+        if existing_run_id is None:
+            self.validate_agent_reasoning_selection(
+                session_id=session_id, requested=llm_reasoning_level,
+                attachment_ids=prepared[0], llm_client_name=prepared[1], llm_model=prepared[2],
+                frozen_policy=policy,
+            )
+        return prepared, policy
 
     def prepare_agent_image_input(self, **kwargs) -> list[str]:
         """Compatibility entry point for existing image API integrations."""
@@ -2172,6 +2284,51 @@ class LocalKnowledgeAgentRuntime:
             return self.management_coordinator.workload(run)
         return nullcontext()
 
+    @contextmanager
+    def _unstarted_run_recovery_guard(self, run_id):
+        runner = self._runner_for_turn(existing_run_id=run_id)
+        if not isinstance(runner, AgentGraphRunner):
+            yield False
+            return
+        lease = runner._execution_lease(run_id)
+        if not lease.acquire(blocking=False):
+            yield False
+            return
+        try:
+            # No business write transaction is open while borrowing a saver.
+            snapshot = runner.get_state(run_id)
+            yield not bool(snapshot.values)
+        finally:
+            try:
+                # Refresh before releasing the graph lock. A stream/resume must
+                # never start from a queued cache after recovery committed failure.
+                record = self.agent_run_store.load_run(run_id)
+                if record is not None:
+                    self.agent_run_manager.refresh_after_transaction(record)
+            finally:
+                lease.release()
+
+    def _execution_failed_before_start(self, run_id, exc):
+        from app.core.agent_dispatch import AgentDispatchFenced
+
+        if isinstance(exc, AgentDispatchFenced):
+            return
+        current = self.agent_run_manager.get_run(run_id)
+        if current is None or current.status.value != "queued":
+            return
+        runner = self._runner_for_turn(existing_run_id=run_id)
+        if isinstance(runner, AgentGraphRunner):
+            lease = runner._execution_lease(run_id)
+            if not lease.acquire(blocking=False):
+                return
+            try:
+                runner._fail_startup(run_id, exc)
+            finally:
+                lease.release()
+        else:
+            self.agent_run_manager.fail_run(run_id, "execution_start_failed", str(exc))
+
+    @admitted_execution
     def run_agent_turn(
         self,
         *,
@@ -2191,17 +2348,14 @@ class LocalKnowledgeAgentRuntime:
     ) -> AgentTurnResult:
         """Run the minimal general agent turn loop."""
 
-        (attachment_ids, llm_client_name, llm_model,
-         llm_answer_client_name, llm_answer_model) = self._prepare_agent_turn_input(
+        prepared, preflight_policy = self._preflight_agent_turn(
             session_id=session_id, attachment_ids=attachment_ids,
             llm_client_name=llm_client_name, llm_model=llm_model,
             llm_answer_client_name=llm_answer_client_name, llm_answer_model=llm_answer_model,
-            existing_run_id=existing_run_id,
+            existing_run_id=existing_run_id, llm_reasoning_level=llm_reasoning_level,
         )
-        if existing_run_id is None:
-            self.validate_agent_reasoning_selection(session_id=session_id, requested=llm_reasoning_level,
-                                                    attachment_ids=attachment_ids,
-                                                    llm_client_name=llm_client_name, llm_model=llm_model)
+        (attachment_ids, llm_client_name, llm_model,
+         llm_answer_client_name, llm_answer_model) = prepared
         if client_request_id is not None and existing_run_id is None:
             correlated_run = self.create_agent_run(
                 session_id=session_id, user_input=user_input, attachment_ids=attachment_ids,
@@ -2212,6 +2366,7 @@ class LocalKnowledgeAgentRuntime:
             existing_run_id = correlated_run.run_id
         llm_reasoning_level, llm_reasoning_source = self.resolve_agent_reasoning_level(
             session_id=session_id, requested=llm_reasoning_level, existing_run_id=existing_run_id,
+            frozen_policy=preflight_policy,
         )
         runner = self._runner_for_turn(existing_run_id=existing_run_id, resumable=resumable)
         with self._management_workload_for_run(existing_run_id):
@@ -2230,6 +2385,7 @@ class LocalKnowledgeAgentRuntime:
                 existing_run_id=existing_run_id,
             )
 
+    @admitted_execution
     async def run_agent_turn_async(
         self,
         *,
@@ -2249,18 +2405,15 @@ class LocalKnowledgeAgentRuntime:
     ) -> AgentTurnResult:
         """Run one agent turn without blocking the event loop."""
 
-        (attachment_ids, llm_client_name, llm_model,
-         llm_answer_client_name, llm_answer_model) = await asyncio.to_thread(
-            self._prepare_agent_turn_input,
+        prepared, preflight_policy = await asyncio.to_thread(
+            self._preflight_agent_turn,
             session_id=session_id, attachment_ids=attachment_ids,
             llm_client_name=llm_client_name, llm_model=llm_model,
             llm_answer_client_name=llm_answer_client_name, llm_answer_model=llm_answer_model,
-            existing_run_id=existing_run_id,
+            existing_run_id=existing_run_id, llm_reasoning_level=llm_reasoning_level,
         )
-        if existing_run_id is None:
-            await asyncio.to_thread(self.validate_agent_reasoning_selection, session_id=session_id,
-                                    requested=llm_reasoning_level, attachment_ids=attachment_ids,
-                                    llm_client_name=llm_client_name, llm_model=llm_model)
+        (attachment_ids, llm_client_name, llm_model,
+         llm_answer_client_name, llm_answer_model) = prepared
         if client_request_id is not None and existing_run_id is None:
             correlated_run = await asyncio.to_thread(self.create_agent_run,
                 session_id=session_id, user_input=user_input, attachment_ids=attachment_ids,
@@ -2271,7 +2424,7 @@ class LocalKnowledgeAgentRuntime:
             existing_run_id = correlated_run.run_id
         llm_reasoning_level, llm_reasoning_source = await asyncio.to_thread(
             self.resolve_agent_reasoning_level, session_id=session_id, requested=llm_reasoning_level,
-            existing_run_id=existing_run_id,
+            existing_run_id=existing_run_id, frozen_policy=preflight_policy,
         )
         runner = await asyncio.to_thread(self._runner_for_turn, existing_run_id=existing_run_id, resumable=resumable)
         workload = await asyncio.to_thread(self._management_workload_for_run, existing_run_id)
@@ -2809,6 +2962,14 @@ class LocalKnowledgeAgentRuntime:
             return "langgraph"
         return getattr(self.agent_turn_runner, "orchestrator_name", "legacy")
 
+    def _create_checkpoint_runtime(self):
+        if self._mysql_config is not None:
+            checkpoint_runtime = create_mysql_checkpoint_runtime(self._mysql_config)
+            checkpoint_runtime.verify_schema()
+            checkpoint_runtime.set_coordinator_owner(self._mysql_owner)
+            return checkpoint_runtime
+        return create_sqlite_checkpoint_runtime(self.settings.data_dir / "agent_checkpoints.sqlite3")
+
     def _runner_for_turn(self, *, existing_run_id: str | None = None,
                          resumable: bool = False) -> AgentTurnRunner:
         if existing_run_id is not None:
@@ -2821,9 +2982,8 @@ class LocalKnowledgeAgentRuntime:
         # Opt-in per new turn; never change the default runner or inference policy.
         with self._resumable_runner_lock:
             if self._resumable_runner is None:
-                checkpoint_runtime = (create_sqlite_checkpoint_runtime(
-                    self.settings.data_dir / "agent_checkpoints.sqlite3"
-                ) if self.local_app_config.agent.checkpoint_backend == "sqlite" else None)
+                checkpoint_runtime = (self._create_checkpoint_runtime()
+                                      if self.local_app_config.agent.checkpoint_backend == "sqlite" else None)
                 self._resumable_runner = AgentGraphRunner(
                     self.agent_turn_loop, checkpoint_runtime=checkpoint_runtime, artifact_store=self.agent_run_store,
                 )
@@ -2913,6 +3073,7 @@ class LocalKnowledgeAgentRuntime:
         finally:
             lease.release()
 
+    @admitted_execution
     def resume_agent_run(self, run_id: str) -> AgentTurnResult:
         """Resume an incomplete LangGraph run from its latest checkpoint."""
 
@@ -2924,6 +3085,7 @@ class LocalKnowledgeAgentRuntime:
         with self._management_workload_for_run(run_id):
             return runner.resume(run_id)
 
+    @admitted_execution
     async def resume_agent_run_async(self, run_id: str) -> AgentTurnResult:
         """Asynchronously resume an incomplete LangGraph run."""
 
@@ -2971,12 +3133,14 @@ class LocalKnowledgeAgentRuntime:
         answer_client, answer_model = self._resolve_answer_input_model(
             session_id=session_id, attachment_ids=attachment_ids,
             client_name=answer_client, model=answer_model, primary_client_name=llm_client_name,
+            frozen_policy=policy,
         )
         self.validate_agent_answer_selection(session_id=session_id,
                                              llm_answer_client_name=answer_client,
                                              llm_answer_model=answer_model,
                                              attachment_ids=attachment_ids,
-                                             primary_client_name=llm_client_name)
+                                             primary_client_name=llm_client_name,
+                                             frozen_policy=policy)
         model_metadata = {
             "llm_reasoning_level": level, "llm_reasoning_source": source,
             "llm_answer_client_name": answer_client, "llm_answer_model": answer_model,
@@ -2987,18 +3151,23 @@ class LocalKnowledgeAgentRuntime:
                 user_input=user_input,
                 parent_run_id=parent_run_id,
                 initial_metadata={**model_metadata, "session_policy": model_metadata},
+                **({"trusted_session_policy": policy.model_copy(deep=True)}
+                   if session_id is not None and parent_run_id is None else {}),
                 **({"client_request_id": client_request_id} if client_request_id is not None else {}),
             )
         except KeyError as exc:
             if "Session is deleted" in str(exc):
                 raise ValueError("Cannot create a run for a deleted session.") from exc
             raise
+        if parent_run_id is None:
+            bind_execution_run(run.run_id)
         return run
 
     def resolve_agent_answer_model(self, *, session_id: str | None,
                                    requested_client: str | None = None,
                                    requested_model: str | None = None,
-                                   existing_run_id: str | None = None) -> tuple[str | None, str | None]:
+                                   existing_run_id: str | None = None,
+                                   frozen_policy: SessionRunPolicy | None = None) -> tuple[str | None, str | None]:
         """Freeze an answer pair independently from the turn's primary inference pair."""
         if existing_run_id is not None:
             run = self.agent_run_manager.get_run(existing_run_id)
@@ -3014,10 +3183,34 @@ class LocalKnowledgeAgentRuntime:
                 return None, None
         if requested_client is not None or requested_model is not None:
             return requested_client, requested_model
-        policy = (self.session_service.run_policy(session_id) if session_id
-                  else self._session_run_policy("__new_ordinary_session__"))
+        policy = frozen_policy or (self.session_service.run_policy(session_id) if session_id
+                                   else self._session_run_policy("__new_ordinary_session__"))
         return (getattr(policy, "llm_answer_client_name", None),
                 getattr(policy, "llm_answer_model", None))
+
+    def validate_agent_input_selection(self, *, session_id: str,
+                                       attachment_ids: list[str], llm: dict[str, Any]) -> None:
+        """Preflight both model choices against one request-local policy snapshot."""
+        answer_client = llm.get("answer_client_name")
+        answer_model = llm.get("answer_model")
+        reasoning_level = llm.get("reasoning_level")
+        needs_policy = (reasoning_level is None or answer_client is None or bool(attachment_ids))
+        policy = self.session_service.run_policy(session_id) if needs_policy else None
+
+        self.validate_agent_answer_selection(
+            session_id=session_id,
+            attachment_ids=attachment_ids,
+            llm_answer_client_name=answer_client,
+            llm_answer_model=answer_model,
+            resolve_preference=True,
+            frozen_policy=policy.model_copy(deep=True) if policy is not None else None,
+        )
+        self.validate_agent_reasoning_selection(
+            session_id=session_id,
+            requested=reasoning_level,
+            attachment_ids=attachment_ids,
+            frozen_policy=policy.model_copy(deep=True) if policy is not None else None,
+        )
 
     def validate_agent_answer_selection(self, *, session_id: str | None,
                                         llm_answer_client_name: str | None = None,
@@ -3025,12 +3218,14 @@ class LocalKnowledgeAgentRuntime:
                                         attachment_ids: list[str] | None = None,
                                         resolve_preference: bool = False,
                                         primary_client_name: str | None = None,
+                                        frozen_policy: SessionRunPolicy | None = None,
                                         **_optional: Any) -> None:
         """Validate configured answer identity and its capacity before run admission."""
         if resolve_preference:
             llm_answer_client_name, llm_answer_model = self.resolve_agent_answer_model(
                 session_id=session_id, requested_client=llm_answer_client_name,
                 requested_model=llm_answer_model,
+                frozen_policy=frozen_policy,
             )
         if llm_answer_client_name is None and llm_answer_model is None:
             return
@@ -3040,13 +3235,14 @@ class LocalKnowledgeAgentRuntime:
             session_id=session_id, attachment_ids=attachment_ids,
             client_name=llm_answer_client_name, model=llm_answer_model,
             primary_client_name=primary_client_name,
+            frozen_policy=frozen_policy,
         )
         registry = self.agent_llm_client.registry
         request_client = llm_answer_client_name
         if request_client is None and llm_answer_model is not None:
             request_client = primary_client_name
             if request_client is None and session_id:
-                request_client = self.session_service.run_policy(session_id).llm_client_name
+                request_client = (frozen_policy or self.session_service.run_policy(session_id)).llm_client_name
         try:
             identity_client, identity_model = self.agent_llm_client._resolve_request_identity(LLMRequest(
                 client_name=request_client, model=llm_answer_model,
@@ -3113,17 +3309,21 @@ class LocalKnowledgeAgentRuntime:
     def validate_agent_reasoning_selection(self, *, session_id: str | None, requested: str | None,
                                            attachment_ids: list[str] | None = None,
                                            llm_client_name: str | None = None,
-                                           llm_model: str | None = None) -> None:
+                                           llm_model: str | None = None,
+                                           frozen_policy: SessionRunPolicy | None = None) -> None:
         """Reject a user-selected level before creating or dispatching a run."""
         if requested is not None and requested not in {"off", "low", "high", "max"}:
             raise ValueError("reasoning_level must be off, low, high, or max")
-        level, _source = self.resolve_agent_reasoning_level(session_id=session_id, requested=requested)
+        level, _source = self.resolve_agent_reasoning_level(
+            session_id=session_id, requested=requested, frozen_policy=frozen_policy,
+        )
         capability_fn = getattr(self.agent_llm_client, "reasoning_capability", None)
         if level is None or not callable(capability_fn):
             return
         client_name, model = self.resolve_agent_input_model(
             session_id=session_id, attachment_ids=attachment_ids or [],
             llm_client_name=llm_client_name, llm_model=llm_model,
+            frozen_policy=frozen_policy,
         )
         level_validator = getattr(self.agent_llm_client, "validate_reasoning_level", None)
         if callable(level_validator):
